@@ -17,6 +17,48 @@ async function loadContainmentModule(): Promise<any> {
 }
 
 describe('grid cell containment limits', () => {
+    it('routes byte-unrepresentable TEXT to a raw sidecar instead of exposing U+FFFD as editable data', async () => {
+        const { containUnrepresentableTextCells } = await loadContainmentModule();
+        const decoded = containUnrepresentableTextCells({
+            sourceRows: [['�', '�']],
+            rawTextRows: [[Uint8Array.of(0x80), Uint8Array.of(0xef, 0xbf, 0xbd)]],
+            rawTextColumnIndices: [0, 1],
+            textEncoding: 'utf-8',
+            contained: { rows: [['�', '�']] }
+        });
+
+        assert.deepStrictEqual(decoded.rows, [['', '�']]);
+        assert.deepStrictEqual(decoded.oversizedCells, {
+            0: { 0: { storageClass: 'text', byteLength: 1 } }
+        });
+    });
+
+    it('contains malformed ordinary SQLite TEXT in an actual WASM table page', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const engine = result.operations!;
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE malformed_text_value (value TEXT); ' +
+                "INSERT INTO malformed_text_value VALUES " +
+                "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT))"
+            );
+            const page = await engine.fetchTableData('malformed_text_value', {
+                columns: ['rowid', 'value'],
+                orderBy: 'rowid',
+                orderDir: 'ASC',
+                limit: 10,
+                offset: 0
+            });
+
+            assert.deepStrictEqual(page.rows, [[1, ''], [2, '�']]);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: { 1: { storageClass: 'text', byteLength: 1 } }
+            });
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('keeps the 1 MiB per-cell ceiling when the page budget is looser', async () => {
         const { deriveEffectiveInlineCellBytes } = await loadContainmentModule();
 

@@ -3,19 +3,29 @@ import { describe, it, mock, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import * as v8 from 'node:v8';
 import { EventEmitter } from 'node:events';
 import * as vscode from 'vscode';
 import { isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import { InvocationTimeoutError } from '../../src/core/rpc';
 import type { DatabaseOperations } from '../../src/core/types';
-import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
+import {
+    encodePrimaryKeyRecordId,
+    MAIN_TABLE_ROOT_PAGE_SQL
+} from '../../src/core/row-identity';
+import {
+    ROWID_ALIAS_COLUMN_SQL,
+    ROWID_TABLE_AUTHORITY_SQL,
+    TABLE_XINFO_WITH_ROWID_ALIAS_SQL
+} from '../../src/core/integer-utils';
 import { createDeferred } from './helpers/deferred';
 import {
     CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES,
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
+import { buildCreateViewTriggerSql } from '../../src/core/view-utils';
 
 const nativeWorkerSource = fs.readFileSync(
     path.resolve(process.cwd(), 'natives', 'native-worker.js'),
@@ -36,11 +46,23 @@ function loadNativeWorkerFunction(
         functionSource,
         `native worker signature changed; expected ${signature}`
     );
-    const dependencyNames = Object.keys(dependencies);
+    const resolvedDependencies = { ...dependencies };
+    if (
+        functionName !== 'describeNativeError'
+        && functionSource.includes('describeNativeError(')
+        && !Object.prototype.hasOwnProperty.call(resolvedDependencies, 'describeNativeError')
+    ) {
+        resolvedDependencies.describeNativeError = loadNativeWorkerFunction(
+            'describeNativeError',
+            ['error', 'fallback'],
+            { MAX_NATIVE_ERROR_MESSAGE_LENGTH: 8192 }
+        );
+    }
+    const dependencyNames = Object.keys(resolvedDependencies);
     return Function(
         ...dependencyNames,
         `"use strict"; return (${functionSource});`
-    )(...dependencyNames.map(name => dependencies[name]));
+    )(...dependencyNames.map(name => resolvedDependencies[name]));
 }
 
 function loadNativeBoundaryFunction(
@@ -65,10 +87,100 @@ interface RecordedNativeCall {
     id: number;
     method: string;
     args: unknown[];
+    timeoutMs?: number;
 }
 
 type RecordedNativeResponse = { result?: unknown; error?: string; cancelled?: boolean };
-type RecordedNativeResponder = (call: RecordedNativeCall) => RecordedNativeResponse | Promise<RecordedNativeResponse>;
+type RecordedNativeResponder = (
+    call: RecordedNativeCall
+) => RecordedNativeResponse | undefined | Promise<RecordedNativeResponse | undefined>;
+
+function isRowIdAliasMetadataCall(call: RecordedNativeCall): boolean {
+    return call.method === 'query' && call.args[0] === ROWID_ALIAS_COLUMN_SQL;
+}
+
+function isPostUpdateRowIdCall(call: RecordedNativeCall): boolean {
+    return call.method === 'query'
+        && /^SELECT CAST\(rowid AS TEXT\) FROM /.test(String(call.args[0]));
+}
+
+function noRowIdAliasResponse(): RecordedNativeResponse {
+    return { result: { columns: ['name'], values: [] } };
+}
+
+function updatedRowIdResponse(...rowIds: Array<number | string>): RecordedNativeResponse {
+    return {
+        result: {
+            columns: ['rowid'],
+            values: rowIds.map(rowId => [String(rowId)])
+        }
+    };
+}
+
+function isUpdateTriggerGuardCall(call: RecordedNativeCall): boolean {
+    if (call.method !== 'queryBatch') return false;
+    const queries = call.args[0];
+    return Array.isArray(queries)
+        && queries.length === 2
+        && queries[0]?.sql === MAIN_TABLE_ROOT_PAGE_SQL
+        && /^EXPLAIN UPDATE /.test(String(queries[1]?.sql));
+}
+
+const explainColumns = ['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5', 'comment'];
+
+function updateTriggerGuardResponse(
+    rows: unknown[][] = [[0, 'Init', 0, 1, 0, null, 0, null]],
+    rootPage: number = 31
+): RecordedNativeResponse {
+    return {
+        result: {
+            results: [
+                { columns: ['rootpage'], values: [[rootPage]] },
+                { columns: explainColumns, values: rows }
+            ]
+        }
+    };
+}
+
+function targetWritingTriggerGuardResponse(): RecordedNativeResponse {
+    return updateTriggerGuardResponse([
+        [0, 'Init', 0, 1, 0, null, 0, null],
+        [0, 'Init', 0, 1, 0, '-- TRIGGER native_entry', 0, null],
+        [1, 'Program', 0, 2, 0, 'program', 0, null],
+        [0, 'Init', 0, 1, 0, '-- TRIGGER native_descendant', 0, null],
+        [1, 'OpenWrite', 0, 31, 0, '2', 0, null]
+    ]);
+}
+
+function auditOnlyTriggerGuardResponse(): RecordedNativeResponse {
+    return updateTriggerGuardResponse([
+        [0, 'Init', 0, 1, 0, null, 0, null],
+        [0, 'Init', 0, 1, 0, '-- TRIGGER native_audit', 0, null],
+        [1, 'OpenWrite', 0, 32, 0, '1', 0, null]
+    ]);
+}
+
+function foreignKeyUpdateGuardResponse(
+    assignment: 'cascade' | 'set-null' | 'set-default'
+): RecordedNativeResponse {
+    const assignmentRow = assignment === 'cascade'
+        ? [20, 'Param', 2, 7, 0, null, 0, null]
+        : assignment === 'set-null'
+            ? [20, 'Null', 0, 7, 0, null, 0, null]
+            : [20, 'String8', 0, 7, 0, 'fallback', 0, null];
+    return updateTriggerGuardResponse([
+        [0, 'Init', 0, 36, 0, null, 0, null],
+        [0, 'Init', 0, 1, 0, null, 0, null],
+        [1, 'Param', 0, 1, 0, null, 0, null],
+        [2, 'Param', 2, 2, 0, null, 0, null],
+        [14, 'OpenWrite', 0, 32, 0, '1', 0, null],
+        assignmentRow,
+        [22, 'MakeRecord', 7, 1, 8, 'D', 0, null],
+        [32, 'Delete', 0, 68, 6, 'child', 0, null],
+        [33, 'Insert', 0, 8, 6, 'child', 5, null],
+        [36, 'Halt', 0, 0, 0, null, 0, null]
+    ]);
+}
 
 function encodeNativeMessage(message: unknown): Buffer {
     // Native worker messages are length-prefixed V8 payloads, matching NativeWorkerProcess.writeMessage.
@@ -109,7 +221,24 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respo
             // receive a generic success response.
             queueMicrotask(async () => {
                 try {
-                    const response = await (respondToCall?.(call) ?? { result: { changes: 1, lastInsertRowId: 1 } });
+                    const defaultResponse = call.method === 'compileBatch'
+                        ? {
+                            result: {
+                                errors: Array.isArray(call.args[0])
+                                    ? call.args[0].map(() => null)
+                                    : []
+                            }
+                        }
+                        : { result: { changes: 1, lastInsertRowId: 1 } };
+                    const suppliedResponse = call.method === 'query'
+                        && call.args[0] === ROWID_TABLE_AUTHORITY_SQL
+                        ? { result: { columns: ['1'], values: [[1]] } }
+                        : await respondToCall?.(call);
+                    const response = call.method === 'compileBatch'
+                        && suppliedResponse?.error === undefined
+                        && !Array.isArray((suppliedResponse?.result as any)?.errors)
+                        ? defaultResponse
+                        : suppliedResponse ?? defaultResponse;
                     emitMessage({ id: call.id, ...response });
                 } catch (err) {
                     emitMessage({ id: call.id, error: err instanceof Error ? err.message : String(err) });
@@ -118,14 +247,13 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respo
         }
     };
 
-    mockProcess.stdin = {
-        write: mock.fn((chunk: Buffer) => {
+    mockProcess.stdin = new EventEmitter();
+    mockProcess.stdin.write = mock.fn((chunk: Buffer) => {
             // NativeWorkerProcess writes the header and payload separately, so buffer until a full frame arrives.
             inputBuffer = Buffer.concat([inputBuffer, Buffer.from(chunk)]);
             readInboundMessages();
             return true;
-        })
-    };
+        });
 
     queueMicrotask(() => {
         emitMessage({ ready: true });
@@ -133,6 +261,198 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respo
 
     return mockProcess;
 }
+
+describe('native statement fallback integrity', () => {
+    it('bounds arbitrary native error text before it reaches IPC or stderr', () => {
+        const describeNativeError = loadNativeWorkerFunction(
+            'describeNativeError',
+            ['error', 'fallback'],
+            { MAX_NATIVE_ERROR_MESSAGE_LENGTH: 8192 }
+        );
+        const hostile = {
+            [Symbol.toPrimitive]() {
+                throw new Error('coercion trap');
+            }
+        };
+
+        assert.strictEqual(describeNativeError(null, 'Unknown error'), 'null');
+        assert.strictEqual(describeNativeError(hostile, 'Unknown error'), 'Unknown error');
+        const bounded = describeNativeError(new Error('x'.repeat(20_000)), 'Unknown error');
+        assert.ok(bounded.length < 8300);
+        assert.match(bounded, /truncated from 20000 characters/);
+    });
+
+    it('never writes SQL text or bound parameter values to worker diagnostics', () => {
+        const diagnosticLines = nativeWorkerSource
+            .split('\n')
+            .filter(line => /console\.(?:error|warn|log)\s*\(/.test(line));
+
+        assert.deepStrictEqual(
+            diagnosticLines.filter(line => /\bsql\b|param/i.test(line)),
+            [],
+            'worker stderr is forwarded into the VS Code extension host and must contain metadata only'
+        );
+    });
+
+    it('does not emit per-request success chatter into the VS Code output channel', () => {
+        const diagnosticSource = nativeWorkerSource
+            .split('\n')
+            .filter(line => /console\.(?:error|warn|log)\s*\(/.test(line))
+            .join('\n');
+
+        assert.doesNotMatch(
+            diagnosticSource,
+            /Starting|Sent ready signal|Received request|Sending response|query complete|completed statements|DEBUG: run complete/i
+        );
+    });
+
+    it('propagates fallback bind failures without executing the unbound statement', () => {
+        const executeStatement = loadNativeWorkerFunction(
+            'executeStatement',
+            ['db', 'sql', 'params']
+        );
+        let steps = 0;
+        let finalizes = 0;
+        const db = {
+            prepare() {
+                return {
+                    bind() { throw new Error('bind rejected value'); },
+                    step() { steps++; },
+                    finalize() { finalizes++; }
+                };
+            }
+        };
+
+        assert.throws(
+            () => executeStatement(db, 'UPDATE t SET value = ?', ['secret']),
+            /bind rejected value/
+        );
+        assert.strictEqual(steps, 0);
+        assert.strictEqual(finalizes, 1);
+    });
+
+    it('refuses parameters when a fallback statement has no binding API', () => {
+        const executeStatement = loadNativeWorkerFunction(
+            'executeStatement',
+            ['db', 'sql', 'params']
+        );
+        let steps = 0;
+        const db = {
+            prepare() {
+                return {
+                    step() { steps++; },
+                    finalize() {}
+                };
+            }
+        };
+
+        assert.throws(
+            () => executeStatement(db, 'UPDATE t SET value = ?', [17]),
+            /does not support parameter binding/i
+        );
+        assert.strictEqual(steps, 0);
+    });
+
+    it('preserves the primary SQLite error when statement finalization also fails', () => {
+        const executeStatement = loadNativeWorkerFunction(
+            'executeStatement',
+            ['db', 'sql', 'params']
+        );
+        const db = {
+            prepare() {
+                return {
+                    run() { throw new Error('attempt to write a readonly database'); },
+                    finalize() { throw new Error('statement already finalized'); }
+                };
+            }
+        };
+
+        let error: unknown;
+        try {
+            executeStatement(db, 'UPDATE t SET value = 1');
+        } catch (caught) {
+            error = caught;
+        }
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /attempt to write a readonly database/i);
+        assert.ok(error instanceof AggregateError);
+        assert.strictEqual(error.errors.length, 2);
+        assert.match(error.message, /statement already finalized/i);
+    });
+
+    it('propagates a changes-query failure instead of reporting a false zero', () => {
+        const readRunFallbackResult = loadNativeWorkerFunction(
+            'readRunFallbackResult',
+            ['db']
+        );
+        let finalizes = 0;
+        const db = {
+            prepare() {
+                return {
+                    all() { throw new Error('changes query failed'); },
+                    finalize() { finalizes++; }
+                };
+            }
+        };
+
+        assert.throws(() => readRunFallbackResult(db), /changes query failed/);
+        assert.strictEqual(finalizes, 1);
+    });
+
+    it('rejects an impossible empty changes result instead of treating it as success', () => {
+        const readRunFallbackResult = loadNativeWorkerFunction(
+            'readRunFallbackResult',
+            ['db']
+        );
+        const db = {
+            prepare() {
+                return { all: () => [], finalize() {} };
+            }
+        };
+
+        assert.throws(
+            () => readRunFallbackResult(db),
+            /did not return mutation metadata/i
+        );
+    });
+
+    it('validates query SQL before trying to log a substring', () => {
+        const executeQuery = loadNativeWorkerFunction(
+            'executeQuery',
+            ['db', 'sql', 'params'],
+            { MAX_QUERY_STATEMENTS: 32 }
+        );
+        assert.throws(
+            () => executeQuery({}, 42, []),
+            /SQL query must be a string/
+        );
+    });
+
+    it('rejects non-array query parameters before preparing or stepping SQL', () => {
+        const executeQuery = loadNativeWorkerFunction(
+            'executeQuery',
+            ['db', 'sql', 'params'],
+            { MAX_QUERY_STATEMENTS: 32 }
+        );
+        let prepares = 0;
+        const db = {
+            prepare() {
+                prepares++;
+                return {
+                    toString: () => 'SELECT ?',
+                    all: (...values: unknown[]) => [{ values }],
+                    finalize() {}
+                };
+            }
+        };
+
+        assert.throws(
+            () => executeQuery(db, 'SELECT ?', 'secret'),
+            /query parameters must be an array/i
+        );
+        assert.strictEqual(prepares, 0);
+    });
+});
 
 describe('isNativeAvailable', () => {
     let originalPlatform: string;
@@ -263,14 +583,23 @@ describe('createNativeDatabaseConnection', () => {
         respondToCall?: RecordedNativeResponder,
         outputChannel?: vscode.OutputChannel,
         queryTimeout: number = 30000,
-        forceReadOnly: boolean = false
+        forceReadOnly: boolean = false,
+        respondToTriggerGuard?: RecordedNativeResponder
     ): Promise<{
         databaseOps: DatabaseOperations;
         calls: RecordedNativeCall[];
+        exportDatabase: () => Promise<Uint8Array>;
         dispose: () => void;
     }> {
         const calls: RecordedNativeCall[] = [];
-        mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls, respondToCall));
+        const responder: RecordedNativeResponder = async call => {
+            if (isUpdateTriggerGuardCall(call)) {
+                return await respondToTriggerGuard?.(call)
+                    ?? updateTriggerGuardResponse();
+            }
+            return respondToCall?.(call);
+        };
+        mock.method(child_process, 'spawn', () => createRecordingNativeProcess(calls, responder));
 
         const { createNativeDatabaseConnection } = require('../../src/nativeWorker');
         const bundle = await createNativeDatabaseConnection(
@@ -280,7 +609,9 @@ describe('createNativeDatabaseConnection', () => {
             queryTimeout
         );
         const connection = await bundle.establishConnection(
-            { fsPath: '/db/path.sqlite' } as any,
+            // Keep the leaf absent: native SQLite may legitimately create a
+            // new database when its parent directory is writable.
+            { fsPath: path.join(tempDir, 'path.sqlite') } as any,
             'TestDB',
             forceReadOnly
         );
@@ -288,9 +619,53 @@ describe('createNativeDatabaseConnection', () => {
         return {
             databaseOps: connection.databaseOps,
             calls,
+            exportDatabase: () => bundle.workerMethods.exportDatabase() as Promise<Uint8Array>,
             dispose: () => bundle.workerMethods[Symbol.dispose]()
         };
     }
+
+    it('uses an isolated cross-platform scratch directory for native snapshots and cleans it', async () => {
+        let exportedPath = '';
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'vacuumInto') {
+                exportedPath = String(call.args[0]);
+                fs.writeFileSync(exportedPath, new Uint8Array([1, 2, 3]));
+                return { result: { success: true } };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            assert.deepStrictEqual(await connection.exportDatabase(), new Uint8Array([1, 2, 3]));
+            assert.ok(path.isAbsolute(exportedPath));
+            assert.strictEqual(path.dirname(exportedPath).startsWith(os.tmpdir()), true);
+            assert.match(path.basename(path.dirname(exportedPath)), /^sqlite-explorer-export-/);
+            assert.strictEqual(fs.existsSync(path.dirname(exportedPath)), false);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('removes the native snapshot scratch directory when export fails', async () => {
+        let exportedPath = '';
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'vacuumInto') {
+                exportedPath = String(call.args[0]);
+                fs.writeFileSync(exportedPath, 'partial');
+                fs.writeFileSync(`${exportedPath}-journal`, 'partial sidecar');
+                return { error: 'snapshot failed' };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            await assert.rejects(connection.exportDatabase(), /snapshot failed/);
+            assert.notStrictEqual(exportedPath, '');
+            assert.strictEqual(fs.existsSync(path.dirname(exportedPath)), false);
+        } finally {
+            connection.dispose();
+        }
+    });
 
     it('routes generated export spool statements through one interruptible native connection', async () => {
         const connection = await createRecordingConnection(call => {
@@ -400,7 +775,7 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
-    it('routes bounded cell sessions with a structured validated row locator', async () => {
+    it('routes bounded cell sessions with a structured validated row locator and transport margin', async () => {
         const metadata = { storageClass: 'blob', byteLength: 4 };
         const connection = await createRecordingConnection(call => {
             if (call.method === 'query') {
@@ -432,7 +807,7 @@ describe('createNativeDatabaseConnection', () => {
             }
             if (call.method === 'closeCellReadSession') return { result: { closed: true } };
             return { result: { success: true } };
-        });
+        }, undefined, 173);
 
         try {
             connection.calls.length = 0;
@@ -447,15 +822,33 @@ describe('createNativeDatabaseConnection', () => {
             await connection.databaseOps.closeCellReadSession(session.sessionId);
 
             assert.deepStrictEqual(chunk.bytes, new Uint8Array([0, 1, 2, 3]));
-            for (const method of ['getCellMetadata', 'openCellReadSession']) {
-                const call = connection.calls.find(candidate => candidate.method === method);
-                assert.ok(call, `missing ${method} native call`);
-                assert.deepStrictEqual(call.args, [
-                    'assets',
-                    'payload',
-                    { kind: 'rowid', value: 7 }
-                ]);
-            }
+            const metadataCall = connection.calls.find(candidate => (
+                candidate.method === 'getCellMetadata'
+            ));
+            assert.ok(metadataCall, 'missing getCellMetadata native call');
+            assert.deepStrictEqual(metadataCall.args, [
+                'assets',
+                'payload',
+                { kind: 'rowid', value: 7 }
+            ]);
+
+            const sessionCalls = connection.calls.filter(call => (
+                ['openCellReadSession', 'readCellChunk', 'closeCellReadSession']
+                    .includes(call.method)
+            ));
+            assert.deepStrictEqual(
+                sessionCalls.map(call => [call.method, call.args, call.timeoutMs]),
+                [
+                    ['openCellReadSession', [
+                        'assets',
+                        'payload',
+                        { kind: 'rowid', value: 7 },
+                        173
+                    ], 2173],
+                    ['readCellChunk', ['native-session-1', 0, 4, 173], 2173],
+                    ['closeCellReadSession', ['native-session-1', 173], 2173]
+                ]
+            );
             assert.ok(connection.calls.every(call => (
                 !['getCellMetadata', 'openCellReadSession'].includes(call.method)
                 || !call.args.some(argument => typeof argument === 'string' && /rowid\s*=/.test(argument))
@@ -473,14 +866,23 @@ describe('createNativeDatabaseConnection', () => {
                 if (sql.startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')) {
                     return { result: { columns: ['type', 'wr'], values: [['table', 1]] } };
                 }
-                if (sql.startsWith('PRAGMA table_info')) {
+                if (sql === TABLE_XINFO_WITH_ROWID_ALIAS_SQL) {
                     return {
                         result: {
-                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+                            columns: [
+                                'cid',
+                                'name',
+                                'type',
+                                'notnull',
+                                'dflt_value',
+                                'pk',
+                                'hidden',
+                                'is_rowid_alias'
+                            ],
                             values: [
-                                [0, 'id', '', 1, null, 1],
-                                [1, 'shard', 'TEXT', 1, null, 2],
-                                [2, 'payload', 'BLOB', 0, null, 0]
+                                [0, 'id', '', 1, null, 1, 0, 0],
+                                [1, 'shard', 'TEXT', 1, null, 2, 0, 0],
+                                [2, 'payload', 'BLOB', 0, null, 0, 0, 0]
                             ]
                         }
                     };
@@ -514,7 +916,12 @@ describe('createNativeDatabaseConnection', () => {
             for (const method of ['getCellMetadata', 'openCellReadSession']) {
                 const call = connection.calls.find(candidate => candidate.method === method);
                 assert.ok(call, `missing ${method} native call`);
-                assert.deepStrictEqual(call.args, ['assets', 'payload', expectedLocator]);
+                assert.deepStrictEqual(
+                    call.args,
+                    method === 'openCellReadSession'
+                        ? ['assets', 'payload', expectedLocator, 30000]
+                        : ['assets', 'payload', expectedLocator]
+                );
             }
 
             const escapeCellIdentifier = loadNativeWorkerFunction(
@@ -576,6 +983,239 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('rejects a native non-alias edit when a descendant trigger can write the target', async () => {
+        const connection = await createRecordingConnection(
+            call => {
+                if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(5);
+                return { result: { changes: 1, lastInsertRowId: 1 } };
+            },
+            undefined,
+            30000,
+            false,
+            () => targetWritingTriggerGuardResponse()
+        );
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCell(
+                    'native_trigger_target',
+                    5,
+                    'note',
+                    'changed'
+                ),
+                /UPDATE trigger.*target table.*rowid identity/i
+            );
+            assert.strictEqual(
+                connection.calls.some(call => (
+                    call.method === 'run'
+                    && /^UPDATE /.test(String(call.args[0]))
+                )),
+                false
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects a native rowid-alias trigger side effect outside undo history', async () => {
+        const connection = await createRecordingConnection(
+            call => {
+                if (isRowIdAliasMetadataCall(call)) {
+                    return { result: { columns: ['name'], values: [['id']] } };
+                }
+                if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(6);
+                return { result: { changes: 1, lastInsertRowId: 1 } };
+            },
+            undefined,
+            30000,
+            false,
+            () => auditOnlyTriggerGuardResponse()
+        );
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCell(
+                    'native_audit_target',
+                    5,
+                    'id',
+                    6
+                ),
+                /UPDATE trigger.*undo history/i
+            );
+            assert.strictEqual(
+                connection.calls.filter(isUpdateTriggerGuardCall).length,
+                1
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    for (const [action, assignment] of [
+        ['SET NULL', 'set-null'],
+        ['SET DEFAULT', 'set-default']
+    ] as const) {
+        it(`rejects a native ON UPDATE ${action} action before issuing the edit`, async () => {
+            const connection = await createRecordingConnection(
+                call => {
+                    if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                    if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(2);
+                    return { result: { changes: 1, lastInsertRowId: 1 } };
+                },
+                undefined,
+                30000,
+                false,
+                () => foreignKeyUpdateGuardResponse(assignment)
+            );
+            try {
+                connection.calls.length = 0;
+                await assert.rejects(
+                    connection.databaseOps.updateCell(
+                        'native_fk_parent',
+                        1,
+                        'id',
+                        2
+                    ),
+                    /foreign-key.*UPDATE.*undo history|UPDATE.*foreign-key.*undo history/i
+                );
+                assert.strictEqual(
+                    connection.calls.some(call => (
+                        call.method === 'run'
+                        && /^UPDATE /.test(String(call.args[0]))
+                    )),
+                    false
+                );
+            } finally {
+                connection.dispose();
+            }
+        });
+    }
+
+    it('allows a native ON UPDATE CASCADE program that propagates the new parent key', async () => {
+        const connection = await createRecordingConnection(
+            call => {
+                if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(2);
+                return { result: { changes: 1, lastInsertRowId: 1 } };
+            },
+            undefined,
+            30000,
+            false,
+            () => foreignKeyUpdateGuardResponse('cascade')
+        );
+        try {
+            connection.calls.length = 0;
+            assert.strictEqual(
+                await connection.databaseOps.updateCell(
+                    'native_fk_parent',
+                    1,
+                    'id',
+                    2
+                ),
+                2
+            );
+            assert.strictEqual(
+                connection.calls.some(call => (
+                    call.method === 'run'
+                    && /^UPDATE /.test(String(call.args[0]))
+                )),
+                true
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects a native non-alias batch when a trigger can substitute its rowid', async () => {
+        const connection = await createRecordingConnection(
+            call => {
+                if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                if (call.method === 'query') {
+                    const sql = String(call.args[0]);
+                    if (sql.startsWith('SELECT CAST(rowid AS TEXT),')) {
+                        return {
+                            result: {
+                                columns: ['rowid', 'note'],
+                                values: [['5', 'target']]
+                            }
+                        };
+                    }
+                    if (sql.startsWith('SELECT CAST(rowid AS TEXT) FROM')) {
+                        return updatedRowIdResponse(5);
+                    }
+                }
+                return { result: { changes: 1, lastInsertRowId: 1 } };
+            },
+            undefined,
+            30000,
+            false,
+            () => targetWritingTriggerGuardResponse()
+        );
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.updateCellBatch('native_trigger_batch', [{
+                    rowId: 5,
+                    column: 'note',
+                    value: 'changed'
+                }]),
+                /UPDATE trigger.*target table.*rowid identity/i
+            );
+            assert.strictEqual(
+                connection.calls.some(call => call.method === 'execBatch'),
+                false
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects a native oversized replacement before a trigger can substitute its rowid', async () => {
+        const connection = await createRecordingConnection(
+            call => {
+                if (call.method === 'query') {
+                    if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                    if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(5);
+                    return {
+                        result: {
+                            columns: ['type', 'wr'],
+                            values: [['table', 0]]
+                        }
+                    };
+                }
+                if (call.method === 'replaceOversizedCell') {
+                    return { result: { changes: 1 } };
+                }
+                return { result: { changes: 1, lastInsertRowId: 1 } };
+            },
+            undefined,
+            30000,
+            false,
+            () => targetWritingTriggerGuardResponse()
+        );
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.replaceOversizedCell(
+                    'native_trigger_replacement',
+                    5,
+                    'note',
+                    'new',
+                    { storageClass: 'text', byteLength: 32 },
+                    8
+                ),
+                /UPDATE trigger.*target table.*rowid identity/i
+            );
+            assert.strictEqual(
+                connection.calls.some(call => call.method === 'replaceOversizedCell'),
+                false
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('rejects a native JSON patch whose resulting stored value is oversized', async () => {
         const prior = JSON.stringify({ a: 'x'.repeat(32) });
         const patch = JSON.stringify({ b: 'y'.repeat(32) });
@@ -593,7 +1233,24 @@ describe('createNativeDatabaseConnection', () => {
                 };
             }
             if (call.method === 'query') {
-                return { result: { columns: ['rowid', 'payload'], values: [[1, prior]] } };
+                const sql = String(call.args[0]);
+                if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                if (sql.startsWith('SELECT CAST(rowid AS TEXT),')) {
+                    return {
+                        result: {
+                            columns: ['rowid', 'storage_class', 'payload'],
+                            values: [['1', 'text', prior]]
+                        }
+                    };
+                }
+                if (sql.startsWith('SELECT json_patch')) {
+                    return {
+                        result: {
+                            columns: ['json_patch'],
+                            values: [[JSON.stringify({ a: 'x'.repeat(32), b: 'y'.repeat(32) })]]
+                        }
+                    };
+                }
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
         });
@@ -623,6 +1280,7 @@ describe('createNativeDatabaseConnection', () => {
     });
 
     it('preflights bounded rowid batches in one worker round trip', async () => {
+        let projectionReadCount = 0;
         const connection = await createRecordingConnection(call => {
             if (call.method === 'open') return { result: { success: true } };
             if (call.method === 'run' || call.method === 'execBatch') {
@@ -640,13 +1298,23 @@ describe('createNativeDatabaseConnection', () => {
                 };
             }
             if (call.method === 'query') {
+                if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(1, 2, 3);
+                projectionReadCount += 1;
+                const after = projectionReadCount > 1;
                 return {
                     result: {
-                        columns: ['rowid', 'left_value', 'right_value'],
+                        columns: [
+                            'rowid',
+                            'left_storage_class',
+                            'left_value',
+                            'right_storage_class',
+                            'right_value'
+                        ],
                         values: [
-                            [1, 'left-1', 'right-1'],
-                            [2, 'left-2', 'right-2'],
-                            [3, 'left-3', 'right-3']
+                            [1, 'text', after ? 'same-left' : 'left-1', 'text', after ? 'same-right' : 'right-1'],
+                            [2, 'text', after ? 'same-left' : 'left-2', 'text', after ? 'same-right' : 'right-2'],
+                            [3, 'text', after ? 'same-left' : 'left-3', 'text', after ? 'same-right' : 'right-3']
                         ]
                     }
                 };
@@ -666,15 +1334,110 @@ describe('createNativeDatabaseConnection', () => {
 
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['run', 'queryBatch', 'query', 'execBatch', 'run']
+                [
+                    'query',
+                    'run',
+                    'queryBatch',
+                    'query',
+                    'queryBatch',
+                    'query',
+                    'execBatch',
+                    'query',
+                    'query',
+                    'run'
+                ]
             );
-            const preflightCall = connection.calls[1];
+            const preflightCall = connection.calls[2];
             const [queries] = preflightCall.args as [Array<{ sql: string; params: unknown[] }>];
             assert.strictEqual(queries.length, 2);
             assert.ok(queries.every(query => /rowid\s+IN\s*\(/i.test(query.sql)));
             assert.ok(queries.some(query => /"left_value"/.test(query.sql)));
             assert.ok(queries.some(query => /"right_value"/.test(query.sql)));
             assert.strictEqual(outcomes.length, 6);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('chunks native rowid value and identity reads above the SQLite variable ceiling', async () => {
+        const updateCount = 32_767;
+        const updates = Array.from({ length: updateCount }, (_, index) => ({
+            rowId: index + 1,
+            column: 'payload',
+            value: 'after'
+        }));
+        const currentReadSizes: number[] = [];
+        const postReadSizes: number[] = [];
+        const identityReadSizes: number[] = [];
+        let mutationApplied = false;
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'open') return { result: { success: true } };
+            if (call.method === 'run' || call.method === 'execBatch') {
+                if (call.method === 'execBatch') mutationApplied = true;
+                return { result: { changes: 1, lastInsertRowId: 1 } };
+            }
+            if (call.method === 'query') {
+                if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                const sql = String(call.args[0]);
+                const rowIds = (call.args[1] ?? []) as Array<number | string>;
+                if (/^SELECT CAST\(rowid AS TEXT\),/.test(sql)) {
+                    assert.ok(rowIds.length <= 32_766);
+                    (mutationApplied ? postReadSizes : currentReadSizes).push(rowIds.length);
+                    return {
+                        result: {
+                            columns: ['rowid', 'storage_class', 'payload'],
+                            values: rowIds.map(rowId => [
+                                String(rowId),
+                                'text',
+                                mutationApplied ? 'after' : 'before'
+                            ])
+                        }
+                    };
+                }
+                if (/^SELECT CAST\(rowid AS TEXT\) FROM main\."native_batch_bind_limit"/.test(sql)) {
+                    assert.ok(rowIds.length <= 32_766);
+                    identityReadSizes.push(rowIds.length);
+                    return {
+                        result: {
+                            columns: ['rowid'],
+                            values: rowIds.map(rowId => [String(rowId)])
+                        }
+                    };
+                }
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const outcomes = await connection.databaseOps.updateCellBatch(
+                'native_batch_bind_limit',
+                updates
+            );
+
+            assert.ok(currentReadSizes.length > 1);
+            assert.ok(postReadSizes.length > 1);
+            assert.ok(identityReadSizes.length > 1);
+            assert.strictEqual(currentReadSizes.reduce((sum, size) => sum + size, 0), updateCount);
+            assert.strictEqual(postReadSizes.reduce((sum, size) => sum + size, 0), updateCount);
+            assert.strictEqual(identityReadSizes.reduce((sum, size) => sum + size, 0), updateCount);
+            assert.strictEqual(outcomes.length, updateCount);
+            assert.deepStrictEqual(outcomes[0], {
+                rowId: 1,
+                columnName: 'payload',
+                priorValue: 'before',
+                newValue: 'after',
+                priorState: { storageClass: 'text', value: 'before' },
+                postState: { storageClass: 'text', value: 'after' },
+                operation: 'set'
+            });
+            assert.strictEqual(outcomes.at(-1)?.rowId, updateCount);
+
+            const execBatch = connection.calls.find(call => call.method === 'execBatch');
+            assert.ok(execBatch);
+            const [batchItems] = execBatch.args as [Array<{ paramsList: unknown[][] }>];
+            assert.strictEqual(batchItems.length, 1);
+            assert.strictEqual(batchItems[0].paramsList.length, updateCount);
         } finally {
             connection.dispose();
         }
@@ -716,7 +1479,7 @@ describe('createNativeDatabaseConnection', () => {
             );
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['run', 'queryBatch', 'run', 'run']
+                ['query', 'run', 'queryBatch', 'run', 'run']
             );
         } finally {
             connection.dispose();
@@ -785,6 +1548,25 @@ describe('createNativeDatabaseConnection', () => {
             }
             if (call.method === 'query') {
                 const sql = String(call.args[0]);
+                if (sql === ROWID_TABLE_AUTHORITY_SQL) {
+                    return { result: { columns: ['1'], values: [[1]] } };
+                }
+                if (sql.includes('pragma.pragma_table_list')) {
+                    return {
+                        result: {
+                            columns: ['type', 'wr'],
+                            values: [['table', 0]]
+                        }
+                    };
+                }
+                if (/^EXPLAIN DELETE /i.test(sql)) {
+                    return {
+                        result: {
+                            columns: ['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5'],
+                            values: [[0, 'Init', 0, 1, 0, null, 0]]
+                        }
+                    };
+                }
                 if (sql.includes('pragma_table_xinfo')) {
                     return { result: { columns: ['name'], values: [['payload']] } };
                 }
@@ -807,7 +1589,7 @@ describe('createNativeDatabaseConnection', () => {
             );
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['run', 'query', 'query', 'run', 'run']
+                ['query', 'query', 'run', 'query', 'query', 'query', 'run', 'run']
             );
             assert.ok(connection.calls.every(call => {
                 const sql = String(call.args[0]);
@@ -819,10 +1601,12 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
-    it('lets native history restore a legacy oversized prior while public edits remain guarded', async () => {
-        const connection = await createRecordingConnection(() => ({
-            result: { changes: 1, lastInsertRowId: 1 }
-        }));
+    it('fails closed for native legacy cell history while public edits remain guarded', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+            if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(1);
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
         const legacyValue = new Uint8Array(DEFAULT_MAX_CELL_EDIT_BYTES + 1);
         try {
             connection.calls.length = 0;
@@ -833,22 +1617,19 @@ describe('createNativeDatabaseConnection', () => {
                 CellEditPolicyError
             );
 
-            await connection.databaseOps.undoModification({
-                modificationType: 'cell_update',
-                description: 'legacy oversized prior',
-                targetTable: 'native_legacy_history',
-                targetRowId: 1,
-                targetColumn: 'payload',
-                priorValue: legacyValue,
-                newValue: Uint8Array.from([1])
-            });
-            assert.deepStrictEqual(connection.calls.map(call => call.method), ['run']);
-            const runParams = connection.calls[0].args[1] as unknown[];
-            const restoredValue = runParams[0];
-            assert.ok(restoredValue instanceof Uint8Array);
-            assert.strictEqual(restoredValue.byteLength, legacyValue.byteLength);
-            assert.strictEqual(restoredValue[0], 0);
-            assert.strictEqual(restoredValue.at(-1), 0);
+            await assert.rejects(
+                connection.databaseOps.undoModification({
+                    modificationType: 'cell_update',
+                    description: 'legacy oversized prior',
+                    targetTable: 'native_legacy_history',
+                    targetRowId: 1,
+                    targetColumn: 'payload',
+                    priorValue: legacyValue,
+                    newValue: Uint8Array.from([1])
+                }),
+                /predates guarded cell history/i
+            );
+            assert.deepStrictEqual(connection.calls, []);
         } finally {
             connection.dispose();
         }
@@ -857,6 +1638,11 @@ describe('createNativeDatabaseConnection', () => {
     it('uses the native guarded replacement command without reading the prior value', async () => {
         const connection = await createRecordingConnection(call => {
             if (call.method === 'query') {
+                if (call.args[0] === ROWID_TABLE_AUTHORITY_SQL) {
+                    return { result: { columns: ['1'], values: [[1]] } };
+                }
+                if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+                if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(7);
                 return {
                     result: {
                         columns: ['type', 'wr'],
@@ -882,9 +1668,21 @@ describe('createNativeDatabaseConnection', () => {
 
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['query', 'replaceOversizedCell']
+                [
+                    'query',
+                    'query',
+                    'run',
+                    'queryBatch',
+                    'replaceOversizedCell',
+                    'query',
+                    'query',
+                    'run'
+                ]
             );
-            const guarded = connection.calls[1];
+            assert.strictEqual(connection.calls[1].args[0], ROWID_TABLE_AUTHORITY_SQL);
+            assert.match(String(connection.calls[2].args[0]), /^SAVEPOINT "sp_replace_oversized_cell_/);
+            assert.match(String(connection.calls[7].args[0]), /^RELEASE "sp_replace_oversized_cell_/);
+            const guarded = connection.calls[4];
             assert.deepStrictEqual(guarded.args, [
                 'native_large',
                 'payload',
@@ -909,6 +1707,7 @@ describe('createNativeDatabaseConnection', () => {
             if (call.method === 'getCellMetadata') {
                 return { result: { storageClass: 'blob', byteLength: 2048 } };
             }
+            if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
             throw new Error(`unexpected native call: ${call.method}`);
         });
         try {
@@ -925,8 +1724,15 @@ describe('createNativeDatabaseConnection', () => {
             );
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['run', 'getCellMetadata']
+                ['query', 'run', 'query', 'queryBatch', 'run', 'getCellMetadata', 'run', 'run']
             );
+            const runSql = connection.calls
+                .filter(call => call.method === 'run')
+                .map(call => String(call.args[0]));
+            assert.match(runSql[0], /^SAVEPOINT "sp_update_rowid_cell_/);
+            assert.strictEqual(runSql[1], 'UPDATE main."native_large" SET "payload" = ? WHERE rowid = ? AND NOT (typeof("payload") IN (\'text\', \'blob\') AND length(CAST("payload" AS BLOB)) > ?)');
+            assert.strictEqual(runSql[2], `ROLLBACK TO ${runSql[0].slice('SAVEPOINT '.length)}`);
+            assert.strictEqual(runSql[3], `RELEASE ${runSql[0].slice('SAVEPOINT '.length)}`);
         } finally {
             connection.dispose();
         }
@@ -974,7 +1780,8 @@ describe('createNativeDatabaseConnection', () => {
             mockProcess = new EventEmitter() as any;
             mockProcess.stdout = new EventEmitter();
             mockProcess.stderr = new EventEmitter();
-            mockProcess.stdin = { write: stdinWriteMock };
+            mockProcess.stdin = new EventEmitter();
+            mockProcess.stdin.write = stdinWriteMock;
             mockProcess.kill = mock.fn();
 
             setTimeout(() => {
@@ -991,71 +1798,45 @@ describe('createNativeDatabaseConnection', () => {
         const extensionUri = { fsPath: tempDir } as any;
         const bundle = await createNativeDatabaseConnection(extensionUri);
 
-        const fileUri = { fsPath: '/db/path.sqlite' } as any;
+        const databasePath = path.join(tempDir, 'unopenable.sqlite');
+        const fileUri = { fsPath: databasePath } as any;
         await assert.rejects(
             bundle.establishConnection(fileUri, 'TestDB'),
-            /Failed to open database "TestDB": SQLITE_CANTOPEN: unable to open database file\. Path: \/db\/path\.sqlite/
+            (error: unknown) => {
+                assert.ok(error instanceof Error);
+                assert.match(
+                    error.message,
+                    /Failed to open database "TestDB": SQLITE_CANTOPEN: unable to open database file/
+                );
+                assert.match(error.message, new RegExp(`Path: ${databasePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`));
+                return true;
+            }
         );
 
         bundle.workerMethods[Symbol.dispose]();
     });
 
-    it('undoes a single json_patch cell by reading current then writing the restored object', async () => {
-        // The SELECT response is the current document after the forward edit plus a concurrent key.
-        const current = { status: 'published', owner: 'ada', reviewer: 'grace' };
-        const connection = await createRecordingConnection((call) => {
+    it('undoes a guarded native JSON patch while preserving an untouched sibling', async () => {
+        const prior = JSON.stringify({ status: 'draft', owner: 'ada' });
+        const patch = JSON.stringify({ status: 'published' });
+        const post = JSON.stringify({ status: 'published', owner: 'ada' });
+        const current = JSON.stringify({ status: 'published', owner: 'ada', reviewer: 'grace' });
+        const restored = JSON.stringify({ status: 'draft', owner: 'ada', reviewer: 'grace' });
+        let stateReadCount = 0;
+        const connection = await createRecordingConnection(call => {
             if (call.method === 'query') {
-                return { result: { columns: ['payload'], values: [[JSON.stringify(current)]] } };
+                stateReadCount += 1;
+                return {
+                    result: {
+                        columns: ['storage_class', 'payload'],
+                        values: [['text', stateReadCount === 1 ? current : restored]]
+                    }
+                };
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
         });
 
         try {
-            connection.calls.length = 0;
-            await connection.databaseOps.undoModification({
-                modificationType: 'cell_update',
-                description: 'undo payload',
-                targetTable: 'docs',
-                targetRowId: 7,
-                targetColumn: 'payload',
-                priorValue: JSON.stringify({ status: 'draft', owner: 'ada' }),
-                newValue: JSON.stringify({ status: 'published' }),
-                operation: 'json_patch'
-            });
-
-            const queryCall = connection.calls.find(call => call.method === 'query');
-            const runCall = connection.calls.find(call => call.method === 'run');
-            assert.ok(queryCall, 'expected a SELECT read');
-            assert.ok(runCall, 'expected a SET write');
-
-            const [readSql, readParams] = queryCall.args as [string, unknown[]];
-            assert.strictEqual(readSql, `SELECT "payload" FROM "docs" WHERE rowid = ?`);
-            assert.deepStrictEqual(readParams, [7]);
-
-            const [sql, params] = runCall.args as [string, unknown[]];
-            assert.strictEqual(sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
-            assert.deepStrictEqual(JSON.parse(params[0] as string), {
-                status: 'draft',
-                owner: 'ada',
-                reviewer: 'grace'
-            });
-            assert.strictEqual(params[1], 7);
-        } finally {
-            connection.dispose();
-        }
-    });
-
-    it('value-replaces a single json_patch undo when the current cell is non-object', async () => {
-        // A non-object current value makes surgical restore unsafe, but the undo still performs the read.
-        const connection = await createRecordingConnection((call) => {
-            if (call.method === 'query') {
-                return { result: { columns: ['payload'], values: [['plain text']] } };
-            }
-            return { result: { changes: 1, lastInsertRowId: 1 } };
-        });
-
-        try {
-            const prior = JSON.stringify({ status: 'draft' });
             connection.calls.length = 0;
             await connection.databaseOps.undoModification({
                 modificationType: 'cell_update',
@@ -1064,40 +1845,167 @@ describe('createNativeDatabaseConnection', () => {
                 targetRowId: 7,
                 targetColumn: 'payload',
                 priorValue: prior,
-                newValue: JSON.stringify({ status: 'published' }),
-                operation: 'json_patch'
+                newValue: patch,
+                operation: 'json_patch',
+                priorState: { storageClass: 'text', value: prior },
+                postState: { storageClass: 'text', value: post }
             });
 
-            const queryCall = connection.calls.find(call => call.method === 'query');
-            const runCall = connection.calls.find(call => call.method === 'run');
-            assert.ok(queryCall, 'expected a SELECT read');
-            assert.ok(runCall, 'expected a SET write');
-            const [sql, params] = runCall.args as [string, unknown[]];
-            assert.strictEqual(sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
-            assert.deepStrictEqual(params, [prior, 7]);
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['query', 'run', 'queryBatch', 'query', 'run', 'query', 'run']
+            );
+            assert.match(String(connection.calls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.strictEqual(isUpdateTriggerGuardCall(connection.calls[2]), true);
+
+            const update = connection.calls[4];
+            const [sql, params] = update.args as [string, unknown[]];
+            assert.match(sql, /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\) WHERE rowid = \?/);
+            assert.match(sql, /typeof\("payload"\) = 'text'/);
+            assert.deepStrictEqual(JSON.parse(params[0] as string), {
+                status: 'draft',
+                owner: 'ada',
+                reviewer: 'grace'
+            });
+            assert.strictEqual(params[1], 7);
+            assert.strictEqual(params[2], current);
         } finally {
             connection.dispose();
         }
     });
 
-    it('undoes a batch of json_patch cells with one queryBatch read and one execBatch write', async () => {
-        // The read side is batched into one worker round-trip, and the write
-        // side remains one execBatch so restored values are applied atomically.
+    it('rejects native JSON undo when a touched path changed externally', async () => {
+        const prior = JSON.stringify({ status: 'draft', owner: 'ada' });
+        const patch = JSON.stringify({ status: 'published' });
+        const post = JSON.stringify({ status: 'published', owner: 'ada' });
+        const external = JSON.stringify({ status: 'external', owner: 'ada', reviewer: 'grace' });
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['storage_class', 'payload'],
+                        values: [['text', external]]
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.undoModification({
+                    modificationType: 'cell_update',
+                    description: 'undo payload',
+                    targetTable: 'docs',
+                    targetRowId: 7,
+                    targetColumn: 'payload',
+                    priorValue: prior,
+                    newValue: patch,
+                    operation: 'json_patch',
+                    priorState: { storageClass: 'text', value: prior },
+                    postState: { storageClass: 'text', value: post }
+                }),
+                /changed outside SQLite Explorer history/i
+            );
+
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['query', 'run', 'queryBatch', 'query', 'run', 'run']
+            );
+            assert.strictEqual(
+                connection.calls.some(call => (
+                    call.method === 'run' && /^UPDATE /.test(String(call.args[0]))
+                )),
+                false
+            );
+            assert.match(String(connection.calls[4].args[0]), /^ROLLBACK TO /);
+            assert.match(String(connection.calls[5].args[0]), /^RELEASE /);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('rejects native set undo when the guarded UPDATE loses a post-read race', async () => {
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                return {
+                    result: {
+                        columns: ['storage_class', 'value'],
+                        values: [['text', 'after']]
+                    }
+                };
+            }
+            if (call.method === 'run' && /^UPDATE /.test(String(call.args[0]))) {
+                return { result: { changes: 0 } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            await assert.rejects(
+                connection.databaseOps.undoModification({
+                    modificationType: 'cell_update',
+                    description: 'undo set',
+                    targetTable: 'docs',
+                    targetRowId: 7,
+                    targetColumn: 'value',
+                    newValue: 'after',
+                    operation: 'set',
+                    priorState: { storageClass: 'text', value: 'before' },
+                    postState: { storageClass: 'text', value: 'after' }
+                }),
+                /changed outside SQLite Explorer history/i
+            );
+
+            const update = connection.calls.find(call => (
+                call.method === 'run' && /^UPDATE /.test(String(call.args[0]))
+            ));
+            assert.ok(update);
+            const [sql, params] = update.args as [string, unknown[]];
+            assert.strictEqual(
+                sql,
+                `UPDATE main."docs" SET "value" = CAST(? AS TEXT) WHERE rowid = ? AND ` +
+                `(typeof("value") = 'text' AND CAST("value" AS BLOB) = CAST(? AS BLOB))`
+            );
+            assert.deepStrictEqual(params, ['before', 7, 'after']);
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                ['query', 'run', 'queryBatch', 'query', 'run', 'run', 'run']
+            );
+            assert.match(String(connection.calls[5].args[0]), /^ROLLBACK TO /);
+            assert.match(String(connection.calls[6].args[0]), /^RELEASE /);
+        } finally {
+            connection.dispose();
+        }
+    });
+
+    it('undoes a guarded native JSON batch inside one replay savepoint', async () => {
         const currents: Record<number, unknown> = {
             3: { count: 2, stable: 'one', concurrent: 'a' },
             4: { count: 11, stable: 'two', concurrent: 'b' }
         };
+        const restored: Record<number, unknown> = {
+            3: { count: 1, stable: 'one', concurrent: 'a' },
+            4: { count: 10, stable: 'two', concurrent: 'b' }
+        };
+        const updatedRows = new Set<number>();
         const connection = await createRecordingConnection((call) => {
-            if (call.method === 'queryBatch') {
-                const [queries] = call.args as [Array<{ sql: string; params: unknown[] }>];
+            if (call.method === 'query') {
+                const rowId = Number((call.args[1] as unknown[])[0]);
                 return {
                     result: {
-                        results: queries.map(query => ({
-                            columns: ['payload'],
-                            values: [[JSON.stringify(currents[Number(query.params[0])])]]
-                        }))
+                        columns: ['storage_class', 'payload'],
+                        values: [[
+                            'text',
+                            JSON.stringify(updatedRows.has(rowId) ? restored[rowId] : currents[rowId])
+                        ]]
                     }
                 };
+            }
+            if (call.method === 'run' && /^UPDATE /.test(String(call.args[0]))) {
+                updatedRows.add(Number((call.args[1] as unknown[])[1]));
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
         });
@@ -1114,46 +2022,62 @@ describe('createNativeDatabaseConnection', () => {
                         columnName: 'payload',
                         priorValue: JSON.stringify({ count: 1, stable: 'one' }),
                         newValue: JSON.stringify({ count: 2 }),
-                        operation: 'json_patch'
+                        operation: 'json_patch',
+                        priorState: {
+                            storageClass: 'text',
+                            value: JSON.stringify({ count: 1, stable: 'one' })
+                        },
+                        postState: {
+                            storageClass: 'text',
+                            value: JSON.stringify({ count: 2, stable: 'one' })
+                        }
                     },
                     {
                         rowId: 4,
                         columnName: 'payload',
                         priorValue: JSON.stringify({ count: 10, stable: 'two' }),
                         newValue: JSON.stringify({ count: 11 }),
-                        operation: 'json_patch'
+                        operation: 'json_patch',
+                        priorState: {
+                            storageClass: 'text',
+                            value: JSON.stringify({ count: 10, stable: 'two' })
+                        },
+                        postState: {
+                            storageClass: 'text',
+                            value: JSON.stringify({ count: 11, stable: 'two' })
+                        }
                     }
                 ]
             });
 
             const queryCalls = connection.calls.filter(call => call.method === 'query');
             const queryBatchCalls = connection.calls.filter(call => call.method === 'queryBatch');
-            const batchCall = connection.calls.find(call => call.method === 'execBatch');
-            assert.strictEqual(queryCalls.length, 0);
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                [
+                    'query',
+                    'run',
+                    'queryBatch',
+                    'query',
+                    'run',
+                    'query',
+                    'query',
+                    'run',
+                    'query',
+                    'run'
+                ]
+            );
+            assert.strictEqual(queryCalls.length, 5);
             assert.strictEqual(queryBatchCalls.length, 1);
-            assert.ok(batchCall, 'batch json_patch undo must write through one execBatch');
-
-            const [queries] = queryBatchCalls[0].args as [Array<{ sql: string; params: unknown[] }>];
-            assert.deepStrictEqual(queries, [
-                { sql: `SELECT "payload" FROM "docs" WHERE rowid = ?`, params: [3] },
-                { sql: `SELECT "payload" FROM "docs" WHERE rowid = ?`, params: [4] }
-            ]);
-
-            const items = (batchCall.args as [Array<{ sql: string; params: unknown[] }>])[0];
-            assert.strictEqual(items.length, 2);
-            assert.ok(items.every(item => item.sql === `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`));
-            assert.deepStrictEqual(JSON.parse(items[0].params[0] as string), {
-                count: 1,
-                stable: 'one',
-                concurrent: 'a'
-            });
-            assert.deepStrictEqual(JSON.parse(items[1].params[0] as string), {
-                count: 10,
-                stable: 'two',
-                concurrent: 'b'
-            });
-            assert.strictEqual(items[0].params[1], 3);
-            assert.strictEqual(items[1].params[1], 4);
+            assert.strictEqual(isUpdateTriggerGuardCall(queryBatchCalls[0]), true);
+            assert.match(String(connection.calls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.match(String(connection.calls.at(-1)?.args[0]), /^RELEASE "sp_replay_cell_history_/);
+            const updates = connection.calls.filter(call => (
+                call.method === 'run' && /^UPDATE /.test(String(call.args[0]))
+            ));
+            assert.strictEqual(updates.length, 2);
+            assert.deepStrictEqual(JSON.parse((updates[0].args[1] as unknown[])[0] as string), restored[3]);
+            assert.deepStrictEqual(JSON.parse((updates[1].args[1] as unknown[])[0] as string), restored[4]);
         } finally {
             connection.dispose();
         }
@@ -1163,13 +2087,35 @@ describe('createNativeDatabaseConnection', () => {
         // The undo read is intentionally held open. A public updateCell call
         // started during that read must wait until undo has also written, so the
         // undo read/write sequence remains contiguous at the worker boundary.
+        const prior = JSON.stringify({ status: 'draft', owner: 'ada' });
+        const patch = JSON.stringify({ status: 'published' });
+        const post = JSON.stringify({ status: 'published', owner: 'ada' });
+        const current = JSON.stringify({ status: 'published', owner: 'ada', reviewer: 'grace' });
+        const restored = JSON.stringify({ status: 'draft', owner: 'ada', reviewer: 'grace' });
         const queryStarted = createDeferred<void>();
         const queryResponse = createDeferred<RecordedNativeResponse>();
+        let replayStateReadCount = 0;
         const connection = await createRecordingConnection((call) => {
-            if (call.method === 'query') {
-                queryStarted.resolve();
-                return queryResponse.promise;
+            if (
+                call.method === 'query'
+                && String(call.args[0]).startsWith(
+                    `SELECT typeof("payload"), "payload" FROM main."docs" WHERE rowid = ?`
+                )
+            ) {
+                replayStateReadCount += 1;
+                if (replayStateReadCount === 1) {
+                    queryStarted.resolve();
+                    return queryResponse.promise;
+                }
+                return {
+                    result: {
+                        columns: ['storage_class', 'payload'],
+                        values: [['text', restored]]
+                    }
+                };
             }
+            if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+            if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(7);
             return { result: { changes: 1, lastInsertRowId: 1 } };
         });
 
@@ -1183,9 +2129,11 @@ describe('createNativeDatabaseConnection', () => {
                 targetTable: 'docs',
                 targetRowId: 7,
                 targetColumn: 'payload',
-                priorValue: JSON.stringify({ status: 'draft', owner: 'ada' }),
-                newValue: JSON.stringify({ status: 'published' }),
-                operation: 'json_patch'
+                priorValue: prior,
+                newValue: patch,
+                operation: 'json_patch',
+                priorState: { storageClass: 'text', value: prior },
+                postState: { storageClass: 'text', value: post }
             });
 
             await queryStarted.promise;
@@ -1196,22 +2144,36 @@ describe('createNativeDatabaseConnection', () => {
             try {
                 assert.deepStrictEqual(
                     connection.calls.map(call => call.method),
-                    ['query'],
+                    ['query', 'run', 'queryBatch', 'query'],
                     'concurrent updateCell must not write while undo is between read and write'
                 );
             } finally {
                 queryResponse.resolve({
                     result: {
-                        columns: ['payload'],
-                        values: [[JSON.stringify({ status: 'published', owner: 'ada', reviewer: 'grace' })]]
+                        columns: ['storage_class', 'payload'],
+                        values: [['text', current]]
                     }
                 });
                 await Promise.allSettled([undoPromise, updatePromise]);
             }
 
-            assert.deepStrictEqual(connection.calls.map(call => call.method), ['query', 'run', 'run']);
-            const undoRun = connection.calls[1];
-            const updateRun = connection.calls[2];
+            assert.deepStrictEqual(
+                connection.calls.map(call => call.method),
+                [
+                    'query', 'run', 'queryBatch', 'query', 'run', 'query', 'run',
+                    'query', 'run', 'query', 'queryBatch', 'run', 'query', 'run'
+                ]
+            );
+            const runCalls = connection.calls.filter(call => call.method === 'run');
+            const runSql = runCalls.map(call => String(call.args[0]));
+            assert.match(runSql[0], /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.match(runSql[1], /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
+            assert.match(runSql[2], /^RELEASE "sp_replay_cell_history_/);
+            assert.match(runSql[3], /^SAVEPOINT "sp_update_rowid_cell_/);
+            assert.strictEqual(runSql[4], 'UPDATE main."docs" SET "payload" = ? WHERE rowid = ?');
+            assert.match(runSql[5], /^RELEASE "sp_update_rowid_cell_/);
+            const undoRun = runCalls[1];
+            const updateRun = runCalls[4];
             assert.deepStrictEqual(JSON.parse((undoRun.args as [string, unknown[]])[1][0] as string), {
                 status: 'draft',
                 owner: 'ada',
@@ -1221,8 +2183,8 @@ describe('createNativeDatabaseConnection', () => {
         } finally {
             queryResponse.resolve({
                 result: {
-                    columns: ['payload'],
-                    values: [[JSON.stringify({ status: 'published', owner: 'ada' })]]
+                    columns: ['storage_class', 'payload'],
+                    values: [['text', current]]
                 }
             });
             if (undoPromise || updatePromise) {
@@ -1232,11 +2194,35 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
-    it('replays single json_patch cell redo through the patch-aware updateCell primitive', async () => {
-        const connection = await createRecordingConnection();
+    it('redoes a guarded native JSON patch only from its recorded prior state', async () => {
+        const prior = JSON.stringify({ meta: { reviewed: false }, owner: 'ada' });
+        const patch = JSON.stringify({ meta: { reviewed: true } });
+        const post = JSON.stringify({ meta: { reviewed: true }, owner: 'ada' });
+        const current = JSON.stringify({
+            meta: { reviewed: false },
+            owner: 'ada',
+            reviewer: 'grace'
+        });
+        const replayed = JSON.stringify({
+            meta: { reviewed: true },
+            owner: 'ada',
+            reviewer: 'grace'
+        });
+        let stateReadCount = 0;
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'query') {
+                stateReadCount += 1;
+                return {
+                    result: {
+                        columns: ['storage_class', 'payload'],
+                        values: [['text', stateReadCount === 1 ? current : replayed]]
+                    }
+                };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        });
 
         try {
-            const patch = JSON.stringify({ meta: { reviewed: true } });
             connection.calls.length = 0;
 
             await connection.databaseOps.redoModification({
@@ -1246,38 +2232,54 @@ describe('createNativeDatabaseConnection', () => {
                 targetRowId: 7,
                 targetColumn: 'payload',
                 newValue: patch,
-                operation: 'json_patch'
+                operation: 'json_patch',
+                priorState: { storageClass: 'text', value: prior },
+                postState: { storageClass: 'text', value: post }
             });
 
-            assert.strictEqual(connection.calls.length, 1);
-            const call = connection.calls[0];
+            assert.strictEqual(connection.calls.length, 7);
+            assert.match(String(connection.calls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.strictEqual(isUpdateTriggerGuardCall(connection.calls[2]), true);
+            assert.strictEqual(connection.calls[3].method, 'query');
+            assert.match(String(connection.calls[6].args[0]), /^RELEASE "sp_replay_cell_history_/);
+            const call = connection.calls[4];
             assert.strictEqual(call.method, 'run');
 
             const [sql, params] = call.args as [string, unknown[]];
-            assert.strictEqual(
-                sql,
-                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
-            );
-            assert.notStrictEqual(sql, `UPDATE "docs" SET "payload" = ? WHERE rowid = ?`);
-            assert.deepStrictEqual(params, [patch, 7]);
+            assert.match(sql, /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
+            assert.match(sql, /typeof\("payload"\) = 'text'/);
+            assert.deepStrictEqual(JSON.parse(params[0] as string), JSON.parse(replayed));
+            assert.strictEqual(params[1], 7);
+            assert.strictEqual(params[2], current);
         } finally {
             connection.dispose();
         }
     });
 
-    it('replays batch json_patch cell redo through operation-aware updateCellBatch', async () => {
+    it('redoes guarded native JSON and set cells as one atomic batch', async () => {
+        const valuesBefore: Record<number, string> = {
+            3: '{}',
+            4: '{}',
+            5: 'Old title'
+        };
+        const valuesAfter: Record<number, string> = {
+            3: JSON.stringify({ status: 'reviewed' }),
+            4: JSON.stringify({ status: 'approved' }),
+            5: 'Plain title'
+        };
+        const updatedRows = new Set<number>();
         const connection = await createRecordingConnection(call => {
-            if (call.method === 'query' && String(call.args[0]).startsWith('SELECT CAST(rowid AS TEXT)')) {
+            if (call.method === 'query') {
+                const rowId = Number((call.args[1] as unknown[])[0]);
                 return {
                     result: {
-                        columns: ['rowid', 'payload', 'title'],
-                        values: [
-                            ['3', '{}', null],
-                            ['4', '{}', null],
-                            ['5', null, 'Old title']
-                        ]
+                        columns: ['storage_class', 'value'],
+                        values: [['text', updatedRows.has(rowId) ? valuesAfter[rowId] : valuesBefore[rowId]]]
                     }
                 };
+            }
+            if (call.method === 'run' && /^UPDATE /.test(String(call.args[0]))) {
+                updatedRows.add(Number((call.args[1] as unknown[])[1]));
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
         });
@@ -1292,41 +2294,50 @@ describe('createNativeDatabaseConnection', () => {
                 description: 'Batch patch payloads',
                 targetTable: 'docs',
                 affectedCells: [
-                    { rowId: 3, columnName: 'payload', newValue: firstPatch, operation: 'json_patch' },
-                    { rowId: 4, columnName: 'payload', newValue: secondPatch, operation: 'json_patch' },
-                    { rowId: 5, columnName: 'title', newValue: 'Plain title' }
+                    {
+                        rowId: 3,
+                        columnName: 'payload',
+                        newValue: firstPatch,
+                        operation: 'json_patch',
+                        priorState: { storageClass: 'text', value: valuesBefore[3] },
+                        postState: { storageClass: 'text', value: valuesAfter[3] }
+                    },
+                    {
+                        rowId: 4,
+                        columnName: 'payload',
+                        newValue: secondPatch,
+                        operation: 'json_patch',
+                        priorState: { storageClass: 'text', value: valuesBefore[4] },
+                        postState: { storageClass: 'text', value: valuesAfter[4] }
+                    },
+                    {
+                        rowId: 5,
+                        columnName: 'title',
+                        newValue: 'Plain title',
+                        priorState: { storageClass: 'text', value: valuesBefore[5] },
+                        postState: { storageClass: 'text', value: valuesAfter[5] }
+                    }
                 ]
             });
 
-            assert.strictEqual(connection.calls.length, 4);
-            assert.strictEqual(connection.calls[0].method, 'run');
-            assert.match(String(connection.calls[0].args[0]), /^SAVEPOINT /);
-            assert.strictEqual(connection.calls[1].method, 'query');
-            const call = connection.calls[2];
-            assert.strictEqual(call.method, 'execBatch');
-            assert.strictEqual(connection.calls[3].method, 'run');
-            assert.match(String(connection.calls[3].args[0]), /^RELEASE /);
-
-            const batch = call.args[0] as {
-                sql: string;
-                paramsList?: unknown[][];
-                params?: unknown[];
-            }[];
-
-            assert.strictEqual(batch.length, 2);
-            // COALESCE so a batch patch on a NULL JSON cell applies to '{}' instead of
-            // returning NULL — must match single-cell updateCell and both WASM json_patch sites.
-            assert.strictEqual(
-                batch[0].sql,
-                `UPDATE "docs" SET "payload" = json_patch(COALESCE("payload", '{}'), ?) WHERE rowid = ?`
+            assert.strictEqual(connection.calls.length, 13);
+            assert.strictEqual(connection.calls[1].method, 'run');
+            assert.match(String(connection.calls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.strictEqual(isUpdateTriggerGuardCall(connection.calls[2]), true);
+            assert.match(String(connection.calls.at(-1)?.args[0]), /^RELEASE "sp_replay_cell_history_/);
+            const updates = connection.calls.filter(call => (
+                call.method === 'run' && /^UPDATE /.test(String(call.args[0]))
+            ));
+            assert.strictEqual(updates.length, 3);
+            assert.deepStrictEqual(
+                updates.map(call => (call.args[1] as unknown[]).slice(0, 2)),
+                [
+                    [valuesAfter[3], 3],
+                    [valuesAfter[4], 4],
+                    [valuesAfter[5], 5]
+                ]
             );
-            assert.notStrictEqual(
-                batch[0].sql,
-                `UPDATE "docs" SET "payload" = json_patch("payload", ?) WHERE rowid = ?`
-            );
-            assert.deepStrictEqual(batch[0].paramsList, [[firstPatch, 3], [secondPatch, 4]]);
-            assert.strictEqual(batch[1].sql, `UPDATE "docs" SET "title" = ? WHERE rowid = ?`);
-            assert.deepStrictEqual(batch[1].paramsList, [['Plain title', 5]]);
+            assert.ok(updates.every(call => /typeof\(/.test(String(call.args[0]))));
         } finally {
             connection.dispose();
         }
@@ -1336,6 +2347,9 @@ describe('createNativeDatabaseConnection', () => {
         const connection = await createRecordingConnection(call => {
             if (call.method === 'query') {
                 const sql = String(call.args[0]);
+                if (sql === ROWID_TABLE_AUTHORITY_SQL) {
+                    return { result: { columns: ['1'], values: [[1]] } };
+                }
                 if (sql.includes('sqlite_schema')) {
                     return {
                         result: {
@@ -1344,11 +2358,20 @@ describe('createNativeDatabaseConnection', () => {
                         }
                     };
                 }
-                if (sql.startsWith('PRAGMA table_info')) {
+                if (sql === TABLE_XINFO_WITH_ROWID_ALIAS_SQL) {
                     return {
                         result: {
-                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
-                            values: [[0, 'id', 'INTEGER', 0, null, 1]]
+                            columns: [
+                                'cid',
+                                'name',
+                                'type',
+                                'notnull',
+                                'dflt_value',
+                                'pk',
+                                'hidden',
+                                'is_rowid_alias'
+                            ],
+                            values: [[0, 'id', 'INTEGER', 0, null, 1, 0, 1]]
                         }
                     };
                 }
@@ -1359,6 +2382,9 @@ describe('createNativeDatabaseConnection', () => {
                             values: [['table', 0]]
                         }
                     };
+                }
+                if (sql === 'PRAGMA data_version') {
+                    return { result: { columns: ['data_version'], values: [[1]] } };
                 }
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
@@ -1381,8 +2407,8 @@ describe('createNativeDatabaseConnection', () => {
                     .map(call => String(call.args[0]))
                     .slice(1, -1),
                 [
-                    `DROP INDEX IF EXISTS "idx_docs_payload"`,
-                    `ALTER TABLE "docs" DROP COLUMN "payload"`
+                    `DROP INDEX IF EXISTS main."idx_docs_payload"`,
+                    `ALTER TABLE main."docs" DROP COLUMN "payload"`
                 ]
             );
         } finally {
@@ -1402,11 +2428,20 @@ describe('createNativeDatabaseConnection', () => {
                         }
                     };
                 }
-                if (sql.startsWith('PRAGMA table_info')) {
+                if (sql === TABLE_XINFO_WITH_ROWID_ALIAS_SQL) {
                     return {
                         result: {
-                            columns: ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
-                            values: [[0, 'id', 'INTEGER', 0, null, 1]]
+                            columns: [
+                                'cid',
+                                'name',
+                                'type',
+                                'notnull',
+                                'dflt_value',
+                                'pk',
+                                'hidden',
+                                'is_rowid_alias'
+                            ],
+                            values: [[0, 'id', 'INTEGER', 0, null, 1, 0, 1]]
                         }
                     };
                 }
@@ -1417,6 +2452,9 @@ describe('createNativeDatabaseConnection', () => {
                             values: [['table', 0]]
                         }
                     };
+                }
+                if (sql === 'PRAGMA data_version') {
+                    return { result: { columns: ['data_version'], values: [[1]] } };
                 }
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
@@ -1435,20 +2473,21 @@ describe('createNativeDatabaseConnection', () => {
                 tableSql: 'CREATE TABLE docs (id INTEGER PRIMARY KEY)',
                 columns: ['id'],
                 identity: { kind: 'rowid' },
-                schemaObjects: []
+                schemaObjects: [],
+                dataVersion: 1
             });
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['run', 'run', 'run', 'query', 'query', 'query', 'run']
+                ['run', 'run', 'run', 'query', 'query', 'query', 'query', 'query', 'run']
             );
             assert.match(String(connection.calls[0].args[0]), /^SAVEPOINT /);
             assert.strictEqual(
                 connection.calls[1].args[0],
-                'DROP INDEX IF EXISTS "idx_docs_payload"'
+                'DROP INDEX IF EXISTS main."idx_docs_payload"'
             );
             assert.strictEqual(
                 connection.calls[2].args[0],
-                'ALTER TABLE "docs" DROP COLUMN "payload"'
+                'ALTER TABLE main."docs" DROP COLUMN "payload"'
             );
             assert.match(String(connection.calls.at(-1)?.args[0]), /^RELEASE /);
         } finally {
@@ -1479,7 +2518,7 @@ describe('createNativeDatabaseConnection', () => {
                 .filter(call => call.method === 'run')
                 .map(call => String(call.args[0]));
             assert.match(runSql[0], /^SAVEPOINT /);
-            assert.strictEqual(runSql[1], 'ALTER TABLE "docs" DROP COLUMN "payload"');
+            assert.strictEqual(runSql[1], 'ALTER TABLE main."docs" DROP COLUMN "payload"');
             assert.strictEqual(runSql[2], `ROLLBACK TO ${runSql[0].slice('SAVEPOINT '.length)}`);
             assert.strictEqual(runSql[3], `RELEASE ${runSql[0].slice('SAVEPOINT '.length)}`);
         } finally {
@@ -1492,8 +2531,8 @@ describe('createNativeDatabaseConnection', () => {
         const connection = await createRecordingConnection(call => {
             if (call.method === 'query') {
                 const sql = String(call.args[0]);
-                if (sql.startsWith('PRAGMA main.table_info')) {
-                    return { result: { columns: ['cid', 'name'], values: [[0, 'm']] } };
+                if (sql.startsWith('PRAGMA main.table_xinfo')) {
+                    return { result: { columns: ['cid', 'name', 'hidden'], values: [[0, 'm', 0]] } };
                 }
                 return { result: { columns: [], values: [] } };
             }
@@ -1553,15 +2592,17 @@ describe('createNativeDatabaseConnection', () => {
                 /parameters are not allowed in views/
             );
 
-            const calls = connection.calls.map(call => ({
-                method: call.method,
-                sql: String(call.method === 'runSingle' ? call.args[1] : call.args[0])
-            }));
-            assert.match(calls[1].sql, /^SAVEPOINT "sp_validate_view_/);
-            assert.strictEqual(calls[2].method, 'runSingle');
-            assert.match(calls[2].sql, /^CREATE VIEW "parameter_view" AS SELECT \? AS value$/);
-            assert.match(calls[3].sql, /^ROLLBACK TO "sp_validate_view_/);
-            assert.match(calls[4].sql, /^RELEASE "sp_validate_view_/);
+            const calls = connection.calls
+                .filter(call => call.method === 'run' || call.method === 'runSingle')
+                .map(call => ({
+                    method: call.method,
+                    sql: String(call.method === 'runSingle' ? call.args[1] : call.args[0])
+                }));
+            assert.match(calls[0].sql, /^SAVEPOINT "sp_validate_view_/);
+            assert.strictEqual(calls[1].method, 'runSingle');
+            assert.match(calls[1].sql, /^CREATE VIEW "parameter_view" AS SELECT \? AS value$/);
+            assert.match(calls[2].sql, /^ROLLBACK TO "sp_validate_view_/);
+            assert.match(calls[3].sql, /^RELEASE "sp_validate_view_/);
         } finally {
             connection.dispose();
         }
@@ -1615,6 +2656,59 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('rejects unusable created identifiers before reaching the native worker', async () => {
+        const connection = await createRecordingConnection();
+        const column = {
+            name: 'value',
+            type: 'TEXT',
+            primaryKey: false,
+            notNull: false
+        };
+        try {
+            connection.calls.length = 0;
+
+            await assert.rejects(
+                connection.databaseOps.createTable('', [column]),
+                /Table name is required/
+            );
+            await assert.rejects(
+                connection.databaseOps.createTable(
+                    'valid table',
+                    [{ ...column, name: 'bad\0column' }]
+                ),
+                /Column name cannot contain NUL/
+            );
+            await assert.rejects(
+                connection.databaseOps.addColumn('valid table', '', 'TEXT'),
+                /Column name is required/
+            );
+            await assert.rejects(
+                connection.databaseOps.validateViewDefinition(
+                    'bad\0view',
+                    'SELECT 1',
+                    'create'
+                ),
+                /View name cannot contain NUL/
+            );
+            await assert.rejects(
+                connection.databaseOps.previewViewDefinition('', 'SELECT 1', 10, 'create'),
+                /View name is required/
+            );
+            await assert.rejects(
+                connection.databaseOps.createView('bad\0view', 'SELECT 1'),
+                /View name cannot contain NUL/
+            );
+
+            assert.deepStrictEqual(
+                connection.calls,
+                [],
+                'unusable identifiers must not reach the native worker'
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('returns preview metadata for zero rows and duplicate aliases', async () => {
         let currentBody = '';
         const connection = await createRecordingConnection(call => {
@@ -1624,11 +2718,11 @@ describe('createNativeDatabaseConnection', () => {
             if (call.method === 'querySingle') {
                 return { result: { columns: [], values: [] } };
             }
-            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_info')) {
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_xinfo')) {
                 return {
                     result: {
-                        columns: ['cid', 'name'],
-                        values: [[0, 'x'], [1, 'x:1']]
+                        columns: ['cid', 'name', 'hidden'],
+                        values: [[0, 'x', 0], [1, 'x:1', 0]]
                     }
                 };
             }
@@ -1662,10 +2756,57 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('executes native preview through the disposable main view binding', async () => {
+        const order: string[] = [];
+        const connection = await createRecordingConnection(call => {
+            if (call.method === 'run') {
+                order.push(String(call.args[0]));
+            }
+            if (call.method === 'query'
+                && String(call.args[0]).startsWith('PRAGMA main.table_xinfo')) {
+                return {
+                    result: {
+                        columns: ['cid', 'name', 'hidden'],
+                        values: [[0, 'value', 0]]
+                    }
+                };
+            }
+            if (call.method === 'queryBounded') {
+                const sql = String(call.args[1]);
+                order.push(`QUERY ${sql}`);
+                return {
+                    result: {
+                        columns: ['value'],
+                        values: [[sql.includes('main."preview_binding"') ? 'MAIN' : 'TEMP']]
+                    }
+                };
+            }
+            return { result: { columns: [], values: [] } };
+        });
+
+        try {
+            connection.calls.length = 0;
+            const preview = await connection.databaseOps.previewViewDefinition(
+                'preview_binding',
+                'SELECT value FROM shadowed_source',
+                10,
+                'create'
+            );
+
+            assert.deepStrictEqual(preview.rows, [['MAIN']]);
+            const queryIndex = order.findIndex(entry => entry.startsWith('QUERY '));
+            const rollbackIndex = order.findIndex(entry => entry.startsWith('ROLLBACK TO '));
+            assert.ok(queryIndex >= 0);
+            assert.ok(rollbackIndex > queryIndex, 'preview query must run before disposable-view rollback');
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('leaves transport margin for the native preview timeout message', async () => {
         const connection = await createRecordingConnection(async call => {
-            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_info')) {
-                return { result: { columns: ['cid', 'name'], values: [[0, 'value']] } };
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_xinfo')) {
+                return { result: { columns: ['cid', 'name', 'hidden'], values: [[0, 'value', 0]] } };
             }
             if (call.method === 'queryBounded') {
                 assert.strictEqual(call.args[5], 7, 'preview row limit');
@@ -1704,8 +2845,8 @@ describe('createNativeDatabaseConnection', () => {
         const queryStarted = createDeferred<RecordedNativeCall>();
         const queryResponse = createDeferred<RecordedNativeResponse>();
         const connection = await createRecordingConnection(call => {
-            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_info')) {
-                return { result: { columns: ['cid', 'name'], values: [[0, 'value']] } };
+            if (call.method === 'query' && String(call.args[0]).startsWith('PRAGMA main.table_xinfo')) {
+                return { result: { columns: ['cid', 'name', 'hidden'], values: [[0, 'value', 0]] } };
             }
             if (call.method === 'queryBounded') {
                 queryStarted.resolve(call);
@@ -1991,7 +3132,7 @@ describe('createNativeDatabaseConnection', () => {
                     result: {
                         results: queries.map(query => {
                             if (query.sql.startsWith(
-                                "SELECT sql FROM sqlite_schema WHERE type = 'view'"
+                                "SELECT sql FROM main.sqlite_schema WHERE type = 'view'"
                             )) {
                                 return { columns: ['sql'], values: [[currentViewSql]] };
                             }
@@ -2204,7 +3345,7 @@ FROM orders o`;
         }
     });
 
-    it('logs a missing native view definition while preserving undo no-op behavior', async () => {
+    it('fails closed when native view undo lacks its definition', async () => {
         const outputLines: string[] = [];
         const outputChannel = {
             appendLine(line: string) {
@@ -2213,20 +3354,21 @@ FROM orders o`;
         } as unknown as vscode.OutputChannel;
         const connection = await createRecordingConnection(undefined, outputChannel);
         try {
-            await connection.databaseOps.undoModification({
-                modificationType: 'view_edit',
-                description: 'legacy edit',
-                targetTable: 'legacy_view'
-            });
-            assert.deepStrictEqual(outputLines, [
-                '[NativeWorker] Skipping view undo: definition missing from history entry'
-            ]);
+            await assert.rejects(
+                connection.databaseOps.undoModification({
+                    modificationType: 'view_edit',
+                    description: 'legacy edit',
+                    targetTable: 'legacy_view'
+                }),
+                /Cannot undo view_edit: missing view definition/
+            );
+            assert.deepStrictEqual(outputLines, []);
         } finally {
             connection.dispose();
         }
     });
 
-    it('logs a missing native view definition while preserving redo no-op behavior', async () => {
+    it('fails closed when native view redo lacks its definition', async () => {
         const outputLines: string[] = [];
         const outputChannel = {
             appendLine(line: string) {
@@ -2235,14 +3377,15 @@ FROM orders o`;
         } as unknown as vscode.OutputChannel;
         const connection = await createRecordingConnection(undefined, outputChannel);
         try {
-            await connection.databaseOps.redoModification({
-                modificationType: 'view_edit',
-                description: 'legacy edit',
-                targetTable: 'legacy_view'
-            });
-            assert.deepStrictEqual(outputLines, [
-                '[NativeWorker] Skipping view redo: definition missing from history entry'
-            ]);
+            await assert.rejects(
+                connection.databaseOps.redoModification({
+                    modificationType: 'view_edit',
+                    description: 'legacy edit',
+                    targetTable: 'legacy_view'
+                }),
+                /Cannot redo view_edit: missing view definition/
+            );
+            assert.deepStrictEqual(outputLines, []);
         } finally {
             connection.dispose();
         }
@@ -2255,7 +3398,11 @@ FROM orders o`;
             'INSTEAD OF INSERT ON "temp native view"',
             'BEGIN SELECT 1; END'
         ].join(' ');
-        const replayTriggerSql = storedTriggerSql.replace('CREATE TRIGGER', 'CREATE TEMP TRIGGER');
+        const replayTriggerSql = buildCreateViewTriggerSql({
+            identifier: 'temp native insert',
+            sql: storedTriggerSql,
+            temporary: true
+        });
         let tempTriggerPresent = true;
 
         const connection = await createRecordingConnection(call => {
@@ -2265,7 +3412,7 @@ FROM orders o`;
                     result: {
                         results: queries.map(query => {
                             if (query.sql.startsWith(
-                                "SELECT sql FROM sqlite_schema WHERE type = 'view'"
+                                "SELECT sql FROM main.sqlite_schema WHERE type = 'view'"
                             )) {
                                 return { columns: ['sql'], values: [[currentViewSql]] };
                             }
@@ -2290,6 +3437,20 @@ FROM orders o`;
                     currentViewSql = sql;
                 } else if (sql === replayTriggerSql) {
                     tempTriggerPresent = true;
+                }
+            }
+            if (call.method === 'query') {
+                const sql = String(call.args[0]);
+                if (sql.includes('pragma_table_xinfo')) {
+                    return { result: { columns: ['name'], values: [['value']] } };
+                }
+                if (sql.startsWith('EXPLAIN ')) {
+                    return {
+                        result: {
+                            columns: ['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5', 'comment'],
+                            values: [[0, 'Init', 0, 1, 0, null, 0, '-- TRIGGER temp native insert']]
+                        }
+                    };
                 }
             }
             return { result: { columns: [], values: [] } };
@@ -2329,7 +3490,7 @@ FROM orders o`;
                     result: {
                         results: queries.map(query => {
                             if (query.sql.startsWith(
-                                "SELECT sql FROM sqlite_schema WHERE type = 'view'"
+                                "SELECT sql FROM main.sqlite_schema WHERE type = 'view'"
                             )) {
                                 return { columns: ['sql'], values: [[currentViewSql]] };
                             }
@@ -2361,11 +3522,11 @@ FROM orders o`;
             }
             if (call.method === 'query') {
                 const [sql] = call.args as [string];
-                if (sql.startsWith('PRAGMA main.table_info')) {
+                if (sql.startsWith('PRAGMA main.table_xinfo')) {
                     return {
                         result: {
-                            columns: ['cid', 'name'],
-                            values: [[0, 'user id'], [1, 'display name']]
+                            columns: ['cid', 'name', 'hidden'],
+                            values: [[0, 'user id', 0], [1, 'display name', 0]]
                         }
                     };
                 }
@@ -2480,6 +3641,72 @@ describe('NativeWorkerProcess', () => {
         assert.strictEqual(errorLogged, true, 'Should log error on bad deserialization');
     });
 
+    it('terminates the worker when a response frame advertises an unsafe allocation', async () => {
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        let killCount = 0;
+        (worker as any).process = {
+            stdin: { write: () => true },
+            kill: () => { killCount++; }
+        };
+        const pending = worker.call('query', [], 50);
+        const hostileHeader = Buffer.alloc(4);
+        hostileHeader.writeUInt32BE(0xffff_ffff, 0);
+
+        (worker as any).handleData(hostileHeader);
+
+        await assert.rejects(pending, /native worker response frame.*limit/i);
+        assert.strictEqual(killCount, 1);
+        assert.strictEqual((worker as any).process, null);
+        assert.strictEqual((worker as any).chunksTotalLength, 0);
+        assert.strictEqual((worker as any).pendingRequests.size, 0);
+    });
+
+    it('retires the worker and clears request state when an IPC write fails', async () => {
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        let killCount = 0;
+        (worker as any).process = {
+            stdin: {
+                write() { throw new Error('native stdin EPIPE'); }
+            },
+            kill: () => { killCount++; }
+        };
+
+        try {
+            await assert.rejects(worker.call('query', [], 1000), /native stdin EPIPE/);
+            assert.strictEqual(killCount, 1);
+            assert.strictEqual((worker as any).process, null);
+            assert.strictEqual((worker as any).pendingRequests.size, 0);
+        } finally {
+            worker.stop();
+        }
+    });
+
+    it('handles an asynchronous child-stdin EPIPE without an unhandled stream error', async () => {
+        const childProcess = require('node:child_process');
+        const fakeChild = new EventEmitter() as any;
+        fakeChild.stdout = new EventEmitter();
+        fakeChild.stderr = new EventEmitter();
+        fakeChild.stdin = new EventEmitter();
+        fakeChild.stdin.write = () => true;
+        let killCount = 0;
+        fakeChild.kill = () => { killCount++; };
+        mock.method(childProcess, 'spawn', () => fakeChild);
+        mock.method(console, 'error', () => {});
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+
+        const starting = worker.start();
+        fakeChild.stdout.emit('data', encodeNativeMessage({ ready: true }));
+        await starting;
+        const pending = worker.call('query', [], 1000);
+
+        fakeChild.stdin.emit('error', new Error('EPIPE from native child'));
+
+        await assert.rejects(pending, /request stream failed: EPIPE from native child/);
+        assert.strictEqual(killCount, 1);
+        assert.strictEqual((worker as any).process, null);
+        assert.strictEqual((worker as any).pendingRequests.size, 0);
+    });
+
     it('marks native request deadlines as invocation timeouts for recovery', async () => {
         const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
         let killCount = 0;
@@ -2499,8 +3726,9 @@ describe('NativeWorkerProcess', () => {
                     return true;
                 }
             );
-            assert.strictEqual(killCount, 0);
-            assert.strictEqual((worker as any).process, fakeProcess);
+            assert.strictEqual(killCount, 1);
+            assert.strictEqual((worker as any).process, null);
+            assert.strictEqual((worker as any).pendingRequests.size, 0);
         } finally {
             worker.stop();
         }
@@ -2614,6 +3842,296 @@ describe('NativeWorkerProcess', () => {
             }
             worker.stop();
         }
+    });
+
+    it('routes an in-flight VACUUM abort to the worker correlation id', async () => {
+        const calls: RecordedNativeCall[] = [];
+        const mockProcess = createRecordingNativeProcess(calls);
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        (worker as any).process = {
+            stdin: mockProcess.stdin,
+            kill: () => {}
+        };
+        const controller = new AbortController();
+        const cancellation = new DOMException('Cancelled native snapshot', 'AbortError');
+        let vacuumPromise: Promise<unknown> | undefined;
+
+        try {
+            vacuumPromise = worker.call('vacuumInto', ['/private/snapshot.sqlite'], 1000, controller.signal);
+            await new Promise(resolve => setImmediate(resolve));
+            const vacuumCall = calls.find(call => call.method === 'vacuumInto');
+            assert.ok(vacuumCall, 'VACUUM must be dispatched before cancellation');
+
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+
+            const cancelCall = calls.find(call => call.method === 'cancel');
+            assert.ok(cancelCall, 'aborting the snapshot must send a cancel verb');
+            assert.deepStrictEqual(cancelCall.args, [vacuumCall.id]);
+
+            (worker as any).handleMessage({
+                id: vacuumCall.id,
+                error: '[vacuumInto] Operation cancelled',
+                cancelled: true
+            });
+            await assert.rejects(vacuumPromise, error => error === cancellation);
+            vacuumPromise = undefined;
+        } finally {
+            if (vacuumPromise) {
+                const vacuumCall = calls.find(call => call.method === 'vacuumInto');
+                if (vacuumCall) {
+                    (worker as any).handleMessage({ id: vacuumCall.id, error: 'test cleanup' });
+                }
+                await vacuumPromise.catch(() => {});
+            }
+            worker.stop();
+        }
+    });
+});
+
+describe('native synchronous query deadlines', () => {
+    it('arms and clears the bundled Database deadline around SQLite stepping', () => {
+        const runWithQueryDeadline = loadNativeWorkerFunction(
+            'runWithQueryDeadline',
+            ['database', 'timeoutMs', 'operation']
+        );
+        const calls: unknown[] = [];
+        const database = {
+            setQueryDeadline(timeoutMs: number) { calls.push(['set', timeoutMs]); },
+            clearQueryDeadline() { calls.push(['clear']); }
+        };
+
+        const result = runWithQueryDeadline(database, 37, () => {
+            calls.push(['step']);
+            return 42;
+        });
+
+        assert.strictEqual(result, 42);
+        assert.deepStrictEqual(calls, [['set', 37], ['step'], ['clear']]);
+    });
+
+    it('clears an expired deadline before reporting SQLite interruption', () => {
+        const runWithQueryDeadline = loadNativeWorkerFunction(
+            'runWithQueryDeadline',
+            ['database', 'timeoutMs', 'operation']
+        );
+        let cleared = false;
+        const database = {
+            setQueryDeadline() {},
+            clearQueryDeadline() { cleared = true; }
+        };
+        const interruption = Object.assign(new Error('interrupted'), { errno: 9 });
+
+        assert.throws(
+            () => runWithQueryDeadline(database, 25, () => { throw interruption; }),
+            /Query execution timed out after 25ms/
+        );
+        assert.strictEqual(cleared, true);
+    });
+
+    it('preserves timeout identity when clearing the expired deadline also fails', () => {
+        const runWithQueryDeadline = loadNativeWorkerFunction(
+            'runWithQueryDeadline',
+            ['database', 'timeoutMs', 'operation']
+        );
+        const database = {
+            setQueryDeadline() {},
+            clearQueryDeadline() { throw new Error('deadline cleanup failed'); }
+        };
+        const interruption = Object.assign(new Error('interrupted'), { errno: 9 });
+        let error: unknown;
+
+        try {
+            runWithQueryDeadline(database, 25, () => { throw interruption; });
+        } catch (caught) {
+            error = caught;
+        }
+
+        assert.ok(error instanceof AggregateError);
+        assert.match(error.message, /Query execution timed out after 25ms/);
+        assert.match(error.message, /deadline cleanup failed/);
+        assert.strictEqual(error.errors.length, 2);
+    });
+
+    it('fails closed when the bundled Database lacks deadline support', () => {
+        const runWithQueryDeadline = loadNativeWorkerFunction(
+            'runWithQueryDeadline',
+            ['database', 'timeoutMs', 'operation']
+        );
+
+        assert.throws(
+            () => runWithQueryDeadline({}, 25, () => undefined),
+            /setQueryDeadline.*clearQueryDeadline/i
+        );
+    });
+
+    it('arms the dedicated connection while reading a cell chunk', () => {
+        const runWithQueryDeadline = loadNativeWorkerFunction(
+            'runWithQueryDeadline',
+            ['database', 'timeoutMs', 'operation']
+        );
+        const calls: unknown[] = [];
+        const session = {
+            connection: {
+                setQueryDeadline(timeoutMs: number) { calls.push(['set', timeoutMs]); },
+                clearQueryDeadline() { calls.push(['clear']); }
+            },
+            target: {
+                table: 'assets',
+                column: 'payload',
+                escapedTable: 'main."assets"',
+                escapedColumn: '"payload"',
+                predicate: { sql: 'rowid = ?', params: [7] }
+            },
+            metadata: { storageClass: 'blob', byteLength: 4 },
+            lastAccessAt: 0
+        };
+        const readCellChunkFromSession = loadNativeWorkerFunction(
+            'readCellChunkFromSession',
+            ['session', 'byteOffset', 'maxBytes', 'timeoutMs'],
+            {
+                runWithQueryDeadline,
+                executeQuery(_connection: unknown, sql: string, params: unknown[]) {
+                    calls.push(['query', sql, params]);
+                    return { values: [[Uint8Array.from([1, 2, 3, 4])]] };
+                },
+                scheduleCellReadSessionExpiry() { calls.push(['schedule']); },
+                Date: { now: () => 91 }
+            }
+        );
+
+        assert.deepStrictEqual(readCellChunkFromSession(session, 0, 4, 23), {
+            byteOffset: 0,
+            bytes: Uint8Array.from([1, 2, 3, 4]),
+            done: true
+        });
+        assert.deepStrictEqual(calls.map(call => Array.isArray(call) ? call[0] : call), [
+            'set',
+            'query',
+            'clear',
+            'schedule'
+        ]);
+        assert.strictEqual(session.lastAccessAt, 91);
+    });
+
+    it('deadlines snapshot cleanup and clears the deadline before closing the handle', () => {
+        const runWithQueryDeadline = loadNativeWorkerFunction(
+            'runWithQueryDeadline',
+            ['database', 'timeoutMs', 'operation']
+        );
+        const calls: unknown[] = [];
+        const connection = {
+            setQueryDeadline(timeoutMs: number) { calls.push(['set', timeoutMs]); },
+            clearQueryDeadline() { calls.push(['clear']); },
+            exec(sql: string) { calls.push(['exec', sql]); },
+            close() { calls.push(['close']); }
+        };
+        const cellReadSessions = new Map([['session-1', {
+            sessionId: 'session-1',
+            connection,
+            usesMainConnection: false,
+            savepointName: 'snapshot_1',
+            expiryTimer: 44
+        }]]);
+        const closeCellReadSessionInternal = loadNativeWorkerFunction(
+            'closeCellReadSessionInternal',
+            ['sessionId', 'timeoutMs'],
+            {
+                CELL_READ_SESSION_IDLE_TIMEOUT_MS: 30_000,
+                cellReadSessions,
+                rememberClosedCellReadSession(sessionId: string) {
+                    calls.push(['remember', sessionId]);
+                },
+                clearTimeout(timer: number) { calls.push(['clear-timeout', timer]); },
+                runWithQueryDeadline,
+                abandonMainConnectionAfterCellReadCleanupFailure() {
+                    calls.push(['abandon']);
+                }
+            }
+        );
+
+        assert.throws(
+            () => closeCellReadSessionInternal('session-1', 0),
+            /positive finite number/
+        );
+        assert.strictEqual(cellReadSessions.size, 1);
+        assert.deepStrictEqual(calls, []);
+
+        assert.strictEqual(closeCellReadSessionInternal('session-1', 29), true);
+        assert.deepStrictEqual(calls.map(call => Array.isArray(call) ? call[0] : call), [
+            'remember',
+            'clear-timeout',
+            'set',
+            'exec',
+            'clear',
+            'close'
+        ]);
+        assert.strictEqual(cellReadSessions.size, 0);
+    });
+});
+
+describe('native async VACUUM routing', () => {
+    it('uses a bound VACUUM main INTO path only outside the main transaction', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const runVacuumInto = loadNativeWorkerFunction(
+            'runVacuumInto',
+            ['asyncDatabase', 'database', 'snapshotPath', 'signal'],
+            { isExplicitlyOutsideTransaction }
+        );
+        const calls: unknown[][] = [];
+        const asyncDatabase = {
+            async run(...args: unknown[]) { calls.push(args); }
+        };
+        const signal = new AbortController().signal;
+
+        await runVacuumInto(
+            asyncDatabase,
+            { inTransaction: false },
+            "/private/quote'snapshot.sqlite",
+            signal
+        );
+        assert.deepStrictEqual(calls, [[
+            'VACUUM main INTO ?',
+            ["/private/quote'snapshot.sqlite"],
+            { signal }
+        ]]);
+
+        await assert.rejects(
+            runVacuumInto(asyncDatabase, { inTransaction: true }, '/private/blocked.sqlite', signal),
+            /active transaction/i
+        );
+        assert.strictEqual(calls.length, 1);
+    });
+
+    it('reports a deadline that lands before an async completion is observed', async () => {
+        const activeOperations = new Map<number, {
+            controller: AbortController;
+            reason?: 'deadline' | 'host';
+        }>();
+        const executeInterruptibleAsyncOperation = loadNativeWorkerFunction(
+            'executeInterruptibleAsyncOperation',
+            ['requestId', 'timeoutMs', 'operation'],
+            {
+                activeOperations,
+                setTimeout(callback: () => void) {
+                    queueMicrotask(callback);
+                    return 1;
+                },
+                clearTimeout() {}
+            }
+        );
+
+        await assert.rejects(
+            executeInterruptibleAsyncOperation(17, 19, async () => {
+                await new Promise<void>(resolve => queueMicrotask(resolve));
+                return 'completed';
+            }),
+            /Query execution timed out after 19ms/
+        );
+        assert.strictEqual(activeOperations.size, 0);
     });
 });
 

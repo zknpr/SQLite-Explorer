@@ -9,7 +9,7 @@ import type {
 /** Canonical trigger sources, ordered by the schema in which they are replayed. */
 export const VIEW_TRIGGER_SCHEMA_QUERIES = [
   {
-    sql: "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE ORDER BY rowid",
+    sql: "SELECT name, sql FROM main.sqlite_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE ORDER BY rowid",
     params: (view: string): CellValue[] => [view],
     temporary: false
   },
@@ -129,7 +129,9 @@ function consumeQualifiedSqlIdentifier(tokens: readonly SqlToken[], index: numbe
 
 interface ParsedStoredTriggerSql {
   tokens: SqlToken[];
+  event: 'insert' | 'update' | 'delete';
   targetSchema?: string;
+  targetStartIndex: number;
   updateOfColumns: SqlToken[];
   referenceStartIndex: number;
   bodyStartIndex: number;
@@ -139,6 +141,7 @@ interface ParsedStoredTriggerSql {
 function parseStoredTriggerSql(triggerSql: string): ParsedStoredTriggerSql {
   const tokens = scanSqlTokens(triggerSql);
   const updateOfColumns: SqlToken[] = [];
+  let event: ParsedStoredTriggerSql['event'];
   let index = 0;
   const expectKeyword = (keyword: string) => {
     if (!isSqlKeyword(tokens[index], keyword)) {
@@ -164,9 +167,14 @@ function parseStoredTriggerSql(triggerSql: string): ParsedStoredTriggerSql {
     expectKeyword('OF');
   }
 
-  if (isSqlKeyword(tokens[index], 'INSERT') || isSqlKeyword(tokens[index], 'DELETE')) {
+  if (isSqlKeyword(tokens[index], 'INSERT')) {
+    event = 'insert';
+    index++;
+  } else if (isSqlKeyword(tokens[index], 'DELETE')) {
+    event = 'delete';
     index++;
   } else if (isSqlKeyword(tokens[index], 'UPDATE')) {
+    event = 'update';
     index++;
     if (isSqlKeyword(tokens[index], 'OF')) {
       index++;
@@ -189,6 +197,7 @@ function parseStoredTriggerSql(triggerSql: string): ParsedStoredTriggerSql {
   }
 
   expectKeyword('ON');
+  const targetStartIndex = index;
   const schemaToken = tokens[index];
   index = consumeSqlIdentifier(tokens, index);
   let targetSchema: string | undefined;
@@ -205,11 +214,108 @@ function parseStoredTriggerSql(triggerSql: string): ParsedStoredTriggerSql {
   }
   return {
     tokens,
+    event,
     targetSchema,
+    targetStartIndex,
     updateOfColumns,
     referenceStartIndex,
     bodyStartIndex: beginIndex + 1
   };
+}
+
+/** Recreate a captured persistent trigger explicitly in main despite TEMP shadows. */
+export function qualifyMainCreateTriggerSql(
+  triggerSql: string,
+  expectedIdentifier: string
+): string {
+  // Validate the complete structural header, including its ON target and body.
+  parseStoredTriggerSql(triggerSql);
+  const tokens = scanSqlTokens(triggerSql);
+  let cursor = 0;
+  const expectKeyword = (keyword: string): void => {
+    if (!isSqlKeyword(tokens[cursor], keyword)) {
+      throw new Error(`Expected ${keyword} in stored CREATE TRIGGER SQL`);
+    }
+    cursor++;
+  };
+  expectKeyword('CREATE');
+  if (isSqlKeyword(tokens[cursor], 'TEMP') || isSqlKeyword(tokens[cursor], 'TEMPORARY')) {
+    throw new Error(`Stored trigger ${expectedIdentifier} is not persistent`);
+  }
+  expectKeyword('TRIGGER');
+  if (isSqlKeyword(tokens[cursor], 'IF')) {
+    cursor++;
+    expectKeyword('NOT');
+    expectKeyword('EXISTS');
+  }
+
+  const first = tokens[cursor];
+  if (!isSqlIdentifierToken(first)) {
+    throw new Error('Expected a trigger identifier in stored CREATE TRIGGER SQL');
+  }
+  const qualified = tokens[cursor + 1]?.kind === 'symbol'
+    && tokens[cursor + 1].value === '.';
+  const name = qualified ? tokens[cursor + 2] : first;
+  if (!isSqlIdentifierToken(name)
+      || foldSqlIdentifier(name.value) !== foldSqlIdentifier(expectedIdentifier)) {
+    throw new Error(`Stored CREATE TRIGGER identifier does not match ${expectedIdentifier}`);
+  }
+  if (qualified) {
+    if (foldSqlIdentifier(first.value) !== 'main') {
+      throw new Error(`Stored CREATE TRIGGER for ${expectedIdentifier} is not in main`);
+    }
+    return triggerSql;
+  }
+  return `${triggerSql.slice(0, first.start)}main.${triggerSql.slice(first.start)}`;
+}
+
+export interface StoredTriggerValidationHeader {
+  event: 'insert' | 'update' | 'delete';
+  targetSchema?: string;
+  updateOfColumns: string[];
+}
+
+/** Parse only the structural fields needed to ask SQLite to compile a stored trigger. */
+export function readStoredTriggerValidationHeader(
+  triggerSql: string
+): StoredTriggerValidationHeader {
+  const parsed = parseStoredTriggerSql(triggerSql);
+  return {
+    event: parsed.event,
+    targetSchema: parsed.targetSchema,
+    updateOfColumns: parsed.updateOfColumns.map(column => column.value)
+  };
+}
+
+/** Build a non-executing DML statement that makes SQLite compile the trigger event. */
+export function buildStoredTriggerValidationSql(
+  triggerSql: string,
+  targetSchema: string,
+  target: string,
+  writableColumns: readonly string[]
+): string {
+  const header = readStoredTriggerValidationHeader(triggerSql);
+  const qualifiedTarget = `${escapeIdentifier(targetSchema)}.${escapeIdentifier(target)}`;
+  if (header.event === 'insert') {
+    return `EXPLAIN INSERT INTO ${qualifiedTarget} DEFAULT VALUES`;
+  }
+  if (header.event === 'delete') {
+    return `EXPLAIN DELETE FROM ${qualifiedTarget} WHERE 0`;
+  }
+
+  const availableColumns = new Map(
+    writableColumns.map(column => [foldSqlIdentifier(column), column])
+  );
+  const updateColumn = header.updateOfColumns
+    .map(column => availableColumns.get(foldSqlIdentifier(column)))
+    .find((column): column is string => column !== undefined)
+    ?? header.updateOfColumns[0]
+    ?? writableColumns[0];
+  if (updateColumn === undefined) {
+    throw new Error(`Trigger target ${targetSchema}.${target} has no writable column to probe`);
+  }
+  const escapedColumn = escapeIdentifier(updateColumn);
+  return `EXPLAIN UPDATE ${qualifiedTarget} SET ${escapedColumn} = ${escapedColumn} WHERE 0`;
 }
 
 /** Return the schema explicitly named by a CREATE TRIGGER ON target, if any. */
@@ -225,6 +331,17 @@ export function escapeMainViewIdentifier(view: string): string {
 export interface MappedViewTriggerRows {
   triggers: ViewTriggerDefinition[];
   ambiguousTemporaryTriggerNames: string[];
+  /** Unqualified TEMP targets require runtime attribution against main.<view>. */
+  unqualifiedTemporaryTriggers: ViewTriggerDefinition[];
+}
+
+/** True only when EXPLAIN emitted the named trigger program for the probed DML. */
+export function explainIncludesTriggerProgram(
+  rows: readonly (readonly CellValue[])[],
+  triggerIdentifier: string
+): boolean {
+  const marker = `-- TRIGGER ${triggerIdentifier}`;
+  return rows.some(row => row.some(value => value === marker));
 }
 
 /** Map canonical trigger-query rows while keeping temp-schema provenance intact. */
@@ -238,6 +355,7 @@ export function mapViewTriggerRows(
 
   const triggers: ViewTriggerDefinition[] = [];
   const ambiguousTemporaryTriggerNames: string[] = [];
+  const unqualifiedTemporaryTriggers: ViewTriggerDefinition[] = [];
   VIEW_TRIGGER_SCHEMA_QUERIES.forEach((source, index) => {
     rowsBySchema[index].forEach(row => {
       if (typeof row[0] !== 'string' || typeof row[1] !== 'string') {
@@ -260,13 +378,17 @@ export function mapViewTriggerRows(
         // Explicit schema qualification is authoritative even without a TEMP
         // shadow: aux.v must never be captured as a trigger on main.v.
         if (targetSchema !== undefined && foldSqlIdentifier(targetSchema) !== 'main') return;
-        if (targetSchema === undefined && hasTempShadow) {
-          // SQLite binds an unqualified TEMP trigger target at CREATE time,
-          // but neither temp.sqlite_schema nor the stored SQL records whether
-          // main.v or a now-present temp.v won that historical lookup. Keep the
-          // candidate visible in the snapshot and let destructive consumers
-          // reject instead of guessing and losing a trigger.
-          ambiguousTemporaryTriggerNames.push(row[0]);
+        if (targetSchema === undefined) {
+          // SQLite binds this target at CREATE time, but temp.sqlite_schema
+          // stores only tbl_name and the still-unqualified SQL. A main view,
+          // TEMP view, or attached-schema view may have won that historical
+          // lookup even if the current catalogs no longer show the same shadow.
+          // Engines must prove ownership by compiling event DML on main.<view>.
+          unqualifiedTemporaryTriggers.push({
+            identifier: row[0],
+            sql: row[1],
+            temporary: true
+          });
           return;
         }
       }
@@ -275,7 +397,7 @@ export function mapViewTriggerRows(
         : { identifier: row[0], sql: row[1] });
     });
   });
-  return { triggers, ambiguousTemporaryTriggerNames };
+  return { triggers, ambiguousTemporaryTriggerNames, unqualifiedTemporaryTriggers };
 }
 
 /** Refuse destructive view changes when SQLite's catalogs cannot identify trigger ownership. */
@@ -287,8 +409,8 @@ export function assertViewTriggerSnapshotIsMutationSafe(definition: ViewDefiniti
   throw new Error(
     `Cannot modify main view "${definition.identifier}" because temporary trigger target ` +
     `ownership is ambiguous for ${triggerNames}. Each named trigger uses an unqualified ON ` +
-    'target while a same-named TEMP view exists. Drop the TEMP shadow view or the TEMP trigger, ' +
-    'or recreate the trigger with an explicitly schema-qualified target, before editing or ' +
+    'target whose historical schema cannot be proven. Drop the TEMP trigger, or recreate it ' +
+    'with an explicitly schema-qualified target, before editing or ' +
     'dropping the main view.'
   );
 }
@@ -584,6 +706,24 @@ export function buildCreateViewSql(
   return `CREATE VIEW ${escapeIdentifier(view)}${preservedColumnList ? ` ${preservedColumnList}` : ''} AS ${selectSql}`;
 }
 
+/** Canonicalize a proven main-bound TEMP trigger before storing it in history. */
+export function qualifyMainTriggerTargetSql(
+  triggerSql: string,
+  triggerIdentifier: string
+): string {
+  const parsed = parseStoredTriggerSql(triggerSql);
+  if (parsed.targetSchema === undefined) {
+    const target = parsed.tokens[parsed.targetStartIndex];
+    return `${triggerSql.slice(0, target.start)}main.${triggerSql.slice(target.start)}`;
+  }
+  if (foldSqlIdentifier(parsed.targetSchema) !== 'main') {
+    throw new Error(
+      `Unable to recreate temporary trigger ${triggerIdentifier}: target is not in main`
+    );
+  }
+  return triggerSql;
+}
+
 /** Rebuild a captured trigger in the schema it originally occupied. */
 export function buildCreateViewTriggerSql(trigger: ViewTriggerDefinition): string {
   if (!trigger.temporary) return trigger.sql;
@@ -594,9 +734,12 @@ export function buildCreateViewTriggerSql(trigger: ViewTriggerDefinition): strin
       `Unable to recreate temporary trigger ${trigger.identifier}: stored SQL is not a CREATE TRIGGER statement`
     );
   }
-  // sqlite_temp_schema normally omits TEMP from its stored SQL, so restore the
-  // schema qualifier explicitly instead of accidentally creating a main trigger.
-  return trigger.sql.replace(createTriggerPrefix, '$1TEMP $2');
+  const mainTargetSql = qualifyMainTriggerTargetSql(trigger.sql, trigger.identifier);
+
+  // sqlite_temp_schema normally omits TEMP from its stored SQL. Restore both
+  // TEMP ownership and an explicit main target: an unqualified target that was
+  // proven main-bound must not rebind to a same-named TEMP/attached view later.
+  return mainTargetSql.replace(createTriggerPrefix, '$1TEMP $2');
 }
 
 interface TriggerReferenceScope {
@@ -910,6 +1053,10 @@ export function isViewTriggerSnapshotCurrent(
 /** Stable cross-RPC error text used by both view-editor conflict surfaces. */
 export const VIEW_DEFINITION_CONFLICT_MESSAGE =
   'The view changed outside this editor. Reload before saving; the view was not modified.';
+export const MAX_VIEW_DEFINITION_CONFIRMATION_ATTEMPTS = 3;
+export const VIEW_DEFINITION_RETRY_EXHAUSTED_MESSAGE =
+  'View definition changed repeatedly while dropping it. ' +
+  'Retry when concurrent changes have stopped.';
 
 /**
  * Enforce an optional compare-and-swap precondition for a stored CREATE VIEW.

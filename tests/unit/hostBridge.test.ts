@@ -15,12 +15,88 @@ import {
 import {
     CELL_EDIT_VALUE_TOO_LARGE_CODE,
     DEFAULT_MAX_CELL_EDIT_BYTES,
+    OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
     toCellEditPolicyErrorData
 } from '../../src/core/cell-edit-policy';
 import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../src/core/cell-containment';
 import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
+import { MAX_TABLE_PAGE_ROWS } from '../../src/core/query-builder';
+import { VIEW_DEFINITION_CONFLICT_MESSAGE } from '../../src/core/view-utils';
 
 describe('HostBridge', () => {
+    it('rejects malformed table-page bounds before calling the database engine', async () => {
+        const fetchTableData = mock.fn(async (_table: string, _options: any) => ({ headers: [], rows: [] }));
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            { databaseOperations: { fetchTableData } } as any
+        );
+
+        for (const limit of [-1, 0, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+            await assert.rejects(
+                bridge.fetchTableData('items', { limit, offset: 0 }),
+                /page limit must be a positive safe integer/i
+            );
+        }
+        for (const offset of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+            await assert.rejects(
+                bridge.fetchTableData('items', { limit: 10, offset }),
+                /page offset must be a non-negative safe integer/i
+            );
+        }
+        assert.strictEqual(fetchTableData.mock.callCount(), 0);
+    });
+
+    it('clamps table-page requests above the declared maximum before delegation', async () => {
+        const fetchTableData = mock.fn(async (_table: string, _options: any) => ({ headers: [], rows: [] }));
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            { databaseOperations: { fetchTableData } } as any
+        );
+
+        await bridge.fetchTableData('items', {
+            limit: MAX_TABLE_PAGE_ROWS + 1,
+            offset: 0
+        });
+
+        assert.strictEqual(fetchTableData.mock.callCount(), 1);
+        assert.strictEqual(fetchTableData.mock.calls[0].arguments[1].limit, MAX_TABLE_PAGE_ROWS);
+    });
+
+    it('delegates bounded cell read sessions without materializing the value', async () => {
+        const target = { table: 'items', rowId: 0, column: 'body' };
+        const session = {
+            sessionId: 'cell-session-1',
+            metadata: { storageClass: 'text' as const, byteLength: 2_000, textEncoding: 'utf-8' as const },
+            expiresAt: Date.now() + 30_000
+        };
+        const chunk = {
+            byteOffset: 0,
+            bytes: Uint8Array.from([0x61, 0x62]),
+            done: false
+        };
+        const openCellReadSession = mock.fn(async () => session);
+        const readCellChunk = mock.fn(async () => chunk);
+        const closeCellReadSession = mock.fn(async () => undefined);
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            {
+                databaseOperations: {
+                    openCellReadSession,
+                    readCellChunk,
+                    closeCellReadSession
+                }
+            } as any
+        );
+
+        assert.strictEqual(await bridge.openCellReadSession(target), session);
+        assert.strictEqual(await bridge.readCellChunk(session.sessionId, 0, 1_024), chunk);
+        await bridge.closeCellReadSession(session.sessionId);
+
+        assert.deepStrictEqual(openCellReadSession.mock.calls[0].arguments, [target]);
+        assert.deepStrictEqual(readCellChunk.mock.calls[0].arguments, [session.sessionId, 0, 1_024]);
+        assert.deepStrictEqual(closeCellReadSession.mock.calls[0].arguments, [session.sessionId]);
+    });
+
     it('projects one canonical row matrix without changing bounded consumer bytes', () => {
         const bytes = Uint8Array.from([0, 1, 2, 127, 255]);
         const rows = [[bytes]];
@@ -39,6 +115,207 @@ describe('HostBridge', () => {
         assert.deepStrictEqual(consumer.rows[0][0], bytes);
     });
 
+    it('records engine-owned schema guards for table creation and column addition', async () => {
+        const columnAddBeforeSnapshot = {
+            tableSql: 'CREATE TABLE "items" ("id" INTEGER PRIMARY KEY)',
+            columns: ['id'],
+            dataVersion: 1,
+            identity: { kind: 'rowid' as const },
+            schemaObjects: []
+        };
+        const tableCreateSnapshot = {
+            tableSql: 'CREATE TABLE "items" ("id" INTEGER PRIMARY KEY)',
+            columns: ['id'],
+            identity: { kind: 'rowid' as const },
+            schemaObjects: []
+        };
+        const columnAddSnapshot = {
+            tableSql: 'CREATE TABLE "items" ("id" INTEGER PRIMARY KEY, "payload" TEXT)',
+            columns: ['id', 'payload'],
+            identity: { kind: 'rowid' as const },
+            schemaObjects: []
+        };
+        const databaseOperations = {
+            createTable: mock.fn(async () => tableCreateSnapshot),
+            getTableInfo: mock.fn(async () => [{
+                ordinal: 0,
+                identifier: 'id',
+                declaredType: 'INTEGER',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 1,
+                isRowidAlias: true
+            }]),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [['table', 'items', columnAddBeforeSnapshot.tableSql]]
+                    }];
+                }
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
+                throw new Error(`Unexpected query: ${sql}`);
+            }),
+            addColumn: mock.fn(async (..._args: unknown[]) => columnAddSnapshot)
+        };
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                databaseOperations,
+                isReadOnlyMode: false,
+                recordExternalModification
+            } as any
+        );
+        const columns = [{
+            name: 'id',
+            type: 'INTEGER',
+            primaryKey: true,
+            notNull: false
+        }];
+
+        await bridge.createTable('items', columns);
+        await bridge.addColumn('items', 'payload', 'TEXT');
+
+        assert.deepStrictEqual(
+            recordExternalModification.mock.calls[0].arguments[0].tableCreateSnapshot,
+            tableCreateSnapshot
+        );
+        assert.deepStrictEqual(
+            recordExternalModification.mock.calls[1].arguments[0].columnAddSnapshot,
+            columnAddSnapshot
+        );
+        assert.deepStrictEqual(
+            recordExternalModification.mock.calls[1].arguments[0].columnAddBeforeSnapshot,
+            columnAddBeforeSnapshot
+        );
+        assert.strictEqual(
+            databaseOperations.addColumn.mock.calls[0].arguments[4],
+            recordExternalModification.mock.calls[1].arguments[0].columnAddBeforeSnapshot
+        );
+    });
+
+    it('preserves legal created identifiers and rejects unusable ones before backend calls', async () => {
+        const table = ' ui "table" 🚀 ';
+        const column = ' id "column" 🧩 ';
+        const addedColumn = ' added "column" ✨ ';
+        const view = ' ui "view" 🚀 ';
+        const tableState = {
+            tableSql: 'CREATE TABLE placeholder (value TEXT)',
+            columns: [column],
+            dataVersion: 1,
+            identity: { kind: 'rowid' as const },
+            schemaObjects: []
+        };
+        const viewDefinition = {
+            identifier: view,
+            sql: 'CREATE VIEW placeholder AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        const databaseOperations = {
+            createTable: mock.fn(async (..._args: unknown[]) => tableState),
+            getTableInfo: mock.fn(async () => [{
+                ordinal: 0,
+                identifier: column,
+                declaredType: 'TEXT',
+                isRequired: 0,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            }]),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [['table', table, tableState.tableSql]]
+                    }];
+                }
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
+                throw new Error(`Unexpected query: ${sql}`);
+            }),
+            addColumn: mock.fn(async (..._args: unknown[]) => tableState),
+            validateViewDefinition: mock.fn(async (..._args: unknown[]) => undefined),
+            previewViewDefinition: mock.fn(async (..._args: unknown[]) => ({
+                headers: ['value'],
+                rows: [[1]]
+            })),
+            createView: mock.fn(async (..._args: unknown[]) => viewDefinition)
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                databaseOperations,
+                isReadOnlyMode: false,
+                connectionGeneration: 1,
+                recordExternalModification: mock.fn()
+            } as any
+        );
+        const columns = [{
+            name: column,
+            type: 'TEXT',
+            primaryKey: false,
+            notNull: false
+        }];
+
+        await bridge.createTable(table, columns);
+        await bridge.addColumn(table, addedColumn, 'TEXT');
+        await bridge.validateViewDefinition(view, 'SELECT 1 AS value', 'create');
+        await bridge.previewViewDefinition(view, 'SELECT 1 AS value', 10, 'create');
+        await bridge.createView(view, 'SELECT 1 AS value');
+
+        assert.deepStrictEqual(databaseOperations.createTable.mock.calls[0].arguments, [table, columns]);
+        assert.deepStrictEqual(
+            databaseOperations.addColumn.mock.calls[0].arguments,
+            [table, addedColumn, 'TEXT', undefined, tableState]
+        );
+        assert.strictEqual(databaseOperations.validateViewDefinition.mock.calls[0].arguments[0], view);
+        assert.strictEqual(databaseOperations.previewViewDefinition.mock.calls[0].arguments[0], view);
+        assert.strictEqual(databaseOperations.createView.mock.calls[0].arguments[0], view);
+
+        await assert.rejects(
+            bridge.createTable('', columns),
+            /Table name is required/
+        );
+        await assert.rejects(
+            bridge.createTable('valid table', [{ ...columns[0], name: 'bad\0column' }]),
+            /Column name cannot contain NUL/
+        );
+        await assert.rejects(
+            bridge.addColumn(table, 'bad\0column', 'TEXT'),
+            /Column name cannot contain NUL/
+        );
+        await assert.rejects(
+            bridge.validateViewDefinition('bad\0view', 'SELECT 1', 'create'),
+            /View name cannot contain NUL/
+        );
+        await assert.rejects(
+            bridge.previewViewDefinition('', 'SELECT 1', 10, 'create'),
+            /View name is required/
+        );
+        await assert.rejects(
+            bridge.createView('bad\0view', 'SELECT 1'),
+            /View name cannot contain NUL/
+        );
+
+        assert.strictEqual(databaseOperations.createTable.mock.callCount(), 1);
+        assert.strictEqual(databaseOperations.addColumn.mock.callCount(), 1);
+        assert.strictEqual(databaseOperations.validateViewDefinition.mock.callCount(), 1);
+        assert.strictEqual(databaseOperations.previewViewDefinition.mock.callCount(), 1);
+        assert.strictEqual(databaseOperations.createView.mock.callCount(), 1);
+    });
+
     it('tracks only database-persistent PRAGMAs for writable paged documents', async () => {
         const pragmas: Record<string, unknown> = {
             journal_mode: 'delete',
@@ -51,6 +328,7 @@ describe('HostBridge', () => {
         };
         const recorded: any[] = [];
         const databaseOperations = {
+            engineKind: Promise.resolve('wasm' as const),
             getPragmas: async () => ({ ...pragmas }),
             setPragma: async (pragma: string, value: unknown) => {
                 pragmas[pragma] = value;
@@ -103,6 +381,33 @@ describe('HostBridge', () => {
                 }
             ]
         );
+    });
+
+    it('tracks database-persistent PRAGMAs for memory-backed WASM documents', async () => {
+        const pragmas: Record<string, unknown> = { journal_mode: 'delete' };
+        const recorded: any[] = [];
+        const databaseOperations = {
+            engineKind: Promise.resolve('wasm' as const),
+            getPragmas: async () => ({ ...pragmas }),
+            setPragma: async (pragma: string, value: unknown) => { pragmas[pragma] = value; }
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                databaseOperations,
+                isReadOnlyMode: false,
+                isPagedWritableMode: false,
+                recordExternalModification: (entry: unknown) => recorded.push(entry)
+            } as any
+        );
+
+        await bridge.setPragma('journal_mode', 'WAL');
+
+        assert.strictEqual(recorded.length, 1);
+        assert.strictEqual(recorded[0].targetPragma, 'journal_mode');
+        assert.strictEqual(recorded[0].priorValue, 'delete');
+        assert.strictEqual(recorded[0].newValue, 'WAL');
+        assert.strictEqual(recorded[0].undoBarrierKind, 'persistent_pragma');
     });
 
     it('rejects every cell/row mutation for an oversized primary-key identity with its precise reason', async () => {
@@ -195,6 +500,43 @@ describe('HostBridge', () => {
         }
     });
 
+    it('refuses to overwrite malformed bounded TEXT with a lossy decoded prior', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const dbOps = result.operations!;
+        const recordExternalModification = mock.fn();
+        try {
+            await dbOps.executeQuery(
+                'CREATE TABLE malformed_prior (value TEXT); ' +
+                "INSERT INTO malformed_prior VALUES (CAST(X'80' AS TEXT))"
+            );
+            const bridge = new HostBridge(
+                { webviews: new Map(), context: {}, isReadOnly: false } as any,
+                {
+                    uri: vscode.Uri.parse('file:///malformed.db'),
+                    documentKey: Promise.resolve('malformed'),
+                    databaseOperations: dbOps,
+                    connectionGeneration: 1,
+                    isReadOnlyMode: false,
+                    recordExternalModification
+                } as any
+            );
+
+            await assert.rejects(
+                bridge.updateCell('malformed_prior', 1, 'value', 'replacement'),
+                /not valid UTF-8.*raw.*Hex/i
+            );
+            assert.deepStrictEqual(
+                (await dbOps.executeQuery(
+                    'SELECT hex(CAST(value AS BLOB)) FROM malformed_prior'
+                ))[0].rows,
+                [['80']]
+            );
+            assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+        } finally {
+            (dbOps as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('cancels a superseded view preview', async () => {
         const signals: Array<AbortSignal | undefined> = [];
         let releaseFirstPreview: (() => void) | undefined;
@@ -257,10 +599,12 @@ describe('HostBridge', () => {
         const mockProvider = { webviews: new Map(), context: {} };
         const bridge = new HostBridge(mockProvider as any, mockDocument as any);
 
-        const showSaveDialogMock = mock.method(vscode.window, 'showSaveDialog', async () => vscode.Uri.parse('file:///dbDir/safe.txt'));
+        const targetUri = vscode.Uri.file('/dbDir/safe.txt');
+        const showSaveDialogMock = mock.method(vscode.window, 'showSaveDialog', async () => targetUri);
         const writeFileMock = mock.method(vscode.workspace.fs, 'writeFile', async () => {});
+        const renameMock = mock.method(vscode.workspace.fs, 'rename', async () => {});
 
-        await bridge.saveFile('../../../etc/passwd', new Uint8Array([1, 2, 3]));
+        const result = await bridge.saveFile('../../../etc/passwd', new Uint8Array([1, 2, 3]));
 
         assert.strictEqual(showSaveDialogMock.mock.callCount(), 1);
         const args = showSaveDialogMock.mock.calls[0].arguments[0] as any;
@@ -268,6 +612,55 @@ describe('HostBridge', () => {
         assert.ok(args.defaultUri.path.endsWith('/dbDir/passwd'), `Expected safe path, got ${args.defaultUri.path}`);
 
         assert.strictEqual(writeFileMock.mock.callCount(), 1);
+        assert.notStrictEqual(writeFileMock.mock.calls[0].arguments[0], targetUri);
+        assert.strictEqual(renameMock.mock.callCount(), 1);
+        assert.strictEqual(renameMock.mock.calls[0].arguments[1], targetUri);
+        assert.deepStrictEqual(result, { success: true });
+    });
+
+    it('preserves an existing blob destination when the provider write fails', async () => {
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            { uri: vscode.Uri.file('/dbDir/test.db') } as any
+        );
+        const targetUri = vscode.Uri.file('/dbDir/payload.bin');
+        const sentinel = Uint8Array.of(9, 8, 7);
+        let targetBytes = sentinel;
+        let temporaryUri: any;
+        mock.method(vscode.window, 'showSaveDialog', async () => targetUri);
+        mock.method(vscode.workspace.fs, 'writeFile', async (uri: any) => {
+            if (uri === targetUri) targetBytes = Uint8Array.of(1);
+            else temporaryUri = uri;
+            throw new Error('provider write failed after a partial temporary write');
+        });
+        const rename = mock.method(vscode.workspace.fs, 'rename', async () => {
+            targetBytes = Uint8Array.of(1);
+        });
+        const deleted: any[] = [];
+        mock.method(vscode.workspace.fs, 'delete', async (uri: any) => { deleted.push(uri); });
+
+        await assert.rejects(
+            () => bridge.saveFile('payload.bin', Uint8Array.of(1, 2, 3)),
+            /provider write failed/
+        );
+        assert.deepStrictEqual(targetBytes, sentinel);
+        assert.strictEqual(rename.mock.callCount(), 0);
+        assert.ok(temporaryUri, 'save must first write an adjacent private resource');
+        assert.deepStrictEqual(deleted, [temporaryUri]);
+    });
+
+    it('reports native save-dialog cancellation without writing', async () => {
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            { uri: vscode.Uri.file('/dbDir/test.db') } as any
+        );
+        mock.method(vscode.window, 'showSaveDialog', async () => undefined);
+        const writeFile = mock.method(vscode.workspace.fs, 'writeFile', async () => {});
+
+        const result = await bridge.saveFile('payload.bin', Uint8Array.of(1));
+
+        assert.deepStrictEqual(result, { success: false, cancelled: true });
+        assert.strictEqual(writeFile.mock.callCount(), 0);
     });
 
     it('rejects an oversized selected BLOB before reading it into the extension host', async () => {
@@ -418,12 +811,12 @@ describe('HostBridge', () => {
             cellMaterializer: materializer
         } as any, mockDocument as any);
 
-        await bridge.openCellEditor(
+        const openResult = await bridge.openCellEditor(
             { table: 'large_cells' },
             1,
             'payload',
             {},
-            { value: new Uint8Array(1024), type: { type: 'binary', ext: 'bin' } }
+            { type: { mime: 'image/png', type: 'image', ext: 'png' } }
         );
 
         assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 1);
@@ -437,6 +830,10 @@ describe('HostBridge', () => {
             materializer.materialize.mock.calls[0].arguments[2].owner,
             mockDocument
         );
+        assert.strictEqual(
+            materializer.materialize.mock.calls[0].arguments[2].fileExtension,
+            'png'
+        );
         assert.strictEqual(executeCommandMock.mock.callCount(), 2);
         assert.deepStrictEqual(executeCommandMock.mock.calls[0].arguments, [
             'vscode.open',
@@ -447,6 +844,62 @@ describe('HostBridge', () => {
             executeCommandMock.mock.calls[1].arguments[0],
             'workbench.action.files.setActiveEditorReadonlyInSession'
         );
+        assert.deepStrictEqual(openResult, {
+            success: true,
+            mode: 'temporary-read-only'
+        });
+    });
+
+    it('materializes an oversized cell whose legal SQLite column name is empty', async () => {
+        const executeCommand = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const tempUri = vscode.Uri.file('/private/materialized/empty-column.bin');
+        const materializer = {
+            materialize: mock.fn(async (_operations: any, _target: any) => ({
+                uri: tempUri,
+                metadata: { storageClass: 'blob', byteLength: 2 * 1024 * 1024 },
+                byteLength: 2 * 1024 * 1024,
+                checksumSha256: '0'.repeat(64)
+            })),
+            release: mock.fn()
+        };
+        const dbOps = {
+            getCellMetadata: mock.fn(async (_target: any) => ({
+                storageClass: 'blob',
+                byteLength: 2 * 1024 * 1024
+            }))
+        };
+        const document = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            onDidDispose: () => ({ dispose() {} })
+        };
+        const bridge = new HostBridge({
+            webviews: new Map(),
+            context: {},
+            cellMaterializer: materializer
+        } as any, document as any);
+
+        const result = await bridge.openCellEditor(
+            { table: 'empty_column_cells' },
+            1,
+            '',
+            {},
+            { type: { mime: 'application/octet-stream', type: 'binary', ext: 'bin' } }
+        );
+
+        assert.deepStrictEqual(dbOps.getCellMetadata.mock.calls[0].arguments[0], {
+            table: 'empty_column_cells',
+            rowId: 1,
+            column: ''
+        });
+        assert.deepStrictEqual(materializer.materialize.mock.calls[0].arguments[1], {
+            table: 'empty_column_cells',
+            rowId: 1,
+            column: ''
+        });
+        assert.deepStrictEqual(result, { success: true, mode: 'temporary-read-only' });
+        assert.strictEqual(executeCommand.mock.callCount(), 2);
     });
 
     it('serves oversized media from a panel-owned temp URI within narrowed roots', async () => {
@@ -475,7 +928,9 @@ describe('HostBridge', () => {
                 uri: tempUri,
                 metadata: { storageClass: 'blob', byteLength: 32 * 1024 * 1024 },
                 byteLength: 32 * 1024 * 1024,
-                checksumSha256: '0'.repeat(64)
+                checksumSha256: '0'.repeat(64),
+                contentEncoding: 'raw-database-bytes',
+                sourcePrefix: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
             })),
             release: mock.fn((_uri: vscode.Uri) => {})
         };
@@ -501,6 +956,7 @@ describe('HostBridge', () => {
             {
                 type: { type: 'image', mime: 'image/png', ext: 'png' },
                 webviewId: 'wv-media',
+                requestId: 'request-success',
                 sourceByteLength: 32 * 1024 * 1024
             }
         );
@@ -536,6 +992,166 @@ describe('HostBridge', () => {
             webview.options.localResourceRoots.map(uri => uri.fsPath),
             ['/extension/assets/codicons']
         );
+    });
+
+    it('rejects media whose same-snapshot storage class or signature changed', async () => {
+        const tempUri = vscode.Uri.file('/private/materialized/run/raced.png');
+        const webview = {
+            options: { enableScripts: true, localResourceRoots: [] as vscode.Uri[] },
+            asWebviewUri: (uri: vscode.Uri) => ({
+                toString: () => `https://wv-resource.test${uri.path}`
+            })
+        };
+        const panel = { webview, onDidDispose: () => ({ dispose() {} }) };
+        const documentUri = vscode.Uri.parse('file:///test.db');
+        const webviews = {
+            getByWebviewId: (id: string) => id === 'wv-media' ? panel : undefined,
+            *get(uri: vscode.Uri) {
+                if (uri.toString() === documentUri.toString()) yield panel;
+            }
+        };
+        const scenarios = [
+            {
+                metadata: { storageClass: 'blob', byteLength: 32 * 1024 * 1024 },
+                sourcePrefix: new TextEncoder().encode('%PDF-1.7'),
+                error: /signature.*image\/png/i
+            },
+            {
+                metadata: {
+                    storageClass: 'text', byteLength: 32 * 1024 * 1024, textEncoding: 'utf-8'
+                },
+                sourcePrefix: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+                error: /changed.*BLOB.*TEXT/i
+            }
+        ];
+        let scenarioIndex = 0;
+        const materializer = {
+            materialize: mock.fn(async () => {
+                const scenario = scenarios[scenarioIndex++];
+                return {
+                    uri: tempUri,
+                    metadata: scenario.metadata,
+                    byteLength: scenario.metadata.byteLength,
+                    checksumSha256: '0'.repeat(64),
+                    contentEncoding: scenario.metadata.storageClass === 'text'
+                        ? 'utf-8'
+                        : 'raw-database-bytes',
+                    sourcePrefix: scenario.sourcePrefix
+                };
+            }),
+            release: mock.fn()
+        };
+        const dbOps = {
+            getCellMetadata: mock.fn(async () => ({
+                storageClass: 'blob', byteLength: 32 * 1024 * 1024
+            }))
+        };
+        const bridge = new HostBridge({
+            webviews,
+            context: { extensionUri: vscode.Uri.file('/extension') },
+            cellMaterializer: materializer
+        } as any, {
+            uri: documentUri,
+            databaseOperations: dbOps
+        } as any);
+
+        for (let index = 0; index < scenarios.length; index++) {
+            await assert.rejects(
+                (bridge as any).prepareCellMediaPreview(
+                    { table: 'large_cells' },
+                    1,
+                    'payload',
+                    {
+                        type: { type: 'image', mime: 'image/png', ext: 'png' },
+                        webviewId: 'wv-media',
+                        requestId: `request-race-${index}`,
+                        sourceByteLength: 32 * 1024 * 1024
+                    }
+                ),
+                scenarios[index].error
+            );
+            assert.strictEqual(materializer.release.mock.callCount(), index + 1);
+            assert.deepStrictEqual(webview.options.localResourceRoots, []);
+        }
+    });
+
+    it('prevents an older metadata completion from replacing a newer media lease', async () => {
+        const firstMetadata = createDeferred<any>();
+        const uriA = vscode.Uri.file('/private/materialized/run/a.png');
+        const uriB = vscode.Uri.file('/private/materialized/run/b.png');
+        const webview = {
+            options: { enableScripts: true, localResourceRoots: [] as vscode.Uri[] },
+            asWebviewUri: (uri: vscode.Uri) => ({
+                toString: () => `https://wv-resource.test${uri.path}`
+            })
+        };
+        const panel = {
+            webview,
+            onDidDispose: () => ({ dispose() {} })
+        };
+        const documentUri = vscode.Uri.parse('file:///test.db');
+        const webviews = {
+            getByWebviewId: (id: string) => id === 'wv-media' ? panel : undefined,
+            *get(uri: vscode.Uri) {
+                if (uri.toString() === documentUri.toString()) yield panel;
+            }
+        };
+        const materializer = {
+            materialize: mock.fn(async (_operations: any, target: any) => ({
+                uri: target.rowId === 1 ? uriA : uriB,
+                metadata: { storageClass: 'blob', byteLength: 32 * 1024 * 1024 },
+                byteLength: 32 * 1024 * 1024,
+                checksumSha256: '0'.repeat(64),
+                contentEncoding: 'raw-database-bytes',
+                sourcePrefix: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+            })),
+            release: mock.fn()
+        };
+        const dbOps = {
+            getCellMetadata: mock.fn(async (target: any) => target.rowId === 1
+                ? firstMetadata.promise
+                : { storageClass: 'blob', byteLength: 32 * 1024 * 1024 })
+        };
+        const bridge = new HostBridge({
+            webviews,
+            context: { extensionUri: vscode.Uri.file('/extension') },
+            cellMaterializer: materializer
+        } as any, {
+            uri: documentUri,
+            databaseOperations: dbOps
+        } as any);
+        const mediaOptions = (requestId: string) => ({
+            type: { type: 'image', mime: 'image/png', ext: 'png' },
+            webviewId: 'wv-media',
+            requestId,
+            sourceByteLength: 32 * 1024 * 1024
+        });
+
+        const first = (bridge as any).prepareCellMediaPreview(
+            { table: 'large_cells' },
+            1,
+            'payload',
+            mediaOptions('request-a')
+        );
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const second = await (bridge as any).prepareCellMediaPreview(
+            { table: 'large_cells' },
+            2,
+            'payload',
+            mediaOptions('request-b')
+        );
+        assert.strictEqual(second.success, true);
+
+        firstMetadata.resolve({ storageClass: 'blob', byteLength: 32 * 1024 * 1024 });
+        await assert.rejects(first, /cancel/i);
+        assert.deepStrictEqual(
+            materializer.materialize.mock.calls.map(call => call.arguments[1].rowId),
+            [2]
+        );
+        assert.strictEqual(materializer.release.mock.callCount(), 0);
+
+        await (bridge as any).releaseCellMediaPreview('wv-media', second.previewId);
+        assert.deepStrictEqual(materializer.release.mock.calls[0].arguments, [uriB]);
     });
 
     it('refuses an oversized VFS open with an explicit export alternative if materialization fails', async () => {
@@ -747,6 +1363,52 @@ describe('HostBridge', () => {
         assert.deepStrictEqual(modification.deletedRows, deletedRows);
     });
 
+    it('records the authoritative inserted row and bounds its history snapshot', async () => {
+        const insertedRow = {
+            rowId: 9,
+            row: { id: 9n, value: 'defaulted' },
+            storageClasses: [
+                { column: 'id', storageClass: 'integer' as const },
+                { column: 'value', storageClass: 'text' as const }
+            ]
+        };
+        const dbOps = {
+            insertRowWithHistory: mock.fn(async (
+                _table: string,
+                _data: Record<string, unknown>,
+                _maxEditValueBytes?: number,
+                _maxUndoSnapshotBytes?: number
+            ) => insertedRow)
+        };
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            {
+                uri: vscode.Uri.parse('file:///test.db'),
+                documentKey: Promise.resolve('test-key'),
+                undoMemoryLimitBytes: 1024,
+                connectionGeneration: 0,
+                recordExternalModification
+            } as any
+        );
+        (bridge as any).ensureDatabaseInitialized = () => dbOps as any;
+
+        assert.strictEqual(await bridge.insertRow('items', { id: 9 }), 9);
+        const args = dbOps.insertRowWithHistory.mock.calls[0].arguments;
+        assert.deepStrictEqual(args.slice(0, 2), ['items', { id: 9 }]);
+        assert.ok(typeof args[2] === 'number' && args[2] > 0);
+        assert.ok(typeof args[3] === 'number' && args[3] > 0 && args[3] < 1024);
+        assert.deepStrictEqual(recordExternalModification.mock.calls[0].arguments[0], {
+            label: 'Insert Row',
+            description: 'Insert row into items',
+            modificationType: 'row_insert',
+            targetTable: 'items',
+            targetRowId: 9,
+            rowData: insertedRow.row,
+            insertedRow
+        });
+    });
+
     it('treats connection-level read-only documents as read-only for web mutators', async () => {
         const dbOps = {
             updateCell: mock.fn(async () => {}),
@@ -792,89 +1454,6 @@ describe('HostBridge', () => {
         assert.strictEqual(dbOps.deleteRows.mock.callCount(), 0);
         assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
-    });
-
-    it('rejects fireEditEvent for a read-only document without recording history', async () => {
-        const recordExternalModification = mock.fn();
-        const bridge = new HostBridge(
-            { webviews: new Map(), context: {}, isReadOnly: false } as any,
-            {
-                isReadOnlyMode: true,
-                recordExternalModification
-            } as any
-        );
-
-        await assert.rejects(
-            () => bridge.fireEditEvent({
-                label: 'Edit Cell',
-                description: 'Update items.name',
-                modificationType: 'cell_update',
-                targetTable: 'items',
-                targetRowId: 1,
-                targetColumn: 'name',
-                priorValue: 'before',
-                newValue: 'after'
-            }),
-            /Document is read-only/
-        );
-        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
-    });
-
-    it('rejects malformed fireEditEvent entries without recording history', async () => {
-        const recordExternalModification = mock.fn();
-        const bridge = new HostBridge(
-            { webviews: new Map(), context: {}, isReadOnly: false } as any,
-            {
-                isReadOnlyMode: false,
-                recordExternalModification
-            } as any
-        );
-
-        await assert.rejects(
-            () => bridge.fireEditEvent({
-                label: 'Forged Edit',
-                description: 'Unknown history entry',
-                modificationType: 'arbitrary_write',
-                targetTable: 'items'
-            } as any),
-            /Invalid document modification/
-        );
-        await assert.rejects(
-            () => bridge.fireEditEvent({
-                label: 'Malformed Delete',
-                description: 'Missing row snapshots',
-                modificationType: 'row_delete',
-                targetTable: 'items'
-            } as any),
-            /Invalid document modification/
-        );
-        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
-    });
-
-    it('records a structurally valid fireEditEvent on a writable document', async () => {
-        const recordExternalModification = mock.fn();
-        const bridge = new HostBridge(
-            { webviews: new Map(), context: {}, isReadOnly: false } as any,
-            {
-                isReadOnlyMode: false,
-                recordExternalModification
-            } as any
-        );
-        const edit = {
-            label: 'Edit Cell',
-            description: 'Update items.name',
-            modificationType: 'cell_update' as const,
-            targetTable: 'items',
-            targetRowId: 1,
-            targetColumn: 'name',
-            priorValue: 'before',
-            newValue: 'after'
-        };
-
-        await bridge.fireEditEvent(edit);
-
-        assert.strictEqual(recordExternalModification.mock.callCount(), 1);
-        assert.strictEqual(recordExternalModification.mock.calls[0].arguments[0], edit);
     });
 
     it('does not record a created view after Reload supersedes its connection', async () => {
@@ -992,11 +1571,58 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('bounds repeated confirmed view-drop conflicts', async () => {
+        const definition = {
+            identifier: 'changing_view',
+            sql: 'CREATE VIEW changing_view AS SELECT 1 AS value',
+            selectSql: 'SELECT 1 AS value',
+            triggers: []
+        };
+        let dropAttempts = 0;
+        const dbOps = {
+            getViewDefinition: mock.fn(async () => definition),
+            dropView: mock.fn(async () => {
+                dropAttempts++;
+                throw new Error(dropAttempts < 5
+                    ? VIEW_DEFINITION_CONFLICT_MESSAGE
+                    : 'test safety stop for an unbounded retry loop');
+            })
+        };
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification: mock.fn()
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            mockDocument as any
+        );
+        const warning = mock.method(
+            vscode.window,
+            'showWarningMessage',
+            async () => ({ title: 'Drop View', value: true })
+        );
+
+        await assert.rejects(
+            () => bridge.dropView('changing_view'),
+            /changed repeatedly/i
+        );
+        assert.ok(dropAttempts > 0 && dropAttempts < 5);
+        assert.strictEqual(warning.mock.callCount(), dropAttempts);
+        assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
+    });
+
     it('rejects a cell update when the document reloads while its undo baseline is loading', async () => {
         const baseline = createDeferred<any>();
         const baselineStarted = createDeferred<void>();
         const dbOps = {
             executeQuery: mock.fn(async (sql: string) => {
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
@@ -1035,7 +1661,16 @@ describe('HostBridge', () => {
                     headers: ['storage_class', 'byte_length', 'bounded_value'],
                     rows: [['blob', 1, new Uint8Array([7])]]
                 }]),
-            updateCell: mock.fn(async () => 7)
+            updateCellBatch: mock.fn(async () => [{
+                rowId: 7,
+                newRowId: 7,
+                columnName: 'payload',
+                priorValue: new Uint8Array([7]),
+                newValue: replacement,
+                priorState: { storageClass: 'blob', value: new Uint8Array([7]) },
+                postState: { storageClass: 'blob', value: replacement },
+                operation: 'set'
+            }])
         };
         const recordExternalModification = mock.fn();
         const mockDocument = {
@@ -1051,12 +1686,21 @@ describe('HostBridge', () => {
         const updatedRowId = await bridge.updateCell('items', 7, 'payload', replacement);
 
         assert.strictEqual(updatedRowId, 7);
-        assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
+        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 1);
         assert.strictEqual(
-            Array.from(dbOps.updateCell.mock.calls[0].arguments)[5],
+            Array.from(dbOps.updateCellBatch.mock.calls[0].arguments)[2],
             MAX_WEBVIEW_BINARY_VALUE_BYTES
         );
         assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+        const history = recordExternalModification.mock.calls[0].arguments[0] as any;
+        assert.deepStrictEqual(history.priorState, {
+            storageClass: 'blob',
+            value: new Uint8Array([7])
+        });
+        assert.deepStrictEqual(history.postState, {
+            storageClass: 'blob',
+            value: replacement
+        });
     });
 
     it('rejects a new cell value above the transport edit ceiling before any database read', async () => {
@@ -1162,6 +1806,53 @@ describe('HostBridge', () => {
         assert.strictEqual(modification.newValue, 'replacement');
     });
 
+    it('bounds repeated oversized-cell replacement conflicts in the desktop host', async () => {
+        let replacementAttempts = 0;
+        const dbOps = {
+            executeQuery: mock.fn(async (sql: string) => sql.includes('pragma_table_list')
+                ? [{ headers: ['type', 'wr'], rows: [['table', 0]] }]
+                : [{
+                    headers: ['storage_class', 'byte_length', 'bounded_value'],
+                    rows: [['blob', 32 * 1024 * 1024, null]]
+                }]),
+            replaceOversizedCell: mock.fn(async () => {
+                replacementAttempts++;
+                throw new Error(replacementAttempts < 5
+                    ? OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE
+                    : 'test safety stop for an unbounded retry loop');
+            }),
+            updateCell: mock.fn(async () => 1)
+        };
+        const recordExternalModification = mock.fn();
+        const mockDocument = {
+            uri: vscode.Uri.parse('file:///test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: dbOps,
+            isReadOnlyMode: false,
+            connectionGeneration: 1,
+            recordExternalModification
+        };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            mockDocument as any
+        );
+        const warning = mock.method(vscode.window, 'showWarningMessage', async () => (
+            { title: 'Replace Without Undo', value: true } as any
+        ));
+
+        await assert.rejects(
+            () => bridge.updateCell('items', 1, 'payload', 'replacement'),
+            /changed repeatedly/i
+        );
+        assert.ok(dbOps.replaceOversizedCell.mock.callCount() > 0);
+        assert.ok(dbOps.replaceOversizedCell.mock.callCount() < 5);
+        assert.strictEqual(
+            warning.mock.callCount(),
+            dbOps.replaceOversizedCell.mock.callCount()
+        );
+        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
     it('leaves history untouched when an oversized replacement fails after confirmation', async () => {
         const writeError = new Error('guarded update failed');
         const dbOps = {
@@ -1222,6 +1913,14 @@ describe('HostBridge', () => {
                         columnName: 'payload',
                         newValue: '{"count":2}',
                         priorValue: '{"count":1,"concurrent":true}',
+                        priorState: {
+                            storageClass: 'text',
+                            value: '{"count":1,"concurrent":true}'
+                        },
+                        postState: {
+                            storageClass: 'text',
+                            value: '{"count":2,"concurrent":true}'
+                        },
                         operation: 'json_patch'
                     },
                     {
@@ -1229,6 +1928,8 @@ describe('HostBridge', () => {
                         columnName: 'label',
                         newValue: 'after',
                         priorValue: 'database-current',
+                        priorState: { storageClass: 'text', value: 'database-current' },
+                        postState: { storageClass: 'text', value: 'after' },
                         operation: 'set'
                     }
                 ];
@@ -1288,6 +1989,14 @@ describe('HostBridge', () => {
                 columnName: 'payload',
                 newValue: '{"count":2}',
                 priorValue: '{"count":1,"concurrent":true}',
+                priorState: {
+                    storageClass: 'text',
+                    value: '{"count":1,"concurrent":true}'
+                },
+                postState: {
+                    storageClass: 'text',
+                    value: '{"count":2,"concurrent":true}'
+                },
                 operation: 'json_patch'
             },
             {
@@ -1295,6 +2004,8 @@ describe('HostBridge', () => {
                 columnName: 'label',
                 newValue: 'after',
                 priorValue: 'database-current',
+                priorState: { storageClass: 'text', value: 'database-current' },
+                postState: { storageClass: 'text', value: 'after' },
                 operation: 'set'
             }
         ]);
@@ -1542,25 +2253,152 @@ describe('HostBridge', () => {
         }
     });
 
+    it('records a numeric newTargetRowId when an INTEGER PRIMARY KEY edit remaps rowid', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const dbOps = result.operations!;
+        const recordExternalModification = mock.fn();
+        try {
+            await dbOps.executeQuery(
+                'CREATE TABLE remapped_host_history (' +
+                'id INTEGER PRIMARY KEY, ' +
+                'doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED); ' +
+                'INSERT INTO remapped_host_history(id) VALUES (3)'
+            );
+            const mockDocument = {
+                uri: vscode.Uri.parse('file:///test.db'),
+                documentKey: Promise.resolve('test-key'),
+                databaseOperations: dbOps,
+                isReadOnlyMode: false,
+                connectionGeneration: 1,
+                recordExternalModification
+            };
+            const bridge = new HostBridge(
+                { webviews: new Map(), context: {} } as any,
+                mockDocument as any
+            );
+
+            assert.strictEqual(
+                await bridge.updateCell('remapped_host_history', 3, 'id', 34),
+                34
+            );
+            assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+            const modification = recordExternalModification.mock.calls[0].arguments[0];
+            assert.strictEqual(modification.targetRowId, 3);
+            assert.strictEqual(modification.newTargetRowId, 34);
+
+            await dbOps.undoModification(modification);
+            assert.deepStrictEqual(
+                (await dbOps.executeQuery(
+                    'SELECT rowid, id, doubled FROM remapped_host_history'
+                ))[0].rows,
+                [[3, 3, 6]]
+            );
+            await dbOps.redoModification(modification);
+            assert.deepStrictEqual(
+                (await dbOps.executeQuery(
+                    'SELECT rowid, id, doubled FROM remapped_host_history'
+                ))[0].rows,
+                [[34, 34, 68]]
+            );
+        } finally {
+            (dbOps as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('records numeric post-update identities for batch history replay', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const dbOps = result.operations!;
+        const recordExternalModification = mock.fn();
+        try {
+            await dbOps.executeQuery(
+                'CREATE TABLE remapped_host_batch_history (' +
+                'id INTEGER PRIMARY KEY, ' +
+                'doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED, ' +
+                'note TEXT); ' +
+                "INSERT INTO remapped_host_batch_history(id, note) VALUES (3, 'before')"
+            );
+            const bridge = new HostBridge(
+                { webviews: new Map(), context: {} } as any,
+                {
+                    uri: vscode.Uri.parse('file:///test.db'),
+                    documentKey: Promise.resolve('test-key'),
+                    databaseOperations: dbOps,
+                    isReadOnlyMode: false,
+                    connectionGeneration: 1,
+                    recordExternalModification
+                } as any
+            );
+
+            const affectedCells = await bridge.updateCellBatch(
+                'remapped_host_batch_history',
+                [
+                    { rowId: 3, column: 'id', value: 44 },
+                    { rowId: 3, column: 'note', value: 'after' }
+                ],
+                'Update row'
+            );
+
+            assert.deepStrictEqual(affectedCells?.map(cell => cell.newRowId), [44, 44]);
+            assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+            const modification = recordExternalModification.mock.calls[0].arguments[0];
+            assert.deepStrictEqual(
+                modification.affectedCells.map((cell: any) => cell.newRowId),
+                [44, 44]
+            );
+
+            await dbOps.undoModification(modification);
+            assert.deepStrictEqual(
+                (await dbOps.executeQuery(
+                    'SELECT id, doubled, note FROM remapped_host_batch_history'
+                ))[0].rows,
+                [[3, 6, 'before']]
+            );
+            await dbOps.redoModification(modification);
+            assert.deepStrictEqual(
+                (await dbOps.executeQuery(
+                    'SELECT id, doubled, note FROM remapped_host_batch_history'
+                ))[0].rows,
+                [[44, 88, 'after']]
+            );
+        } finally {
+            (dbOps as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('preserves rowid editing for virtual tables when resolving host-side identity', async () => {
         const identityQueries: string[] = [];
         const dbOps = {
             executeQuery: mock.fn(async (sql: string) => {
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
                 if (sql.includes('pragma_table_list')) {
                     identityQueries.push(sql);
                     return sql.includes(`"type" = 'table'`)
                         ? [{ headers: ['type', 'wr'], rows: [] }]
                         : [{ headers: ['type', 'wr'], rows: [['virtual', 0]] }];
                 }
+                if (sql === 'PRAGMA encoding') {
+                    return [{ headers: ['encoding'], rows: [['UTF-8']] }];
+                }
                 return [{
-                    headers: ['storage_class', 'byte_length', 'bounded_value'],
-                    rows: [['text', 6, 'before']]
+                    headers: ['storage_class', 'byte_length', 'bounded_value', 'raw_text'],
+                    rows: [['text', 6, 'before', new TextEncoder().encode('before')]]
                 }];
             }),
             getTableInfo: mock.fn(async () => {
                 throw new Error('virtual tables must not require declared-PK metadata');
             }),
-            updateCell: mock.fn(async () => 7)
+            updateCellBatch: mock.fn(async () => [{
+                rowId: 7,
+                newRowId: 7,
+                columnName: 'body',
+                priorValue: 'before',
+                newValue: 'after',
+                priorState: { storageClass: 'text', value: 'before' },
+                postState: { storageClass: 'text', value: 'after' },
+                operation: 'set'
+            }])
         };
         const recordExternalModification = mock.fn();
         const mockDocument = {
@@ -1575,7 +2413,7 @@ describe('HostBridge', () => {
 
         await bridge.updateCell('docs_fts', 7, 'body', 'after');
 
-        assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
+        assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 1);
         assert.strictEqual(dbOps.getTableInfo.mock.callCount(), 0);
         assert.strictEqual(recordExternalModification.mock.callCount(), 1);
         assert.strictEqual(identityQueries.length, 1);
@@ -1722,6 +2560,71 @@ describe('HostBridge', () => {
         assert.strictEqual(mockDocument.recordExternalModification.mock.callCount(), 0);
     });
 
+    it('rejects column deletion when a confirmed dependent index is replaced', async () => {
+        let indexReplaced = false;
+        const beforeColumns = [{
+            ordinal: 0,
+            identifier: 'payload',
+            declaredType: 'TEXT',
+            isRequired: 0,
+            defaultExpression: null,
+            primaryKeyPosition: 0
+        }];
+        const dbOps = {
+            findDependentIndexes: mock.fn(async () => ['idx_payload']),
+            getTableInfo: mock.fn(async () => beforeColumns),
+            executeQuery: mock.fn(async (sql: string) => {
+                if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
+                if (sql.includes('pragma_table_list')) {
+                    return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
+                }
+                if (sql.includes('sqlite_schema')) {
+                    return [{
+                        headers: ['type', 'name', 'sql'],
+                        rows: [
+                            ['table', 'items', 'CREATE TABLE items (payload TEXT)'],
+                            [
+                                'index',
+                                'idx_payload',
+                                indexReplaced
+                                    ? 'CREATE INDEX idx_payload ON items(payload DESC)'
+                                    : 'CREATE INDEX idx_payload ON items(payload)'
+                            ]
+                        ]
+                    }];
+                }
+                throw new Error(`Unexpected query: ${sql}`);
+            }),
+            deleteColumns: mock.fn(async () => undefined)
+        };
+        const recordExternalModification = mock.fn();
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {}, isReadOnly: false } as any,
+            {
+                uri: vscode.Uri.parse('file:///test.db'),
+                documentKey: Promise.resolve('test-key'),
+                databaseOperations: dbOps,
+                isReadOnlyMode: false,
+                connectionGeneration: 1,
+                recordExternalModification
+            } as any
+        );
+        mock.method(vscode.window, 'showWarningMessage', async () => {
+            indexReplaced = true;
+            return { title: 'Drop Indexes & Continue', value: true };
+        });
+
+        await assert.rejects(
+            bridge.deleteColumns('items', ['payload']),
+            /schema changed while the confirmation was open/i
+        );
+        assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 0);
+        assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+    });
+
     it('refuses oversized column-drop history before selecting values or dropping schema', async () => {
         let fullValueSelects = 0;
         const beforeColumns = [
@@ -1746,6 +2649,9 @@ describe('HostBridge', () => {
             findDependentIndexes: mock.fn(async () => []),
             getTableInfo: mock.fn(async () => beforeColumns),
             executeQuery: mock.fn(async (sql: string) => {
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 1]] }];
                 }
@@ -1830,6 +2736,9 @@ describe('HostBridge', () => {
             findDependentIndexes: mock.fn(async () => []),
             getTableInfo: mock.fn(async () => beforeColumns),
             executeQuery: mock.fn(async (sql: string) => {
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 1]] }];
                 }
@@ -1911,6 +2820,9 @@ describe('HostBridge', () => {
             getTableInfo: mock.fn(async () => dropped ? [beforeColumns[0]] : beforeColumns),
             executeQuery: mock.fn(async (sql: string) => {
                 if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
@@ -2010,6 +2922,9 @@ describe('HostBridge', () => {
                 : beforeColumns),
             executeQuery: mock.fn(async (sql: string) => {
                 if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/i.test(sql)) return [];
+                if (sql === 'PRAGMA data_version') {
+                    return [{ headers: ['data_version'], rows: [[1]] }];
+                }
                 if (sql.includes('pragma_table_list')) {
                     return [{ headers: ['type', 'wr'], rows: [['table', 0]] }];
                 }
@@ -2032,6 +2947,7 @@ describe('HostBridge', () => {
                 return {
                     tableSql: afterSql,
                     columns: ['id', 'tail'],
+                    dataVersion: 1,
                     identity: { kind: 'rowid' as const },
                     schemaObjects: []
                 };
@@ -2058,12 +2974,14 @@ describe('HostBridge', () => {
             before: {
                 tableSql: beforeSql,
                 columns: ['id', 'payload', 'tail'],
+                dataVersion: 1,
                 identity: { kind: 'rowid' },
                 schemaObjects: []
             },
             after: {
                 tableSql: afterSql,
                 columns: ['id', 'tail'],
+                dataVersion: 1,
                 identity: { kind: 'rowid' },
                 schemaObjects: []
             }
@@ -2196,6 +3114,24 @@ describe('HostBridge', () => {
             /Reload is unavailable for untitled databases/
         );
         assert.strictEqual(reloadFromDisk.mock.callCount(), 0);
+    });
+
+    it('does not change live auto-commit behavior when configuration persistence fails', async () => {
+        const persistenceError = new Error('settings write denied');
+        const mockDocument = { autoCommitEnabled: false };
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            mockDocument as any
+        );
+        mock.method(vscode.workspace, 'getConfiguration', () => ({
+            update: async () => { throw persistenceError; }
+        }) as any);
+
+        await assert.rejects(
+            () => bridge.updateExtensionSetting('autoCommit', true),
+            error => error === persistenceError
+        );
+        assert.strictEqual(mockDocument.autoCommitEnabled, false);
     });
 
     it('propagates a column-history capture failure without dropping the column', async () => {

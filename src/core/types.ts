@@ -56,6 +56,12 @@ export interface CellReadTarget {
 /** SQLite storage classes returned by typeof(). */
 export type CellStorageClass = 'null' | 'integer' | 'real' | 'text' | 'blob';
 
+/** Exact value and SQLite storage class used to guard cell-history replay. */
+export interface StoredCellState {
+  storageClass: CellStorageClass;
+  value: CellValue;
+}
+
 /** Database encoding used by byte-windowed TEXT reads. */
 export type CellTextEncoding = 'utf-8' | 'utf-16le' | 'utf-16be';
 
@@ -172,7 +178,7 @@ export interface QueryResultSet {
 export type WebviewQueryResultSet = Omit<QueryResultSet, 'values' | 'records'>;
 
 /**
- * Column metadata from PRAGMA table_info.
+ * Column metadata from PRAGMA table_xinfo.
  */
 export interface ColumnMetadata {
   /** Column index (0-based) */
@@ -187,6 +193,10 @@ export interface ColumnMetadata {
   defaultExpression: CellValue;
   /** Primary key position (0 if not PK) */
   primaryKeyPosition: number;
+  /** True for VIRTUAL or STORED generated columns, which SQLite computes. */
+  isGenerated?: boolean;
+  /** True only when this exact INTEGER PRIMARY KEY aliases the table rowid. */
+  isRowidAlias?: boolean;
 }
 
 /**
@@ -312,8 +322,12 @@ export interface ColumnDropSchemaObject {
 /** Exact table state on one side of a guarded column-drop history transition. */
 export interface ColumnDropTableState {
   tableSql: string;
-  /** Insertable columns in their SQLite ordinal order. */
+  /** All visible schema columns in their SQLite ordinal order. */
   columns: string[];
+  /** Generated columns omitted from INSERT...SELECT during a table rebuild. */
+  generatedColumns?: string[];
+  /** Connection-local SQLite data_version used to reject external row writes. */
+  dataVersion?: number;
   identity: TableIdentity;
   schemaObjects: ColumnDropSchemaObject[];
 }
@@ -336,7 +350,7 @@ export interface ModificationEntry {
   targetTable?: string;
   /** Affected row ID */
   targetRowId?: RecordId;
-  /** Row identity after a primary-key cell update. */
+  /** Row identity after this cell update. */
   newTargetRowId?: RecordId;
   /** Affected column name */
   targetColumn?: string;
@@ -346,6 +360,10 @@ export interface ModificationEntry {
   priorValue?: CellValue;
   /** Value after modification */
   newValue?: CellValue;
+  /** Exact stored value before a guarded cell update; absent in legacy history. */
+  priorState?: StoredCellState;
+  /** Exact stored value after a guarded cell update; absent in legacy history. */
+  postState?: StoredCellState;
   /** Cell update operation; missing values from older backups are treated as set. */
   operation?: CellUpdateOperation;
   /**
@@ -369,17 +387,29 @@ export interface ModificationEntry {
     columnName: string;
     priorValue?: CellValue;
     newValue?: CellValue;
+    /** Exact stored value before this update; absent in legacy history. */
+    priorState?: StoredCellState;
+    /** Exact stored value after this update; absent in legacy history. */
+    postState?: StoredCellState;
     /** Per-cell operation; missing values from older backups are treated as set. */
     operation?: CellUpdateOperation;
   }[];
   /** Row data for insert/delete undo/redo */
   rowData?: Record<string, CellValue>;
+  /** Authoritative post-insert row required for guarded undo/redo. */
+  insertedRow?: DeletedRow;
   /** Multiple deleted rows data */
-  deletedRows?: { rowId: RecordId; row: Record<string, CellValue> }[];
+  deletedRows?: DeletedRow[];
   /** Table definition for create/drop undo/redo */
   tableDef?: { columns: ColumnDefinition[] };
+  /** Exact post-create schema required before table_create undo may drop the table. */
+  tableCreateSnapshot?: ColumnDropTableState;
   /** Column definition for add/drop undo/redo */
   columnDef?: { type: string; defaultValue?: string };
+  /** Exact post-add schema required before column_add undo may drop the column. */
+  columnAddSnapshot?: ColumnDropTableState;
+  /** Exact pre-add schema required before column_add redo may alter the table. */
+  columnAddBeforeSnapshot?: ColumnDropTableState;
   /** Deleted columns data for column_drop undo */
   deletedColumns?: {
       name: string;
@@ -467,7 +497,7 @@ export interface DatabaseOperations {
   closeQueryReadSession?(sessionId: string): Promise<void>;
 
   /** Export database to binary */
-  serializeDatabase(): Promise<Uint8Array>;
+  serializeDatabase(signal?: AbortSignal): Promise<Uint8Array>;
 
   /** Apply pending modifications */
   applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
@@ -483,6 +513,16 @@ export interface DatabaseOperations {
 
   /** Discard pending changes */
   discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+
+  /**
+   * Move the live database to its saved checkpoint in one atomic transition.
+   * `discard` is undone newest-first; `restore` is replayed in the given order.
+   */
+  revertModifications?(
+    discard: ModificationEntry[],
+    restore: ModificationEntry[],
+    signal?: AbortSignal
+  ): Promise<void>;
 
   /** Update a single cell value */
   updateCell(
@@ -511,6 +551,14 @@ export interface DatabaseOperations {
     maxEditValueBytes?: number
   ): Promise<RecordId | undefined>;
 
+  /** Insert and capture the authoritative post-image before releasing SQLite. */
+  insertRowWithHistory?(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow>;
+
   /** Insert multiple rows in a batch */
   insertRowBatch(
     table: string,
@@ -529,14 +577,15 @@ export interface DatabaseOperations {
   deleteColumns(
     table: string,
     columns: string[],
-    dropDependentIndexes?: string[]
+    dropDependentIndexes?: string[],
+    expectedCurrentState?: ColumnDropTableState
   ): Promise<ColumnDropTableState>;
 
   /** Find indexes that depend on specific columns */
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
 
   /** Create a new table */
-  createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
+  createTable(table: string, columns: ColumnDefinition[]): Promise<ColumnDropTableState>;
 
   /** Read a view and the INSTEAD OF triggers that must survive replacement. */
   getViewDefinition(view: string): Promise<ViewDefinition>;
@@ -585,7 +634,13 @@ export interface DatabaseOperations {
   ): Promise<CellUpdateResult[]>;
 
   /** Add a new column to a table */
-  addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
+  addColumn(
+    table: string,
+    column: string,
+    type: string,
+    defaultValue?: string,
+    expectedCurrentState?: ColumnDropTableState
+  ): Promise<ColumnDropTableState>;
 
   /** Fetch table data */
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
@@ -626,11 +681,13 @@ export interface CellUpdate {
 /** Authoritative before/after state captured by an atomic batch update. */
 export interface CellUpdateResult {
   rowId: RecordId;
-  /** Identity to use after the update when a PK member changed. */
+  /** Row identity to use after this update. */
   newRowId?: RecordId;
   columnName: string;
   priorValue?: CellValue;
   newValue?: CellValue;
+  priorState: StoredCellState;
+  postState: StoredCellState;
   operation: CellUpdateOperation;
 }
 
@@ -638,6 +695,8 @@ export interface CellUpdateResult {
 export interface DeletedRow {
   rowId: RecordId;
   row: Record<string, CellValue>;
+  /** Exact storage classes paired with `row`; absent in legacy history. */
+  storageClasses?: Array<{ column: string; storageClass: CellStorageClass }>;
 }
 
 /**

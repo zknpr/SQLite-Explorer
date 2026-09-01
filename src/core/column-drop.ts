@@ -5,12 +5,14 @@ import type {
   TableIdentity
 } from './types';
 import { encodePrimaryKeyRecordId } from './row-identity';
-import { escapeIdentifier, validateSqlType } from './sql-utils';
+import { qualifyMainCreateIndexSql } from './schema-ddl';
+import { escapeIdentifier, escapeMainIdentifier, validateSqlType } from './sql-utils';
+import { qualifyMainCreateTriggerSql } from './view-utils';
 
 /** Read the table DDL plus every persistent index/trigger owned by it. */
 export const COLUMN_DROP_TABLE_STATE_SQL = `
 SELECT type, name, sql
-FROM sqlite_schema
+FROM main.sqlite_schema
 WHERE (type = 'table' AND name = ? COLLATE NOCASE)
    OR (tbl_name = ? COLLATE NOCASE
        AND type IN ('index', 'trigger')
@@ -69,7 +71,7 @@ function aggregateColumnDropHistoryQuery(
     kind,
     sql:
       `SELECT COUNT(*), COALESCE(SUM(${expressions.join(' + ') || '0'}), 0) ` +
-      `FROM ${escapeIdentifier(table)}`,
+      `FROM ${escapeMainIdentifier(table)}`,
     params: []
   };
 }
@@ -344,14 +346,14 @@ export async function executeSchemaPreservingColumnDrop(
   dropDependentIndexes: readonly string[] | undefined,
   execute: ColumnDropStatementExecutor
 ): Promise<void> {
+  const escapedMainTable = `main.${escapeIdentifier(table)}`;
   for (const indexName of dropDependentIndexes ?? []) {
-    await execute(`DROP INDEX IF EXISTS ${escapeIdentifier(indexName)}`);
+    await execute(`DROP INDEX IF EXISTS main.${escapeIdentifier(indexName)}`);
   }
 
-  const escapedTable = escapeIdentifier(table);
   for (const column of columns) {
     await execute(
-      `ALTER TABLE ${escapedTable} DROP COLUMN ${escapeIdentifier(column)}`
+      `ALTER TABLE ${escapedMainTable} DROP COLUMN ${escapeIdentifier(column)}`
     );
   }
 }
@@ -361,8 +363,13 @@ export function mapColumnDropTableState(
   table: string,
   columns: readonly string[],
   identity: TableIdentity,
-  rows: readonly (readonly unknown[])[]
+  rows: readonly (readonly unknown[])[],
+  generatedColumns: readonly string[] = [],
+  dataVersion?: number
 ): ColumnDropTableState {
+  if (dataVersion !== undefined && (!Number.isSafeInteger(dataVersion) || dataVersion < 0)) {
+    throw new Error(`Unable to capture the data version for ${table}`);
+  }
   const tableRows = rows.filter(row => row[0] === 'table');
   if (
     tableRows.length !== 1
@@ -388,6 +395,10 @@ export function mapColumnDropTableState(
   return {
     tableSql: tableRows[0][2],
     columns: [...columns],
+    ...(generatedColumns.length > 0
+      ? { generatedColumns: [...generatedColumns] }
+      : {}),
+    ...(dataVersion !== undefined ? { dataVersion } : {}),
     identity,
     schemaObjects
   };
@@ -423,22 +434,45 @@ function sameSchemaObjects(
     });
 }
 
+/** Refuse a destructive history transition when its recorded schema is stale. */
+export function assertTableSchemaStateCurrent(
+  table: string,
+  expected: ColumnDropTableState,
+  current: ColumnDropTableState,
+  action: string,
+  changedWhen: string
+): void {
+  if (expected.dataVersion !== undefined && expected.dataVersion !== current.dataVersion) {
+    throw new Error(
+      `Cannot ${action} on ${table}: database content changed ${changedWhen}`
+    );
+  }
+  if (
+    expected.tableSql !== current.tableSql
+    || !sameStrings(expected.columns, current.columns)
+    || !sameStrings(expected.generatedColumns ?? [], current.generatedColumns ?? [])
+    || !sameIdentity(expected.identity, current.identity)
+    || !sameSchemaObjects(expected.schemaObjects, current.schemaObjects)
+  ) {
+    throw new Error(
+      `Cannot ${action} on ${table}: the table schema changed ${changedWhen}`
+    );
+  }
+}
+
 /** Refuse to overwrite schema that no longer matches the recorded post-drop state. */
 export function assertColumnDropTableStateCurrent(
   table: string,
   expected: ColumnDropTableState,
   current: ColumnDropTableState
 ): void {
-  if (
-    expected.tableSql !== current.tableSql
-    || !sameStrings(expected.columns, current.columns)
-    || !sameIdentity(expected.identity, current.identity)
-    || !sameSchemaObjects(expected.schemaObjects, current.schemaObjects)
-  ) {
-    throw new Error(
-      `Cannot undo column drop on ${table}: the table schema changed after the column was dropped`
-    );
-  }
+  assertTableSchemaStateCurrent(
+    table,
+    expected,
+    current,
+    'undo column drop',
+    'after the column was dropped'
+  );
 }
 
 export interface ColumnDropRestorePlan {
@@ -458,12 +492,27 @@ function validateState(state: ColumnDropTableState, label: string): void {
   if (!Array.isArray(state.columns) || state.columns.length === 0) {
     throw new Error(`Invalid ${label} column-drop columns`);
   }
+  if (state.dataVersion !== undefined
+      && (!Number.isSafeInteger(state.dataVersion) || state.dataVersion < 0)) {
+    throw new Error(`Invalid ${label} column-drop data version`);
+  }
   const columnNames = new Set<string>();
   for (const column of state.columns) {
     if (typeof column !== 'string' || column === '' || columnNames.has(column)) {
       throw new Error(`Invalid ${label} column-drop column: ${String(column)}`);
     }
     columnNames.add(column);
+  }
+  const generatedNames = new Set<string>();
+  for (const column of state.generatedColumns ?? []) {
+    if (
+      typeof column !== 'string'
+      || !columnNames.has(column)
+      || generatedNames.has(column)
+    ) {
+      throw new Error(`Invalid ${label} generated column: ${String(column)}`);
+    }
+    generatedNames.add(column);
   }
   if (!state.identity || (state.identity.kind !== 'rowid' && state.identity.kind !== 'primaryKey')) {
     throw new Error(`Invalid ${label} column-drop identity`);
@@ -520,9 +569,12 @@ export function buildColumnDropRestorePlan(
     deletedNames.add(column.name);
   }
   const expectedAfterColumns = snapshot.before.columns.filter(column => !deletedNames.has(column));
+  const expectedAfterGeneratedColumns = (snapshot.before.generatedColumns ?? [])
+    .filter(column => !deletedNames.has(column));
   if (
     deletedNames.size === 0
     || !sameStrings(snapshot.after.columns, expectedAfterColumns)
+    || !sameStrings(snapshot.after.generatedColumns ?? [], expectedAfterGeneratedColumns)
     || [...deletedNames].some(column => !snapshot.before.columns.includes(column))
   ) {
     throw new Error(`Invalid column-drop ordinal snapshot for ${table}`);
@@ -538,9 +590,13 @@ export function buildColumnDropRestorePlan(
     }
   }
 
-  const escapedTable = escapeIdentifier(table);
-  const escapedStagingTable = escapeIdentifier(stagingTable);
-  const escapedColumns = snapshot.before.columns.map(escapeIdentifier);
+  const escapedTable = `main.${escapeIdentifier(table)}`;
+  const escapedStagingTable = `main.${escapeIdentifier(stagingTable)}`;
+  const escapedRenameTarget = escapeIdentifier(stagingTable);
+  const generatedColumns = new Set(snapshot.before.generatedColumns ?? []);
+  const escapedColumns = snapshot.before.columns
+    .filter(column => !generatedColumns.has(column))
+    .map(escapeIdentifier);
   const copyColumns = snapshot.before.identity.kind === 'rowid'
     ? ['rowid', ...escapedColumns]
     : escapedColumns;
@@ -551,14 +607,18 @@ export function buildColumnDropRestorePlan(
       return `ALTER TABLE ${escapedTable} ADD COLUMN ${escapeIdentifier(column.name)}${declaredType}`;
     }),
     dropCurrentSchemaObjects: snapshot.after.schemaObjects.map(object => (
-      `DROP ${object.type.toUpperCase()} ${escapeIdentifier(object.identifier)}`
+      `DROP ${object.type.toUpperCase()} main.${escapeIdentifier(object.identifier)}`
     )),
-    renameCurrentTable: `ALTER TABLE ${escapedTable} RENAME TO ${escapedStagingTable}`,
+    renameCurrentTable: `ALTER TABLE ${escapedTable} RENAME TO ${escapedRenameTarget}`,
     createOriginalTable: snapshot.before.tableSql,
     copyRows:
       `INSERT INTO ${escapedTable} (${copyColumns.join(', ')}) ` +
       `SELECT ${copyColumns.join(', ')} FROM ${escapedStagingTable}`,
     dropStagingTable: `DROP TABLE ${escapedStagingTable}`,
-    restoreSchemaObjects: snapshot.before.schemaObjects.map(object => object.sql)
+    restoreSchemaObjects: snapshot.before.schemaObjects.map(object => (
+      object.type === 'index'
+        ? qualifyMainCreateIndexSql(object.sql, object.identifier)
+        : qualifyMainCreateTriggerSql(object.sql, object.identifier)
+    ))
   };
 }

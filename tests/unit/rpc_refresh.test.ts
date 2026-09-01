@@ -132,6 +132,81 @@ it('re-applies read-only capabilities carried by a reload refresh', async () => 
     }
 });
 
+it('clears table identities, pins, and an active editor across a connection generation', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const rpcModulePath = '../../core/ui/modules/rpc.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const { backendApi } = await import(apiModulePath);
+    const { refreshContent } = await import(rpcModulePath);
+    const { state } = await import(stateModulePath);
+    const originals = {
+        fetchSchema: backendApi.fetchSchema,
+        getTableInfo: backendApi.getTableInfo
+    };
+    let observedClearedState = false;
+    backendApi.fetchSchema = async () => ({
+        tables: [{ identifier: 'items', identity: { kind: 'rowid' } }],
+        views: [],
+        indexes: []
+    });
+    backendApi.getTableInfo = async () => {
+        observedClearedState = state.selectedRowIds.size === 0
+            && state.selectedColumns.size === 0
+            && state.selectedCells.length === 0
+            && state.pinnedRowIds.size === 0
+            && state.pinnedColumns.size === 0
+            && state.editingCellInfo === null
+            && state.activeCellInput === null
+            && state.renderedTable === null;
+        throw new Error('stop after ownership assertion');
+    };
+    paginationElements.set('gridContainer', {
+        textContent: '',
+        innerHTML: '<table class="data-grid"></table>',
+        disabled: false
+    });
+    state.isDbConnected = true;
+    state.connectionGeneration = 5;
+    state.selectedTable = 'items';
+    state.selectedTableType = 'table';
+    state.renderedTable = 'items';
+    state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+    state.gridData = [[1, 'old']];
+    state.selectedRowIds = new Set([1]);
+    state.selectedColumns = new Set(['value']);
+    state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 1, value: 'old' }];
+    state.pinnedRowIds = new Set([1]);
+    state.pinnedColumns = new Set(['value']);
+    state.editingCellInfo = { rowIdx: 0, colIdx: 0 };
+    state.activeCellInput = { value: 'draft' };
+
+    try {
+        await refreshContent('shared.db', {
+            connected: true,
+            readOnly: false,
+            connectionGeneration: 6
+        });
+        assert.strictEqual(observedClearedState, true);
+        assert.deepStrictEqual([...state.selectedRowIds], []);
+        assert.deepStrictEqual([...state.pinnedRowIds], []);
+        assert.strictEqual(state.connectionGeneration, 6);
+    } finally {
+        Object.assign(backendApi, originals);
+        paginationElements.delete('gridContainer');
+        state.isDbConnected = false;
+        state.selectedTable = null;
+        state.selectedTableType = 'table';
+        state.renderedTable = null;
+        state.selectedRowIds.clear();
+        state.selectedColumns.clear();
+        state.selectedCells = [];
+        state.pinnedRowIds.clear();
+        state.pinnedColumns.clear();
+        state.editingCellInfo = null;
+        state.activeCellInput = null;
+    }
+});
+
 it('clears and persists selection when refresh removes the selected table', async () => {
     const apiModulePath = '../../core/ui/modules/api.js';
     const rpcModulePath = '../../core/ui/modules/rpc.js';

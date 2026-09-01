@@ -13,17 +13,22 @@ export interface BatchColumnDef {
   name: string;
   type?: string;
   isPrimaryKey?: boolean;
+  isRowidAlias?: boolean;
+  notnull?: number;
 }
 
 /** Minimal shape of a batch-field <input> (real element or test stand-in). */
 export interface BatchInputLike {
   value: string;
-  dataset?: { isnull?: string; ispatch?: string };
+  dataset?: { isnull?: string; ispatch?: string; mode?: string };
 }
 
 export interface BatchColumnInfo {
   name: string;
   type?: string;
+  notnull?: number;
+  isPrimaryKey?: boolean;
+  isRowidAlias?: boolean;
   values: Set<unknown>;
 }
 

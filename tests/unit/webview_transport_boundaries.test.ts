@@ -29,6 +29,25 @@ const stableDemoParent = {
     }
 };
 
+const OWN_PROTO_JSON =
+    '{"safe":1,"__proto__":{"inherited":"top"},"nested":[{"safe":2,"__proto__":{"inherited":"nested"}}]}';
+
+function ownProtoFixture(): any {
+    return JSON.parse(OWN_PROTO_JSON);
+}
+
+function assertOwnProtoPreserved(value: unknown): void {
+    const root = value as Record<string, any>;
+    const nested = root.nested[0] as Record<string, any>;
+    for (const [record, expected] of [[root, 'top'], [nested, 'nested']] as const) {
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(record, '__proto__'), true);
+        assert.deepStrictEqual(record['__proto__'], { inherited: expected });
+        assert.strictEqual(record.inherited, undefined);
+    }
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(value)), ownProtoFixture());
+    assert.strictEqual(({} as Record<string, unknown>).inherited, undefined);
+}
+
 after(() => {
     if (originalAcquireVsCodeApi === undefined) delete (globalThis as any).acquireVsCodeApi;
     else (globalThis as any).acquireVsCodeApi = originalAcquireVsCodeApi;
@@ -72,6 +91,116 @@ async function settleRejectedBeforePost(
 }
 
 describe('VS Code webview transport guards', () => {
+    it('clears pending state when VS Code postMessage throws', async () => {
+        activeVsCodeMessages = [];
+        (globalThis as any).acquireVsCodeApi = () => stableVsCodeApi;
+        onVsCodePost = () => { throw new Error('VS Code transport unavailable'); };
+        const originalClearTimeout = globalThis.clearTimeout;
+        let clearedTimers = 0;
+        (globalThis as any).clearTimeout = (timer: ReturnType<typeof setTimeout>) => {
+            clearedTimers++;
+            return originalClearTimeout(timer);
+        };
+
+        try {
+            const api = await import(`../../core/ui/modules/api.js?post-failure=${Date.now()}`);
+            await assert.rejects(api.sendRpcRequest('ping', []), /transport unavailable/);
+            assert.strictEqual(clearedTimers, 1);
+        } finally {
+            onVsCodePost = undefined;
+            (globalThis as any).clearTimeout = originalClearTimeout;
+        }
+    });
+
+    it('preserves own __proto__ keys in api.js outbound requests', async () => {
+        activeVsCodeMessages = [];
+        onVsCodePost = undefined;
+        (globalThis as any).acquireVsCodeApi = () => stableVsCodeApi;
+        const api = await import(`../../core/ui/modules/api.js?own-proto-out=${Date.now()}`);
+        const request = api.sendRpcRequest('probe', [ownProtoFixture()]);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const message = activeVsCodeMessages[0];
+        assertOwnProtoPreserved(message.content.payload[0]);
+        api.handleRpcResponse({
+            kind: 'response',
+            messageId: message.content.messageId,
+            success: true,
+            data: null
+        });
+        await request;
+    });
+
+    it('preserves own __proto__ keys in api.js inbound responses', async () => {
+        activeVsCodeMessages = [];
+        onVsCodePost = undefined;
+        (globalThis as any).acquireVsCodeApi = () => stableVsCodeApi;
+        const api = await import(`../../core/ui/modules/api.js?own-proto-in=${Date.now()}`);
+        const request = api.sendRpcRequest('probe', []);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        api.handleRpcResponse({
+            kind: 'response',
+            messageId: activeVsCodeMessages[0].content.messageId,
+            success: true,
+            data: structuredClone(ownProtoFixture())
+        });
+        assertOwnProtoPreserved(await request);
+    });
+
+    it('exposes bounded cell reads and restores chunk bytes from the host', async () => {
+        activeVsCodeMessages = [];
+        onVsCodePost = undefined;
+        (globalThis as any).acquireVsCodeApi = () => stableVsCodeApi;
+        const api = await import(`../../core/ui/modules/api.js?cell-read=${Date.now()}`);
+
+        const open = api.backendApi.openCellReadSession({
+            table: 'items',
+            rowId: 0,
+            column: 'body'
+        });
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const openMessage = activeVsCodeMessages.shift();
+        assert.strictEqual(openMessage.content.targetMethod, 'openCellReadSession');
+        api.handleRpcResponse({
+            kind: 'response',
+            messageId: openMessage.content.messageId,
+            success: true,
+            data: {
+                sessionId: 'session-1',
+                metadata: { storageClass: 'text', byteLength: 2, textEncoding: 'utf-8' },
+                expiresAt: Date.now() + 30_000
+            }
+        });
+        const session = await open;
+
+        const read = api.backendApi.readCellChunk(session.sessionId, 0, 2);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const readMessage = activeVsCodeMessages.shift();
+        assert.strictEqual(readMessage.content.targetMethod, 'readCellChunk');
+        api.handleRpcResponse({
+            kind: 'response',
+            messageId: readMessage.content.messageId,
+            success: true,
+            data: {
+                byteOffset: 0,
+                bytes: { __type: 'Uint8Array', base64: 'YWI=' },
+                done: true
+            }
+        });
+        assert.deepStrictEqual((await read).bytes, Uint8Array.from([0x61, 0x62]));
+
+        const close = api.backendApi.closeCellReadSession(session.sessionId);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const closeMessage = activeVsCodeMessages.shift();
+        assert.strictEqual(closeMessage.content.targetMethod, 'closeCellReadSession');
+        api.handleRpcResponse({
+            kind: 'response',
+            messageId: closeMessage.content.messageId,
+            success: true,
+            data: null
+        });
+        await close;
+    });
+
     it('preserves signed infinities across the JSON-only transport encoding', async () => {
         const transport = await import(`../../core/ui/modules/transport.js?nonfinite=${Date.now()}`);
         const encoded = await transport.serializeValueAsync(
@@ -84,6 +213,22 @@ describe('VS Code webview transport guards', () => {
         assert.strictEqual(restored[0], Infinity);
         assert.strictEqual(restored[1], -Infinity);
         assert.ok(Number.isNaN(restored[2]));
+    });
+
+    it('preserves own __proto__ keys while serializing through the shared web transport', async () => {
+        const transport = await import(`../../core/ui/modules/transport.js?own-proto-out=${Date.now()}`);
+        assertOwnProtoPreserved(await transport.serializeValueAsync(
+            ownProtoFixture(),
+            { surface: 'own __proto__ outbound test' }
+        ));
+    });
+
+    it('preserves own __proto__ keys while deserializing through the shared web transport', async () => {
+        const transport = await import(`../../core/ui/modules/transport.js?own-proto-in=${Date.now()}`);
+        assertOwnProtoPreserved(transport.deserializeValue(
+            structuredClone(ownProtoFixture()),
+            { surface: 'own __proto__ inbound test' }
+        ));
     });
 
     it('round-trips marker-shaped user objects without decoding them as numbers', async () => {
@@ -182,6 +327,94 @@ describe('VS Code webview transport guards', () => {
 });
 
 describe('web demo iframe transport guards', () => {
+    it('fails closed when a Firefox-style parent-origin handshake never arrives', async () => {
+        activeDemoMessages = [];
+        onDemoPost = undefined;
+        (globalThis as any).window = {
+            parent: stableDemoParent,
+            location: { ancestorOrigins: ['https://demo.example'] },
+            addEventListener() {},
+            confirm: () => false
+        };
+        const api = await import(`../../core/ui/modules/web-api.js?origin-timeout=${Date.now()}`);
+
+        await assert.rejects(api.waitForParentOrigin({
+            originPromise: new Promise(() => undefined),
+            lockedOrigin: null,
+            timeoutMs: 1
+        }), /parent origin handshake timed out/i);
+    });
+
+    it('clears pending state when parent postMessage throws', async () => {
+        activeDemoMessages = [];
+        onDemoPost = () => { throw new Error('parent transport unavailable'); };
+        (globalThis as any).window = {
+            parent: stableDemoParent,
+            location: { ancestorOrigins: ['https://demo.example'] },
+            addEventListener() {},
+            confirm: () => false
+        };
+        const originalClearTimeout = globalThis.clearTimeout;
+        let clearedTimers = 0;
+        (globalThis as any).clearTimeout = (timer: ReturnType<typeof setTimeout>) => {
+            clearedTimers++;
+            return originalClearTimeout(timer);
+        };
+
+        try {
+            const api = await import(`../../core/ui/modules/web-api.js?post-failure=${Date.now()}`);
+            await assert.rejects(api.sendRpcRequest('ping', []), /transport unavailable/);
+            assert.strictEqual(clearedTimers, 1);
+        } finally {
+            onDemoPost = undefined;
+            (globalThis as any).clearTimeout = originalClearTimeout;
+        }
+    });
+
+    it('preserves own __proto__ keys in web-api.js outbound requests', async () => {
+        activeDemoMessages = [];
+        onDemoPost = undefined;
+        (globalThis as any).window = {
+            parent: stableDemoParent,
+            location: { ancestorOrigins: ['https://demo.example'] },
+            addEventListener() {},
+            confirm: () => false
+        };
+        const api = await import(`../../core/ui/modules/web-api.js?own-proto-out=${Date.now()}`);
+        const request = api.sendRpcRequest('probe', [ownProtoFixture()]);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        const message = activeDemoMessages[0];
+        assertOwnProtoPreserved(message.content.payload[0]);
+        api.handleRpcResponse({
+            kind: 'response',
+            messageId: message.content.messageId,
+            success: true,
+            data: null
+        });
+        await request;
+    });
+
+    it('preserves own __proto__ keys in web-api.js inbound responses', async () => {
+        activeDemoMessages = [];
+        onDemoPost = undefined;
+        (globalThis as any).window = {
+            parent: stableDemoParent,
+            location: { ancestorOrigins: ['https://demo.example'] },
+            addEventListener() {},
+            confirm: () => false
+        };
+        const api = await import(`../../core/ui/modules/web-api.js?own-proto-in=${Date.now()}`);
+        const request = api.sendRpcRequest('probe', []);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        api.handleRpcResponse({
+            kind: 'response',
+            messageId: activeDemoMessages[0].content.messageId,
+            success: true,
+            data: structuredClone(ownProtoFixture())
+        });
+        assertOwnProtoPreserved(await request);
+    });
+
     it('rejects oversized iframe requests before posting them to the parent', async () => {
         let resolvePosted!: (message: any) => void;
         const posted = new Promise<any>(resolve => { resolvePosted = resolve; });

@@ -91,7 +91,14 @@ function serializeValueUnchecked(value: unknown): unknown {
     const result: Record<string, unknown> = {};
     for (const key in obj) {
       if (Object.prototype.hasOwnProperty.call(obj, key)) {
-        result[key] = serializeValueUnchecked(obj[key]);
+        // Assignment would invoke Object.prototype.__proto__'s setter. Defining
+        // a data property preserves legitimate SQLite/RPC keys verbatim.
+        Object.defineProperty(result, key, {
+          value: serializeValueUnchecked(obj[key]),
+          enumerable: true,
+          configurable: true,
+          writable: true
+        });
       }
     }
     return result;
@@ -149,7 +156,12 @@ function deserializeValueUnchecked(value: unknown): unknown {
     const result: Record<string, unknown> = {};
     for (const key in obj) {
       if (Object.prototype.hasOwnProperty.call(obj, key)) {
-        result[key] = deserializeValueUnchecked(obj[key]);
+        Object.defineProperty(result, key, {
+          value: deserializeValueUnchecked(obj[key]),
+          enumerable: true,
+          configurable: true,
+          writable: true
+        });
       }
     }
     return result;

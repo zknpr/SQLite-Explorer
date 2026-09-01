@@ -96,7 +96,7 @@ export function getBatchSelectionEligibility() {
     let readOnlyCount = 0;
     let readOnlyReason;
     for (const cell of state.selectedCells) {
-        const currentReason = getReadOnlyRowReason(cell.rowIdx);
+        const currentReason = getCellMutationBlockReason(cell.rowIdx, cell.colIdx);
         if (isReadOnlyPrimaryKeyRecordId(cell.rowId) || currentReason) {
             readOnlyCount++;
             readOnlyReason ??= currentReason;
@@ -123,11 +123,21 @@ export function getCellMutationBlockReason(
 ) {
     const rowReason = getReadOnlyRowReason(rowIdx);
     if (rowReason) return rowReason;
+    const column = state.tableColumns[colIdx];
+    if (column?.isGenerated) {
+        return `Generated column ${column.name} is computed by SQLite and is read-only.`;
+    }
     const oversized = getOversizedCellMetadata(rowIdx, colIdx);
     if (!oversized || allowOversizedReplacement) return undefined;
+    // This sidecar covers size/page containment and byte-unrepresentable TEXT.
+    // It has no reason discriminator, so describe the shared safety invariant
+    // instead of falsely claiming that every contained value is too large.
+    const byteUnit = oversized.byteLength === 1 ? 'byte' : 'bytes';
     return (
-        `Too large to edit inline — ${oversized.byteLength.toLocaleString()} bytes ` +
-        `(${oversized.storageClass.toUpperCase()})`
+        `Inline editing unavailable because the grid does not contain the full byte-exact value. ` +
+        `Use View Full Content and the Hex view ` +
+        `(${oversized.storageClass.toUpperCase()}, ` +
+        `${oversized.byteLength.toLocaleString()} ${byteUnit}).`
     );
 }
 

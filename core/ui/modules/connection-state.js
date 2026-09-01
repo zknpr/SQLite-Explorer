@@ -13,10 +13,13 @@ const MUTATION_CONTROL_IDS = [
     'blob-replace-btn'
 ];
 
-function updateMutationControlCapabilities() {
+export function updateMutationControlCapabilities() {
     for (const id of MUTATION_CONTROL_IDS) {
         const control = document.getElementById(id);
-        if (control) control.disabled = state.isReadOnly;
+        if (control) control.disabled = state.isReadOnly || state.isRefreshingContent;
+    }
+    for (const control of document.querySelectorAll?.('.setting-pragma') ?? []) {
+        control.disabled = state.isReadOnly || state.isRefreshingContent;
     }
 }
 
@@ -32,6 +35,14 @@ export function applyConnectionResult(result) {
         : typeof result?.isReadOnly === 'boolean'
             ? result.isReadOnly
             : true;
+    if (Number.isSafeInteger(result?.connectionGeneration)
+        && result.connectionGeneration >= 0) {
+        state.connectionGeneration = result.connectionGeneration;
+    } else {
+        // The standalone demo has no host document generation. Each successful
+        // connection envelope still denotes a new logical database snapshot.
+        state.connectionGeneration++;
+    }
 
     updateMutationControlCapabilities();
     return connected;

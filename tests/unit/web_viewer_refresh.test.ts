@@ -27,9 +27,14 @@ it('clears and persists a displayed view selection before the demo refresh reloa
         selectedCells: [{ rowIdx: 1, colIdx: 0, rowId: 2, value: 'old' }],
         selectedRowIds: new Set([2]),
         selectedColumns: new Set(['old_column']),
+        pinnedRowIds: new Set<number>(),
+        pinnedColumns: new Set<string>(),
         lastSelectedCell: { rowIdx: 1, colIdx: 0 },
         lastSelectedColumnIndex: 0,
         lastSelectedRowIndex: 1,
+        contentGeneration: 0,
+        connectionGeneration: 0,
+        isRefreshingContent: false,
         schemaCache: { tables: [], views: [{ name: 'shared_view' }], indexes: [] }
     };
     let messageHandler: ((event: { data: unknown }) => void) | undefined;
@@ -58,6 +63,7 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                 && state.lastSelectedColumnIndex === null
                 && state.lastSelectedRowIndex === null
                 && persistCalls === 1;
+            return true;
         },
         sendRpcResult: (_correlationId: string, result: unknown) => response.resolve(result),
         sendRpcError: (_correlationId: string, error: unknown) => response.reject(error)
@@ -113,12 +119,18 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                             export function updateStatus() {}
                             export function showEmptyState() {}
                             export function showErrorState() {}
+                            export function showLoading() {}
+                            export function updateToolbarButtons() {}
                             export function initSidebarResize() {}
                         `,
-                        './modules/modals.js': 'export function initModals() {}',
+                        './modules/modals.js': `
+                            export function initModals() {}
+                            export function closeDatabaseTargetModals() {}
+                        `,
                         './modules/grid.js': `
                             export async function loadTableColumns() {
                                 ${harness}.refreshOrder.push('columns');
+                                return true;
                             }
                             export async function loadTableData() {
                                 ${harness}.refreshOrder.push('data');
@@ -144,6 +156,7 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                                 ${harness}.state.isDbConnected = !!result?.connected;
                                 return ${harness}.state.isDbConnected;
                             }
+                            export function updateMutationControlCapabilities() {}
                         `,
                         './modules/global-shortcuts.js': 'export function setupGlobalShortcuts() {}',
                         './modules/count-cache.js': `

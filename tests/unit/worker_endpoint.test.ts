@@ -132,7 +132,7 @@ describe('Worker Endpoint', () => {
         await endpoint.closeQueryReadSession(querySession.sessionId);
     });
 
-    it('forwards skipped view-undo diagnostics through the endpoint logger', async () => {
+    it('fails closed when view undo history is missing its definition', async () => {
         const logs: Array<{ level: string; args: unknown[] }> = [];
         endpoint = createWorkerEndpoint((level, ...args) => {
             logs.push({ level, args });
@@ -144,16 +144,16 @@ describe('Worker Endpoint', () => {
             wasmBinary
         });
 
-        await endpoint.undoModification({
-            description: 'Corrupt legacy view history',
-            modificationType: 'view_edit',
-            targetTable: 'missing_view'
-        });
+        await assert.rejects(
+            endpoint.undoModification({
+                description: 'Corrupt legacy view history',
+                modificationType: 'view_edit',
+                targetTable: 'missing_view'
+            }),
+            /Cannot undo view_edit: missing view definition/
+        );
 
-        assert.deepStrictEqual(logs, [{
-            level: 'warn',
-            args: ['[WasmDatabaseEngine] Skipping view undo: definition missing from history entry']
-        }]);
+        assert.deepStrictEqual(logs, []);
     });
 
     it('should shutdown previous database when initializing a new one', async () => {

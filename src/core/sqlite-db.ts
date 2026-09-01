@@ -866,6 +866,20 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().insertRow(table, data, maxEditValueBytes);
     },
 
+    async insertRowWithHistory(
+      table: string,
+      data: Record<string, CellValue>,
+      maxEditValueBytes?: number,
+      maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow> {
+      return requireEngine().insertRowWithHistory(
+        table,
+        data,
+        maxEditValueBytes,
+        maxUndoSnapshotBytes
+      );
+    },
+
     async insertRowBatch(
       table: string,
       rows: Record<string, CellValue>[],
@@ -885,16 +899,25 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
     async deleteColumns(
       table: string,
       columns: string[],
-      dropDependentIndexes?: string[]
+      dropDependentIndexes?: string[],
+      expectedCurrentState?: ColumnDropTableState
     ): Promise<ColumnDropTableState> {
-      return requireEngine().deleteColumns(table, columns, dropDependentIndexes);
+      return requireEngine().deleteColumns(
+        table,
+        columns,
+        dropDependentIndexes,
+        expectedCurrentState
+      );
     },
 
     async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
       return requireEngine().findDependentIndexes(table, columns);
     },
 
-    async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
+    async createTable(
+      table: string,
+      columns: ColumnDefinition[]
+    ): Promise<ColumnDropTableState> {
       return requireEngine().createTable(table, columns);
     },
 
@@ -968,7 +991,12 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       );
     },
 
-    async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {
+    async addColumn(
+      table: string,
+      column: string,
+      type: string,
+      defaultValue?: string
+    ): Promise<ColumnDropTableState> {
       return requireEngine().addColumn(table, column, type, defaultValue);
     },
 

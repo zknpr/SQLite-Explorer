@@ -3,11 +3,11 @@
  */
 import { state, persistState } from './state.js';
 import { backendApi } from './api.js';
-import { openModal, closeModal } from './modals.js';
+import { openModal, closeModal, registerModalCloseHandler } from './modals.js';
 import { refreshSchema } from './sidebar.js';
 import { clearSelection, loadTableColumns, loadTableData } from './grid.js';
 import { showEmptyState, updateStatus, updateToolbarButtons } from './ui.js';
-import { formatCellValueAsText } from './utils.js';
+import { formatCellValueAsText, getErrorMessage } from './utils.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 import { invalidateAllCounts } from './count-cache.js';
 import {
@@ -15,13 +15,25 @@ import {
     isViewDefinitionSnapshotCurrent,
     isViewTriggerSnapshotCurrent
 } from '../../../src/core/view-utils.ts';
+import { assertUsableSqlIdentifier } from '../../../src/core/sql-utils.ts';
 
 let editingViewName = null;
 let editingViewDefinitionSql;
 let editingViewDefinitionTriggers;
 let activeViewModalSession = 0;
 let activePreviewRequest = 0;
-let isSavingView = false;
+let activeViewConnectionGeneration = 0;
+let activeViewContentGeneration = 0;
+const savingViewSessions = new Set();
+const droppingViews = new Set();
+
+registerModalCloseHandler('viewModal', () => {
+    activeViewModalSession++;
+    activePreviewRequest++;
+    editingViewName = null;
+    editingViewDefinitionSql = undefined;
+    editingViewDefinitionTriggers = undefined;
+});
 
 function getElements() {
     return {
@@ -92,10 +104,20 @@ function renderPreview(result) {
 function getDraft() {
     const elements = getElements();
     return {
-        name: elements.name?.value.trim() ?? '',
+        name: elements.name?.value ?? '',
         selectSql: elements.sql?.value.trim() ?? '',
         preserveTriggers: elements.preserveTriggers?.checked !== false
     };
+}
+
+function getDraftInputError(draft) {
+    try {
+        assertUsableSqlIdentifier(draft.name, 'View name');
+    } catch (err) {
+        return getErrorMessage(err);
+    }
+    if (!draft.selectSql) return 'A SELECT definition is required.';
+    return null;
 }
 
 function draftsMatch(left, right) {
@@ -153,6 +175,8 @@ export function openCreateViewModal() {
         return;
     }
     activeViewModalSession++;
+    activeViewConnectionGeneration = state.connectionGeneration;
+    activeViewContentGeneration = state.contentGeneration;
     editingViewName = null;
     editingViewDefinitionSql = undefined;
     editingViewDefinitionTriggers = undefined;
@@ -178,6 +202,8 @@ export function openCreateViewModal() {
 
 export async function openEditViewModal(view) {
     const modalSession = ++activeViewModalSession;
+    activeViewConnectionGeneration = state.connectionGeneration;
+    activeViewContentGeneration = state.contentGeneration;
     const isSuperseded = () => modalSession !== activeViewModalSession;
     try {
         updateStatus(`Loading view "${view}"...`);
@@ -204,7 +230,7 @@ export async function openEditViewModal(view) {
         openModal('viewModal');
         updateStatus('Ready');
     } catch (err) {
-        if (!isSuperseded()) updateStatus(`Error: ${err.message}`);
+        if (!isSuperseded()) updateStatus(`Error: ${getErrorMessage(err)}`);
     }
 }
 
@@ -217,8 +243,9 @@ async function validateDraft(draft = getDraft(), modalSession = activeViewModalS
     const intent = editingViewName ? 'edit' : 'create';
     const canUpdateFeedback = () => isCurrentModalSession(modalSession)
         && draftsMatch(draft, getDraft());
-    if (!draft.name || !draft.selectSql) {
-        if (canUpdateFeedback()) setFeedback('A view name and SELECT definition are required.', true);
+    const inputError = getDraftInputError(draft);
+    if (inputError) {
+        if (canUpdateFeedback()) setFeedback(inputError, true);
         return false;
     }
 
@@ -228,7 +255,7 @@ async function validateDraft(draft = getDraft(), modalSession = activeViewModalS
         if (canUpdateFeedback()) setFeedback('Definition is valid.');
         return true;
     } catch (err) {
-        if (canUpdateFeedback()) setFeedback(err.message, true);
+        if (canUpdateFeedback()) setFeedback(getErrorMessage(err), true);
         return false;
     }
 }
@@ -241,9 +268,10 @@ async function previewDraft() {
     const isCurrentPreview = () => previewRequest === activePreviewRequest
         && isCurrentModalSession(modalSession)
         && draftsMatch(draft, getDraft());
-    if (!draft.name || !draft.selectSql) {
+    const inputError = getDraftInputError(draft);
+    if (inputError) {
         if (isCurrentPreview()) {
-            setFeedback('A view name and SELECT definition are required.', true);
+            setFeedback(inputError, true);
         }
         return;
     }
@@ -263,7 +291,7 @@ async function previewDraft() {
     } catch (err) {
         if (!isCurrentPreview()) return;
         clearPreview();
-        setFeedback(err.message, true);
+        setFeedback(getErrorMessage(err), true);
     }
 }
 
@@ -272,17 +300,21 @@ async function saveDraft() {
         setFeedback('Document is read-only.', true);
         return;
     }
-    if (isSavingView) return;
-
     // The modal can be closed and reused while SQLite validation is pending.
     // Snapshot every mutation input and require the same visible modal session
     // before starting the write, so an old Save cannot target a newer draft.
     const modalSession = activeViewModalSession;
+    if (savingViewSessions.has(modalSession)) return;
+    if (activeViewConnectionGeneration !== state.connectionGeneration
+        || activeViewContentGeneration !== state.contentGeneration) {
+        setFeedback('Database content changed. Close and reopen this editor.', true);
+        return;
+    }
     const draft = getDraft();
     const targetView = editingViewName;
     const targetDefinitionSql = editingViewDefinitionSql;
     const targetDefinitionTriggers = editingViewDefinitionTriggers;
-    isSavingView = true;
+    savingViewSessions.add(modalSession);
     const saveElements = getElements();
     const saveButton = saveElements.save;
     const nameInput = saveElements.name;
@@ -300,6 +332,8 @@ async function saveDraft() {
     try {
         if (!await validateDraft(draft, modalSession)) return;
         if (!isCurrentModalSession(modalSession)) return;
+        if (activeViewConnectionGeneration !== state.connectionGeneration
+            || activeViewContentGeneration !== state.contentGeneration) return;
 
         if (targetView) {
             const currentDefinition = await backendApi.getViewDefinition(targetView);
@@ -328,6 +362,7 @@ async function saveDraft() {
             if (isCurrentModalSession(modalSession)) setFeedback('Edit cancelled.');
             return;
         }
+        if (!isCurrentModalSession(modalSession)) return;
 
         const changedView = targetView ?? draft.name;
         // A redefined view is a different query — and any OTHER view that
@@ -336,25 +371,25 @@ async function saveDraft() {
         // selected). Wholesale invalidation is the only sound scope here;
         // it costs one count refetch on the next load.
         invalidateAllCounts();
-        if (isCurrentModalSession(modalSession)) closeModal('viewModal');
+        closeModal('viewModal');
+        const closedSession = activeViewModalSession;
         await refreshSchema();
         if (state.selectedTable === changedView && state.selectedTableType === 'view') {
             clearSelection();
             persistState();
-            await loadTableColumns();
-            await loadTableData(true, false);
+            if (await loadTableColumns()) await loadTableData(true, false);
         }
-        if (modalSession === activeViewModalSession) {
+        if (activeViewModalSession === closedSession) {
             updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - Ctrl+S to save`);
         }
     } catch (err) {
         if (isCurrentModalSession(modalSession)) {
             if (targetView && isViewDefinitionConflictError(err)) showDefinitionConflict();
-            else setFeedback(err.message, true);
+            else setFeedback(getErrorMessage(err), true);
         }
-        if (modalSession === activeViewModalSession) updateStatus(`Error: ${err.message}`);
+        if (modalSession === activeViewModalSession) updateStatus(`Error: ${getErrorMessage(err)}`);
     } finally {
-        isSavingView = false;
+        savingViewSessions.delete(modalSession);
         if (modalSession === activeViewModalSession) {
             if (saveButton) saveButton.disabled = false;
             if (reloadLatest) reloadLatest.disabled = false;
@@ -389,7 +424,7 @@ async function reloadLatestViewDefinition() {
         setFeedback('Latest definition loaded. Review it before saving.');
     } catch (err) {
         if (isCurrentModalSession(modalSession) && editingViewName === targetView) {
-            setFeedback(err.message, true);
+            setFeedback(getErrorMessage(err), true);
         }
     } finally {
         if (isCurrentModalSession(modalSession) && editingViewName === targetView) {
@@ -414,7 +449,7 @@ async function openDraftInVsCode() {
         closeModal('viewModal');
         updateStatus(`Editing view "${targetView}" in VS Code`);
     } catch (err) {
-        if (isCurrentRequest()) setFeedback(err.message, true);
+        if (isCurrentRequest()) setFeedback(getErrorMessage(err), true);
     }
 }
 
@@ -424,6 +459,8 @@ export async function dropViewFromSidebar(view) {
         return;
     }
 
+    if (droppingViews.has(view)) return;
+    droppingViews.add(view);
     try {
         const result = await backendApi.dropView(view);
         if (result?.cancelled) {
@@ -449,6 +486,8 @@ export async function dropViewFromSidebar(view) {
         await refreshSchema();
         updateStatus(`View "${view}" dropped - Ctrl+S to save`);
     } catch (err) {
-        updateStatus(`Error: ${err.message}`);
+        updateStatus(`Error: ${getErrorMessage(err)}`);
+    } finally {
+        droppingViews.delete(view);
     }
 }

@@ -5,7 +5,7 @@ import type {
   CellTextEncoding,
   CellValue
 } from './types';
-import { escapeIdentifier } from './sql-utils';
+import { escapeIdentifier, escapeMainIdentifier } from './sql-utils';
 
 /** One RPC response stays at or below Stage A's default per-cell ceiling. */
 export const MAX_CELL_READ_CHUNK_BYTES = 1024 * 1024;
@@ -69,7 +69,7 @@ export function buildCellMetadataQuery(target: CellReadSqlTarget): {
     sql:
       `SELECT typeof(${column}), ` +
       `CASE WHEN ${column} IS NULL THEN 0 ELSE length(CAST(${column} AS BLOB)) END ` +
-      `FROM ${escapeIdentifier(target.table)} WHERE ${target.predicateSql} LIMIT 2`,
+      `FROM ${escapeMainIdentifier(target.table)} WHERE ${target.predicateSql} LIMIT 2`,
     params: target.predicateParams
   };
 }
@@ -85,7 +85,7 @@ export function buildCellChunkQuery(target: CellReadSqlTarget): {
     // with either UTF-8 bytes or JavaScript UTF-16 code units.
     sql:
       `SELECT substr(CAST(${column} AS BLOB), ? + 1, ?) ` +
-      `FROM ${escapeIdentifier(target.table)} WHERE ${target.predicateSql} LIMIT 2`,
+      `FROM ${escapeMainIdentifier(target.table)} WHERE ${target.predicateSql} LIMIT 2`,
     params: target.predicateParams
   };
 }

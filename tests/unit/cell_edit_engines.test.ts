@@ -90,7 +90,7 @@ describe('WASM oversized-cell edit policy', () => {
         }
     });
 
-    it('allows history replay to restore a legacy oversized value without opening a policy bypass', async () => {
+    it('allows guarded history replay to restore an oversized value without opening a policy bypass', async () => {
         const initialized = await createDatabaseEngine({
             content: null,
             maxSize: 0,
@@ -114,7 +114,10 @@ describe('WASM oversized-cell edit policy', () => {
                 targetRowId: 1,
                 targetColumn: 'payload',
                 priorValue: legacyValue,
-                newValue: Uint8Array.from([1])
+                newValue: Uint8Array.from([1]),
+                operation: 'set',
+                priorState: { storageClass: 'blob', value: legacyValue },
+                postState: { storageClass: 'blob', value: Uint8Array.from([1]) }
             });
             assert.strictEqual(
                 (await engine.executeQuery('SELECT length(payload) FROM legacy_history'))[0].rows[0][0],
@@ -128,7 +131,10 @@ describe('WASM oversized-cell edit policy', () => {
                 targetRowId: 1,
                 targetColumn: 'payload',
                 priorValue: legacyValue,
-                newValue: Uint8Array.from([1])
+                newValue: Uint8Array.from([1]),
+                operation: 'set',
+                priorState: { storageClass: 'blob', value: legacyValue },
+                postState: { storageClass: 'blob', value: Uint8Array.from([1]) }
             });
             assert.strictEqual(
                 (await engine.executeQuery('SELECT length(payload) FROM legacy_history'))[0].rows[0][0],

@@ -28,6 +28,19 @@ describe('viewer template accessibility', () => {
         assert.match(revealRule, /opacity\s*:\s*1(?:\D|$)/i);
     });
 
+    it('reveals hidden grid icon actions when their cell receives keyboard focus', () => {
+        const css = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.css'),
+            'utf8'
+        );
+        const focusRule = css.match(
+            /\.header-cell:focus-within\s+\.pin-icon,[^{]*\.header-cell:focus-within\s+\.select-column-icon,[^{]*\.data-cell\.row-number:focus-within\s+\.pin-icon\s*\{([^}]*)\}/s
+        )?.[1];
+
+        assert.ok(focusRule, 'keyboard focus must reveal grid pin and select actions');
+        assert.match(focusRule, /opacity\s*:\s*(?:0?\.\d*[1-9]\d*|1)(?:\D|$)/i);
+    });
+
     it('gives the toolbar table filter an accessible name', () => {
         const template = readFileSync(
             path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
@@ -47,6 +60,35 @@ describe('viewer template accessibility', () => {
         )?.[0];
         assert.ok(clearButton, 'toolbar filter must expose a clear button');
         assert.match(clearButton, /\baria-label\s*=\s*["'][^"']+["']/i);
+    });
+
+    it('uses native controls for sidebar navigation and labels both resize handles', () => {
+        const template = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
+            'utf8'
+        );
+
+        for (const section of ['tables', 'views', 'indexes']) {
+            const toggle = template.match(
+                new RegExp(`<button\\b(?=[^>]*\\bclass=["'][^"']*\\bsection-toggle\\b[^"']*["'])(?=[^>]*\\bdata-section=["']${section}["'])[^>]*>`, 'i')
+            )?.[0];
+            assert.ok(toggle, `${section} section must use a native toggle button`);
+            assert.match(toggle, /\baria-expanded=["'](?:true|false)["']/i);
+            assert.match(toggle, new RegExp(`\\baria-controls=["']${section}List["']`, 'i'));
+        }
+
+        const settings = template.match(
+            /<button\b(?=[^>]*\bid=["']btnOpenSettings["'])[^>]*>/i
+        )?.[0];
+        assert.ok(settings, 'Configuration must be a native button');
+
+        const resize = template.match(
+            /<[^>]+\bid=["']resizeHandle["'][^>]*>/i
+        )?.[0];
+        assert.ok(resize, 'sidebar resize handle must exist');
+        assert.match(resize, /\brole=["']separator["']/i);
+        assert.match(resize, /\btabindex=["']0["']/i);
+        assert.match(resize, /\baria-label=["'][^"']+["']/i);
     });
 
     it('announces the keyboard escape route for both multiline editors', () => {
@@ -121,6 +163,108 @@ describe('viewer template accessibility', () => {
             );
             assert.ok(title, `${titleId} must label ${modalId}`);
         }
+    });
+
+    it('gives icon-only modal, filter, and pagination buttons meaningful names', () => {
+        const template = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
+            'utf8'
+        );
+
+        const modalCloseButtons = [...template.matchAll(
+            /<button\b(?=[^>]*\bclass=["'][^"']*\bmodal-close\b[^"']*["'])[^>]*>/gi
+        )].map(match => match[0]);
+        assert.ok(modalCloseButtons.length > 0, 'standard modal close buttons must exist');
+        for (const button of modalCloseButtons) {
+            assert.match(button, /\baria-label=["']Close [^"']+["']/i);
+        }
+
+        for (const [id, name] of [
+            ['btnApplyFilter', 'Search table'],
+            ['btnFirst', 'First page'],
+            ['btnPrev', 'Previous page'],
+            ['btnNext', 'Next page'],
+            ['btnLast', 'Last page'],
+            ['btnCloseCellPreview', 'Close cell preview']
+        ]) {
+            const button = template.match(
+                new RegExp(`<button\\b(?=[^>]*\\bid=["']${id}["'])[^>]*>`, 'i')
+            )?.[0];
+            assert.ok(button, `${id} must exist`);
+            assert.match(
+                button,
+                new RegExp(`\\baria-label=["']${name}["']`, 'i'),
+                `${id} must expose the name "${name}"`
+            );
+        }
+    });
+
+    it('announces status changes and associates both footer selectors with visible labels', () => {
+        const template = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
+            'utf8'
+        );
+        const status = template.match(/<[^>]+\bid=["']statusText["'][^>]*>/i)?.[0];
+        assert.ok(status, 'status text must exist');
+        assert.match(status, /\brole=["']status["']/i);
+        assert.match(status, /\baria-live=["']polite["']/i);
+        assert.match(status, /\baria-atomic=["']true["']/i);
+
+        for (const [id, text] of [
+            ['pageSizeSelect', 'Rows:'],
+            ['dateFormatSelect', 'Date Format:']
+        ]) {
+            const label = template.match(
+                new RegExp(`<label\\b(?=[^>]*\\bfor=["']${id}["'])[^>]*>\\s*${text}\\s*</label>`, 'i')
+            )?.[0];
+            assert.ok(label, `${id} must be associated with its visible label`);
+        }
+    });
+
+    it('associates static create, add-column, and export fields with their labels', () => {
+        const template = readFileSync(
+            path.resolve(process.cwd(), 'core/ui/viewer.template.html'),
+            'utf8'
+        );
+
+        for (const [id, text] of [
+            ['newTableName', 'Table Name'],
+            ['newColumnName', 'Column Name'],
+            ['newColumnType', 'Type'],
+            ['newColumnDefault', 'Default Value (optional)'],
+            ['exportFormat', 'Format']
+        ]) {
+            const label = template.match(
+                new RegExp(`<label\\b(?=[^>]*\\bfor=["']${id}["'])[^>]*>\\s*${text.replace(/[()]/g, '\\$&')}\\s*</label>`, 'i')
+            )?.[0];
+            assert.ok(label, `${id} must be associated with its visible label`);
+        }
+
+        for (const [groupId, labelId] of [
+            ['columnDefinitions', 'columnDefinitionsLabel'],
+            ['exportColumns', 'exportColumnsLabel'],
+            ['exportOptions', 'exportOptionsLabel']
+        ]) {
+            const group = template.match(
+                new RegExp(`<[^>]+\\bid=["']${groupId}["'][^>]*>`, 'i')
+            )?.[0];
+            assert.ok(group, `${groupId} must exist`);
+            assert.match(group, /\brole=["']group["']/i);
+            assert.match(group, new RegExp(`\\baria-labelledby=["']${labelId}["']`, 'i'));
+            assert.match(template, new RegExp(`<[^>]+\\bid=["']${labelId}["'][^>]*>`, 'i'));
+        }
+
+        const cellEditor = template.match(
+            /<textarea\b(?=[^>]*\bid=["']cellPreviewTextarea["'])[^>]*>/i
+        )?.[0];
+        assert.ok(cellEditor, 'cell preview editor must exist');
+        assert.match(cellEditor, /\baria-labelledby=["']cellPreviewTitle["']/i);
+
+        const hexDump = template.match(
+            /<textarea\b(?=[^>]*\bclass=["'][^"']*\bhex-dump-textarea\b[^"']*["'])[^>]*>/i
+        )?.[0];
+        assert.ok(hexDump, 'BLOB hex dump must exist');
+        assert.match(hexDump, /\baria-label=["']BLOB hexadecimal data["']/i);
     });
 
     it('marks selection-dependent controls so click-away handling preserves the selection', () => {

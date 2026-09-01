@@ -479,7 +479,8 @@ describe('filter controls', () => {
             assert.strictEqual(applied, false, 'the failed load contract must reach the filter queue');
             assert.strictEqual(state.lastGridLoadError, 'malformed filter predicate');
             assert.strictEqual(state.filterQuery, 'working');
-            assert.deepStrictEqual(state.columnFilters, {});
+            assert.deepStrictEqual(Object.keys(state.columnFilters), []);
+            assert.strictEqual(Object.getPrototypeOf(state.columnFilters), null);
             assert.deepStrictEqual(state.gridData, [['working row']]);
             assert.strictEqual(globalInput.value, 'broken draft');
             assert.match(elements.statusText.textContent, /filter failed.*reverted/i);

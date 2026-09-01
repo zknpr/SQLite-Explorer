@@ -1,4 +1,4 @@
-import { describe, it, afterEach } from 'node:test';
+import { describe, it, afterEach, mock } from 'node:test';
 import assert from 'node:assert';
 import {
   processProtocolMessage,
@@ -7,7 +7,8 @@ import {
   WorkerPort,
   Transfer,
   InvocationTimeoutError,
-  isInvocationTimeoutError
+  isInvocationTimeoutError,
+  rejectPendingInvocations
 } from '../../src/core/rpc';
 import {
   CellEditPolicyError,
@@ -97,6 +98,91 @@ describe('RPC', () => {
       });
     });
 
+    it('rejects non-array invocation parameters before dispatch', () => {
+      const ping = mock.fn();
+      let response: any = null;
+
+      const handled = processProtocolMessage({
+        kind: 'invoke',
+        correlationId: 'malformed-parameters',
+        methodName: 'ping',
+        parameters: 'spread-me-as-characters'
+      } as any, { ping }, message => { response = message; });
+
+      assert.strictEqual(handled, true);
+      assert.strictEqual(ping.mock.callCount(), 0);
+      assert.deepStrictEqual(response, {
+        kind: 'result',
+        correlationId: 'malformed-parameters',
+        errorText: 'RPC parameters must be an array'
+      });
+    });
+
+    it('drops an unsafe invocation correlation ID before dispatch or reflection', async () => {
+      const ping = mock.fn();
+      const responses: unknown[] = [];
+
+      const handled = processProtocolMessage({
+        kind: 'invoke',
+        correlationId: { secret: 'must-not-be-reflected' },
+        methodName: 'ping',
+        parameters: []
+      } as any, { ping }, message => { responses.push(message); });
+      await new Promise(resolve => setImmediate(resolve));
+
+      assert.strictEqual(handled, true);
+      assert.strictEqual(ping.mock.callCount(), 0);
+      assert.deepStrictEqual(responses, []);
+    });
+
+    it('faults a pending call cleanly when a response error is not text', () => {
+      let fault: Error | undefined;
+      const pending = new Map<string, any>([[
+        'malformed-error',
+        {
+          onComplete() {},
+          onFault(error: Error) { fault = error; },
+          expirationTimer: setTimeout(() => undefined, 60_000)
+        }
+      ]]);
+
+      assert.doesNotThrow(() => processProtocolMessage({
+        kind: 'result',
+        correlationId: 'malformed-error',
+        errorText: { secret: 'not text' }
+      } as any, undefined, undefined, undefined, pending));
+
+      assert.match(fault?.message ?? '', /malformed RPC error response/i);
+      assert.strictEqual(pending.size, 0);
+    });
+
+    it('responds when a method rejects with a value that cannot be stringified', { timeout: 200 }, async () => {
+      const hostile = {
+        [Symbol.toPrimitive]() {
+          throw new Error('coercion trap');
+        }
+      };
+
+      const response = await new Promise<unknown>(resolve => {
+        processProtocolMessage({
+          kind: 'invoke',
+          correlationId: 'hostile-rejection',
+          methodName: 'fail',
+          parameters: []
+        }, {
+          fail() {
+            throw hostile;
+          }
+        }, resolve as any);
+      });
+
+      assert.deepStrictEqual(response, {
+        kind: 'result',
+        correlationId: 'hostile-rejection',
+        errorText: 'Unknown remote error'
+      });
+    });
+
     it('should handle Transfer wrappers in return value', () => {
       const buffer = new ArrayBuffer(8);
       const methods = {
@@ -130,6 +216,22 @@ describe('RPC', () => {
   });
 
   describe('buildMethodProxy', () => {
+    it('rejects and clears every pending invocation when its transport retires', async () => {
+      const proxy = buildMethodProxy<{
+        first: () => Promise<void>;
+        second: () => Promise<void>;
+      }>(() => {}, ['first', 'second']);
+      const first = proxy.first();
+      const second = proxy.second();
+      const retired = new Error('RPC transport closed');
+
+      rejectPendingInvocations(proxy.__pendingInvocations, retired);
+
+      assert.strictEqual(proxy.__pendingInvocations.size, 0);
+      await assert.rejects(first, error => error === retired);
+      await assert.rejects(second, error => error === retired);
+    });
+
     it('should extract transferables from arguments', () => {
       let dispatchedEnvelope: any = null;
       let dispatchedTransfer: Transferable[] | undefined = undefined;
@@ -159,6 +261,48 @@ describe('RPC', () => {
       assert.ok(transfer);
       assert.strictEqual(transfer.length, 1);
       assert.strictEqual(transfer[0], buffer);
+    });
+
+    it('round-trips nested own prototype-spelled keys without changing prototypes', async () => {
+      let invocation: unknown;
+      const proxy = buildMethodProxy<{
+        echo: (value: unknown) => Promise<unknown>;
+      }>(envelope => { invocation = envelope; }, ['echo']);
+      const nested = JSON.parse(
+        '{"__proto__":{"polluted":"rpc-prototype"},' +
+        '"constructor":"constructor-value","prototype":"prototype-value"}'
+      );
+
+      const pending = proxy.echo({ nested });
+      const response = await new Promise<unknown>(resolve => {
+        processProtocolMessage(
+          invocation,
+          { echo: (value: unknown) => value },
+          resolve as any
+        );
+      });
+      processProtocolMessage(
+        response,
+        undefined,
+        undefined,
+        undefined,
+        proxy.__pendingInvocations
+      );
+      const roundTripped = await pending as { nested: Record<string, unknown> };
+
+      assert.strictEqual(Object.getPrototypeOf(roundTripped.nested), Object.prototype);
+      assert.strictEqual(
+        Object.prototype.propertyIsEnumerable.call(roundTripped.nested, '__proto__'),
+        true
+      );
+      assert.deepStrictEqual(Object.keys(roundTripped.nested), [
+        '__proto__',
+        'constructor',
+        'prototype'
+      ]);
+      assert.deepStrictEqual(roundTripped.nested.__proto__, { polluted: 'rpc-prototype' });
+      assert.strictEqual(roundTripped.nested.constructor, 'constructor-value');
+      assert.strictEqual(roundTripped.nested.prototype, 'prototype-value');
     });
 
     it('rejects and removes pending state when a transport dispatcher throws', async () => {
@@ -315,6 +459,14 @@ describe('RPC', () => {
     const error = await roundTripThrownError(new Error(message));
     assert.strictEqual(error instanceof InvocationTimeoutError, false);
     assert.strictEqual((error as Error).message, message);
+  });
+
+  it('bounds database-controlled worker errors before IPC delivery', async () => {
+    const error = await roundTripThrownError(new Error('x'.repeat(20_000)));
+
+    assert.ok(error instanceof Error);
+    assert.ok(error.message.length < 8400);
+    assert.match(error.message, /truncated from 20000 characters/i);
   });
 
   describe('connectWorkerPort', () => {

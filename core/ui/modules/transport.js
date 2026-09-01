@@ -14,6 +14,7 @@ import {
     encodeJsonSafeNonFiniteNumber,
     escapeJsonSafeNumberString
 } from '../../../src/core/json-safe-numbers.ts';
+import { getErrorMessage } from './utils.js';
 
 export {
     MAX_WEBVIEW_BINARY_VALUE_BYTES,
@@ -76,7 +77,14 @@ async function serializeValueUnchecked(value) {
     if (Array.isArray(value)) return Promise.all(value.map(serializeValueUnchecked));
     if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
         const result = {};
-        for (const key of Object.keys(value)) result[key] = await serializeValueUnchecked(value[key]);
+        for (const key of Object.keys(value)) {
+            Object.defineProperty(result, key, {
+                value: await serializeValueUnchecked(value[key]),
+                enumerable: true,
+                configurable: true,
+                writable: true
+            });
+        }
         return result;
     }
     return value;
@@ -121,7 +129,14 @@ function deserializeValueUnchecked(value) {
             return new Uint8Array(value.data);
         }
         const result = {};
-        for (const key of keys) result[key] = deserializeValueUnchecked(value[key]);
+        for (const key of keys) {
+            Object.defineProperty(result, key, {
+                value: deserializeValueUnchecked(value[key]),
+                enumerable: true,
+                configurable: true,
+                writable: true
+            });
+        }
         return result;
     }
     if (Array.isArray(value)) return value.map(deserializeValueUnchecked);
@@ -141,7 +156,7 @@ export function errorFromRpcResponse(message) {
 }
 
 export function rpcErrorFields(error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorMessage = getErrorMessage(error);
     const typed = toCellEditRpcErrorData(error)
         ?? toWebviewPayloadLimitErrorData(error);
     return {

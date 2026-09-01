@@ -531,7 +531,7 @@ function assertNoSiblingWalFramesSync(
  * in both rollback and WAL modes; if another writer already owns it, saving
  * fails closed before the active pathname is replaced.
  */
-function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock {
+export function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock {
   let DatabaseSync: typeof import('node:sqlite').DatabaseSync;
   try {
     ({ DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite'));

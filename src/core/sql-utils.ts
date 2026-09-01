@@ -21,6 +21,27 @@ export function escapeIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
 
+/** Qualify a persistent object so a same-named TEMP object cannot intercept DDL/DML. */
+export function escapeMainIdentifier(identifier: string): string {
+  return `main.${escapeIdentifier(identifier)}`;
+}
+
+/**
+ * Reject identifiers that cannot be represented safely, without imposing an
+ * application-specific naming grammar on SQLite identifiers.
+ */
+export function assertUsableSqlIdentifier(
+  identifier: unknown,
+  label: string = 'Identifier'
+): asserts identifier is string {
+  if (typeof identifier !== 'string' || identifier.length === 0) {
+    throw new Error(`${label} is required`);
+  }
+  if (identifier.includes('\0')) {
+    throw new Error(`${label} cannot contain NUL characters`);
+  }
+}
+
 /**
  * Validate a SQL type definition to ensure it is safe.
  * Allows standard SQLite types and common variants.

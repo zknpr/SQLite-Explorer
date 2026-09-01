@@ -477,7 +477,10 @@ async function probeCellSaveUndo(options: ProbeOptions): Promise<Record<string, 
         get(target, property, receiver) {
           if (property !== 'executeQuery') return Reflect.get(target, property, receiver);
           return async (sql: string, params?: CellValue[]) => {
-            if (sql.includes('FROM "large_cells"') && sql.includes('"payload"')) {
+            if (
+              /\bFROM\s+(?:main\.)?"large_cells"(?:\s|$)/i.test(sql)
+              && sql.includes('"payload"')
+            ) {
               const bounded = sql.includes('THEN NULL ELSE "payload" END');
               containmentReadObserved ||= bounded;
               wholePriorValueReadObserved ||= !bounded;

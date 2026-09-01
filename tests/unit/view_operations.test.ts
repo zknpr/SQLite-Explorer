@@ -15,6 +15,7 @@ import {
     normalizeViewDefinitionError,
     normalizeViewSelectSql
 } from '../../src/core/view-utils';
+import { MAX_SCHEMA_DEPENDENCY_PROBES } from '../../src/core/schema-dependency';
 import { HostBridge } from '../../src/hostBridge';
 
 async function createEngine(): Promise<DatabaseOperations> {
@@ -105,6 +106,55 @@ describe('view operations', () => {
             assert.strictEqual(definition.selectSql, 'SELECT id, name FROM users WHERE active = 1');
             assert.deepStrictEqual(definition.triggers, []);
             assert.strictEqual(await readScalar(engine, 'SELECT name FROM "active users"'), 'Ada');
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('preserves legal view identifiers and rejects unusable names at every create probe', async () => {
+        const engine = await createEngine();
+        const view = ' ui "view" 🚀 ';
+        try {
+            await engine.validateViewDefinition(view, 'SELECT 7 AS value', 'create');
+            const preview = await engine.previewViewDefinition(
+                view,
+                'SELECT 7 AS value',
+                10,
+                'create'
+            );
+            assert.deepStrictEqual(preview.rows, [[7]]);
+
+            const definition = await engine.createView(view, 'SELECT 7 AS value');
+            assert.strictEqual(definition.identifier, view);
+            assert.strictEqual(await readScalar(engine, `SELECT value FROM main." ui ""view"" 🚀 "`), 7);
+            assert.strictEqual(
+                await readScalar(
+                    engine,
+                    "SELECT name FROM sqlite_schema WHERE type = 'view' AND name = " +
+                    "' ui \"view\" 🚀 '"
+                ),
+                view
+            );
+
+            await assert.rejects(
+                engine.createView(' UI "VIEW" 🚀 ', 'SELECT 8 AS value'),
+                /already exists/i
+            );
+            await engine.createView('Ä View', 'SELECT 1 AS value');
+            await engine.createView('ä View', 'SELECT 2 AS value');
+
+            await assert.rejects(
+                engine.validateViewDefinition('', 'SELECT 1', 'create'),
+                /View name is required/
+            );
+            await assert.rejects(
+                engine.previewViewDefinition('bad\0view', 'SELECT 1', 10, 'create'),
+                /View name cannot contain NUL/
+            );
+            await assert.rejects(
+                engine.createView('bad\0view', 'SELECT 1'),
+                /View name cannot contain NUL/
+            );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }
@@ -310,7 +360,7 @@ describe('view operations', () => {
                     'SELECT value * 2 AS value FROM shadow_trigger_main_rows',
                     true
                 ),
-                /shadow_trigger_insert.*drop the TEMP shadow view.*schema-qualified target/is
+                /shadow_trigger_insert.*TEMP trigger.*schema-qualified target/is
             );
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM main.shadow_trigger_view'),
@@ -335,7 +385,7 @@ describe('view operations', () => {
         }
     });
 
-    it('rejects edit and drop when a main-bound TEMP trigger becomes catalog-ambiguous', async () => {
+    it('proves and preserves a main-bound unqualified TEMP trigger through a later shadow', async () => {
         const engine = await createEngine();
         try {
             await engine.executeQuery('CREATE TABLE ambiguous_main_rows (value INTEGER)');
@@ -357,29 +407,25 @@ describe('view operations', () => {
 
             const browsed = await engine.getViewDefinition('ambiguous_trigger_view');
             assert.strictEqual(browsed.selectSql, 'SELECT value FROM ambiguous_main_rows');
-            assert.deepStrictEqual(browsed.triggers, []);
             assert.deepStrictEqual(
-                browsed.ambiguousTemporaryTriggerNames,
+                browsed.triggers.map(trigger => trigger.identifier),
                 ['ambiguous_main_insert']
             );
+            assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
 
-            const expectedError = /ambiguous_main_insert.*drop the TEMP shadow view.*TEMP trigger.*schema-qualified target/is;
-            await assert.rejects(
-                () => engine.editView(
-                    'ambiguous_trigger_view',
-                    'SELECT value * 2 AS value FROM ambiguous_main_rows',
-                    true
-                ),
-                expectedError
+            const edit = await engine.editView(
+                'ambiguous_trigger_view',
+                'SELECT value * 2 AS value FROM ambiguous_main_rows',
+                true
             );
-            await assert.rejects(
-                () => engine.dropView('ambiguous_trigger_view'),
-                expectedError
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => trigger.identifier),
+                ['ambiguous_main_insert']
             );
 
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM main.ambiguous_trigger_view'),
-                3
+                6
             );
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM temp.ambiguous_trigger_view'),
@@ -736,6 +782,59 @@ describe('view operations', () => {
         }
     });
 
+    it('refuses to rebind an unqualified TEMP trigger that was historically attached elsewhere', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery("ATTACH DATABASE ':memory:' AS aux");
+            await engine.executeQuery('CREATE TABLE aux.historical_aux_rows (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE VIEW aux.historical_trigger_view AS SELECT value FROM historical_aux_rows'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TABLE historical_trigger_log (target TEXT, value INTEGER)'
+            );
+            // At creation time no main object has this name, so SQLite binds
+            // the unqualified target to aux. temp.sqlite_schema does not retain
+            // that provenance after a same-named main view appears later.
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER historical_aux_insert ' +
+                'INSTEAD OF INSERT ON historical_trigger_view ' +
+                "BEGIN INSERT INTO historical_trigger_log VALUES ('aux', NEW.value); END"
+            );
+            await engine.executeQuery('CREATE TABLE historical_main_rows (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE VIEW historical_trigger_view AS SELECT value FROM historical_main_rows'
+            );
+
+            const browsed = await engine.getViewDefinition('historical_trigger_view');
+            assert.deepStrictEqual(browsed.triggers, []);
+            assert.deepStrictEqual(
+                browsed.ambiguousTemporaryTriggerNames,
+                ['historical_aux_insert']
+            );
+            await assert.rejects(
+                () => engine.editView(
+                    'historical_trigger_view',
+                    'SELECT value * 2 AS value FROM historical_main_rows',
+                    true
+                ),
+                /historical_aux_insert.*TEMP trigger.*schema-qualified target/is
+            );
+
+            await assert.rejects(
+                () => engine.executeQuery('INSERT INTO main.historical_trigger_view VALUES (11)'),
+                /cannot modify.*view/i
+            );
+            await engine.executeQuery('INSERT INTO aux.historical_trigger_view VALUES (13)');
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM historical_trigger_log'),
+                13
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('preserves an explicit view column list when replacing its SELECT body', async () => {
         const engine = await createEngine();
         try {
@@ -872,6 +971,43 @@ describe('view operations', () => {
             assert.strictEqual(
                 await readScalar(engine, 'SELECT value FROM main.restore_compile_shadow'),
                 'main-before'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('saves the same main-bound view definition that validation accepts', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE main.view_source_shadow (value TEXT); ' +
+                "INSERT INTO main.view_source_shadow VALUES ('main'); " +
+                'CREATE TEMP TABLE view_source_shadow (other TEXT)'
+            );
+            const body = 'SELECT value FROM view_source_shadow';
+
+            await engine.validateViewDefinition(
+                'validated_source_binding',
+                body,
+                'create'
+            );
+            await engine.createView('validated_source_binding', body);
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.validated_source_binding'),
+                'main'
+            );
+
+            await engine.createView('edited_source_binding', "SELECT 'before' AS value");
+            await engine.validateViewDefinition(
+                'edited_source_binding',
+                body,
+                'edit'
+            );
+            await engine.editView('edited_source_binding', body, true);
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM main.edited_source_binding'),
+                'main'
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
@@ -1119,7 +1255,7 @@ describe('view operations', () => {
 
             await assert.rejects(
                 () => engine.createView('unsafe_body', 'SELECT 1; DROP TABLE sentinel'),
-                /syntax error/
+                /Exactly one SQL statement is required|syntax error/
             );
 
             assert.strictEqual(await readScalar(
@@ -1304,12 +1440,11 @@ describe('view operations', () => {
                 ['9007199254740992', '9007199254740993']
             );
 
-            await engine.updateCell(
-                'unsafe_rowids',
-                result.rows[2][0] as string,
-                'value',
-                'edited'
-            );
+            const [updated] = await engine.updateCellBatch('unsafe_rowids', [{
+                rowId: result.rows[2][0] as string,
+                column: 'value',
+                value: 'edited'
+            }]);
             const values = await engine.executeQuery(
                 'SELECT CAST(rowid AS TEXT), value FROM unsafe_rowids ' +
                 'WHERE rowid >= 9007199254740992 ORDER BY rowid'
@@ -1326,7 +1461,10 @@ describe('view operations', () => {
                 targetRowId: '9007199254740993',
                 targetColumn: 'value',
                 priorValue: 'higher',
-                newValue: 'edited'
+                newValue: 'edited',
+                priorState: updated.priorState,
+                postState: updated.postState,
+                operation: updated.operation
             };
             await engine.undoModification(modification);
             assert.strictEqual(
@@ -1904,21 +2042,19 @@ describe('view operations', () => {
         }
     });
 
-    it('logs a missing WASM view definition while preserving undo no-op behavior', async () => {
+    it('fails closed when WASM view undo lacks its definition', async () => {
         const engine = await createEngine();
         const warning = mock.method(console, 'warn', () => {});
         try {
-            await engine.undoModification({
-                description: 'Legacy view edit',
-                modificationType: 'view_edit',
-                targetTable: 'legacy_view'
-            });
-
-            assert.strictEqual(warning.mock.callCount(), 1);
-            assert.strictEqual(
-                warning.mock.calls[0].arguments[0],
-                '[WasmDatabaseEngine] Skipping view undo: definition missing from history entry'
+            await assert.rejects(
+                engine.undoModification({
+                    description: 'Legacy view edit',
+                    modificationType: 'view_edit',
+                    targetTable: 'legacy_view'
+                }),
+                /Cannot undo view_edit: missing view definition/
             );
+            assert.strictEqual(warning.mock.callCount(), 0);
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
         }
@@ -2181,6 +2317,44 @@ describe('view operations', () => {
         ]);
     });
 
+    it('guards the exact current triggers named by the discard confirmation', async () => {
+        const stale = createViewDefinition({
+            triggers: [{
+                identifier: 'active_users_insert',
+                sql: 'CREATE TRIGGER active_users_insert INSTEAD OF INSERT ON active_users BEGIN SELECT 1; END'
+            }]
+        });
+        const current = createViewDefinition({
+            triggers: [
+                ...stale.triggers,
+                {
+                    identifier: 'active_users_update',
+                    sql: 'CREATE TRIGGER active_users_update INSTEAD OF UPDATE ON active_users BEGIN SELECT 2; END'
+                }
+            ]
+        });
+        const editView = mock.fn(async (..._args: unknown[]) => ({
+            before: current,
+            after: { ...current, triggers: [] }
+        }));
+        const getViewDefinition = mock.fn(async () => current);
+        const { bridge } = createHostBridge({ editView, getViewDefinition });
+        mock.method(vscode.window, 'showWarningMessage', async () => ({
+            title: 'Edit and Drop Triggers',
+            value: true
+        }));
+
+        await bridge.editView(
+            'active_users',
+            'SELECT id FROM users',
+            false,
+            stale.sql,
+            stale.triggers
+        );
+
+        assert.deepStrictEqual(editView.mock.calls[0].arguments[4], current.triggers);
+    });
+
     it('drops a view only after modal confirmation and records the reversible definition', async () => {
         const before = createViewDefinition({
             triggers: [
@@ -2322,5 +2496,298 @@ describe('view operations', () => {
             recordExternalModification.mock.calls[0].arguments[0].viewDefBefore,
             latest
         );
+    });
+
+    it('rejects every writable view transition that would break a valid dependent view', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE dependency_source_rows (id INTEGER, label TEXT); ' +
+                'INSERT INTO dependency_source_rows VALUES (1, \'kept\'); ' +
+                'CREATE VIEW dependency_source AS ' +
+                'SELECT id, label FROM dependency_source_rows; ' +
+                'CREATE VIEW dependency_consumer AS SELECT id FROM dependency_source'
+            );
+
+            const assertOriginalSchema = async () => {
+                assert.strictEqual(
+                    (await engine.getViewDefinition('dependency_source')).selectSql,
+                    'SELECT id, label FROM dependency_source_rows'
+                );
+                assert.strictEqual(
+                    await readScalar(engine, 'SELECT id FROM dependency_consumer'),
+                    1
+                );
+            };
+
+            await assert.rejects(
+                engine.validateViewDefinition(
+                    'dependency_source',
+                    'SELECT label FROM dependency_source_rows'
+                ),
+                /would break existing view.*dependency_consumer/is
+            );
+            await assertOriginalSchema();
+
+            await assert.rejects(
+                engine.previewViewDefinition(
+                    'dependency_source',
+                    'SELECT label FROM dependency_source_rows',
+                    10
+                ),
+                /would break existing view.*dependency_consumer/is
+            );
+            await assertOriginalSchema();
+
+            await assert.rejects(
+                engine.editView(
+                    'dependency_source',
+                    'SELECT label FROM dependency_source_rows'
+                ),
+                /would break existing view.*dependency_consumer/is
+            );
+            await assertOriginalSchema();
+
+            await assert.rejects(
+                engine.dropView('dependency_source'),
+                /would break existing view.*dependency_consumer/is
+            );
+            await assertOriginalSchema();
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects creating a main view that would shadow and break a TEMP dependency', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                "ATTACH ':memory:' AS aux; " +
+                'CREATE TABLE aux.created_view_shadow (value TEXT); ' +
+                "INSERT INTO aux.created_view_shadow VALUES ('aux'); " +
+                'CREATE TEMP VIEW created_view_shadow_consumer AS ' +
+                'SELECT value FROM created_view_shadow'
+            );
+
+            await assert.rejects(
+                engine.createView('created_view_shadow', "SELECT 'main' AS other"),
+                /would break existing view.*created_view_shadow_consumer/is
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM temp.created_view_shadow_consumer'),
+                'aux'
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    "SELECT name FROM main.sqlite_schema WHERE type = 'view' " +
+                    "AND name = 'created_view_shadow'"
+                ))[0].rows,
+                []
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects a view transition that would break a valid reverse trigger body', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE reverse_trigger_rows (id INTEGER, label TEXT); ' +
+                'INSERT INTO reverse_trigger_rows VALUES (7, \'kept\'); ' +
+                'CREATE VIEW reverse_insert_source AS ' +
+                'SELECT id, label FROM reverse_trigger_rows; ' +
+                'CREATE VIEW reverse_update_source AS ' +
+                'SELECT id, label FROM reverse_trigger_rows; ' +
+                'CREATE VIEW reverse_delete_source AS ' +
+                'SELECT id, label FROM reverse_trigger_rows; ' +
+                'CREATE TABLE reverse_insert_events (event_id INTEGER); ' +
+                'CREATE TABLE reverse_update_events (event_id INTEGER); ' +
+                'INSERT INTO reverse_update_events VALUES (1); ' +
+                'CREATE TABLE reverse_delete_events (event_id INTEGER); ' +
+                'INSERT INTO reverse_delete_events VALUES (1); ' +
+                'CREATE TABLE reverse_trigger_log (seen_id INTEGER); ' +
+                'CREATE TRIGGER reverse_insert_probe AFTER INSERT ON reverse_insert_events ' +
+                'BEGIN INSERT INTO reverse_trigger_log SELECT id FROM reverse_insert_source; END; ' +
+                'CREATE TRIGGER reverse_update_probe AFTER UPDATE OF event_id ON reverse_update_events ' +
+                'BEGIN INSERT INTO reverse_trigger_log SELECT id FROM reverse_update_source; END; ' +
+                'CREATE TRIGGER reverse_delete_probe AFTER DELETE ON reverse_delete_events ' +
+                'BEGIN INSERT INTO reverse_trigger_log SELECT id FROM reverse_delete_source; END'
+            );
+
+            for (const [source, trigger] of [
+                ['reverse_insert_source', 'reverse_insert_probe'],
+                ['reverse_update_source', 'reverse_update_probe'],
+                ['reverse_delete_source', 'reverse_delete_probe']
+            ] as const) {
+                await assert.rejects(
+                    engine.editView(source, 'SELECT label FROM reverse_trigger_rows'),
+                    new RegExp(`would break existing trigger.*${trigger}`, 'is')
+                );
+            }
+            await assert.rejects(
+                engine.validateViewDefinition(
+                    'reverse_insert_source',
+                    'SELECT label FROM reverse_trigger_rows'
+                ),
+                /would break existing trigger.*reverse_insert_probe/is
+            );
+            await assert.rejects(
+                engine.previewViewDefinition(
+                    'reverse_insert_source',
+                    'SELECT label FROM reverse_trigger_rows',
+                    10
+                ),
+                /would break existing trigger.*reverse_insert_probe/is
+            );
+            await assert.rejects(
+                engine.dropView('reverse_insert_source'),
+                /would break existing trigger.*reverse_insert_probe/is
+            );
+
+            await engine.executeQuery(
+                'INSERT INTO reverse_insert_events VALUES (1); ' +
+                'UPDATE reverse_update_events SET event_id = 2; ' +
+                'DELETE FROM reverse_delete_events'
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT count(*) FROM reverse_trigger_log WHERE seen_id = 7'),
+                3
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('guards both undo and redo view history against newer reverse dependencies', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE history_dependency_rows (id INTEGER, label TEXT); ' +
+                'INSERT INTO history_dependency_rows VALUES (1, \'kept\')'
+            );
+
+            const undoBefore = await engine.createView(
+                'history_undo_source',
+                'SELECT id FROM history_dependency_rows'
+            );
+            const undoEdit = await engine.editView(
+                'history_undo_source',
+                'SELECT id, label FROM history_dependency_rows'
+            );
+            const undoModification = {
+                description: 'Edit history_undo_source',
+                modificationType: 'view_edit' as const,
+                targetTable: 'history_undo_source',
+                viewDefBefore: undoBefore,
+                viewDefAfter: undoEdit.after
+            };
+            await engine.executeQuery(
+                'CREATE VIEW history_undo_consumer AS SELECT label FROM history_undo_source'
+            );
+            await assert.rejects(
+                engine.undoModification(undoModification),
+                /would break existing view.*history_undo_consumer/is
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT label FROM history_undo_consumer'),
+                'kept'
+            );
+
+            const redoBefore = await engine.createView(
+                'history_redo_source',
+                'SELECT id, label FROM history_dependency_rows'
+            );
+            const redoEdit = await engine.editView(
+                'history_redo_source',
+                'SELECT id FROM history_dependency_rows'
+            );
+            const redoModification = {
+                description: 'Edit history_redo_source',
+                modificationType: 'view_edit' as const,
+                targetTable: 'history_redo_source',
+                viewDefBefore: redoBefore,
+                viewDefAfter: redoEdit.after
+            };
+            await engine.undoModification(redoModification);
+            await engine.executeQuery(
+                'CREATE VIEW history_redo_consumer AS SELECT label FROM history_redo_source'
+            );
+            await assert.rejects(
+                engine.redoModification(redoModification),
+                /would break existing view.*history_redo_consumer/is
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT label FROM history_redo_consumer'),
+                'kept'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('allows a safe view edit when an unrelated schema object was already broken', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE VIEW already_broken_view AS SELECT missing FROM missing_table; ' +
+                'CREATE TABLE already_broken_trigger_events (id INTEGER); ' +
+                'CREATE TRIGGER already_broken_trigger ' +
+                'AFTER INSERT ON already_broken_trigger_events BEGIN ' +
+                'INSERT INTO missing_trigger_sink VALUES (NEW.id); END; ' +
+                'CREATE TABLE unaffected_source_rows (id INTEGER); ' +
+                'INSERT INTO unaffected_source_rows VALUES (3); ' +
+                'CREATE VIEW unaffected_source AS SELECT id FROM unaffected_source_rows'
+            );
+
+            await engine.validateViewDefinition(
+                'unaffected_source',
+                'SELECT id, id + 1 AS next_id FROM unaffected_source_rows'
+            );
+            const edit = await engine.editView(
+                'unaffected_source',
+                'SELECT id, id + 1 AS next_id FROM unaffected_source_rows'
+            );
+
+            assert.strictEqual(edit.after.selectSql, 'SELECT id, id + 1 AS next_id FROM unaffected_source_rows');
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT next_id FROM unaffected_source'),
+                4
+            );
+            await assert.rejects(
+                engine.executeQuery('SELECT * FROM already_broken_view'),
+                /no such table|no such column/i
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('fails closed before replacing a view when the schema probe bound is exceeded', async () => {
+        const engine = await createEngine();
+        try {
+            const fillerViews = Array.from(
+                { length: MAX_SCHEMA_DEPENDENCY_PROBES },
+                (_, index) => `CREATE VIEW bounded_filler_${index} AS SELECT ${index} AS value`
+            );
+            await engine.executeQuery(
+                'CREATE VIEW bounded_dependency_source AS SELECT 1 AS value; ' +
+                fillerViews.join('; ')
+            );
+
+            await assert.rejects(
+                engine.validateViewDefinition(
+                    'bounded_dependency_source',
+                    'SELECT 2 AS value'
+                ),
+                /fail-closed limit is 1024/i
+            );
+            assert.strictEqual(
+                await readScalar(engine, 'SELECT value FROM bounded_dependency_source'),
+                1
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
     });
 });

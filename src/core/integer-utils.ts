@@ -1,5 +1,5 @@
 import type { CellValue, ExactIntegerTextMap } from './types';
-import { escapeIdentifier } from './sql-utils';
+import { escapeIdentifier, escapeMainIdentifier } from './sql-utils';
 
 const NUMERIC_SOURCE_ALIAS = '__sqlite_explorer_numeric_source';
 const NUMERIC_VALUE_PREFIX = '__sqlite_explorer_numeric_value_';
@@ -16,18 +16,89 @@ export const SQLITE_MAX_VARIABLE_NUMBER = 32766;
 /**
  * Authoritative main-schema capability check required before companion reads.
  * SQLite resolves each special rowid alias independently. These queries use
- * the literal `rowid`, so only a declared column with that name shadows the
- * intrinsic identity; declared `oid` or `_rowid_` columns do not affect it.
+ * the literal `rowid`, so only a declared column with that name can shadow the
+ * intrinsic identity; declared `oid` or `_rowid_` columns do not affect it. A
+ * true `rowid INTEGER PRIMARY KEY` aliases the intrinsic value and remains
+ * authoritative. SQLite's inline `INTEGER PRIMARY KEY DESC` exception has a
+ * PK-origin index and is therefore rejected with every other shadowing column.
  * The `pragma` schema prevents same-named user tables from shadowing the
  * metadata virtual tables themselves.
  * Binds the table name twice.
  */
 export const ROWID_TABLE_AUTHORITY_SQL =
-  `SELECT 1 FROM pragma.pragma_table_list ` +
+  `SELECT 1 FROM pragma.pragma_table_list AS target ` +
   `WHERE "schema" = 'main' AND "name" = ? AND (` +
   `("type" = 'table' AND "wr" = 0) OR "type" IN ('virtual', 'shadow')) ` +
-  `AND NOT EXISTS (SELECT 1 FROM pragma.pragma_table_info(?, 'main') ` +
-  `WHERE lower("name") = 'rowid') LIMIT 1`;
+  `AND (NOT EXISTS (SELECT 1 FROM pragma.pragma_table_info(?, 'main') ` +
+  `WHERE lower("name") = 'rowid') OR (` +
+  `"type" = 'table' AND ` +
+  `(SELECT count(*) FROM pragma.pragma_table_info(target."name", 'main') ` +
+  `WHERE "pk" > 0) = 1 AND ` +
+  `EXISTS (SELECT 1 FROM pragma.pragma_table_info(target."name", 'main') ` +
+  `WHERE lower("name") = 'rowid' AND lower(trim("type")) = 'integer' AND "pk" = 1) AND ` +
+  `NOT EXISTS (SELECT 1 FROM pragma.pragma_index_list(target."name", 'main') ` +
+  `WHERE "origin" = 'pk'))) LIMIT 1`;
+
+/**
+ * Resolve SQLite's exact INTEGER PRIMARY KEY alias for one ordinary table.
+ *
+ * `PRAGMA table_xinfo` alone cannot distinguish the historical inline
+ * `INTEGER PRIMARY KEY DESC` exception from a real rowid alias. SQLite creates
+ * a PK-origin index only for that exception, so the absence of such an index
+ * is the authoritative discriminator. Table-level `PRIMARY KEY(id DESC)` does
+ * remain a rowid alias and correctly has no PK-origin index.
+ *
+ * Binds the main-schema table name once.
+ */
+export const ROWID_ALIAS_COLUMN_SQL =
+  `SELECT info."name" FROM pragma.pragma_table_list AS target ` +
+  `JOIN pragma.pragma_table_info(target."name", 'main') AS info ` +
+  `WHERE target."schema" = 'main' AND target."name" = ? ` +
+  `AND target."type" = 'table' AND target."wr" = 0 ` +
+  `AND info."pk" = 1 AND lower(trim(info."type")) = 'integer' ` +
+  `AND (SELECT count(*) FROM pragma.pragma_table_info(target."name", 'main') ` +
+  `WHERE "pk" > 0) = 1 ` +
+  `AND NOT EXISTS (SELECT 1 FROM pragma.pragma_index_list(target."name", 'main') ` +
+  `WHERE "origin" = 'pk') LIMIT 2`;
+
+/**
+ * Extended table metadata and the rowid-alias bit from one SQLite snapshot.
+ * Native files can receive external schema commits between RPCs, so callers
+ * must not combine a separate table_xinfo read with ROWID_ALIAS_COLUMN_SQL.
+ * Binds the main-schema relation name once.
+ */
+export const TABLE_XINFO_WITH_ROWID_ALIAS_SQL =
+  `SELECT info."cid", info."name", info."type", info."notnull", ` +
+  `info."dflt_value", info."pk", info."hidden", ` +
+  `CASE WHEN target."type" = 'table' AND target."wr" = 0 ` +
+  `AND info."pk" = 1 AND lower(trim(info."type")) = 'integer' ` +
+  `AND (SELECT count(*) FROM pragma.pragma_table_info(target."name", 'main') ` +
+  `WHERE "pk" > 0) = 1 ` +
+  `AND NOT EXISTS (SELECT 1 FROM pragma.pragma_index_list(target."name", 'main') ` +
+  `WHERE "origin" = 'pk') THEN 1 ELSE 0 END AS is_rowid_alias ` +
+  `FROM pragma.pragma_table_list AS target ` +
+  `JOIN pragma.pragma_table_xinfo(target."name", 'main') AS info ` +
+  `WHERE target."schema" = 'main' AND target."name" = ? ORDER BY info."cid"`;
+
+/** Validate and extract ROWID_ALIAS_COLUMN_SQL's optional singleton. */
+export function parseRowIdAliasColumn(
+  rows: readonly (readonly unknown[])[],
+  table: string
+): string | undefined {
+  if (rows.length === 0) return undefined;
+  if (rows.length !== 1 || rows[0].length < 1 || typeof rows[0][0] !== 'string') {
+    throw new Error(`SQLite returned invalid rowid-alias metadata for ${table}`);
+  }
+  return rows[0][0];
+}
+
+/** SQLite folds ASCII identifier case but leaves non-ASCII bytes alone. */
+export function sqliteIdentifiersEqual(left: string, right: string): boolean {
+  const foldAscii = (value: string) => value.replace(/[A-Z]/g, character => (
+    String.fromCharCode(character.charCodeAt(0) + 0x20)
+  ));
+  return foldAscii(left) === foldAscii(right);
+}
 
 export interface ExactNumericTextQuery {
   sql: string;
@@ -176,7 +247,7 @@ export function buildRowIdExactRealTextQueries(
       queries.push({
         sql:
           `SELECT rowid AS ${escapeIdentifier(ROWID_COMPANION_ID)}, ` +
-          `${textExpressions.join(', ')} FROM ${escapeIdentifier(table)} ` +
+          `${textExpressions.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
           `WHERE rowid IN (${rowIdChunk.map(() => '?').join(', ')})`,
         params,
         transportColumns: [ROWID_COMPANION_ID, ...textColumns],

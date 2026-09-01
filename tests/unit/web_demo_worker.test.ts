@@ -14,11 +14,18 @@ import {
     DEFAULT_MAX_CELL_EDIT_BYTES,
     fromCellEditRpcErrorData
 } from '../../src/core/cell-edit-policy';
-import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
+import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
+import { MAX_TABLE_PAGE_ROWS } from '../../src/core/query-builder';
+import {
+    encodePrimaryKeyRecordId,
+    isReadOnlyPrimaryKeyRecordId
+} from '../../src/core/row-identity';
 import type { PrimaryKeyColumn, RecordId } from '../../src/core/types';
 
 interface WorkerHarness {
     invoke(method: string, ...payload: unknown[]): Promise<any>;
+    invokeWithPayload(method: string, payload: unknown): Promise<any>;
+    dispatchRaw(data: unknown): Promise<void>;
 }
 
 const authoredWorkerPath = path.resolve(
@@ -93,6 +100,8 @@ async function createWorkerHarness(options: {
     onImportScripts?: (url: string) => void;
     onSql?: (kind: 'exec' | 'prepare', sql: string) => void;
     onSqlResult?: (kind: 'exec' | 'prepare', sql: string, result: unknown) => void;
+    onWarn?: (...args: unknown[]) => void;
+    onError?: (...args: unknown[]) => void;
     coerceBigIntsToNumbers?: boolean;
 } = {}): Promise<WorkerHarness> {
     const source = await readCurrentWorkerBundle();
@@ -134,7 +143,11 @@ async function createWorkerHarness(options: {
     const context = vm.createContext({
         self: workerGlobal,
         importScripts(url: string) { options.onImportScripts?.(url); },
-        console: { log() {}, warn() {}, error() {} },
+        console: {
+            log() {},
+            warn: options.onWarn ?? (() => {}),
+            error: options.onError ?? (() => {})
+        },
         Uint8Array,
         Int32Array,
         ArrayBuffer,
@@ -152,7 +165,7 @@ async function createWorkerHarness(options: {
         .runInContext(context);
 
     let messageId = 0;
-    const invoke = async (method: string, ...payload: unknown[]) => {
+    const invokeWithPayload = async (method: string, payload: unknown) => {
         const id = `test_${++messageId}`;
         await workerGlobal.onmessage({
             data: {
@@ -174,6 +187,7 @@ async function createWorkerHarness(options: {
         }
         return response.content.data;
     };
+    const invoke = (method: string, ...payload: unknown[]) => invokeWithPayload(method, payload);
 
     const initConfig: Record<string, unknown> = {
         content: options.content ?? null,
@@ -188,7 +202,11 @@ async function createWorkerHarness(options: {
         ));
     }
     await invoke('initializeDatabase', 'test.db', initConfig);
-    return { invoke };
+    return {
+        invoke,
+        invokeWithPayload,
+        dispatchRaw: async data => workerGlobal.onmessage({ data })
+    };
 }
 
 async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown> {
@@ -197,6 +215,94 @@ async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown
 }
 
 describe('web demo view worker', () => {
+    it('bounds database-controlled errors before response and diagnostic delivery', async () => {
+        const diagnostics: unknown[][] = [];
+        const worker = await createWorkerHarness({
+            onError: (...args) => diagnostics.push(args)
+        });
+        const attackerText = 'x'.repeat(20_000);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE error_target (id INTEGER); ' +
+            'CREATE TRIGGER huge_error BEFORE INSERT ON error_target BEGIN ' +
+            `SELECT RAISE(ABORT, '${attackerText}'); END;`
+        );
+
+        await assert.rejects(worker.invoke('runQuery', 'INSERT INTO error_target VALUES (1)'), error => {
+            assert.ok(error instanceof Error);
+            assert.ok(error.message.length < 8400);
+            assert.match(error.message, /truncated from .* characters/i);
+            return true;
+        });
+        assert.strictEqual(diagnostics.length, 1, 'one failed RPC should produce one bounded diagnostic');
+        assert.ok(JSON.stringify(diagnostics).length < 8500);
+    });
+
+    it('does not retain or print hostile invalid-message payloads', async () => {
+        const warnings: unknown[][] = [];
+        const worker = await createWorkerHarness({
+            onWarn: (...args) => warnings.push(args)
+        });
+        const hostileEnvelope = {
+            secret: 'private-cell-value',
+            payload: new Uint8Array(1024 * 1024)
+        };
+
+        await worker.dispatchRaw(hostileEnvelope);
+
+        assert.strictEqual(warnings.length, 1);
+        assert.ok(!warnings[0].includes(hostileEnvelope));
+        assert.doesNotMatch(JSON.stringify(warnings), /private-cell-value/);
+    });
+
+    it('rejects inherited object properties as worker RPC methods', async () => {
+        const worker = await createWorkerHarness();
+
+        await assert.rejects(worker.invoke('constructor'), /Unknown method: constructor/);
+        await assert.rejects(worker.invoke('toString'), /Unknown method: toString/);
+    });
+
+    it('rejects a non-array worker RPC payload before dispatch', async () => {
+        const worker = await createWorkerHarness();
+
+        await assert.rejects(
+            worker.invokeWithPayload('ping', 'attacker-controlled-string'),
+            /payload must be an array/i
+        );
+    });
+
+    it('preserves format-specific output for empty-table exports', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_empty_export (id INTEGER, note TEXT)'
+        );
+        const exportEmpty = (format: string) => worker.invoke(
+            'exportTable',
+            { table: 'demo_empty_export' },
+            ['id', 'note'],
+            {},
+            {},
+            { format }
+        );
+
+        const csv = await exportEmpty('csv');
+        const excel = await exportEmpty('excel');
+        const json = await exportEmpty('json');
+        const sql = await exportEmpty('sql');
+
+        assert.strictEqual(Array.from(csv.contentChunks).join(''), 'id,note');
+        assert.strictEqual(csv.mimeType, 'text/csv');
+        assert.strictEqual(csv.filename, 'demo_empty_export.csv');
+        assert.strictEqual(Array.from(excel.contentChunks).join(''), 'id,note');
+        assert.strictEqual(excel.mimeType, 'text/csv');
+        assert.strictEqual(excel.filename, 'demo_empty_export.csv');
+        assert.strictEqual(Array.from(json.contentChunks).join(''), '[]');
+        assert.strictEqual(json.mimeType, 'application/json');
+        assert.strictEqual(Array.from(sql.contentChunks).join(''), '');
+        assert.strictEqual(sql.mimeType, 'text/sql');
+    });
+
     it('returns bounded exports as chunks while preserving CSV, JSON, and SQL bytes', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -309,6 +415,40 @@ describe('web demo view worker', () => {
                 ['integer', '-9223372036854775808']
             ]
         );
+    });
+
+    it('exports prototype-spelled columns as own enumerable JSON properties', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_proto_export (' +
+            '"__proto__" TEXT, "constructor" TEXT, "prototype" TEXT)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_proto_export VALUES (?, ?, ?)',
+            ['proto-value', 'constructor-value', 'prototype-value']
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_proto_export' },
+            ['__proto__', 'constructor', 'prototype'],
+            {},
+            {},
+            { format: 'json' }
+        );
+        const json = Array.from(exported.contentChunks).join('');
+
+        assert.strictEqual(
+            json,
+            '[\n  {\n    "__proto__": "proto-value",\n' +
+            '    "constructor": "constructor-value",\n' +
+            '    "prototype": "prototype-value"\n  }\n]'
+        );
+        const [row] = JSON.parse(json);
+        assert.strictEqual(Object.prototype.propertyIsEnumerable.call(row, '__proto__'), true);
+        assert.deepStrictEqual(Object.keys(row), ['__proto__', 'constructor', 'prototype']);
     });
 
     it('neutralizes formula-bearing TEXT values and headers in bundled CSV exports', async () => {
@@ -564,7 +704,7 @@ describe('web demo view worker', () => {
             onSqlResult: (kind, sql, result) => {
                 if (
                     kind === 'exec'
-                    && sql.includes('FROM "demo_format_blob_placeholder"')
+                    && sql.includes('FROM main."demo_format_blob_placeholder"')
                     && !/COUNT\s*\(\s*\*\s*\)/i.test(sql)
                 ) {
                     projectionResults.push(result);
@@ -702,6 +842,422 @@ describe('web demo view worker', () => {
         assert.deepStrictEqual(remaining[0].rows, [[0]]);
     });
 
+    it('chunks a demo rowid batch update above the SQLite bind limit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_bulk_rowid_update (value INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 32768' +
+            ') INSERT INTO demo_bulk_rowid_update SELECT 0 FROM ids'
+        );
+        const updates = Array.from({ length: 32_768 }, (_, index) => ({
+            rowId: index + 1,
+            column: 'value',
+            value: 1,
+            originalValue: 0
+        }));
+
+        const outcomes = await worker.invoke(
+            'updateCellBatch',
+            'demo_bulk_rowid_update',
+            updates
+        );
+        assert.strictEqual(outcomes.length, 32_768);
+        const result = await worker.invoke(
+            'runQuery',
+            'SELECT count(*), sum(value) FROM demo_bulk_rowid_update'
+        );
+        assert.deepStrictEqual(result[0].rows, [[32_768, 32_768]]);
+    });
+
+    it('refuses an unreturnable demo delete snapshot before mutating the row', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_oversized_delete_snapshot (payload BLOB); ' +
+            `INSERT INTO demo_oversized_delete_snapshot VALUES (` +
+            `zeroblob(${MAX_WEBVIEW_BINARY_VALUE_BYTES + 1}))`
+        );
+
+        await assert.rejects(
+            worker.invoke('deleteRows', 'demo_oversized_delete_snapshot', [1]),
+            /delete snapshot.*web transport|web transport.*delete snapshot/i
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT count(*) FROM demo_oversized_delete_snapshot'
+            ),
+            1
+        );
+    });
+
+    it('keeps demo table reads, full-cell reads, and exports on main through a TEMP shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_main_read_shadow (value TEXT); ' +
+            "INSERT INTO main.demo_main_read_shadow VALUES ('main-cell'); " +
+            'CREATE TEMP TABLE demo_main_read_shadow (value TEXT); ' +
+            "INSERT INTO temp.demo_main_read_shadow VALUES ('temporary-cell'), ('temporary-extra')"
+        );
+
+        // Arbitrary SQL keeps SQLite's normal TEMP-first name resolution.
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_main_read_shadow LIMIT 1'),
+            'temporary-cell'
+        );
+
+        const page = await worker.invoke('fetchTableData', 'demo_main_read_shadow', {
+            columns: ['rowid', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(
+            Array.from(page.rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'main-cell']]
+        );
+        const count = await worker.invoke('fetchTableCount', 'demo_main_read_shadow', {});
+        assert.strictEqual(count.count, 1);
+        assert.strictEqual(count.isExact, true);
+
+        const metadata = await worker.invoke('getCellMetadata', {
+            table: 'demo_main_read_shadow',
+            rowId: 1,
+            column: 'value'
+        });
+        assert.strictEqual(metadata.byteLength, new TextEncoder().encode('main-cell').byteLength);
+        const session = await worker.invoke('openCellReadSession', {
+            table: 'demo_main_read_shadow',
+            rowId: 1,
+            column: 'value'
+        });
+        const chunk = await worker.invoke('readCellChunk', session.sessionId, 0, 64);
+        assert.strictEqual(new TextDecoder().decode(chunk.bytes), 'main-cell');
+        await worker.invoke('closeCellReadSession', session.sessionId);
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_main_read_shadow' },
+            ['value'],
+            {},
+            {},
+            { format: 'json' }
+        );
+        const exportedJson = Array.from(exported.contentChunks).join('');
+        assert.match(exportedJson, /main-cell/);
+        assert.doesNotMatch(exportedJson, /temporary-/);
+    });
+
+    it('keeps demo table mutations on main through a TEMP shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_main_write_shadow (' +
+            'id INTEGER PRIMARY KEY, value TEXT, payload BLOB); ' +
+            "INSERT INTO main.demo_main_write_shadow VALUES " +
+            "(1, 'main-update', X'01'), " +
+            "(2, 'main-batch', X'02'), " +
+            "(3, 'main-replace', X'010203040506'), " +
+            "(5, 'main-delete', X'05'); " +
+            'CREATE TEMP TABLE demo_main_write_shadow (' +
+            'id INTEGER PRIMARY KEY, value TEXT, payload BLOB); ' +
+            "INSERT INTO temp.demo_main_write_shadow VALUES " +
+            "(1, 'temp-update', X'11'), " +
+            "(2, 'temp-batch', X'12'), " +
+            "(3, 'temp-replace', X'11121314151617'), " +
+            "(5, 'temp-delete', X'15')"
+        );
+
+        await worker.invoke(
+            'updateCell',
+            'demo_main_write_shadow',
+            1,
+            'value',
+            'main-updated'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_main_write_shadow WHERE id = 1'),
+            'main-updated'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_main_write_shadow WHERE id = 1'),
+            'temp-update'
+        );
+
+        await worker.invoke('updateCellBatch', 'demo_main_write_shadow', [{
+            rowId: 2,
+            column: 'value',
+            value: 'main-batched'
+        }]);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_main_write_shadow WHERE id = 2'),
+            'main-batched'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_main_write_shadow WHERE id = 2'),
+            'temp-batch'
+        );
+
+        await worker.invoke(
+            'replaceOversizedCell',
+            'demo_main_write_shadow',
+            3,
+            'payload',
+            Uint8Array.from([9]),
+            { storageClass: 'blob', byteLength: 6 },
+            4
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT hex(payload) FROM main.demo_main_write_shadow WHERE id = 3'),
+            '09'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT hex(payload) FROM temp.demo_main_write_shadow WHERE id = 3'),
+            '11121314151617'
+        );
+
+        assert.strictEqual(
+            await worker.invoke('insertRow', 'demo_main_write_shadow', {
+                id: 4,
+                value: 'main-inserted',
+                payload: Uint8Array.from([4])
+            }),
+            4
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_main_write_shadow WHERE id = 4'),
+            'main-inserted'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM temp.demo_main_write_shadow WHERE id = 4'),
+            0
+        );
+
+        await worker.invoke('deleteRows', 'demo_main_write_shadow', [5]);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM main.demo_main_write_shadow WHERE id = 5'),
+            0
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM temp.demo_main_write_shadow WHERE id = 5'),
+            1
+        );
+
+        await worker.invoke('addColumn', 'demo_main_write_shadow', 'main_only', 'TEXT');
+        const mainInfo = await worker.invoke(
+            'runQuery',
+            'PRAGMA main.table_info(demo_main_write_shadow)'
+        );
+        const tempInfo = await worker.invoke(
+            'runQuery',
+            'PRAGMA temp.table_info(demo_main_write_shadow)'
+        );
+        assert.ok(mainInfo[0].rows.some((row: unknown[]) => row[1] === 'main_only'));
+        assert.ok(tempInfo[0].rows.every((row: unknown[]) => row[1] !== 'main_only'));
+    });
+
+    it('preflights main trigger programs through a same-named TEMP table', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_main_probe_shadow (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO main.demo_main_probe_shadow VALUES (1, 'one'), (2, 'two'); " +
+            'CREATE TRIGGER demo_main_probe_update ' +
+            'AFTER UPDATE OF value ON demo_main_probe_shadow BEGIN ' +
+            "UPDATE demo_main_probe_shadow SET value = 'side-update' WHERE id = 2; END; " +
+            'CREATE TRIGGER demo_main_probe_insert ' +
+            'AFTER INSERT ON demo_main_probe_shadow BEGIN ' +
+            "INSERT INTO demo_main_probe_shadow VALUES (NEW.id + 100, 'side-insert'); END; " +
+            'CREATE TRIGGER demo_main_probe_delete ' +
+            'AFTER DELETE ON demo_main_probe_shadow BEGIN ' +
+            'DELETE FROM demo_main_probe_shadow WHERE id = 2; END; ' +
+            'CREATE TEMP TABLE demo_main_probe_shadow (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO temp.demo_main_probe_shadow VALUES (1, 'temp-one'), (2, 'temp-two')"
+        );
+
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_main_probe_shadow', 1, 'value', 'changed'),
+            /UPDATE trigger.*target table.*rolled back/i
+        );
+        await assert.rejects(
+            worker.invoke('insertRow', 'demo_main_probe_shadow', { id: 3, value: 'three' }),
+            /INSERT trigger.*undo history/i
+        );
+        await assert.rejects(
+            worker.invoke('deleteRows', 'demo_main_probe_shadow', [1]),
+            /DELETE trigger.*undo history/i
+        );
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT id, value FROM main.demo_main_probe_shadow ORDER BY id'
+            ))[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'one'], [2, 'two']]
+        );
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT id, value FROM temp.demo_main_probe_shadow ORDER BY id'
+            ))[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'temp-one'], [2, 'temp-two']]
+        );
+    });
+
+    it('reads demo JSON undo state from main through a TEMP shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_main_history_shadow (document TEXT); ' +
+            `INSERT INTO main.demo_main_history_shadow VALUES (` +
+            `'${JSON.stringify({ a: 1, untouched: 'main' })}'); ` +
+            'CREATE TEMP TABLE demo_main_history_shadow (document TEXT); ' +
+            `INSERT INTO temp.demo_main_history_shadow VALUES (` +
+            `'${JSON.stringify({ a: 2, untouched: 'temp' })}')`
+        );
+
+        const affectedCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_main_history_shadow',
+            [{
+                rowId: 1,
+                column: 'document',
+                value: JSON.stringify({ a: 2 }),
+                operation: 'json_patch'
+            }]
+        );
+        await worker.invoke('undoModification', {
+            modificationType: 'cell_update',
+            targetTable: 'demo_main_history_shadow',
+            affectedCells
+        });
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT document FROM main.demo_main_history_shadow WHERE rowid = 1'
+            ),
+            JSON.stringify({ a: 1, untouched: 'main' })
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT document FROM temp.demo_main_history_shadow WHERE rowid = 1'
+            ),
+            JSON.stringify({ a: 2, untouched: 'temp' })
+        );
+    });
+
+    it('rejects demo cell-history replay after the edited cell changes externally', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_cell_history_conflict (value TEXT); " +
+            "INSERT INTO demo_cell_history_conflict VALUES ('before')"
+        );
+        const affectedCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_cell_history_conflict',
+            [{ rowId: 1, column: 'value', value: 'after' }]
+        );
+        await worker.invoke(
+            'runQuery',
+            "UPDATE demo_cell_history_conflict SET value = 'external' WHERE rowid = 1"
+        );
+
+        await assert.rejects(
+            worker.invoke('undoModification', {
+                modificationType: 'cell_update',
+                targetTable: 'demo_cell_history_conflict',
+                affectedCells
+            }),
+            /changed outside SQLite Explorer history.*not applied/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_cell_history_conflict'),
+            'external'
+        );
+    });
+
+    it('rejects demo JSON undo when an externally changed path overlaps the patch', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            `CREATE TABLE demo_json_history_conflict (document TEXT); ` +
+            `INSERT INTO demo_json_history_conflict VALUES (` +
+            `'${JSON.stringify({ changed: 1, untouched: 'before' })}')`
+        );
+        const affectedCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_json_history_conflict',
+            [{
+                rowId: 1,
+                column: 'document',
+                value: JSON.stringify({ changed: 2 }),
+                operation: 'json_patch'
+            }]
+        );
+        const external = JSON.stringify({ changed: 3, untouched: 'external' });
+        await worker.invoke(
+            'runQuery',
+            'UPDATE demo_json_history_conflict SET document = ?',
+            [external]
+        );
+
+        await assert.rejects(
+            worker.invoke('undoModification', {
+                modificationType: 'cell_update',
+                targetTable: 'demo_json_history_conflict',
+                affectedCells
+            }),
+            /changed outside SQLite Explorer history.*not applied/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT document FROM demo_json_history_conflict'),
+            external
+        );
+    });
+
+    it('rejects duplicate canonical demo batch targets before writing', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_duplicate_rowid_batch (value TEXT); ' +
+            "INSERT INTO demo_duplicate_rowid_batch VALUES ('rowid-before'); " +
+            'CREATE TABLE demo_duplicate_pk_batch (' +
+            'id TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO demo_duplicate_pk_batch VALUES ('a', 'pk-before')"
+        );
+
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 'demo_duplicate_rowid_batch', [
+                { rowId: 1, column: 'value', value: 'first' },
+                { rowId: '+1', column: 'VALUE', value: 'second' }
+            ]),
+            /duplicate.*row identity.*column/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_duplicate_rowid_batch'),
+            'rowid-before'
+        );
+
+        const primaryKey = encodePrimaryKeyRecordId(
+            [{ identifier: 'id', declaredType: 'TEXT', position: 1 }],
+            ['a']
+        );
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 'demo_duplicate_pk_batch', [
+                { rowId: primaryKey, column: 'value', value: 'first' },
+                { rowId: primaryKey, column: 'VALUE', value: 'second' }
+            ]),
+            /duplicate.*row identity.*column/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_duplicate_pk_batch'),
+            'pk-before'
+        );
+    });
+
     it('preserves an untouched unsafe typeless key member across guarded replacement and PK edits', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -813,12 +1369,18 @@ describe('web demo view worker', () => {
             priorValue: legacyValue,
             newValue: 'bounded'
         };
-        await worker.invoke('undoModification', legacyModification);
-        assert.strictEqual(
-            await workerScalar(worker, 'SELECT length(payload) FROM demo_stage_d'),
-            legacyValue.byteLength
+        await assert.rejects(
+            worker.invoke('undoModification', legacyModification),
+            /predates guarded cell history/i
         );
-        await worker.invoke('redoModification', legacyModification);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT payload FROM demo_stage_d'),
+            'bounded'
+        );
+        await assert.rejects(
+            worker.invoke('redoModification', legacyModification),
+            /predates guarded cell history/i
+        );
         assert.strictEqual(
             await workerScalar(worker, 'SELECT payload FROM demo_stage_d'),
             'bounded'
@@ -895,6 +1457,737 @@ describe('web demo view worker', () => {
         assert.deepStrictEqual(Array.from(rows[0].rows[0]), [1, 'survives']);
     });
 
+    it('surfaces demo generated columns as read-only metadata', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_generated_metadata (' +
+            'base INTEGER, ' +
+            'virtual_value INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL, ' +
+            'stored_value INTEGER GENERATED ALWAYS AS (base * 3) STORED)'
+        );
+
+        const info = await worker.invoke('getTableInfo', 'demo_generated_metadata');
+        assert.deepStrictEqual(
+            Array.from(info, (column: any) => [column.identifier, column.isGenerated]),
+            [
+                ['base', false],
+                ['virtual_value', true],
+                ['stored_value', true]
+            ]
+        );
+    });
+
+    it('tracks demo INTEGER PRIMARY KEY rowid changes through history', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_remapped_rowid_history (' +
+            'id INTEGER PRIMARY KEY, ' +
+            'doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED, ' +
+            'note TEXT, payload TEXT); ' +
+            "INSERT INTO demo_remapped_rowid_history(id, note, payload) " +
+            "VALUES (3, 'before', '{\"n\":9007199254740993}')"
+        );
+
+        const singleCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_remapped_rowid_history',
+            [{ rowId: 3, column: 'id', value: 34 }]
+        );
+        const remapped = singleCells[0].newRowId;
+        assert.strictEqual(remapped, 34);
+        const singleModification = {
+            modificationType: 'cell_update',
+            targetTable: 'demo_remapped_rowid_history',
+            affectedCells: singleCells
+        };
+        await worker.invoke('undoModification', singleModification);
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT rowid, id, doubled, note, payload FROM demo_remapped_rowid_history'
+            ))[0].rows[0]),
+            [3, 3, 6, 'before', '{"n":9007199254740993}']
+        );
+        await worker.invoke('redoModification', singleModification);
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT rowid, id, doubled, note, payload FROM demo_remapped_rowid_history'
+            ))[0].rows[0]),
+            [34, 34, 68, 'before', '{"n":9007199254740993}']
+        );
+        await worker.invoke('undoModification', singleModification);
+
+        const affectedCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_remapped_rowid_history',
+            [
+                { rowId: 3, column: 'id', value: 44 },
+                { rowId: 3, column: 'note', value: 'after' },
+                {
+                    rowId: 3,
+                    column: 'payload',
+                    value: '{"added":true}',
+                    operation: 'json_patch'
+                }
+            ]
+        );
+        assert.deepStrictEqual(
+            Array.from(affectedCells, (cell: any) => cell.newRowId),
+            [44, 44, 44]
+        );
+        const batchModification = {
+            modificationType: 'cell_update',
+            targetTable: 'demo_remapped_rowid_history',
+            affectedCells
+        };
+        await worker.invoke('undoModification', batchModification);
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT rowid, id, doubled, note, payload FROM demo_remapped_rowid_history'
+            ))[0].rows[0]),
+            [3, 3, 6, 'before', '{"n":9007199254740993}']
+        );
+        await worker.invoke('redoModification', batchModification);
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT rowid, id, doubled, note, payload FROM demo_remapped_rowid_history'
+            ))[0].rows[0]),
+            [44, 44, 88, 'after', '{"n":9007199254740993,"added":true}']
+        );
+    });
+
+    it('canonicalizes a demo exact int64 alias edit from rowid zero', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_coerced_rowid_alias (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO demo_coerced_rowid_alias(id, value) VALUES (0, 'kept')"
+        );
+        const newRowId = await worker.invoke(
+            'updateCell',
+            'demo_coerced_rowid_alias',
+            0,
+            'id',
+            '09223372036854775807'
+        );
+        assert.strictEqual(newRowId, '9223372036854775807');
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT CAST(rowid AS TEXT), CAST(id AS TEXT), value ' +
+                'FROM demo_coerced_rowid_alias'
+            ))[0].rows[0]),
+            ['9223372036854775807', '9223372036854775807', 'kept']
+        );
+    });
+
+    it('rolls back a demo alias edit with a substituting trigger', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_triggered_rowid_alias (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO demo_triggered_rowid_alias VALUES (5, 'target'), (8, 'decoy'); " +
+            'CREATE TRIGGER demo_substitute_rowid_alias ' +
+            'AFTER UPDATE OF id ON demo_triggered_rowid_alias BEGIN ' +
+            'UPDATE demo_triggered_rowid_alias SET id = 107 WHERE rowid = NEW.rowid; ' +
+            'UPDATE demo_triggered_rowid_alias SET id = NEW.id WHERE rowid = 8; ' +
+            'END'
+        );
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_triggered_rowid_alias', 5, 'id', '0007'),
+            /rowid identity.*UPDATE trigger|UPDATE trigger.*rowid identity/i
+        );
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT rowid, id, value FROM demo_triggered_rowid_alias ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 5, 'target'], [8, 8, 'decoy']]
+        );
+    });
+
+    it('rolls back a demo non-alias edit when a trigger substitutes a decoy rowid', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_triggered_non_alias ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            "INSERT INTO demo_triggered_non_alias VALUES (5, 'target'), (8, 'decoy'); " +
+            'CREATE TRIGGER demo_substitute_non_alias ' +
+            'AFTER UPDATE OF note ON demo_triggered_non_alias BEGIN ' +
+            'UPDATE demo_triggered_non_alias SET id = 105 WHERE rowid = NEW.rowid; ' +
+            'UPDATE demo_triggered_non_alias SET id = NEW.id WHERE rowid = 8; ' +
+            'END'
+        );
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_triggered_non_alias', 5, 'note', 'changed'),
+            /UPDATE trigger.*target table.*rowid identity/i
+        );
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT rowid, id, note FROM demo_triggered_non_alias ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 5, 'target'], [8, 8, 'decoy']]
+        );
+    });
+
+    it('guards demo batch and oversized edits against rowid substitution', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_triggered_batch_substitution ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            "INSERT INTO demo_triggered_batch_substitution VALUES " +
+            "(5, 'target'), (8, 'decoy'); " +
+            'CREATE TRIGGER demo_substitute_batch_rowid ' +
+            'AFTER UPDATE OF note ON demo_triggered_batch_substitution BEGIN ' +
+            'UPDATE demo_triggered_batch_substitution SET id = 105 ' +
+            'WHERE rowid = NEW.rowid; ' +
+            'UPDATE demo_triggered_batch_substitution SET id = NEW.id WHERE rowid = 8; ' +
+            'END'
+        );
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 'demo_triggered_batch_substitution', [
+                { rowId: 5, column: 'note', value: 'changed' }
+            ]),
+            /UPDATE trigger.*target table.*rowid identity/i
+        );
+        let rows = await worker.invoke(
+            'runQuery',
+            'SELECT rowid, id, note FROM demo_triggered_batch_substitution ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 5, 'target'], [8, 8, 'decoy']]
+        );
+
+        const original = 'x'.repeat(32);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_triggered_replacement_substitution ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            `INSERT INTO demo_triggered_replacement_substitution VALUES ` +
+            `(5, '${original}'), (8, 'decoy'); ` +
+            'CREATE TRIGGER demo_substitute_replacement_rowid ' +
+            'AFTER UPDATE OF note ON demo_triggered_replacement_substitution BEGIN ' +
+            'UPDATE demo_triggered_replacement_substitution SET id = 105 ' +
+            'WHERE rowid = NEW.rowid; ' +
+            'UPDATE demo_triggered_replacement_substitution SET id = NEW.id ' +
+            'WHERE rowid = 8; END'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'replaceOversizedCell',
+                'demo_triggered_replacement_substitution',
+                5,
+                'note',
+                'new',
+                { storageClass: 'text', byteLength: 32 },
+                8
+            ),
+            /UPDATE trigger.*target table.*rowid identity/i
+        );
+        rows = await worker.invoke(
+            'runQuery',
+            'SELECT rowid, id, note ' +
+            'FROM demo_triggered_replacement_substitution ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 5, original], [8, 8, 'decoy']]
+        );
+    });
+
+    it('rejects a demo non-alias edit whose trigger side effect cannot be undone', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_harmless_audit_target ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            'CREATE TABLE demo_harmless_audit_events (target_id INTEGER, note TEXT); ' +
+            "INSERT INTO demo_harmless_audit_target VALUES (5, 'before'); " +
+            'CREATE TRIGGER demo_record_harmless_audit ' +
+            'AFTER UPDATE OF note ON demo_harmless_audit_target BEGIN ' +
+            'INSERT INTO demo_harmless_audit_events VALUES (NEW.id, NEW.note); ' +
+            'END'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_harmless_audit_target',
+                5,
+                'note',
+                'after'
+            ),
+            /UPDATE trigger.*undo history/i
+        );
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT id, note, (SELECT count(*) FROM demo_harmless_audit_events) ' +
+            'FROM demo_harmless_audit_target'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 'before', 0]]
+        );
+    });
+
+    it('rejects a demo rowid-alias edit whose trigger side effect cannot be undone', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_alias_audit_target ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            'CREATE TABLE demo_alias_audit_events (target_id INTEGER); ' +
+            "INSERT INTO demo_alias_audit_target VALUES (5, 'kept'); " +
+            'CREATE TRIGGER demo_record_alias_audit ' +
+            'AFTER UPDATE OF id ON demo_alias_audit_target BEGIN ' +
+            'INSERT INTO demo_alias_audit_events VALUES (NEW.id); END'
+        );
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_alias_audit_target', 5, 'id', 6),
+            /UPDATE trigger.*undo history/i
+        );
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT id, note, (SELECT count(*) FROM demo_alias_audit_events) ' +
+            'FROM demo_alias_audit_target'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 'kept', 0]]
+        );
+    });
+
+    it('rejects demo INSERT/DELETE side effects that cannot be represented in history', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'PRAGMA foreign_keys = ON; ' +
+            'CREATE TABLE demo_insert_target (id INTEGER PRIMARY KEY); ' +
+            'CREATE TABLE demo_insert_audit (id INTEGER); ' +
+            'CREATE TRIGGER demo_insert_trigger AFTER INSERT ON demo_insert_target ' +
+            'BEGIN INSERT INTO demo_insert_audit VALUES (NEW.id); END; ' +
+            'CREATE TABLE demo_delete_target (id INTEGER PRIMARY KEY); ' +
+            'INSERT INTO demo_delete_target VALUES (1); ' +
+            'CREATE TRIGGER demo_delete_trigger BEFORE DELETE ON demo_delete_target ' +
+            'BEGIN SELECT RAISE(IGNORE); END; ' +
+            'CREATE TABLE demo_cascade_parent (id INTEGER PRIMARY KEY); ' +
+            'CREATE TABLE demo_cascade_child (' +
+            'parent_id INTEGER REFERENCES demo_cascade_parent(id) ON DELETE CASCADE); ' +
+            'INSERT INTO demo_cascade_parent VALUES (1); ' +
+            'INSERT INTO demo_cascade_child VALUES (1)'
+        );
+
+        await assert.rejects(
+            worker.invoke('insertRow', 'demo_insert_target', { id: 1 }),
+            /INSERT trigger.*undo history/i
+        );
+        await assert.rejects(
+            worker.invoke('deleteRows', 'demo_delete_target', [1]),
+            /DELETE trigger.*undo history/i
+        );
+        await assert.rejects(
+            worker.invoke('deleteRows', 'demo_cascade_parent', [1]),
+            /foreign-key.*DELETE.*undo history/i
+        );
+
+        const result = await worker.invoke(
+            'runQuery',
+            'SELECT ' +
+            '(SELECT count(*) FROM demo_insert_target), ' +
+            '(SELECT count(*) FROM demo_insert_audit), ' +
+            '(SELECT count(*) FROM demo_delete_target), ' +
+            '(SELECT count(*) FROM demo_cascade_parent), ' +
+            '(SELECT count(*) FROM demo_cascade_child)'
+        );
+        assert.deepStrictEqual(
+            Array.from(result[0].rows, (row: unknown[]) => Array.from(row)),
+            [[0, 0, 1, 1, 1]]
+        );
+    });
+
+    it('marks only demo SQLite rowid aliases in table metadata', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_metadata_rowid_alias (id INTEGER PRIMARY KEY, value TEXT); ' +
+            'CREATE TABLE demo_metadata_desc_pk (id INTEGER PRIMARY KEY DESC, value TEXT); ' +
+            'CREATE TABLE demo_metadata_table_desc ' +
+            '(id INTEGER, value TEXT, PRIMARY KEY(id DESC)); ' +
+            'CREATE TABLE demo_metadata_named_rowid ' +
+            '("rowid" INTEGER PRIMARY KEY, value TEXT); ' +
+            'CREATE TABLE demo_metadata_named_rowid_desc ' +
+            '("rowid" INTEGER PRIMARY KEY DESC, value TEXT)'
+        );
+        const alias = await worker.invoke('getTableInfo', 'demo_metadata_rowid_alias');
+        const descending = await worker.invoke('getTableInfo', 'demo_metadata_desc_pk');
+        const tableDescending = await worker.invoke(
+            'getTableInfo',
+            'demo_metadata_table_desc'
+        );
+        const namedRowid = await worker.invoke('getTableInfo', 'demo_metadata_named_rowid');
+        const namedRowidDescending = await worker.invoke(
+            'getTableInfo',
+            'demo_metadata_named_rowid_desc'
+        );
+        assert.strictEqual(
+            alias.find((column: any) => column.identifier === 'id')?.isRowidAlias,
+            true
+        );
+        assert.strictEqual(
+            descending.find((column: any) => column.identifier === 'id')?.isRowidAlias,
+            false
+        );
+        assert.strictEqual(
+            tableDescending.find((column: any) => column.identifier === 'id')?.isRowidAlias,
+            true
+        );
+        assert.strictEqual(
+            namedRowid.find((column: any) => column.identifier === 'rowid')?.isRowidAlias,
+            true
+        );
+        assert.strictEqual(
+            namedRowidDescending.find(
+                (column: any) => column.identifier === 'rowid'
+            )?.isRowidAlias,
+            false
+        );
+    });
+
+    it('preserves legal schema identifiers and rejects NUL names in the authored demo', async () => {
+        const worker = await createWorkerHarness();
+        const table = ' ui "table" 🚀 ';
+        const firstColumn = ' id "column" 🧩 ';
+        const addedColumn = ' added "column" ✨ ';
+        const view = ' ui "view" 🚀 ';
+
+        await worker.invoke('createTable', table, [{
+            name: firstColumn,
+            type: 'TEXT',
+            pk: false,
+            notnull: false
+        }]);
+        await worker.invoke('addColumn', table, addedColumn, 'TEXT');
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO " ui ""table"" 🚀 " ' +
+            '(" id ""column"" 🧩 ", " added ""column"" ✨ ") VALUES (?, ?)',
+            ['first', 'second']
+        );
+        const columns = await worker.invoke('getTableInfo', table);
+        assert.deepStrictEqual(
+            Array.from(columns, (column: any) => column.identifier),
+            [firstColumn, addedColumn]
+        );
+
+        await worker.invoke('validateViewDefinition', view, 'SELECT 7 AS value', 'create');
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            view,
+            'SELECT 7 AS value',
+            10,
+            'create'
+        );
+        assert.deepStrictEqual(Array.from(preview.rows[0]), [7]);
+        const definition = await worker.invoke('createView', view, 'SELECT 7 AS value');
+        assert.strictEqual(definition.identifier, view);
+
+        await assert.rejects(
+            worker.invoke('createTable', 'bad\0table', [{
+                name: 'value', type: 'TEXT', pk: false, notnull: false
+            }]),
+            /Table name cannot contain NUL/
+        );
+        await assert.rejects(
+            worker.invoke('addColumn', table, 'bad\0column', 'TEXT'),
+            /Column name cannot contain NUL/
+        );
+        await assert.rejects(
+            worker.invoke('validateViewDefinition', 'bad\0view', 'SELECT 1', 'create'),
+            /View name cannot contain NUL/
+        );
+        await assert.rejects(
+            worker.invoke('previewViewDefinition', '', 'SELECT 1', 10, 'create'),
+            /View name is required/
+        );
+        await assert.rejects(
+            worker.invoke('createView', 'bad\0view', 'SELECT 1'),
+            /View name cannot contain NUL/
+        );
+    });
+
+    it('honors the Create Table UI column flags in the authored demo', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createTable', 'demo_ui_create_shape', [
+            {
+                name: 'id',
+                type: 'INTEGER',
+                primaryKey: true,
+                notNull: false
+            },
+            {
+                name: 'required_value',
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: true
+            }
+        ]);
+
+        const columns = await worker.invoke('getTableInfo', 'demo_ui_create_shape');
+        assert.strictEqual(
+            columns.find((column: any) => column.identifier === 'id')?.primaryKeyPosition,
+            1
+        );
+        assert.strictEqual(
+            columns.find((column: any) => column.identifier === 'required_value')?.isRequired,
+            1
+        );
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO demo_ui_create_shape VALUES (1, 'present')"
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_ui_create_shape VALUES (1, 'duplicate')"
+            ),
+            /UNIQUE constraint failed/
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                'INSERT INTO demo_ui_create_shape (id) VALUES (2)'
+            ),
+            /NOT NULL constraint failed/
+        );
+    });
+
+    it('creates composite keys and defaults with the shared main-schema DDL contract', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TABLE demo_composite_create (shadow TEXT)'
+        );
+
+        await worker.invoke('createTable', 'demo_composite_create', [
+            {
+                name: 'tenant',
+                type: 'TEXT',
+                primaryKey: true,
+                notNull: true
+            },
+            {
+                name: 'sequence',
+                type: 'INTEGER',
+                primaryKey: true,
+                notNull: true
+            },
+            {
+                name: 'note',
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: false,
+                defaultValue: "O'Reilly"
+            },
+            {
+                name: 'quantity',
+                type: 'INTEGER',
+                primaryKey: false,
+                notNull: false,
+                defaultValue: '3'
+            }
+        ]);
+
+        const tableSql = String(await workerScalar(
+            worker,
+            "SELECT sql FROM main.sqlite_schema " +
+            "WHERE type = 'table' AND name = 'demo_composite_create'"
+        ));
+        assert.strictEqual((tableSql.match(/PRIMARY KEY/gi) ?? []).length, 1);
+        assert.match(tableSql, /PRIMARY KEY\s*\(\s*"tenant"\s*,\s*"sequence"\s*\)/i);
+        assert.match(tableSql, /"note"\s+TEXT\s+DEFAULT\s+'O''Reilly'/i);
+        assert.match(tableSql, /"quantity"\s+INTEGER\s+DEFAULT\s+3/i);
+
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO main.demo_composite_create (tenant, sequence) VALUES ('acme', 1)"
+        );
+        const row = await worker.invoke(
+            'runQuery',
+            'SELECT tenant, sequence, note, quantity FROM main.demo_composite_create'
+        );
+        assert.deepStrictEqual(Array.from(row[0].rows[0]), ['acme', 1, "O'Reilly", 3]);
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO main.demo_composite_create (tenant, sequence) VALUES ('acme', 1)"
+            ),
+            /UNIQUE constraint failed/i
+        );
+    });
+
+    it('rolls back demo table and view creation that would break TEMP dependencies', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "ATTACH ':memory:' AS aux; " +
+            'CREATE TABLE aux.demo_created_table_shadow (value TEXT); ' +
+            "INSERT INTO aux.demo_created_table_shadow VALUES ('aux-table'); " +
+            'CREATE TEMP VIEW demo_created_table_consumer AS ' +
+            'SELECT value FROM demo_created_table_shadow'
+        );
+
+        await assert.rejects(
+            worker.invoke('createTable', 'demo_created_table_shadow', [{
+                name: 'other',
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: false
+            }]),
+            /would break existing view.*demo_created_table_consumer/is
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_created_table_consumer'),
+            'aux-table'
+        );
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM main.sqlite_schema " +
+            "WHERE type = 'table' AND name = 'demo_created_table_shadow'"
+        ), 0);
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE aux.demo_created_view_shadow (value TEXT); ' +
+            "INSERT INTO aux.demo_created_view_shadow VALUES ('aux-view'); " +
+            'CREATE TEMP VIEW demo_created_view_consumer AS ' +
+            'SELECT value FROM demo_created_view_shadow'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'createView',
+                'demo_created_view_shadow',
+                "SELECT 'main' AS other"
+            ),
+            /would break existing view.*demo_created_view_consumer/is
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_created_view_consumer'),
+            'aux-view'
+        );
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM main.sqlite_schema " +
+            "WHERE type = 'view' AND name = 'demo_created_view_shadow'"
+        ), 0);
+    });
+
+    it('discovers direct, expression, and partial indexes that depend on a demo column', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_index_dependencies (kept TEXT, removed TEXT); ' +
+            'CREATE INDEX demo_idx_direct ON demo_index_dependencies(removed); ' +
+            'CREATE INDEX demo_idx_expression ON demo_index_dependencies(lower(removed)); ' +
+            'CREATE INDEX demo_idx_partial ON demo_index_dependencies(kept) ' +
+            'WHERE removed IS NOT NULL; ' +
+            'CREATE INDEX demo_idx_kept ON demo_index_dependencies(kept)'
+        );
+
+        const dependencies = await worker.invoke(
+            'findDependentIndexes',
+            'demo_index_dependencies',
+            ['removed']
+        );
+
+        assert.deepStrictEqual(
+            Array.from(dependencies, (dependency: any) => dependency.identifier),
+            ['demo_idx_direct', 'demo_idx_expression', 'demo_idx_partial']
+        );
+        assert.ok(dependencies.every((dependency: any) => (
+            typeof dependency.sql === 'string' && dependency.sql.includes(dependency.identifier)
+        )));
+    });
+
+    it('requires a current dependent-index snapshot before deleting a demo column', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_confirmed_index_drop (kept TEXT, removed TEXT); ' +
+            'CREATE INDEX demo_confirmed_removed ON demo_confirmed_index_drop(removed); ' +
+            'CREATE INDEX demo_confirmed_kept ON demo_confirmed_index_drop(kept)'
+        );
+
+        const stale = await worker.invoke(
+            'findDependentIndexes',
+            'demo_confirmed_index_drop',
+            ['removed']
+        );
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'demo_confirmed_index_drop', ['removed']),
+            /confirmation.*demo_confirmed_removed/i
+        );
+        await worker.invoke(
+            'runQuery',
+            'DROP INDEX demo_confirmed_removed; ' +
+            'CREATE INDEX demo_confirmed_removed ' +
+            'ON demo_confirmed_index_drop(removed COLLATE NOCASE)'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'deleteColumns',
+                'demo_confirmed_index_drop',
+                ['removed'],
+                stale
+            ),
+            /changed while the confirmation was open/i
+        );
+
+        const current = await worker.invoke(
+            'findDependentIndexes',
+            'demo_confirmed_index_drop',
+            ['removed']
+        );
+        await worker.invoke(
+            'deleteColumns',
+            'demo_confirmed_index_drop',
+            ['removed'],
+            current
+        );
+
+        const columns = await worker.invoke('getTableInfo', 'demo_confirmed_index_drop');
+        assert.deepStrictEqual(
+            Array.from(columns, (column: any) => column.identifier),
+            ['kept']
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT count(*) FROM sqlite_schema " +
+                "WHERE type = 'index' AND name = 'demo_confirmed_kept'"
+            ),
+            1
+        );
+    });
+
+    it('refuses to report a worker-local demo reload as successful', async () => {
+        const worker = await createWorkerHarness();
+
+        await assert.rejects(
+            worker.invoke('refreshFile'),
+            /demo host.*reinitialize|reinitialize.*demo host/i
+        );
+    });
+
     it('drops a demo column without changing surviving schema contracts', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -923,12 +2216,17 @@ describe('web demo view worker', () => {
             "SELECT type, name, sql FROM sqlite_master " +
             "WHERE name IN ('demo_constraints_qty', 'demo_constraints_audit') ORDER BY type, name"
         );
+        const dependentIndexes = await worker.invoke(
+            'findDependentIndexes',
+            'demo_constraints',
+            ['removed']
+        );
 
         await worker.invoke(
             'deleteColumns',
             'demo_constraints',
             ['removed'],
-            ['demo_constraints_removed']
+            dependentIndexes
         );
 
         const untouchedAfter = await worker.invoke(
@@ -1132,6 +2430,21 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('fails closed when demo view history lacks its authoritative definition', async () => {
+        const worker = await createWorkerHarness();
+        for (const direction of ['undoModification', 'redoModification']) {
+            for (const modificationType of ['view_create', 'view_edit', 'view_drop']) {
+                await assert.rejects(
+                    worker.invoke(direction, {
+                        modificationType,
+                        targetTable: 'missing_history_view'
+                    }),
+                    /missing view definition/i
+                );
+            }
+        }
+    });
+
     it('rejects a demo drop whose confirmed trigger snapshot became stale', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke('createView', 'demo_drop_cas', 'SELECT 1 AS value');
@@ -1239,6 +2552,19 @@ describe('web demo view worker', () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
             'runQuery',
+            'CREATE TABLE demo_create_compile_source (value TEXT NOT NULL)'
+        );
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO demo_create_compile_source VALUES ('main-created')"
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_create_compile_source AS ' +
+            'SELECT value FROM missing_demo_create_source'
+        );
+        await worker.invoke(
+            'runQuery',
             'CREATE TEMP VIEW demo_create_compile_shadow AS ' +
             'SELECT value FROM missing_demo_create_source'
         );
@@ -1246,7 +2572,7 @@ describe('web demo view worker', () => {
         await worker.invoke(
             'createView',
             'demo_create_compile_shadow',
-            "SELECT 'main-created' AS value"
+            'SELECT value FROM demo_create_compile_source'
         );
         assert.strictEqual(
             await workerScalar(worker, 'SELECT value FROM main.demo_create_compile_shadow'),
@@ -1260,13 +2586,26 @@ describe('web demo view worker', () => {
         );
         await worker.invoke(
             'runQuery',
+            'CREATE TABLE demo_edit_compile_source (value TEXT NOT NULL)'
+        );
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO demo_edit_compile_source VALUES ('main-after')"
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_edit_compile_source AS ' +
+            'SELECT value FROM missing_demo_edit_source'
+        );
+        await worker.invoke(
+            'runQuery',
             'CREATE TEMP VIEW demo_edit_compile_shadow AS ' +
             'SELECT value FROM missing_demo_edit_source'
         );
         await worker.invoke(
             'editView',
             'demo_edit_compile_shadow',
-            "SELECT 'main-after' AS value",
+            'SELECT value FROM demo_edit_compile_source',
             true
         );
         assert.strictEqual(
@@ -1347,6 +2686,43 @@ describe('web demo view worker', () => {
             [['under_score']]
         );
         assert.deepStrictEqual({ ...underscoreCount }, { count: 1, isExact: true });
+    });
+
+    it('bounds malformed and excessive demo table-page requests', async () => {
+        const sql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, statement) => {
+                if (kind === 'prepare' && statement.includes('FROM main."demo_page_bounds"')) {
+                    sql.push(statement);
+                }
+            }
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_page_bounds (value TEXT); INSERT INTO demo_page_bounds VALUES (\'one\')'
+        );
+
+        for (const limit of [-1, 0, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+            await assert.rejects(
+                worker.invoke('fetchTableData', 'demo_page_bounds', { limit, offset: 0 }),
+                /page limit must be a positive safe integer/i
+            );
+        }
+        for (const offset of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+            await assert.rejects(
+                worker.invoke('fetchTableData', 'demo_page_bounds', { limit: 1, offset }),
+                /page offset must be a non-negative safe integer/i
+            );
+        }
+
+        const page = await worker.invoke('fetchTableData', 'demo_page_bounds', {
+            columns: ['value'],
+            limit: MAX_TABLE_PAGE_ROWS + 1,
+            offset: 0
+        });
+        assert.deepStrictEqual(Array.from(page.rows, (row: unknown[]) => Array.from(row)), [['one']]);
+        assert.ok(sql.some(statement => statement.includes(`LIMIT ${MAX_TABLE_PAGE_ROWS} OFFSET 0`)));
+        assert.ok(sql.every(statement => !statement.includes('LIMIT -1')));
     });
 
     it('matches native/WASM bounded TEXT and BLOB grid previews', async () => {
@@ -1701,6 +3077,32 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('routes malformed ordinary demo TEXT to byte-faithful inspector metadata', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_malformed_text_value (value TEXT); ' +
+            "INSERT INTO demo_malformed_text_value VALUES " +
+            "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT))"
+        );
+
+        const page = await worker.invoke('fetchTableData', 'demo_malformed_text_value', {
+            columns: ['rowid', 'value'],
+            orderBy: 'rowid',
+            orderDir: 'ASC',
+            limit: 10,
+            offset: 0
+        });
+
+        assert.deepStrictEqual(
+            Array.from(page.rows, (row: unknown[]) => Array.from(row)),
+            [[1, ''], [2, '�']]
+        );
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(page.oversizedCells)), {
+            0: { 1: { storageClass: 'text', byteLength: 1 } }
+        });
+    });
+
     it('suppresses demo keyset anchors for malformed ordinary TEXT sort keys', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -1913,7 +3315,7 @@ describe('web demo view worker', () => {
         assert.deepStrictEqual(Array.from(previous.rows), Array.from(offsetPages[0].rows));
     });
 
-    it('orders anchorable OFFSET pages by the full keyset key and leaves shadowed tables unchanged', async () => {
+    it('orders anchorable OFFSET pages by the full keyset key and preserves rowid-shadow fallback', async () => {
         const observed: string[] = [];
         const worker = await createWorkerHarness({
             onSql: (kind, sql) => { if (kind === 'prepare') observed.push(sql); }
@@ -1950,13 +3352,13 @@ describe('web demo view worker', () => {
         // The fallback SELECT itself carries the full deterministic key order.
         assert.ok(
             observed.some(sql => sql.includes(
-                'FROM "demo_ties" ORDER BY "s" DESC, "rowid" DESC LIMIT 4 OFFSET 4'
+                'FROM main."demo_ties" ORDER BY "s" DESC, "rowid" DESC LIMIT 4 OFFSET 4'
             )),
             `expected the deterministic fallback ORDER BY, saw:\n${observed.join('\n')}`
         );
 
         // A declared rowid column shadows real identity: no key derives, and
-        // the emitted SQL stays byte-identical to the pre-keyset shape.
+        // the emitted SQL keeps the pre-keyset shape on the authoritative main table.
         await worker.invoke(
             'runQuery',
             "CREATE TABLE demo_shadow_order (rowid TEXT); " +
@@ -1972,7 +3374,7 @@ describe('web demo view worker', () => {
         assert.strictEqual(shadow.keysetAnchors, undefined);
         assert.ok(
             observed.some(sql =>
-                sql === 'SELECT "rowid", "rowid" FROM "demo_shadow_order" LIMIT 10 OFFSET 0'
+                sql === 'SELECT "rowid", "rowid" FROM main."demo_shadow_order" LIMIT 10 OFFSET 0'
             ),
             `expected the unchanged shadowed-table SQL, saw:\n${observed.join('\n')}`
         );
@@ -2004,10 +3406,10 @@ describe('web demo view worker', () => {
             globalFilter: 'needle'
         });
 
-        assert.deepStrictEqual(
-            Array.from(data.rows, (row: unknown[]) => Array.from(row)),
-            [['needle', 'needle']]
-        );
+        assert.strictEqual(data.rows.length, 1);
+        assert.strictEqual(isReadOnlyPrimaryKeyRecordId(data.rows[0][0]), true);
+        assert.strictEqual(data.rows[0][1], 'needle');
+        assert.match(data.readOnlyRowReasons?.[0] ?? '', /declared.*rowid.*identity/i);
         assert.deepStrictEqual({ ...count }, { count: 1, isExact: true });
     });
 
@@ -2074,6 +3476,43 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('returns an exact unsafe demo auto-rowid and undoes only that inserted row', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_unsafe_auto_rowid (value TEXT); ' +
+            "INSERT INTO demo_unsafe_auto_rowid(rowid, value) VALUES " +
+            "(9007199254740991, 'lower'), (9007199254740992, 'upper')"
+        );
+
+        const insertedRow = await worker.invoke(
+            'insertRowWithHistory',
+            'demo_unsafe_auto_rowid',
+            { value: 'inserted' }
+        );
+        assert.strictEqual(insertedRow.rowId, '9007199254740993');
+
+        await worker.invoke('undoModification', {
+            description: 'Undo unsafe demo auto-rowid insert',
+            modificationType: 'row_insert',
+            targetTable: 'demo_unsafe_auto_rowid',
+            targetRowId: insertedRow.rowId,
+            rowData: insertedRow.row,
+            insertedRow
+        });
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT CAST(rowid AS TEXT), value FROM demo_unsafe_auto_rowid ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            rows[0].rows,
+            [
+                ['9007199254740991', 'lower'],
+                ['9007199254740992', 'upper']
+            ]
+        );
+    });
+
     it('treats a declared demo rowid column with duplicate unsafe values as data', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -2084,20 +3523,49 @@ describe('web demo view worker', () => {
         );
 
         const data = await worker.invoke('fetchTableData', 'demo_declared_rowid_dupes', {
-            columns: ['rowid', 'value'],
+            columns: ['rowid', 'rowid', 'value'],
             limit: 10,
             offset: 0
         });
 
         // The declared column shadows the intrinsic rowid, so it must never be
-        // promoted to an exact row identity; both rows keep the rounded number
-        // plus sidecar text.
+        // promoted to identity. The synthetic slot is non-mutable while the
+        // duplicate visible data values retain exact text metadata.
+        assert.ok(data.rows.every((row: unknown[]) => (
+            isReadOnlyPrimaryKeyRecordId(row[0] as RecordId)
+        )));
         assert.deepStrictEqual(
-            data.rows.map((row: unknown[]) => row[0]),
+            data.rows.map((row: unknown[]) => row[1]),
             [9007199254740992, 9007199254740992]
         );
-        assert.strictEqual(data.exactIntegerTexts[0][0], '9007199254740993');
-        assert.strictEqual(data.exactIntegerTexts[1][0], '9007199254740993');
+        assert.strictEqual(data.exactIntegerTexts[0][1], '9007199254740993');
+        assert.strictEqual(data.exactIntegerTexts[1][1], '9007199254740993');
+        assert.match(data.readOnlyRowReasons?.[0] ?? '', /read-only.*declared.*rowid/i);
+        assert.match(data.readOnlyRowReasons?.[1] ?? '', /read-only.*declared.*rowid/i);
+    });
+
+    it('rejects a unique declared demo rowid as a direct mutation identity', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_unique_declared_rowid ("rowid" INTEGER UNIQUE, value TEXT); ' +
+            "INSERT INTO demo_unique_declared_rowid(rowid, value) VALUES (7, 'preserved')"
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_unique_declared_rowid',
+                7,
+                'value',
+                'wrong row'
+            ),
+            /read-only.*declared.*rowid.*identity/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_unique_declared_rowid'),
+            'preserved'
+        );
     });
 
     it('fails clearly when a demo UPDATE trigger rewrites the primary key', async () => {
@@ -2127,7 +3595,7 @@ describe('web demo view worker', () => {
                 'value',
                 'after'
             ),
-            /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+            /UPDATE trigger changed or removed.*primary-key identity.*target table.*rolled back/is
         );
         await assert.rejects(
             worker.invoke(
@@ -2139,7 +3607,7 @@ describe('web demo view worker', () => {
                 { storageClass: 'text', byteLength: 6 },
                 5
             ),
-            /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+            /UPDATE trigger changed or removed.*primary-key identity.*target table.*rolled back/is
         );
         assert.deepStrictEqual(
             Array.from(
@@ -3181,6 +4649,8 @@ describe('web demo view worker', () => {
             columnName: 'value',
             priorValue: 'before',
             newValue: 'after',
+            priorState: { storageClass: 'text', value: 'before' },
+            postState: { storageClass: 'text', value: 'after' },
             operation: 'set'
         }]);
         await worker.invoke('runQuery', 'RELEASE outer_batch');
@@ -3551,7 +5021,7 @@ describe('web demo view worker', () => {
                 'SELECT value * 2 AS value FROM demo_shadow_trigger_main_rows',
                 true
             ),
-            /demo_shadow_trigger_insert.*drop the TEMP shadow view.*schema-qualified target/is
+            /demo_shadow_trigger_insert.*TEMP trigger.*schema-qualified target/is
         );
         assert.strictEqual(
             await workerScalar(worker, 'SELECT value FROM main.demo_shadow_trigger_view'),
@@ -3568,7 +5038,7 @@ describe('web demo view worker', () => {
         );
     });
 
-    it('rejects demo edit and drop when a main-bound TEMP trigger becomes ambiguous', async () => {
+    it('proves and preserves a demo main-bound unqualified TEMP trigger through a later shadow', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
             'runQuery',
@@ -3591,30 +5061,26 @@ describe('web demo view worker', () => {
             'demo_ambiguous_trigger_view'
         );
         assert.strictEqual(browsed.selectSql, 'SELECT value FROM demo_ambiguous_main_rows');
-        assert.deepStrictEqual(Array.from(browsed.triggers), []);
         assert.deepStrictEqual(
-            Array.from(browsed.ambiguousTemporaryTriggerNames),
+            Array.from(browsed.triggers).map((trigger: any) => trigger.identifier),
             ['demo_ambiguous_main_insert']
         );
+        assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
 
-        const expectedError = /demo_ambiguous_main_insert.*drop the TEMP shadow view.*TEMP trigger.*schema-qualified target/is;
-        await assert.rejects(
-            worker.invoke(
-                'editView',
-                'demo_ambiguous_trigger_view',
-                'SELECT value * 2 AS value FROM demo_ambiguous_main_rows',
-                true
-            ),
-            expectedError
+        const edit = await worker.invoke(
+            'editView',
+            'demo_ambiguous_trigger_view',
+            'SELECT value * 2 AS value FROM demo_ambiguous_main_rows',
+            true
         );
-        await assert.rejects(
-            worker.invoke('dropView', 'demo_ambiguous_trigger_view'),
-            expectedError
+        assert.deepStrictEqual(
+            Array.from(edit.after.triggers).map((trigger: any) => trigger.identifier),
+            ['demo_ambiguous_main_insert']
         );
 
         assert.strictEqual(
             await workerScalar(worker, 'SELECT value FROM main.demo_ambiguous_trigger_view'),
-            3
+            6
         );
         assert.strictEqual(
             await workerScalar(worker, 'SELECT value FROM temp.demo_ambiguous_trigger_view'),
@@ -3632,6 +5098,52 @@ describe('web demo view worker', () => {
         assert.strictEqual(
             await workerScalar(worker, 'SELECT value FROM demo_ambiguous_main_log'),
             19
+        );
+    });
+
+    it('refuses to rebind a demo TEMP trigger historically attached elsewhere', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "ATTACH DATABASE ':memory:' AS demo_aux_history; " +
+            'CREATE TABLE demo_aux_history.demo_historical_rows (value INTEGER); ' +
+            'CREATE VIEW demo_aux_history.demo_historical_view AS ' +
+            'SELECT value FROM demo_historical_rows; ' +
+            'CREATE TEMP TABLE demo_historical_log (value INTEGER); ' +
+            'CREATE TEMP TRIGGER demo_historical_aux_insert ' +
+            'INSTEAD OF INSERT ON demo_historical_view ' +
+            'BEGIN INSERT INTO demo_historical_log VALUES (NEW.value); END; ' +
+            'CREATE TABLE demo_historical_main_rows (value INTEGER); ' +
+            'CREATE VIEW demo_historical_view AS ' +
+            'SELECT value FROM demo_historical_main_rows'
+        );
+
+        const browsed = await worker.invoke('getViewDefinition', 'demo_historical_view');
+        assert.deepStrictEqual(Array.from(browsed.triggers), []);
+        assert.deepStrictEqual(
+            Array.from(browsed.ambiguousTemporaryTriggerNames),
+            ['demo_historical_aux_insert']
+        );
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_historical_view',
+                'SELECT value * 2 AS value FROM demo_historical_main_rows',
+                true
+            ),
+            /demo_historical_aux_insert.*TEMP trigger.*schema-qualified target/is
+        );
+        await assert.rejects(
+            worker.invoke('runQuery', 'INSERT INTO main.demo_historical_view VALUES (23)'),
+            /cannot modify.*view/i
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_aux_history.demo_historical_view VALUES (29)'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_historical_log'),
+            29
         );
     });
 
@@ -3701,6 +5213,165 @@ describe('web demo view worker', () => {
                 "SELECT value FROM demo_qualified_trigger_log WHERE target = 'temp'"
             ),
             17
+        );
+    });
+
+    it('rejects demo view changes that break reverse view and trigger dependencies', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_dependency_rows (id INTEGER, label TEXT); ' +
+            "INSERT INTO demo_dependency_rows VALUES (29, 'kept'); " +
+            'CREATE VIEW demo_dependency_source AS ' +
+            'SELECT id, label FROM demo_dependency_rows; ' +
+            'CREATE VIEW demo_dependency_consumer AS ' +
+            'SELECT id FROM demo_dependency_source'
+        );
+
+        for (const operation of [
+            () => worker.invoke(
+                'validateViewDefinition',
+                'demo_dependency_source',
+                'SELECT label FROM demo_dependency_rows'
+            ),
+            () => worker.invoke(
+                'previewViewDefinition',
+                'demo_dependency_source',
+                'SELECT label FROM demo_dependency_rows',
+                10
+            ),
+            () => worker.invoke(
+                'editView',
+                'demo_dependency_source',
+                'SELECT label FROM demo_dependency_rows'
+            ),
+            () => worker.invoke('dropView', 'demo_dependency_source')
+        ]) {
+            await assert.rejects(
+                operation(),
+                /would break existing view.*demo_dependency_consumer/is
+            );
+        }
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT id FROM demo_dependency_consumer'),
+            29
+        );
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_reverse_trigger_source AS ' +
+            'SELECT id, label FROM demo_dependency_rows; ' +
+            'CREATE TABLE demo_reverse_trigger_events (event_id INTEGER); ' +
+            'CREATE TABLE demo_reverse_trigger_log (seen_id INTEGER); ' +
+            'CREATE TRIGGER demo_reverse_trigger_probe ' +
+            'AFTER INSERT ON demo_reverse_trigger_events BEGIN ' +
+            'INSERT INTO demo_reverse_trigger_log ' +
+            'SELECT id FROM demo_reverse_trigger_source; END'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_reverse_trigger_source',
+                'SELECT label FROM demo_dependency_rows'
+            ),
+            /would break existing trigger.*demo_reverse_trigger_probe/is
+        );
+        await assert.rejects(
+            worker.invoke(
+                'validateViewDefinition',
+                'demo_reverse_trigger_source',
+                'SELECT label FROM demo_dependency_rows'
+            ),
+            /would break existing trigger.*demo_reverse_trigger_probe/is
+        );
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'demo_reverse_trigger_source',
+                'SELECT label FROM demo_dependency_rows',
+                10
+            ),
+            /would break existing trigger.*demo_reverse_trigger_probe/is
+        );
+        await assert.rejects(
+            worker.invoke('dropView', 'demo_reverse_trigger_source'),
+            /would break existing trigger.*demo_reverse_trigger_probe/is
+        );
+        await worker.invoke('runQuery', 'INSERT INTO demo_reverse_trigger_events VALUES (1)');
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT seen_id FROM demo_reverse_trigger_log'),
+            29
+        );
+    });
+
+    it('rejects demo undo and redo that break newer dependent views', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_history_dependency_rows (id INTEGER, label TEXT); ' +
+            "INSERT INTO demo_history_dependency_rows VALUES (1, 'kept')"
+        );
+
+        const undoBefore = await worker.invoke(
+            'createView',
+            'demo_history_dependency_undo',
+            'SELECT id FROM demo_history_dependency_rows'
+        );
+        const undoEdit = await worker.invoke(
+            'editView',
+            'demo_history_dependency_undo',
+            'SELECT id, label FROM demo_history_dependency_rows'
+        );
+        const undoModification = {
+            description: 'Edit demo_history_dependency_undo',
+            modificationType: 'view_edit',
+            targetTable: 'demo_history_dependency_undo',
+            viewDefBefore: undoBefore,
+            viewDefAfter: undoEdit.after
+        };
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_history_dependency_undo_consumer AS ' +
+            'SELECT label FROM demo_history_dependency_undo'
+        );
+        await assert.rejects(
+            worker.invoke('undoModification', undoModification),
+            /would break existing view.*demo_history_dependency_undo_consumer/is
+        );
+
+        const redoBefore = await worker.invoke(
+            'createView',
+            'demo_history_dependency_redo',
+            'SELECT id, label FROM demo_history_dependency_rows'
+        );
+        const redoEdit = await worker.invoke(
+            'editView',
+            'demo_history_dependency_redo',
+            'SELECT id FROM demo_history_dependency_rows'
+        );
+        const redoModification = {
+            description: 'Edit demo_history_dependency_redo',
+            modificationType: 'view_edit',
+            targetTable: 'demo_history_dependency_redo',
+            viewDefBefore: redoBefore,
+            viewDefAfter: redoEdit.after
+        };
+        await worker.invoke('undoModification', redoModification);
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_history_dependency_redo_consumer AS ' +
+            'SELECT label FROM demo_history_dependency_redo'
+        );
+        await assert.rejects(
+            worker.invoke('redoModification', redoModification),
+            /would break existing view.*demo_history_dependency_redo_consumer/is
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT label FROM demo_history_dependency_redo_consumer'
+            ),
+            'kept'
         );
     });
 });

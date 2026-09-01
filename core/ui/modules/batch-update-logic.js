@@ -25,6 +25,8 @@ export function groupSelectedCellsByColumn(selectedCells, tableColumns) {
             columns.set(cell.colIdx, {
                 name: colDef.name,
                 type: colDef.type,
+                notnull: colDef.notnull,
+                isPrimaryKey: colDef.isPrimaryKey,
                 values: new Set()
             });
         }
@@ -45,6 +47,7 @@ export function summarizeColumnValue(values) {
     const val = uniqueValues[0];
     if (val === null) return 'NULL';
     if (val instanceof Uint8Array) return '[BLOB]';
+    if (val === '') return '(empty string)';
     return String(val);
 }
 
@@ -69,12 +72,20 @@ export function prepareBatchUpdates(
         if (!input) continue;
 
         const dataset = input.dataset || {};
-        const isNull = dataset.isnull === 'true';
-        const isPatch = dataset.ispatch === 'true';
+        const explicitMode = dataset.mode;
+        if (explicitMode === 'unchanged') continue;
+        const isNull = explicitMode
+            ? explicitMode === 'null'
+            : dataset.isnull === 'true';
+        const isPatch = explicitMode
+            ? explicitMode === 'patch'
+            : dataset.ispatch === 'true';
         const value = input.value;
 
-        // Skip cells left blank unless they were explicitly set to NULL.
-        if (value === '' && !isNull) continue;
+        // Legacy inputs have no mode; retain skip-blank compatibility. Real
+        // batch fields explicitly distinguish untouched from value-mode '',
+        // so an empty string can be stored without conflating it with NULL.
+        if (!explicitMode && value === '' && !isNull) continue;
 
         const colDef = tableColumns && tableColumns[cell.colIdx];
         if (!colDef) continue; // skip stale/out-of-bounds selections
@@ -92,8 +103,7 @@ export function prepareBatchUpdates(
             // may report e.g. 'integer' rather than 'INTEGER'.
             const colType = (colDef.type || '').toUpperCase();
             const numericValue = Number(value);
-            if (usesDeclaredPrimaryKey
-                && colDef.isPrimaryKey
+            if ((usesDeclaredPrimaryKey && colDef.isPrimaryKey || colDef.isRowidAlias === true)
                 && hasIntegerOrNumericAffinity(colType)
                 && /^[+-]?\d+$/.test(value.trim())
                 && !Number.isSafeInteger(numericValue)) {

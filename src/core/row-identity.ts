@@ -1,11 +1,12 @@
 import type {
+  CellUpdate,
   CellValue,
   PrimaryKeyColumn,
   RecordId,
   TableIdentity
 } from './types';
 import { SQLITE_MAX_VARIABLE_NUMBER } from './integer-utils';
-import { escapeIdentifier, validateRowId } from './sql-utils';
+import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './sql-utils';
 
 const PRIMARY_KEY_RECORD_ID_PREFIX = 'pk:';
 const PRIMARY_KEY_RECORD_ID_VERSION = 1;
@@ -77,6 +78,311 @@ export function unresolvableTriggeredPrimaryKeyUpdateError(table: string): Error
     `An UPDATE trigger changed or removed the primary-key identity in ${table}; ` +
     'the edit was rolled back because SQLite Explorer cannot safely identify the resulting row.'
   );
+}
+
+/**
+ * A rowid table has no second stable handle after a trigger moves its row.
+ * Roll the whole savepoint back instead of returning a stale identity that
+ * would make undo or a subsequent edit target the wrong row.
+ */
+export function unresolvableTriggeredRowIdUpdateError(table: string): Error {
+  return new Error(
+    `An UPDATE trigger changed or removed the rowid identity in ${table}; ` +
+    'the edit was rolled back because SQLite Explorer cannot safely identify the resulting row.'
+  );
+}
+
+/** Let SQLite itself decide which UPDATE/UPDATE OF triggers apply. */
+export function buildUpdateTriggerProbeSql(
+  table: string,
+  columns: readonly string[],
+  hasIntrinsicRowId: boolean = true
+): string {
+  const uniqueColumns = [...new Set(columns)];
+  if (uniqueColumns.length === 0) {
+    throw new Error('UPDATE trigger probe requires at least one column');
+  }
+  const assignments = uniqueColumns.map(column => {
+    const quoted = escapeIdentifier(column);
+    return `${quoted} = ${quoted}`;
+  });
+  const predicate = hasIntrinsicRowId ? 'rowid = ?' : '0';
+  return `EXPLAIN UPDATE ${escapeMainIdentifier(table)} SET ${assignments.join(', ')} WHERE ${predicate}`;
+}
+
+/** Compile the exact INSERT trigger set without executing constraints or user code. */
+export function buildInsertTriggerProbeSql(
+  table: string,
+  columns: readonly string[]
+): string {
+  const insert = columns.length === 0
+    ? `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`
+    : `INSERT INTO ${escapeMainIdentifier(table)} ` +
+      `(${columns.map(escapeIdentifier).join(', ')}) VALUES ` +
+      `(${columns.map(() => 'NULL').join(', ')})`;
+  return `EXPLAIN ${insert}`;
+}
+
+/** Compile DELETE triggers and active FK actions independently of row identity. */
+export function buildDeleteTriggerProbeSql(table: string): string {
+  return `EXPLAIN DELETE FROM ${escapeMainIdentifier(table)} WHERE 0`;
+}
+
+/** Main-schema btree identity used to distinguish target writes in EXPLAIN. */
+export const MAIN_TABLE_ROOT_PAGE_SQL =
+  `SELECT "rootpage" FROM main.sqlite_schema ` +
+  `WHERE "type" = 'table' AND "name" = ? LIMIT 2`;
+
+/** Validate the singleton root page before trusting it as a bytecode authority. */
+export function parseMainTableRootPage(
+  rows: readonly (readonly unknown[])[],
+  table: string
+): number {
+  if (rows.length !== 1 || rows[0].length < 1) {
+    throw new Error(`SQLite returned invalid table root-page metadata for ${table}`);
+  }
+  const rawRootPage = rows[0][0];
+  const rootPage = typeof rawRootPage === 'bigint'
+    ? Number(rawRootPage)
+    : rawRootPage;
+  if (!Number.isSafeInteger(rootPage) || Number(rootPage) < 0) {
+    throw new Error(`SQLite returned invalid table root-page metadata for ${table}`);
+  }
+  return Number(rootPage);
+}
+
+function readExplainInteger(value: unknown): number | undefined {
+  const parsed = typeof value === 'bigint' ? Number(value) : value;
+  return Number.isSafeInteger(parsed) ? Number(parsed) : undefined;
+}
+
+/**
+ * Reject applicable user-trigger programs that can write this table's btree.
+ *
+ * SQLite exposes neither an AFTER-trigger row handle nor enough stable register
+ * semantics to prove that an arbitrary self-write preserved the edited row.
+ * We therefore use OpenWrite/Clear against the target table to select the
+ * stronger identity error; every applicable user-trigger program is rejected
+ * because its side effects are outside history. For foreign-key UPDATE programs,
+ * only CASCADE is reversible through the existing parent-row history; SET
+ * NULL/DEFAULT sever the reference and must be rejected before mutation.
+ */
+export function assertNoApplicableUpdateTriggerTargetWrites(
+  table: string,
+  targetRootPage: number,
+  rows: readonly (readonly unknown[])[],
+  identityKind: 'rowid' | 'primary-key' = 'rowid'
+): void {
+  if (!Number.isSafeInteger(targetRootPage) || targetRootPage < 0) {
+    throw new Error(`SQLite returned invalid table root-page metadata for ${table}`);
+  }
+
+  let hasApplicableUserTrigger = false;
+  let subprogramStart = -1;
+  let programCount = 0;
+  let hasUntrackedForeignKeyUpdate = false;
+  let foreignKeyProgram: {
+    isUserTrigger: boolean;
+    hasWrite: boolean;
+    prologueParameters: number[];
+    parametersAfterWrite: Set<number>;
+    prologueComplete: boolean;
+  } | undefined;
+
+  const finishForeignKeyProgram = () => {
+    if (!foreignKeyProgram || foreignKeyProgram.isUserTrigger || !foreignKeyProgram.hasWrite) {
+      return;
+    }
+
+    // SQLite's FK UPDATE subprogram starts with old/new parent parameter
+    // pairs. CASCADE later reads every new-parent parameter while constructing
+    // the child row; SET NULL/DEFAULT instead emit literal/default opcodes.
+    // Treat any unfamiliar shape as unsafe rather than guessing from Program.
+    const parameters = foreignKeyProgram.prologueParameters;
+    const parametersAfterWrite = foreignKeyProgram.parametersAfterWrite;
+    const newParentParameters = parameters.filter((_, index) => index % 2 === 1);
+    const provesCascade = parameters.length > 0
+      && parameters.length % 2 === 0
+      && newParentParameters.every(parameter => parametersAfterWrite.has(parameter));
+    if (!provesCascade) hasUntrackedForeignKeyUpdate = true;
+  };
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (row.length < 6 || typeof row[1] !== 'string') {
+      throw new Error(`SQLite returned invalid UPDATE trigger metadata for ${table}`);
+    }
+    const address = readExplainInteger(row[0]);
+    if (address === undefined) {
+      throw new Error(`SQLite returned invalid UPDATE trigger metadata for ${table}`);
+    }
+    if (row[1] === 'Init' && address === 0) {
+      finishForeignKeyProgram();
+      programCount += 1;
+      if (programCount === 2) subprogramStart = index;
+      const isUserTrigger = typeof row[5] === 'string'
+        && row[5].startsWith('-- TRIGGER ');
+      if (isUserTrigger) {
+        hasApplicableUserTrigger = true;
+      }
+      foreignKeyProgram = programCount > 1
+        ? {
+            isUserTrigger,
+            hasWrite: false,
+            prologueParameters: [],
+            parametersAfterWrite: new Set<number>(),
+            prologueComplete: false
+          }
+        : undefined;
+      continue;
+    }
+
+    if (!foreignKeyProgram) continue;
+    if (row[1] === 'Param') {
+      const parameter = readExplainInteger(row[2]);
+      if (parameter === undefined) {
+        throw new Error(`SQLite returned invalid UPDATE trigger metadata for ${table}`);
+      }
+      if (foreignKeyProgram.hasWrite) {
+        foreignKeyProgram.parametersAfterWrite.add(parameter);
+      } else if (!foreignKeyProgram.prologueComplete) {
+        foreignKeyProgram.prologueParameters.push(parameter);
+      }
+      continue;
+    }
+    if (row[1] === 'OpenWrite' || row[1] === 'Clear') {
+      foreignKeyProgram.prologueComplete = true;
+      foreignKeyProgram.hasWrite = true;
+    } else if (row[1].startsWith('Open')) {
+      foreignKeyProgram.prologueComplete = true;
+    }
+  }
+  finishForeignKeyProgram();
+
+  if (hasApplicableUserTrigger) {
+    if (subprogramStart < 0) {
+      throw new Error(`SQLite returned invalid UPDATE trigger metadata for ${table}`);
+    }
+
+    const writesTarget = rows.slice(subprogramStart).some(row => {
+      if (row[1] === 'OpenWrite') {
+        const rootPage = readExplainInteger(row[3]);
+        const databaseIndex = readExplainInteger(row[4]);
+        if (rootPage === undefined || databaseIndex === undefined) {
+          throw new Error(`SQLite returned invalid UPDATE trigger metadata for ${table}`);
+        }
+        return rootPage === targetRootPage && databaseIndex === 0;
+      }
+      if (row[1] === 'Clear') {
+        const rootPage = readExplainInteger(row[2]);
+        const databaseIndex = readExplainInteger(row[3]);
+        if (rootPage === undefined || databaseIndex === undefined) {
+          throw new Error(`SQLite returned invalid UPDATE trigger metadata for ${table}`);
+        }
+        return rootPage === targetRootPage && databaseIndex === 0;
+      }
+      return false;
+    });
+    if (writesTarget) {
+      throw new Error(
+        'SQLite Explorer cannot prove whether an applicable UPDATE trigger changed or removed ' +
+        `the ${identityKind} identity in ${table}; the trigger can write the target table, so the edit ` +
+        `was rolled back because SQLite cannot expose a trustworthy post-trigger ${identityKind} identity.`
+      );
+    }
+    throw new Error(
+      `Cannot update ${table} while an applicable UPDATE trigger can run; ` +
+      'the operation was rolled back because trigger side effects cannot be represented safely ' +
+      'in undo history.'
+    );
+  }
+
+  if (hasUntrackedForeignKeyUpdate) {
+    throw new Error(
+      `Cannot update ${table} while a mutating foreign-key UPDATE action can run; ` +
+      'the operation was rolled back because affected child rows are not represented in undo history.'
+    );
+  }
+}
+
+/**
+ * Reject INSERT/DELETE programs whose side effects are not captured by the
+ * row-level history payload. User triggers are always unsafe: even a program
+ * with no btree write can RAISE(IGNORE), making history claim a mutation that
+ * never happened. For DELETE, FK CASCADE/SET actions appear as non-trigger
+ * subprograms with a write cursor; RESTRICT/NO ACTION remain allowed.
+ */
+export function assertNoUntrackedMutationPrograms(
+  operation: 'INSERT' | 'DELETE',
+  table: string,
+  rows: readonly (readonly unknown[])[]
+): void {
+  let programCount = 0;
+  let mutatingForeignKeyProgram = false;
+
+  for (const row of rows) {
+    if (row.length < 6 || typeof row[1] !== 'string') {
+      throw new Error(`SQLite returned invalid ${operation} trigger metadata for ${table}`);
+    }
+    const address = readExplainInteger(row[0]);
+    if (address === undefined) {
+      throw new Error(`SQLite returned invalid ${operation} trigger metadata for ${table}`);
+    }
+
+    if (row[1] === 'Init' && address === 0) {
+      programCount += 1;
+      if (typeof row[5] === 'string' && row[5].startsWith('-- TRIGGER ')) {
+        throw new Error(
+          `Cannot ${operation.toLowerCase()} ${table} while an applicable ${operation} trigger can run; ` +
+          'the operation was rolled back because trigger side effects cannot be represented safely ' +
+          'in undo history.'
+        );
+      }
+      continue;
+    }
+
+    if (
+      operation === 'DELETE'
+      && programCount > 1
+      && (row[1] === 'OpenWrite' || row[1] === 'Clear')
+    ) {
+      mutatingForeignKeyProgram = true;
+    }
+  }
+
+  if (mutatingForeignKeyProgram) {
+    throw new Error(
+      `Cannot delete from ${table} while a mutating foreign-key DELETE action can run; ` +
+      'the operation was rolled back because affected child rows are not represented in undo history.'
+    );
+  }
+}
+
+/**
+ * Rowid-changing updates cannot authenticate the resulting row after an AFTER
+ * trigger runs. Applicable trigger subprograms carry an Init p4 marker; this
+ * deliberately excludes foreign-key action subprograms such as ON UPDATE
+ * CASCADE, which also use the generic Program opcode.
+ */
+export function assertNoApplicableUpdateTriggerPrograms(
+  table: string,
+  rows: readonly (readonly unknown[])[]
+): void {
+  for (const row of rows) {
+    if (row.length < 6 || typeof row[1] !== 'string') {
+      throw new Error(`SQLite returned invalid UPDATE trigger metadata for ${table}`);
+    }
+    if (
+      row[1] === 'Init'
+      && typeof row[5] === 'string'
+      && row[5].startsWith('-- TRIGGER ')
+    ) {
+      throw new Error(
+        `Cannot change the rowid identity in ${table} while an UPDATE trigger can run; ` +
+        'the edit was rolled back because SQLite cannot expose a trustworthy post-trigger row identity.'
+      );
+    }
+  }
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -312,6 +618,47 @@ function decodeDeclaredPrimaryKeyRecordId(
     );
   }
   return decoded;
+}
+
+function foldSqliteIdentifier(identifier: string): string {
+  return identifier.replace(/[A-Z]/g, character => (
+    String.fromCharCode(character.charCodeAt(0) + 0x20)
+  ));
+}
+
+/**
+ * Reject aliases of the same batch target before any savepoint or write.
+ *
+ * Rowids are canonicalized through the same exact-int64 validator used by the
+ * statements, while PK identities are decoded against the declared key (which
+ * also proves that their opaque transport encoding is canonical). SQLite folds
+ * ASCII identifier case, so `value` and `VALUE` are the same target column.
+ */
+export function assertUniqueCellUpdateTargets(
+  updates: readonly CellUpdate[],
+  identity: TableIdentity
+): void {
+  const columnsByRow = new Map<string, Set<string>>();
+  for (const update of updates) {
+    const canonicalRowId = identity.kind === 'rowid'
+      ? `rowid:${String(validateRowId(update.rowId))}`
+      : (() => {
+          decodeDeclaredPrimaryKeyRecordId(update.rowId, identity);
+          return `primary-key:${String(update.rowId)}`;
+        })();
+    const canonicalColumn = foldSqliteIdentifier(update.column);
+    let columns = columnsByRow.get(canonicalRowId);
+    if (!columns) {
+      columns = new Set<string>();
+      columnsByRow.set(canonicalRowId, columns);
+    }
+    if (columns.has(canonicalColumn)) {
+      throw new Error(
+        `Duplicate batch update target for row ${String(update.rowId)}, column ${update.column}`
+      );
+    }
+    columns.add(canonicalColumn);
+  }
 }
 
 /**

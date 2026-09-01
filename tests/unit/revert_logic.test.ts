@@ -38,7 +38,10 @@ describe('Revert Logic', () => {
             targetColumn: 'value',
             priorValue: 'initial',  // The value to restore
             newValue: 'modified',
-            description: 'Update cell'
+            description: 'Update cell',
+            operation: 'set',
+            priorState: { storageClass: 'text', value: 'initial' },
+            postState: { storageClass: 'text', value: 'modified' }
         }];
 
         await engine.discardModifications(modificationsToDiscard);

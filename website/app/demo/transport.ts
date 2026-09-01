@@ -15,28 +15,74 @@ import {
   toCellEditRpcErrorData
 } from '../../../src/core/cell-edit-policy';
 
+const MAX_DEMO_RPC_IDENTIFIER_LENGTH = 256;
+const MAX_DEMO_RPC_ERROR_MESSAGE_LENGTH = 8192;
+
+export function isSafeDemoRpcIdentifier(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= MAX_DEMO_RPC_IDENTIFIER_LENGTH;
+}
+
+function assertDemoRpcEnvelope(value: unknown, kind: 'invoke' | 'response'): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('Demo RPC value must be an envelope object');
+  }
+  const envelope = value as Record<string, unknown>;
+  if (envelope.channel !== 'rpc') throw new TypeError('Demo RPC channel must be "rpc"');
+  if (!envelope.content || typeof envelope.content !== 'object' || Array.isArray(envelope.content)) {
+    throw new TypeError('Demo RPC content must be an object');
+  }
+  const content = envelope.content as Record<string, unknown>;
+  if (content.kind !== kind) throw new TypeError(`Demo RPC kind must be "${kind}"`);
+  if (!isSafeDemoRpcIdentifier(content.messageId)) {
+    throw new TypeError('Demo RPC messageId must be a bounded string');
+  }
+
+  if (kind === 'invoke') {
+    if (!isSafeDemoRpcIdentifier(content.targetMethod)) {
+      throw new TypeError('Demo RPC method must be a bounded string');
+    }
+    if (!Array.isArray(content.payload)) {
+      throw new TypeError('Demo RPC payload must be an array');
+    }
+    return;
+  }
+
+  if (typeof content.success !== 'boolean') {
+    throw new TypeError('Demo RPC response success must be a boolean');
+  }
+  if (content.success === false && typeof content.errorMessage !== 'string') {
+    throw new TypeError('Failed demo RPC responses must contain an error message');
+  }
+}
+
 export function guardDemoIframeRequest(value: unknown): void {
   assertWebviewTransportPayload(value, {
     surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeRequest
   });
+  assertDemoRpcEnvelope(value, 'invoke');
 }
 
 export function guardDemoIframeResponse(value: unknown): void {
   assertWebviewTransportPayload(value, {
     surface: WEBVIEW_TRANSPORT_SURFACES.demoIframeResponse
   });
+  assertDemoRpcEnvelope(value, 'response');
 }
 
 export function guardDemoWorkerRequest(value: unknown): void {
   assertWebviewTransportPayload(value, {
     surface: WEBVIEW_TRANSPORT_SURFACES.demoWorkerRequest
   });
+  assertDemoRpcEnvelope(value, 'invoke');
 }
 
 export function guardDemoWorkerResponse(value: unknown): void {
   assertWebviewTransportPayload(value, {
     surface: WEBVIEW_TRANSPORT_SURFACES.demoWorkerResponse
   });
+  assertDemoRpcEnvelope(value, 'response');
 }
 
 /**
@@ -108,9 +154,24 @@ export function serializeDemoIframeResponse(value: unknown): unknown {
 }
 
 export function demoRpcErrorFields(error: unknown) {
-  const errorMessage = error instanceof Error ? error.message : String(error);
-  const typed = toCellEditRpcErrorData(error)
-    ?? toWebviewPayloadLimitErrorData(error);
+  let errorMessage = 'Unknown error';
+  try {
+    errorMessage = error instanceof Error ? error.message : String(error);
+  } catch {
+    // A malformed rejection still needs a terminal scalar response.
+  }
+  if (errorMessage.length > MAX_DEMO_RPC_ERROR_MESSAGE_LENGTH) {
+    const originalLength = errorMessage.length;
+    errorMessage = errorMessage.slice(0, MAX_DEMO_RPC_ERROR_MESSAGE_LENGTH)
+      + `... [truncated from ${originalLength} characters]`;
+  }
+  let typed;
+  try {
+    typed = toCellEditRpcErrorData(error)
+      ?? toWebviewPayloadLimitErrorData(error);
+  } catch {
+    // Hostile getters/proxies are not allowed to break response delivery.
+  }
   return {
     errorMessage,
     ...(typed ? { error: typed } : {})

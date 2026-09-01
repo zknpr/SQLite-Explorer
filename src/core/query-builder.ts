@@ -3,10 +3,16 @@
  *
  * Constructs safe SQL queries for read operations.
  */
-import { escapeIdentifier, escapeLikePattern } from './sql-utils';
+import { escapeIdentifier, escapeLikePattern, escapeMainIdentifier } from './sql-utils';
 import { getActiveFilterValue } from './filter-utils';
 import { assembleKeysetSelect, type ResolvedKeysetPlan } from './keyset-pagination';
 import type { CellValue, TableQueryOptions, TableCountOptions } from './types';
+import {
+  normalizeTablePageLimit,
+  normalizeTablePageOffset
+} from './table-pagination';
+
+export { MAX_TABLE_PAGE_ROWS } from './table-pagination';
 
 /**
  * Build a SELECT query from options.
@@ -32,7 +38,7 @@ export function buildSelectQuery(
     globalFilterColumns = columns
   } = options;
 
-  const escapedTable = escapeIdentifier(table);
+  const escapedTable = escapeMainIdentifier(table);
   const escapedColumns = columns.map(col => {
     if (col === '*') return '*';
     if (col === 'rowid') return '"rowid" AS "rowid"';
@@ -57,7 +63,10 @@ export function buildSelectQuery(
       escapedTable,
       whereClauses,
       filterParams: params,
-      plan: keysetPlan
+      plan: {
+        ...keysetPlan,
+        limit: normalizeTablePageLimit(keysetPlan.limit)
+      }
     });
   }
 
@@ -75,12 +84,12 @@ export function buildSelectQuery(
       .join(', ')}`;
   }
 
-  if (typeof limit === 'number') {
-    sql += ` LIMIT ${limit}`;
+  if (limit !== undefined) {
+    sql += ` LIMIT ${normalizeTablePageLimit(limit)}`;
   }
 
-  if (typeof offset === 'number') {
-    sql += ` OFFSET ${offset}`;
+  if (offset !== undefined) {
+    sql += ` OFFSET ${normalizeTablePageOffset(offset)}`;
   }
 
   return { sql, params };
@@ -97,7 +106,7 @@ export function buildCountQuery(table: string, options: TableCountOptions): { sq
     globalFilter
   } = options;
 
-  const escapedTable = escapeIdentifier(table);
+  const escapedTable = escapeMainIdentifier(table);
   let sql = `SELECT COUNT(*) as count FROM ${escapedTable}`;
   const whereClauses: string[] = [];
   const params: CellValue[] = [];

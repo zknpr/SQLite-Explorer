@@ -17,7 +17,9 @@ import path from 'path';
 import {
   connectWorkerPort,
   DEFAULT_INVOCATION_TIMEOUT_MS,
-  Transfer
+  rejectPendingInvocations,
+  Transfer,
+  type ProxyWithPendingInvocations
 } from './core/rpc';
 import { serializeOperations } from './core/operation-serializer';
 import { GlobalOutputChannel } from './main';
@@ -165,6 +167,12 @@ interface WorkerMethods {
     data: Record<string, CellValue>,
     maxEditValueBytes?: number
   ): Promise<RecordId | undefined>;
+  insertRowWithHistory(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow>;
   insertRowBatch(
     table: string,
     rows: Record<string, CellValue>[],
@@ -178,10 +186,11 @@ interface WorkerMethods {
   deleteColumns(
     table: string,
     columns: string[],
-    dropDependentIndexes?: string[]
+    dropDependentIndexes?: string[],
+    expectedCurrentState?: ColumnDropTableState
   ): Promise<ColumnDropTableState>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
-  createTable(table: string, columns: ColumnDefinition[]): Promise<void>;
+  createTable(table: string, columns: ColumnDefinition[]): Promise<ColumnDropTableState>;
   getViewDefinition(view: string): Promise<ViewDefinition>;
   validateViewDefinition(
     view: string,
@@ -214,7 +223,12 @@ interface WorkerMethods {
     maxEditValueBytes?: number,
     maxUndoSnapshotBytes?: number
   ): Promise<CellUpdateResult[]>;
-  addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void>;
+  addColumn(
+    table: string,
+    column: string,
+    type: string,
+    defaultValue?: string
+  ): Promise<ColumnDropTableState>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
   fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult>;
   fetchSchema(): Promise<SchemaSnapshot>;
@@ -245,6 +259,7 @@ const WORKER_METHOD_NAMES = [
   'updateCell',
   'replaceOversizedCell',
   'insertRow',
+  'insertRowWithHistory',
   'insertRowBatch',
   'deleteRows',
   'deleteColumns',
@@ -408,28 +423,88 @@ export async function createDatabaseConnection(
         // Wrap the native bundle to provide fallback to WASM if file open fails
         // This handles cases where native SQLite can't access a specific file
         // (e.g., macOS sandboxing, permission issues, file locked)
-        const wasmBundlePromise = desktopTestBackend === 'native'
-          ? undefined
-          : createWasmDatabaseConnection(extensionUri, _reporter);
+        let wasmBundlePromise: Promise<DatabaseConnectionBundle> | undefined;
         let wasmBundle: DatabaseConnectionBundle | null = null;
+        let nativeDisposed = false;
+        let wasmDisposed = false;
+        let wrapperDisposed = false;
+
+        const disposeNative = (): void => {
+          if (nativeDisposed) return;
+          nativeDisposed = true;
+          nativeBundle.workerMethods[Symbol.dispose]();
+        };
+        const disposeWasm = (): void => {
+          if (!wasmBundle || wasmDisposed) return;
+          wasmDisposed = true;
+          wasmBundle.workerMethods[Symbol.dispose]();
+        };
+        const getWasmBundle = async (): Promise<DatabaseConnectionBundle> => {
+          if (wrapperDisposed) throw new Error('Database connection bundle has been disposed');
+          wasmBundlePromise ??= createWasmDatabaseConnection(extensionUri, _reporter);
+          try {
+            const created = await wasmBundlePromise;
+            wasmBundle = created;
+            if (wrapperDisposed) {
+              disposeWasm();
+              throw new Error('Database connection bundle was disposed during WASM fallback');
+            }
+            return created;
+          } catch (error) {
+            // Permit an explicit retry after a factory-level failure. A bundle
+            // that was created and then disposed remains recorded above.
+            if (!wasmBundle) wasmBundlePromise = undefined;
+            throw error;
+          }
+        };
+
+        const workerMethods = {
+          ...nativeBundle.workerMethods,
+          [Symbol.dispose]: (): void => {
+            if (wrapperDisposed) return;
+            wrapperDisposed = true;
+            const failures: unknown[] = [];
+            try {
+              disposeNative();
+            } catch (error) {
+              failures.push(error);
+            }
+            try {
+              disposeWasm();
+            } catch (error) {
+              failures.push(error);
+            }
+            // Close a fallback that is still being constructed. This branch is
+            // normally unreachable through DatabaseDocument's lifecycle but
+            // keeps the bundle ownership contract complete under races.
+            if (wasmBundlePromise && !wasmBundle) {
+              void wasmBundlePromise.then(bundle => {
+                wasmBundle = bundle;
+                disposeWasm();
+              }).catch(() => {});
+            }
+            if (failures.length > 0) {
+              throw new AggregateError(failures, 'Failed to dispose database connection workers');
+            }
+          }
+        };
 
         return {
-          workerMethods: nativeBundle.workerMethods,
+          workerMethods,
           async establishConnection(fileUri, displayName, forceReadOnly, autoCommit) {
+            if (wrapperDisposed) throw new Error('Database connection bundle has been disposed');
             try {
               // Try native first
               return await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             } catch (nativeErr) {
+              disposeNative();
               if (desktopTestBackend === 'native') {
-                nativeBundle.workerMethods[Symbol.dispose]();
                 throw nativeErr;
               }
               // Native failed - fall back to WASM
               GlobalOutputChannel?.appendLine(`[SQLite Explorer] Native file open failed, falling back to WASM: ${nativeErr instanceof Error ? nativeErr.message : String(nativeErr)}`);
-              if (!wasmBundle) {
-                wasmBundle = await wasmBundlePromise!;
-              }
-              return wasmBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
+              const fallback = await getWasmBundle();
+              return fallback.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             }
           }
         };
@@ -610,6 +685,17 @@ async function createInProcessWasmDatabaseConnection(
           data: Record<string, CellValue>,
           maxEditValueBytes?: number
         ) => endpoint.insertRow(table, data, maxEditValueBytes),
+        insertRowWithHistory: (
+          table: string,
+          data: Record<string, CellValue>,
+          maxEditValueBytes?: number,
+          maxUndoSnapshotBytes?: number
+        ) => endpoint.insertRowWithHistory(
+          table,
+          data,
+          maxEditValueBytes,
+          maxUndoSnapshotBytes
+        ),
         insertRowBatch: (
           table: string,
           rows: Record<string, CellValue>[],
@@ -617,8 +703,17 @@ async function createInProcessWasmDatabaseConnection(
         ) => endpoint.insertRowBatch(table, rows, maxEditValueBytes),
         deleteRows: (table: string, rowIds: RecordId[], maxUndoSnapshotBytes?: number) =>
           endpoint.deleteRows(table, rowIds, maxUndoSnapshotBytes),
-        deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
-          endpoint.deleteColumns(table, columns, dropDependentIndexes),
+        deleteColumns: (
+          table: string,
+          columns: string[],
+          dropDependentIndexes?: string[],
+          expectedCurrentState?: ColumnDropTableState
+        ) => endpoint.deleteColumns(
+          table,
+          columns,
+          dropDependentIndexes,
+          expectedCurrentState
+        ),
         findDependentIndexes: (table: string, columns: string[]) =>
           endpoint.findDependentIndexes(table, columns),
         createTable: (table: string, columns: ColumnDefinition[]) =>
@@ -736,6 +831,14 @@ async function createWorkerBackedWasmDatabaseConnection(
 
   // Termination handler
   const terminateWorker = () => {
+    const pending = (workerProxy as Partial<ProxyWithPendingInvocations<WorkerMethods>>)
+      .__pendingInvocations;
+    if (pending) {
+      rejectPendingInvocations(
+        pending,
+        new Error('Database worker terminated before its RPC completed')
+      );
+    }
     workerThread.terminate();
   };
 
@@ -1003,11 +1106,28 @@ async function createWorkerBackedWasmDatabaseConnection(
             maxEditValueBytes?: number
           ) => {
             // Retain caller-owned values because insert history records this object.
-            const wrappedData: Record<string, CellValue> = {};
+            const wrappedData = Object.create(null) as Record<string, CellValue>;
             for (const key of Object.keys(data)) {
               wrappedData[key] = wrapForTransfer(data[key]);
             }
             return workerProxy.insertRow(table, wrappedData, maxEditValueBytes);
+          },
+          insertRowWithHistory: (
+            table: string,
+            data: Record<string, CellValue>,
+            maxEditValueBytes?: number,
+            maxUndoSnapshotBytes?: number
+          ) => {
+            const wrappedData = Object.create(null) as Record<string, CellValue>;
+            for (const key of Object.keys(data)) {
+              wrappedData[key] = wrapForTransfer(data[key]);
+            }
+            return workerProxy.insertRowWithHistory(
+              table,
+              wrappedData,
+              maxEditValueBytes,
+              maxUndoSnapshotBytes
+            );
           },
           insertRowBatch: (
             table: string,
@@ -1016,8 +1136,17 @@ async function createWorkerBackedWasmDatabaseConnection(
           ) => workerProxy.insertRowBatch(table, rows, maxEditValueBytes),
           deleteRows: (table: string, rowIds: RecordId[], maxUndoSnapshotBytes?: number) =>
             workerProxy.deleteRows(table, rowIds, maxUndoSnapshotBytes),
-          deleteColumns: (table: string, columns: string[], dropDependentIndexes?: string[]) =>
-            workerProxy.deleteColumns(table, columns, dropDependentIndexes),
+          deleteColumns: (
+            table: string,
+            columns: string[],
+            dropDependentIndexes?: string[],
+            expectedCurrentState?: ColumnDropTableState
+          ) => workerProxy.deleteColumns(
+            table,
+            columns,
+            dropDependentIndexes,
+            expectedCurrentState
+          ),
           findDependentIndexes: (table: string, columns: string[]) =>
             workerProxy.findDependentIndexes(table, columns),
           createTable: (table: string, columns: ColumnDefinition[]) =>
@@ -1148,13 +1277,34 @@ async function loadDatabaseFile(uri: vsc.Uri): Promise<Uint8Array> {
 
   const maxSize = getMaximumFileSizeBytes();
 
-  // Check file size
-  const fileStat = await Promise.resolve(vsc.workspace.fs.stat(uri)).catch(() => ({ size: 0 }));
+  // A failed or malformed stat cannot be treated as an empty file: doing so
+  // turns the following provider read into an unbounded extension-host
+  // allocation and bypasses maxFileSize entirely.
+  let fileStat: vsc.FileStat;
+  try {
+    fileStat = await vsc.workspace.fs.stat(uri);
+  } catch (error) {
+    throw new Error(
+      `Cannot verify database file size for ${uri.toString()}: `
+      + (error instanceof Error ? error.message : String(error)),
+      { cause: error }
+    );
+  }
+  if (!Number.isSafeInteger(fileStat.size) || fileStat.size < 0) {
+    throw new Error(`Cannot verify database file size for ${uri.toString()}: invalid provider size`);
+  }
   if (maxSize !== 0 && fileStat.size > maxSize) {
     throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
   }
 
-  return vsc.workspace.fs.readFile(uri);
+  const bytes = await vsc.workspace.fs.readFile(uri);
+  // The resource can grow between stat and read, and providers are not
+  // required to give those two calls one snapshot. Enforce the bound again on
+  // the allocation that will actually cross into sql.js.
+  if (maxSize !== 0 && bytes.byteLength > maxSize) {
+    throw new Error(`File size (${(bytes.byteLength / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
+  }
+  return bytes;
 }
 
 // WAL_HEADER_SIZE_BYTES (frame-detection threshold for sibling -wal files,
@@ -1173,7 +1323,16 @@ async function statWalSize(uri: vsc.Uri): Promise<number> {
   }
   const walUri = uri.with({ path: uri.path + '-wal' });
   try {
-    return (await vsc.workspace.fs.stat(walUri)).size;
+    const size = (await vsc.workspace.fs.stat(walUri)).size;
+    if (!Number.isSafeInteger(size) || size < 0) {
+      GlobalOutputChannel?.appendLine(
+        `SQLite Explorer: could not inspect ${walUri.toString()} (`
+        + `provider returned invalid size ${String(size)}); `
+        + 'treating WAL state as unknown and opening read-only'
+      );
+      return Number.POSITIVE_INFINITY;
+    }
+    return size;
   } catch (err) {
     const code = (err as { code?: string } | undefined)?.code;
     if (code === 'FileNotFound' || code === 'ENOENT') {

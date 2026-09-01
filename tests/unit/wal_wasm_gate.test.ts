@@ -441,6 +441,18 @@ describe('desktop WASM WAL gate in workerFactory', () => {
     );
   });
 
+  it('fails toward read-only when a provider returns an invalid -wal size', async () => {
+    for (const walSize of [Number.NaN, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const result = await connectDesktop({ walSize });
+      assert.strictEqual(result.config?.readOnlyMode, true, `invalid WAL size ${walSize} must gate`);
+      assert.strictEqual(result.isReadOnly, true);
+      assert.ok(
+        result.outputLines.some(line => /invalid size/.test(line) && /read-only/.test(line)),
+        `invalid WAL size ${walSize} was not reported: ${JSON.stringify(result.outputLines)}`
+      );
+    }
+  });
+
   it('keeps forceReadOnly working independently of WAL state', async () => {
     const result = await connectDesktop({ walSize: null, forceReadOnly: true });
     assert.strictEqual(result.config?.readOnlyMode, true);

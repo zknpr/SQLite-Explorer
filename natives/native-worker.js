@@ -26,6 +26,28 @@ const MAX_CELL_READ_CHUNK_BYTES = 1024 * 1024;
 const MAX_CELL_READ_SESSIONS = 4;
 const CELL_READ_SESSION_IDLE_TIMEOUT_MS = 30_000;
 const CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS = 5 * 60_000;
+const MAX_SCHEMA_DEPENDENCY_PROBES = 1024;
+const MAX_QUERY_STATEMENTS = 1024;
+const MAX_NATIVE_ERROR_MESSAGE_LENGTH = 8192;
+
+/** Bound untrusted SQLite/library failures before IPC and stderr forwarding. */
+function describeNativeError(error, fallback) {
+  const safeFallback = typeof fallback === 'string' && fallback
+    ? fallback
+    : 'Unknown error';
+  let message;
+  try {
+    message = error && typeof error.message === 'string' && error.message
+      ? error.message
+      : String(error);
+  } catch {
+    message = safeFallback;
+  }
+  if (!message) message = safeFallback;
+  if (message.length <= MAX_NATIVE_ERROR_MESSAGE_LENGTH) return message;
+  return message.slice(0, MAX_NATIVE_ERROR_MESSAGE_LENGTH)
+    + `... [truncated from ${message.length} characters]`;
+}
 
 // Both stdio handles changed API in the same txiki generation. Detect once so
 // the legacy path stays identical and the WHATWG handles remain locked to one
@@ -300,6 +322,134 @@ function shouldUseAsyncDatabase(database, asyncDatabase) {
   return Boolean(asyncDatabase) && isExplicitlyOutsideTransaction(database);
 }
 
+/** Keep every synchronous SQLite step inside the host request deadline. */
+function runWithQueryDeadline(database, timeoutMs, operation) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('Query timeout must be a positive finite number');
+  }
+  if (
+    !database ||
+    typeof database.setQueryDeadline !== 'function' ||
+    typeof database.clearQueryDeadline !== 'function'
+  ) {
+    throw new Error(
+      'Native SQLite requires setQueryDeadline and clearQueryDeadline support'
+    );
+  }
+
+  database.setQueryDeadline(timeoutMs);
+  let cleared = false;
+  const finish = (operationError) => {
+    let cleanupError;
+    if (!cleared) {
+      cleared = true;
+      try {
+        database.clearQueryDeadline();
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
+    const primaryError = operationError?.errno === 9
+      ? new Error(`Query execution timed out after ${timeoutMs}ms`, { cause: operationError })
+      : operationError;
+    if (primaryError !== undefined && cleanupError !== undefined) {
+      throw new AggregateError(
+        [primaryError, cleanupError],
+        `${describeNativeError(primaryError, 'Query execution failed')}; ` +
+        `clearing the query deadline also failed: ` +
+        `${describeNativeError(cleanupError, 'Unknown cleanup error')}`
+      );
+    }
+    if (cleanupError !== undefined) throw cleanupError;
+    if (primaryError !== undefined) throw primaryError;
+  };
+
+  try {
+    const result = operation();
+    if (result && typeof result.then === 'function') {
+      return Promise.resolve(result).then(
+        value => {
+          finish();
+          return value;
+        },
+        error => finish(error)
+      );
+    }
+    finish();
+    return result;
+  } catch (error) {
+    finish(error);
+  }
+}
+
+/** Run one AsyncDatabase operation with worker deadline and host cancellation. */
+function executeInterruptibleAsyncOperation(requestId, timeoutMs, operation) {
+  return (async () => {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error('Query timeout must be a positive finite number');
+    }
+    const active = {
+      controller: new AbortController(),
+      reason: undefined
+    };
+    activeOperations.set(requestId, active);
+    const deadline = setTimeout(() => {
+      if (active.reason === undefined) {
+        active.reason = 'deadline';
+        active.controller.abort();
+      }
+    }, timeoutMs);
+
+    try {
+      const result = await operation(active.controller.signal);
+      if (active.reason === 'deadline') {
+        throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+      }
+      if (active.reason === 'host') {
+        const cancellationError = new Error('Operation cancelled');
+        cancellationError.name = 'AbortError';
+        cancellationError.cancelled = true;
+        throw cancellationError;
+      }
+      return result;
+    } catch (error) {
+      if (active.reason === 'deadline') {
+        throw new Error(`Query execution timed out after ${timeoutMs}ms`, { cause: error });
+      }
+      if (active.reason === 'host') {
+        const cancellationError = new Error('Operation cancelled', { cause: error });
+        cancellationError.name = 'AbortError';
+        cancellationError.cancelled = true;
+        throw cancellationError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(deadline);
+      if (activeOperations.get(requestId) === active) {
+        activeOperations.delete(requestId);
+      }
+    }
+  })();
+}
+
+/** VACUUM must run on the interruptible connection and outside transactions. */
+function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
+  if (!asyncDatabase || typeof asyncDatabase.run !== 'function') {
+    return Promise.reject(
+      new Error('Interruptible native database snapshots are unavailable in this runtime')
+    );
+  }
+  if (!isExplicitlyOutsideTransaction(database)) {
+    return Promise.reject(
+      new Error('Cannot create a native database snapshot during an active transaction')
+    );
+  }
+  if (typeof snapshotPath !== 'string' || snapshotPath.length === 0) {
+    return Promise.reject(new Error('A native export snapshot path is required'));
+  }
+  return asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal });
+}
+
 /** Abort one active async operation without affecting queued or future work. */
 function cancelOperation(correlationId) {
   const operation = activeOperations.get(correlationId);
@@ -334,7 +484,7 @@ function openAsyncDatabase(path, readOnly) {
 
     let candidate;
     try {
-      candidate = new AsyncDatabase(path, { readonly: readOnly });
+      candidate = new AsyncDatabase(path, { readOnly });
       if (!asyncCapabilityProbed) {
         asyncCapabilitySupported = await probeAsyncDatabase(candidate);
         asyncCapabilityProbed = true;
@@ -349,7 +499,10 @@ function openAsyncDatabase(path, readOnly) {
       if (candidate && typeof candidate.close === 'function') {
         try { await candidate.close(); } catch { /* best-effort capability fallback */ }
       }
-      console.error('[native-worker] AsyncDatabase unavailable; using sync fallback:', err?.message || String(err));
+      console.error(
+        '[native-worker] AsyncDatabase unavailable; using sync fallback:',
+        describeNativeError(err, 'Unknown AsyncDatabase error')
+      );
     }
   })();
 }
@@ -367,8 +520,13 @@ function openAsyncDatabase(path, readOnly) {
  * @returns {object} Result with changes and lastInsertRowId
  */
 function executeStatement(db, sql, params) {
+  if (typeof sql !== 'string') throw new Error('SQL statement must be a string');
+  if (params !== undefined && params !== null && !Array.isArray(params)) {
+    throw new Error('SQL statement parameters must be an array');
+  }
   const stmt = db.prepare(sql);
   let result = { changes: 0, lastInsertRowId: 0 };
+  let executionError;
 
   try {
     if (typeof stmt.run === 'function') {
@@ -378,27 +536,110 @@ function executeStatement(db, sql, params) {
         result.lastInsertRowId = runResult.lastInsertRowId !== undefined ? runResult.lastInsertRowId : 0;
       }
     } else if (typeof stmt.step === 'function') {
-      if (params && params.length > 0 && typeof stmt.bind === 'function') {
-        try { stmt.bind(...params); } catch(e) { /* ignore */ }
+      if (params && params.length > 0) {
+        if (typeof stmt.bind !== 'function') {
+          throw new Error('Native SQLite statement does not support parameter binding');
+        }
+        stmt.bind(...params);
       }
       stmt.step();
     } else if (typeof stmt.execute === 'function') {
-      if (params && params.length > 0 && typeof stmt.bind === 'function') {
-        try { stmt.bind(...params); } catch(e) { /* ignore */ }
+      if (params && params.length > 0) {
+        if (typeof stmt.bind !== 'function') {
+          throw new Error('Native SQLite statement does not support parameter binding');
+        }
+        stmt.bind(...params);
       }
       stmt.execute();
     } else {
-      if (params && params.length > 0 && typeof stmt.bind === 'function') {
-        try { stmt.bind(...params); } catch(e) { /* ignore */ }
+      if (params && params.length > 0) {
+        if (typeof stmt.bind !== 'function') {
+          throw new Error('Native SQLite statement does not support parameter binding');
+        }
+        stmt.bind(...params);
       }
       for (const _ of stmt) {}
     }
+  } catch (error) {
+    executionError = error;
+    throw error;
   } finally {
     if (stmt && typeof stmt.finalize === 'function') {
-      try { stmt.finalize(); } catch (e) { /* ignore */ }
+      try {
+        stmt.finalize();
+      } catch (finalizeError) {
+        if (executionError !== undefined) {
+          throw new AggregateError(
+            [executionError, finalizeError],
+            `${describeNativeError(executionError, 'Statement execution failed')}; ` +
+            `native SQLite statement finalization also failed: ` +
+            `${describeNativeError(finalizeError, 'Unknown finalization error')}`
+          );
+        }
+        throw finalizeError;
+      }
     }
   }
   return result;
+}
+
+/** Read authoritative mutation metadata when the statement API did not expose it. */
+function readRunFallbackResult(db) {
+  const directChanges = db.changes;
+  let rawChanges;
+  let lastInsertRowId;
+
+  if (directChanges !== undefined) {
+    rawChanges = directChanges;
+    lastInsertRowId = db.lastInsertRowId ?? 0;
+  } else {
+    const statement = db.prepare('SELECT changes() AS c, last_insert_rowid() AS id');
+    let rows;
+    let readError;
+    try {
+      if (typeof statement.all === 'function') {
+        rows = statement.all();
+      } else {
+        rows = [];
+        for (const row of statement) {
+          rows.push(row);
+          break;
+        }
+      }
+    } catch (error) {
+      readError = error;
+      throw error;
+    } finally {
+      if (typeof statement.finalize === 'function') {
+        try {
+          statement.finalize();
+        } catch (finalizeError) {
+          if (readError !== undefined) {
+            throw new AggregateError(
+              [readError, finalizeError],
+              `${describeNativeError(readError, 'Mutation metadata read failed')}; ` +
+              `native mutation-metadata statement finalization also failed: ` +
+              `${describeNativeError(finalizeError, 'Unknown finalization error')}`
+            );
+          }
+          throw finalizeError;
+        }
+      }
+    }
+
+    const row = rows?.[0];
+    if (!row) {
+      throw new Error('Native SQLite did not return mutation metadata');
+    }
+    rawChanges = row.c;
+    lastInsertRowId = row.id ?? 0;
+  }
+
+  const changes = typeof rawChanges === 'bigint' ? Number(rawChanges) : rawChanges;
+  if (!Number.isSafeInteger(changes) || changes < 0) {
+    throw new Error('Native SQLite returned an invalid changes() count');
+  }
+  return { changes, lastInsertRowId };
 }
 
 /**
@@ -410,86 +651,69 @@ function executeStatement(db, sql, params) {
  * @returns {object} Result with columns, values, rowCount
  */
 function executeQuery(db, sql, params) {
-  console.error("[native-worker] query:", sql.substring(0, 50));
-
-  // Detect if this is a SELECT query or a modification (UPDATE/INSERT/DELETE/etc)
-  const trimmedSql = sql.trim().toUpperCase();
-  const isSelectQuery = trimmedSql.startsWith("SELECT") ||
-                        trimmedSql.startsWith("PRAGMA") ||
-                        trimmedSql.startsWith("EXPLAIN") ||
-                        trimmedSql.startsWith("WITH");
-
-  console.error("[native-worker] isSelectQuery:", isSelectQuery);
-
-  let columns = [];
-  let values = [];
-  let rowCount = 0;
-
-  if (isSelectQuery) {
-    const stmt = db.prepare(sql);
-    let rows;
-    try {
-      if (typeof stmt.all === 'function') {
-          if (params && params.length > 0) {
-              rows = stmt.all(...params);
-          } else {
-              rows = stmt.all();
-          }
-      } else {
-          // Fallback for iterators
-          rows = [];
-          if (params && params.length > 0 && typeof stmt.bind === 'function') {
-              try { stmt.bind(...params); } catch(e) { console.error("bind failed", e); }
-          }
-          for (const row of stmt) {
-              rows.push(row);
-          }
-      }
-    } finally {
-       if (typeof stmt.finalize === 'function') stmt.finalize();
-    }
-
-    console.error("[native-worker] got rows:", rows?.length);
-
-    if (rows && rows.length > 0) {
-      columns = Object.keys(rows[0]);
-      values = rows.map(row => columns.map(col => row[col]));
-      rowCount = rows.length;
-    }
-  } else {
-    // Non-SELECT via query() - typically shouldn't happen for updateCell but good to support
-    console.error("[native-worker] executing non-SELECT via query()");
-    if (params && params.length > 0) {
-      const stmt = db.prepare(sql);
-      try {
-          if (typeof stmt.run === 'function') {
-              stmt.run(...params);
-          } else if (typeof stmt.execute === 'function') {
-              if (typeof stmt.bind === 'function') stmt.bind(...params);
-              stmt.execute();
-          } else {
-              if (typeof stmt.bind === 'function') stmt.bind(...params);
-              stmt.step(); // or iterate
-          }
-      } finally {
-          if (typeof stmt.finalize === 'function') stmt.finalize();
-      }
-    } else {
-      db.exec(sql);
-    }
-
-    // Get changes
-    try {
-       const chg = db.prepare("SELECT changes() as c").all()[0].c;
-       rowCount = chg;
-    } catch(e) { rowCount = 0; }
+  if (typeof sql !== 'string') throw new Error('SQL query must be a string');
+  if (params !== undefined && params !== null && !Array.isArray(params)) {
+    throw new Error('SQL query parameters must be an array');
   }
 
-  return {
-    columns,
-    values,
-    rowCount
-  };
+  const hasParameters = Array.isArray(params) && params.length > 0;
+  if (hasParameters) {
+    const boundary = '/*sqlite_explorer_parameterized_query_boundary*/';
+    const validation = db.prepare(`${sql}\n${boundary}`);
+    try {
+      const validatedSql = typeof validation.toString === 'function'
+        ? validation.toString().trimEnd()
+        : '';
+      if (!validatedSql.endsWith(boundary)) {
+        throw new Error('Bound parameters require exactly one SQL statement');
+      }
+    } finally {
+      if (typeof validation.finalize === 'function') validation.finalize();
+    }
+  }
+
+  let remaining = sql;
+  let statementCount = 0;
+  let lastResult = { columns: [], values: [], rowCount: 0 };
+  const resultSets = [];
+
+  while (remaining.length > 0) {
+    if (statementCount >= MAX_QUERY_STATEMENTS) {
+      throw new Error(`SQL query exceeds ${MAX_QUERY_STATEMENTS} statements`);
+    }
+    const stmt = db.prepare(remaining);
+    let preparedSql = '';
+    try {
+      preparedSql = typeof stmt.toString === 'function' ? stmt.toString() : '';
+      if (preparedSql.length === 0) break;
+      if (!hasParameters && !remaining.startsWith(preparedSql)) {
+        throw new Error(
+          'Native SQLite did not preserve the prepared SQL prefix: ' +
+          `input=${JSON.stringify(remaining.slice(0, 160))}, ` +
+          `prepared=${JSON.stringify(preparedSql.slice(0, 160))}`
+        );
+      }
+
+      const rows = statementCount === 0 && params && params.length > 0
+        ? stmt.all(...params)
+        : stmt.all();
+      const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
+      lastResult = {
+        columns,
+        values: (rows || []).map(row => columns.map(column => row[column])),
+        rowCount: rows?.length ?? 0
+      };
+      if (columns.length > 0) resultSets.push(lastResult);
+      statementCount++;
+    } finally {
+      if (typeof stmt.finalize === 'function') stmt.finalize();
+    }
+    remaining = hasParameters ? '' : remaining.slice(preparedSql.length);
+  }
+
+  return statementCount > 1
+    ? { ...lastResult, resultSets }
+    : lastResult;
 }
 
 function foreignKeyIntegerText(value) {
@@ -738,7 +962,7 @@ function normalizeCellTextEncoding(value) {
 }
 
 function readCellMetadata(connection, table, column, locator) {
-  const escapedTable = escapeCellIdentifier(table, 'table');
+  const escapedTable = `main.${escapeCellIdentifier(table, 'table')}`;
   const escapedColumn = escapeCellIdentifier(column, 'column');
   const predicate = buildCellLocator(locator);
   const metadataResult = executeQuery(
@@ -839,7 +1063,7 @@ function replaceOversizedCellValue(
     );
   }
 
-  const escapedTable = escapeCellIdentifier(table, 'table');
+  const escapedTable = `main.${escapeCellIdentifier(table, 'table')}`;
   const escapedColumn = escapeCellIdentifier(column, 'column');
   const predicate = buildCellLocator(locator);
   executeStatement(
@@ -893,7 +1117,7 @@ function scheduleCellReadSessionExpiry(session) {
     } catch (err) {
       console.error(
         `[native-worker] Failed to expire cell read session ${session.sessionId}:`,
-        err?.message || String(err)
+        describeNativeError(err, 'Unknown cell read cleanup error')
       );
     }
   }, Math.max(1, expiresAt - Date.now()));
@@ -919,24 +1143,45 @@ function abandonMainConnectionAfterCellReadCleanupFailure(connection, errors) {
   }
 }
 
-function closeCellReadSessionInternal(sessionId) {
+function closeCellReadSessionInternal(sessionId, timeoutMs) {
   const session = cellReadSessions.get(sessionId);
   if (!session) return false;
+  const operationTimeoutMs = timeoutMs === undefined
+    ? CELL_READ_SESSION_IDLE_TIMEOUT_MS
+    : timeoutMs;
+  if (!Number.isFinite(operationTimeoutMs) || operationTimeoutMs <= 0) {
+    throw new Error('Query timeout must be a positive finite number');
+  }
+
+  // Closing is terminal once the timeout itself is known to be valid. If the
+  // native deadline API fails, retaining a session whose handle is about to be
+  // closed would expose a stale connection on the next chunk request.
   cellReadSessions.delete(sessionId);
   rememberClosedCellReadSession(sessionId);
   if (session.expiryTimer !== undefined) clearTimeout(session.expiryTimer);
 
   const cleanupErrors = [];
   try {
-    session.connection.exec(`RELEASE SAVEPOINT "${session.savepointName}"`);
-  } catch (releaseError) {
-    try {
-      session.connection.exec(`ROLLBACK TO SAVEPOINT "${session.savepointName}"`);
-      session.connection.exec(`RELEASE SAVEPOINT "${session.savepointName}"`);
-    } catch (rollbackError) {
-      cleanupErrors.push(releaseError, rollbackError);
-    }
+    runWithQueryDeadline(session.connection, operationTimeoutMs, () => {
+      try {
+        session.connection.exec(`RELEASE SAVEPOINT "${session.savepointName}"`);
+      } catch (releaseError) {
+        try {
+          session.connection.exec(`ROLLBACK TO SAVEPOINT "${session.savepointName}"`);
+          session.connection.exec(`RELEASE SAVEPOINT "${session.savepointName}"`);
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [releaseError, rollbackError],
+            'Cell read snapshot bracket could not be released'
+          );
+        }
+      }
+    });
+  } catch (cleanupError) {
+    cleanupErrors.push(cleanupError);
   } finally {
+    // clearQueryDeadline must run on an open handle. Dedicated handles are
+    // therefore closed only after runWithQueryDeadline has unwound.
     if (!session.usesMainConnection) {
       try {
         session.connection.close();
@@ -957,6 +1202,41 @@ function closeCellReadSessionInternal(sessionId) {
     );
   }
   return true;
+}
+
+function readCellChunkFromSession(session, byteOffset, maxBytes, timeoutMs) {
+  const { target, metadata } = session;
+  const chunkResult = runWithQueryDeadline(session.connection, timeoutMs, () => (
+    executeQuery(
+      session.connection,
+      `SELECT substr(CAST(${target.escapedColumn} AS BLOB), ? + 1, ?) ` +
+        `FROM ${target.escapedTable} WHERE ${target.predicate.sql} LIMIT 2`,
+      [byteOffset, maxBytes, ...target.predicate.params]
+    )
+  ));
+  if (chunkResult.values.length !== 1) {
+    throw new Error(
+      chunkResult.values.length === 0
+        ? `Cell ${target.table}.${target.column} no longer exists in its snapshot`
+        : `Cell ${target.table}.${target.column} matched more than one row`
+    );
+  }
+  const value = chunkResult.values[0][0];
+  const bytes = value === null
+    ? new Uint8Array(0)
+    : value instanceof Uint8Array
+      ? Uint8Array.from(value)
+      : undefined;
+  if (!bytes) {
+    throw new Error(`SQLite returned a non-BLOB chunk for ${target.table}.${target.column}`);
+  }
+  session.lastAccessAt = Date.now();
+  scheduleCellReadSessionExpiry(session);
+  return {
+    byteOffset,
+    bytes,
+    done: byteOffset + bytes.byteLength >= metadata.byteLength
+  };
 }
 
 function closeAllCellReadSessions() {
@@ -1352,11 +1632,13 @@ function executeExportSpoolQuery(asyncDatabase, validationDb, requestId, markedS
  * @returns {Promise<object>} Response { id, result } or { id, error }
  */
 async function handleRequest(request) {
-  const { id, method, args = [] } = request;
+  const { id, method, args = [], timeoutMs = 30_000 } = request;
 
   try {
-    let result;
     assertMainConnectionCellReadSessionAllows(method);
+    const deadlineDatabase = db;
+    const executeRequest = async () => {
+    let result;
 
     switch (method) {
       // ========================================
@@ -1372,7 +1654,7 @@ async function handleRequest(request) {
         if (db) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
-        db = new Database(path, { readonly: readOnly });
+        db = new Database(path, { readOnly });
         databasePath = path;
         await openAsyncDatabase(path, readOnly);
         result = { success: true };
@@ -1436,7 +1718,6 @@ async function handleRequest(request) {
         if (!db) throw new Error("Database not open");
 
         result = executeQuery(db, sql, params);
-        console.error("[native-worker] query complete");
         break;
       }
 
@@ -1476,7 +1757,7 @@ async function handleRequest(request) {
       }
 
       case "openCellReadSession": {
-        const [table, column, locator] = args;
+        const [table, column, locator, operationTimeoutMs = timeoutMs] = args;
         if (!db) throw new Error('Database not open');
         if (cellReadSessions.size >= MAX_CELL_READ_SESSIONS) {
           throw new Error(`At most ${MAX_CELL_READ_SESSIONS} cell read sessions may be open`);
@@ -1492,14 +1773,16 @@ async function handleRequest(request) {
         }
         const connection = usesMainConnection
           ? db
-          : new Database(databasePath, { readonly: true });
+          : new Database(databasePath, { readOnly: true });
         const savepointName = `sqlite_explorer_cell_read_${++savepointCounter}`;
         let bracketOpened = false;
         try {
-          connection.exec(`SAVEPOINT "${savepointName}"`);
-          bracketOpened = true;
-          // The first SELECT fixes the snapshot before the session is returned.
-          const snapshot = readCellMetadata(connection, table, column, locator);
+          const snapshot = runWithQueryDeadline(connection, operationTimeoutMs, () => {
+            connection.exec(`SAVEPOINT "${savepointName}"`);
+            bracketOpened = true;
+            // The first SELECT fixes the snapshot before the session is returned.
+            return readCellMetadata(connection, table, column, locator);
+          });
           const now = Date.now();
           const sessionId = createCellReadSessionId();
           const session = {
@@ -1525,14 +1808,12 @@ async function handleRequest(request) {
           const cleanupErrors = [];
           if (bracketOpened) {
             try {
-              connection.exec(`ROLLBACK TO SAVEPOINT "${savepointName}"`);
-            } catch (rollbackError) {
-              cleanupErrors.push(rollbackError);
-            }
-            try {
-              connection.exec(`RELEASE SAVEPOINT "${savepointName}"`);
-            } catch (releaseError) {
-              cleanupErrors.push(releaseError);
+              runWithQueryDeadline(connection, operationTimeoutMs, () => {
+                connection.exec(`ROLLBACK TO SAVEPOINT "${savepointName}"`);
+                connection.exec(`RELEASE SAVEPOINT "${savepointName}"`);
+              });
+            } catch (cleanupError) {
+              cleanupErrors.push(cleanupError);
             }
           }
           if (!usesMainConnection) {
@@ -1555,7 +1836,7 @@ async function handleRequest(request) {
       }
 
       case "readCellChunk": {
-        const [sessionId, byteOffset, maxBytes] = args;
+        const [sessionId, byteOffset, maxBytes, operationTimeoutMs = timeoutMs] = args;
         validateCellReadWindow(byteOffset, maxBytes);
         const session = cellReadSessions.get(sessionId);
         if (!session) {
@@ -1566,48 +1847,27 @@ async function handleRequest(request) {
           );
         }
         if (Date.now() >= session.expiresAt) {
-          closeCellReadSessionInternal(sessionId);
+          closeCellReadSessionInternal(sessionId, operationTimeoutMs);
           throw new Error(`Cell read session ${sessionId} is closed or expired`);
         }
-        const { target, metadata } = session;
-        const chunkResult = executeQuery(
-          session.connection,
-          `SELECT substr(CAST(${target.escapedColumn} AS BLOB), ? + 1, ?) ` +
-            `FROM ${target.escapedTable} WHERE ${target.predicate.sql} LIMIT 2`,
-          [byteOffset, maxBytes, ...target.predicate.params]
-        );
-        if (chunkResult.values.length !== 1) {
-          throw new Error(
-            chunkResult.values.length === 0
-              ? `Cell ${target.table}.${target.column} no longer exists in its snapshot`
-              : `Cell ${target.table}.${target.column} matched more than one row`
-          );
-        }
-        const value = chunkResult.values[0][0];
-        const bytes = value === null
-          ? new Uint8Array(0)
-          : value instanceof Uint8Array
-            ? Uint8Array.from(value)
-            : undefined;
-        if (!bytes) {
-          throw new Error(`SQLite returned a non-BLOB chunk for ${target.table}.${target.column}`);
-        }
-        session.lastAccessAt = Date.now();
-        scheduleCellReadSessionExpiry(session);
-        result = {
+        result = readCellChunkFromSession(
+          session,
           byteOffset,
-          bytes,
-          done: byteOffset + bytes.byteLength >= metadata.byteLength
-        };
+          maxBytes,
+          operationTimeoutMs
+        );
         break;
       }
 
       case "closeCellReadSession": {
-        const [sessionId] = args;
+        const [sessionId, operationTimeoutMs = timeoutMs] = args;
         if (typeof sessionId !== 'string' || sessionId.length === 0) {
           throw new Error('Cell read session id is required');
         }
-        if (!closeCellReadSessionInternal(sessionId) && !closedCellReadSessionIds.has(sessionId)) {
+        if (
+          !closeCellReadSessionInternal(sessionId, operationTimeoutMs)
+          && !closedCellReadSessionIds.has(sessionId)
+        ) {
           throw new Error(`Unknown cell read session: ${sessionId}`);
         }
         result = { success: true };
@@ -1703,25 +1963,41 @@ async function handleRequest(request) {
         break;
       }
 
+      case "compileBatch": {
+        // Compile generated EXPLAIN statements on the transaction-owning
+        // connection and return one independent validity result per probe.
+        const [queries] = args;
+        if (!db) throw new Error("Database not open");
+        if (!Array.isArray(queries) || queries.length > MAX_SCHEMA_DEPENDENCY_PROBES) {
+          throw new Error(
+            `Schema dependency probe batch exceeds ${MAX_SCHEMA_DEPENDENCY_PROBES} statements`
+          );
+        }
+        const errors = [];
+        for (const sql of queries) {
+          if (typeof sql !== 'string' || !/^\s*EXPLAIN\s/i.test(sql)) {
+            throw new Error('Schema dependency probes must be EXPLAIN statements');
+          }
+          let statement;
+          try {
+            statement = db.prepare(sql);
+            errors.push(null);
+          } catch (error) {
+            errors.push(describeNativeError(error, 'Unknown compile error'));
+          } finally {
+            if (statement && typeof statement.finalize === 'function') {
+              try { statement.finalize(); } catch { /* preparation result is already known */ }
+            }
+          }
+        }
+        result = { errors };
+        break;
+      }
+
       case "run": {
         // Execute SQL for modifications (INSERT, UPDATE, DELETE)
         // args: [sql: string, params?: any[]]
         const [sql, params] = args;
-
-        // Debug logging - avoid JSON.stringify on binary data
-        console.error("[native-worker] Received request: run");
-        console.error("[native-worker] DEBUG: sql =", sql);
-        // Log param types and sizes instead of full content to avoid huge logs for binary data
-        if (params && params.length > 0) {
-          const paramInfo = params.map((p, i) => {
-            if (p instanceof Uint8Array) return `[${i}]: Uint8Array(${p.length})`;
-            if (typeof p === 'string' && p.length > 100) return `[${i}]: string(${p.length} chars)`;
-            return `[${i}]: ${typeof p === 'object' ? JSON.stringify(p) : p}`;
-          });
-          console.error("[native-worker] DEBUG: params =", paramInfo.join(', '));
-        } else {
-          console.error("[native-worker] DEBUG: params = (none)");
-        }
 
         if (!db) throw new Error("Database not open");
 
@@ -1731,47 +2007,14 @@ async function handleRequest(request) {
           if (runResult.changes > 0 || runResult.lastInsertRowId > 0) {
              result = runResult;
           } else {
-              // tjs sqlite might not expose totalChanges/changes on db object
-              // Query for value if missing
-              if (db.changes !== undefined) {
-                 result = {
-                   changes: db.changes,
-                   lastInsertRowId: db.lastInsertRowId || 0
-                 };
-              } else {
-                 try {
-                     const changesStmt = db.prepare("SELECT changes() as c, last_insert_rowid() as id");
-                     let row;
-                     if (typeof changesStmt.all === 'function') {
-                         const rows = changesStmt.all();
-                         if (rows && rows.length > 0) row = rows[0];
-                     } else {
-                         for (const r of changesStmt) { row = r; break; }
-                     }
-
-                     if (typeof changesStmt.finalize === 'function') {
-                         changesStmt.finalize();
-                     }
-
-                     if (row) {
-                         result = {
-                             changes: row.c,
-                             lastInsertRowId: row.id
-                         };
-                     } else {
-                         result = { changes: 0, lastInsertRowId: 0 };
-                     }
-                 } catch (e) {
-                     console.error("[native-worker] Failed to query changes:", e);
-                     result = { changes: 0, lastInsertRowId: 0 };
-                 }
-              }
+              // tjs sqlite might not expose changes on the run result. This is
+              // authoritative mutation state: failure must abort the caller,
+              // never masquerade as a successful zero-row write.
+              result = readRunFallbackResult(db);
           }
         } catch (e) {
-            console.error("[native-worker] DEBUG: execution failed", e);
             throw e;
         }
-        console.error("[native-worker] DEBUG: run complete, changes:", result?.changes);
         break;
       }
 
@@ -1894,14 +2137,17 @@ async function handleRequest(request) {
         if (!db) throw new Error("Database not open");
 
         const tablesStmt = db.prepare(
-          "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+          "SELECT name, sql FROM main.sqlite_schema " +
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         );
         const tables = tablesStmt.all();
         tablesStmt.finalize();
 
         const schema = [];
         for (const table of tables) {
-          const columnsStmt = db.prepare(`PRAGMA table_info("${table.name}")`);
+          const columnsStmt = db.prepare(
+            `PRAGMA main.table_info(${escapeCellIdentifier(table.name, 'table')})`
+          );
           const columns = columnsStmt.all();
           columnsStmt.finalize();
 
@@ -1922,14 +2168,15 @@ async function handleRequest(request) {
         break;
       }
 
-      case "export": {
+      case "vacuumInto": {
         if (!db) throw new Error("Database not open");
-        // Create a temporary file and use VACUUM INTO to get a consistent snapshot
-        const tmpPath = `/tmp/sqlite-export-${Date.now()}.db`;
-        db.exec(`VACUUM INTO '${tmpPath}'`);
-        const content = await tjs.readFile(tmpPath);
-        await tjs.remove(tmpPath);
-        result = { content };
+        const [snapshotPath, operationTimeoutMs = timeoutMs] = args;
+        await executeInterruptibleAsyncOperation(
+          id,
+          operationTimeoutMs,
+          signal => runVacuumInto(asyncDb, db, snapshotPath, signal)
+        );
+        result = { success: true };
         break;
       }
 
@@ -1942,10 +2189,28 @@ async function handleRequest(request) {
         throw new Error(`Unknown method: ${method}`);
     }
 
+    return result;
+    };
+
+    const result = deadlineDatabase && ![
+      'open',
+      'openMemory',
+      'close',
+      'cancel',
+      'ping',
+      // These methods can execute on a dedicated snapshot connection. Each
+      // case arms that actual handle rather than the unrelated main database.
+      'openCellReadSession',
+      'readCellChunk',
+      'closeCellReadSession'
+    ].includes(method)
+      ? await runWithQueryDeadline(deadlineDatabase, timeoutMs, executeRequest)
+      : await executeRequest();
+
     return { id, result };
 
   } catch (err) {
-    const errorMsg = err.message || String(err);
+    const errorMsg = describeNativeError(err, 'Unknown native worker error');
     console.error(`[native-worker] ERROR in ${method}:`, errorMsg);
     return {
       id,
@@ -1960,51 +2225,51 @@ async function handleRequest(request) {
 // ============================================================================
 
 async function main() {
-  console.error("[native-worker] Starting...");
   let writeTail = Promise.resolve();
   const enqueueMessage = (message) => {
     const write = writeTail.then(() => writeMessage(message));
     writeTail = write.catch(err => {
-      console.error('[native-worker] Message write failed:', err?.message || String(err));
+      console.error(
+        '[native-worker] Message write failed:',
+        describeNativeError(err, 'Unknown message write error')
+      );
     });
     return write;
   };
   let requestTail = Promise.resolve();
 
   await enqueueMessage({ ready: true, version: "1.0.0" });
-  console.error("[native-worker] Sent ready signal");
-
   while (true) {
     try {
       const request = await readMessage();
 
       if (request === null) {
-        console.error("[native-worker] EOF received, shutting down");
         break;
       }
 
-      console.error("[native-worker] Received request:", request?.method);
       if (request?.method === 'cancel') {
         // Cancel must bypass the normal FIFO tail so it can reach the
         // AbortController while AsyncDatabase is executing SQLite work.
         const response = await handleRequest(request);
-        console.error("[native-worker] Sending response for:", request?.method, response?.error ? "ERROR: " + response.error : "OK");
         await enqueueMessage(response);
         continue;
       }
 
       const queuedRequest = requestTail.then(async () => {
         const response = await handleRequest(request);
-        console.error("[native-worker] Sending response for:", request?.method, response?.error ? "ERROR: " + response.error : "OK");
         await enqueueMessage(response);
       });
       requestTail = queuedRequest.catch(err => {
-        console.error('[native-worker] Queued request failed:', err?.message || String(err));
+        console.error(
+          '[native-worker] Queued request failed:',
+          describeNativeError(err, 'Unknown queued request error')
+        );
       });
 
     } catch (err) {
-      console.error("[native-worker] Main loop error:", err.message || String(err));
-      await enqueueMessage({ id: -1, error: err.message || String(err) });
+      const errorMessage = describeNativeError(err, 'Unknown native worker loop error');
+      console.error("[native-worker] Main loop error:", errorMessage);
+      await enqueueMessage({ id: -1, error: errorMessage });
     }
   }
 
@@ -2019,6 +2284,6 @@ async function main() {
 }
 
 main().catch(err => {
-  console.error("Native worker error:", err);
+  console.error("Native worker error:", describeNativeError(err, 'Unknown fatal worker error'));
   tjs.exit(1);
 });

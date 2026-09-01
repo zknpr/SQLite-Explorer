@@ -190,6 +190,12 @@ export type JsonUndoPlan =
     | { kind: 'restore'; value: string }
     | { kind: 'replace' };
 
+export type JsonPatchHistoryReplayDirection = 'undo' | 'redo';
+
+export type JsonPatchHistoryReplayPlan =
+    | { kind: 'write'; value: CellValue }
+    | { kind: 'conflict' };
+
 /** Parse a raw cell value to a plain JSON object, or undefined if it is not one. */
 function parseJsonObject(raw: unknown): Record<string, unknown> | undefined {
     if (typeof raw !== 'string') return undefined;
@@ -232,6 +238,150 @@ export function computeJsonPatchUndo(
         return { kind: 'replace' };
     }
     return { kind: 'restore', value: JSON.stringify(restoreInto(current, forwardPatch, prior, 0)) };
+}
+
+/**
+ * Plan a guarded JSON merge-patch undo/redo without overwriting unrelated keys.
+ *
+ * Object patches validate only the paths the forward patch touched. This lets a
+ * concurrent sibling survive history replay while rejecting a concurrent edit
+ * to the same path. Cases that cannot round-trip through JavaScript JSON
+ * exactly fall back to byte-for-byte whole-cell comparison.
+ */
+export function planJsonPatchHistoryReplay(
+    currentRaw: CellValue,
+    forwardPatchRaw: CellValue,
+    priorRaw: CellValue,
+    postRaw: CellValue,
+    direction: JsonPatchHistoryReplayDirection
+): JsonPatchHistoryReplayPlan {
+    const expectedRaw = direction === 'undo' ? postRaw : priorRaw;
+    const targetRaw = direction === 'undo' ? priorRaw : postRaw;
+    const exactPlan = (): JsonPatchHistoryReplayPlan => (
+        cellValuesEqual(currentRaw, expectedRaw)
+            ? { kind: 'write', value: targetRaw }
+            : { kind: 'conflict' }
+    );
+
+    if (
+        hasPrecisionRiskyNumber(currentRaw)
+        || hasPrecisionRiskyNumber(forwardPatchRaw)
+        || hasPrecisionRiskyNumber(priorRaw)
+        || hasPrecisionRiskyNumber(postRaw)
+    ) {
+        return exactPlan();
+    }
+
+    const current = parseJsonObject(currentRaw);
+    const forwardPatch = parseJsonObject(forwardPatchRaw);
+    const prior = parseJsonObject(priorRaw);
+    const post = parseJsonObject(postRaw);
+    if (!current || !forwardPatch || !prior || !post) {
+        return exactPlan();
+    }
+
+    const expected = direction === 'undo' ? post : prior;
+    if (!patchFootprintMatches(current, expected, forwardPatch, prior, 0)) {
+        return { kind: 'conflict' };
+    }
+
+    const replayed = direction === 'undo'
+        ? restoreInto(current, forwardPatch, prior, 0)
+        : applyMergePatch(current, forwardPatch, 0);
+    return { kind: 'write', value: JSON.stringify(replayed) };
+}
+
+/** Validate only the object branches and leaves selected by a merge patch. */
+function patchFootprintMatches(
+    currentObj: Record<string, unknown>,
+    expectedObj: Record<string, unknown>,
+    patchObj: Record<string, unknown>,
+    forwardPriorObj: Record<string, unknown>,
+    depth: number
+): boolean {
+    if (depth > MAX_DEPTH) {
+        throw new Error('JSON history replay depth limit exceeded');
+    }
+    for (const key of Object.keys(patchObj)) {
+        const patchValue = patchObj[key];
+        const currentHas = Object.prototype.hasOwnProperty.call(currentObj, key);
+        const expectedHas = Object.prototype.hasOwnProperty.call(expectedObj, key);
+        const forwardPriorHas = Object.prototype.hasOwnProperty.call(forwardPriorObj, key);
+        const currentValue = currentHas ? currentObj[key] : undefined;
+        const expectedValue = expectedHas ? expectedObj[key] : undefined;
+        const forwardPriorValue = forwardPriorHas ? forwardPriorObj[key] : undefined;
+
+        if (isObject(patchValue)) {
+            if (!forwardPriorHas || !isObject(forwardPriorValue)) {
+                // The forward edit created/replaced this whole branch. Undo may
+                // delete or value-replace it, so accepting a new descendant
+                // sibling here would clobber that external write.
+                if (!jsonOwnValueEqual(currentHas, currentValue, expectedHas, expectedValue, depth + 1)) {
+                    return false;
+                }
+                continue;
+            }
+            if (
+                !currentHas || !isObject(currentValue)
+                || !expectedHas || !isObject(expectedValue)
+            ) {
+                return false;
+            }
+            if (!patchFootprintMatches(
+                currentValue,
+                expectedValue,
+                patchValue,
+                forwardPriorValue,
+                depth + 1
+            )) {
+                return false;
+            }
+            continue;
+        }
+
+        // RFC 7396 treats arrays, scalars, and null as atomic patch leaves.
+        if (!jsonOwnValueEqual(currentHas, currentValue, expectedHas, expectedValue, depth + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function jsonOwnValueEqual(
+    leftHas: boolean,
+    left: unknown,
+    rightHas: boolean,
+    right: unknown,
+    depth: number
+): boolean {
+    return leftHas === rightHas && (!leftHas || jsonValueEqual(left, right, depth));
+}
+
+function jsonValueEqual(left: unknown, right: unknown, depth: number): boolean {
+    if (depth > MAX_DEPTH) {
+        throw new Error('JSON history replay depth limit exceeded');
+    }
+    if (Object.is(left, right)) return true;
+    if (Array.isArray(left) || Array.isArray(right)) {
+        if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+        return left.every((value, index) => jsonValueEqual(value, right[index], depth + 1));
+    }
+    if (!isObject(left) || !isObject(right)) return false;
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    if (leftKeys.length !== rightKeys.length) return false;
+    return leftKeys.every(key => (
+        Object.prototype.hasOwnProperty.call(right, key)
+        && jsonValueEqual(left[key], right[key], depth + 1)
+    ));
+}
+
+function cellValuesEqual(left: CellValue, right: CellValue): boolean {
+    if (left instanceof Uint8Array || right instanceof Uint8Array) {
+        if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array)) return false;
+        return left.length === right.length && left.every((byte, index) => byte === right[index]);
+    }
+    return Object.is(left, right);
 }
 
 /**

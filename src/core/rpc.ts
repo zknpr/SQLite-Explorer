@@ -84,10 +84,38 @@ export interface PendingInvocation {
   readonly expirationTimer: ReturnType<typeof setTimeout>;
 }
 
+/** Reject and detach every call owned by a transport that can no longer reply. */
+export function rejectPendingInvocations(
+  pendingInvocations: Map<MessageCorrelationId, PendingInvocation>,
+  error: Error
+): void {
+  const pending = [...pendingInvocations.values()];
+  pendingInvocations.clear();
+  const callbackErrors: unknown[] = [];
+  for (const invocation of pending) {
+    clearTimeout(invocation.expirationTimer);
+    try {
+      invocation.onFault(error);
+    } catch (callbackError) {
+      callbackErrors.push(callbackError);
+    }
+  }
+  if (callbackErrors.length > 0) {
+    throw new AggregateError(callbackErrors, 'Failed to reject one or more retired RPC calls');
+  }
+}
+
 /**
  * Default timeout for remote invocations (60 seconds to accommodate large blob operations).
  */
 export const DEFAULT_INVOCATION_TIMEOUT_MS = 60000;
+const MAX_PROTOCOL_IDENTIFIER_LENGTH = 256;
+
+function isSafeProtocolIdentifier(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= MAX_PROTOCOL_IDENTIFIER_LENGTH;
+}
 
 /** A host-side RPC deadline expired before the remote endpoint replied. */
 export class InvocationTimeoutError extends Error {
@@ -111,6 +139,13 @@ export class InvocationTimeoutError extends Error {
 const PRIVATE_MARKER_LEAD = '\u001e';
 const INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX = PRIVATE_MARKER_LEAD + 'SQLiteExplorerInvocationTimeout:';
 const CELL_EDIT_ERROR_TEXT_PREFIX = PRIVATE_MARKER_LEAD + 'SQLiteExplorerCellEditPolicy:';
+const MAX_INVOCATION_ERROR_MESSAGE_LENGTH = 8192;
+
+function boundInvocationErrorMessage(message: string): string {
+  if (message.length <= MAX_INVOCATION_ERROR_MESSAGE_LENGTH) return message;
+  return message.slice(0, MAX_INVOCATION_ERROR_MESSAGE_LENGTH)
+    + `... [truncated from ${message.length} characters]`;
+}
 
 export function isInvocationTimeoutError(error: unknown): error is InvocationTimeoutError {
   if (error instanceof InvocationTimeoutError) return true;
@@ -121,21 +156,31 @@ export function isInvocationTimeoutError(error: unknown): error is InvocationTim
 }
 
 function serializeInvocationError(error: unknown): string {
-  if (isInvocationTimeoutError(error)) {
-    const message = error instanceof Error ? error.message : String(error);
-    return INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX + JSON.stringify({
-      methodName: error.methodName,
-      message
-    });
+  try {
+    if (isInvocationTimeoutError(error)) {
+      const message = boundInvocationErrorMessage(
+        error instanceof Error ? error.message : String(error)
+      );
+      return INVOCATION_TIMEOUT_ERROR_TEXT_PREFIX + JSON.stringify({
+        methodName: error.methodName,
+        message
+      });
+    }
+    const cellEditError = toCellEditRpcErrorData(error);
+    if (cellEditError) {
+      return CELL_EDIT_ERROR_TEXT_PREFIX + JSON.stringify(cellEditError);
+    }
+    const message = boundInvocationErrorMessage(
+      error instanceof Error ? error.message : String(error)
+    );
+    // Doubling a leading marker byte keeps ordinary text out of the reserved
+    // namespace; deserializeInvocationError strips it back off.
+    return message.startsWith(PRIVATE_MARKER_LEAD) ? PRIVATE_MARKER_LEAD + message : message;
+  } catch {
+    // A rejected value may be a Proxy or define a throwing coercion hook. The
+    // responder still owes the caller a terminal result instead of a timeout.
+    return 'Unknown remote error';
   }
-  const cellEditError = toCellEditRpcErrorData(error);
-  if (cellEditError) {
-    return CELL_EDIT_ERROR_TEXT_PREFIX + JSON.stringify(cellEditError);
-  }
-  const message = error instanceof Error ? error.message : String(error);
-  // Doubling a leading marker byte keeps ordinary text out of the reserved
-  // namespace; deserializeInvocationError strips it back off.
-  return message.startsWith(PRIVATE_MARKER_LEAD) ? PRIVATE_MARKER_LEAD + message : message;
 }
 
 function deserializeInvocationError(errorText: string): Error {
@@ -240,7 +285,15 @@ export function buildMethodProxy<T extends object>(
     if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
       const result: Record<string, unknown> = {};
       for (const key of Object.keys(value as Record<string, unknown>)) {
-        result[key] = extractTransferables((value as Record<string, unknown>)[key], transferList);
+        // Assignment would invoke Object.prototype.__proto__ for a data key
+        // with that spelling. Define an ordinary own property instead so RPC
+        // cloning cannot drop the value or replace the clone's prototype.
+        Object.defineProperty(result, key, {
+          value: extractTransferables((value as Record<string, unknown>)[key], transferList),
+          enumerable: true,
+          configurable: true,
+          writable: true
+        });
       }
       return result;
     }
@@ -361,6 +414,26 @@ export function processProtocolMessage(
   if (msg.kind === 'invoke' && localMethods && sendResponse) {
     const { correlationId, methodName, parameters } = msg;
 
+    // Correlation IDs are reflected in responses. Reject malformed identities
+    // before invoking code or copying an attacker-controlled object graph.
+    if (!isSafeProtocolIdentifier(correlationId)) return true;
+    if (!isSafeProtocolIdentifier(methodName)) {
+      sendResponse({
+        kind: 'result',
+        correlationId,
+        errorText: 'RPC method name must be a bounded string'
+      });
+      return true;
+    }
+    if (!Array.isArray(parameters)) {
+      sendResponse({
+        kind: 'result',
+        correlationId,
+        errorText: 'RPC parameters must be an array'
+      });
+      return true;
+    }
+
     // SECURITY: Validate method name to prevent prototype pollution attacks.
     // An attacker could try to invoke 'constructor', '__proto__', 'toString', etc.
     // We only allow methods that exist directly on the localMethods object,
@@ -426,14 +499,17 @@ export function processProtocolMessage(
   // Handle incoming response — look up in the provided pending map
   if (msg.kind === 'result' && pendingInvocations) {
     const { correlationId, payload, errorText } = msg;
+    if (!isSafeProtocolIdentifier(correlationId)) return true;
     const pending = pendingInvocations.get(correlationId);
 
     if (pending) {
       clearTimeout(pending.expirationTimer);
       pendingInvocations.delete(correlationId);
 
-      if (errorText) {
-        pending.onFault(deserializeInvocationError(errorText));
+      if (errorText !== undefined) {
+        pending.onFault(typeof errorText === 'string'
+          ? deserializeInvocationError(errorText)
+          : new Error('Malformed RPC error response: errorText must be a string'));
       } else {
         pending.onComplete(payload);
       }

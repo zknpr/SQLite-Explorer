@@ -2,7 +2,7 @@ import {
   OversizedCellReplacementRequiredError
 } from './cell-edit-policy';
 import { SQLITE_MAX_VARIABLE_NUMBER } from './integer-utils';
-import { escapeIdentifier, validateRowId } from './sql-utils';
+import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './sql-utils';
 import {
   buildRecordIdentityPredicateChunks
 } from './row-identity';
@@ -55,7 +55,7 @@ export function buildBatchPriorLimitQueries(
         sql:
           `SELECT typeof(${escapedColumn}) AS "storage_class", ` +
           `length(CAST(${escapedColumn} AS BLOB)) AS "byte_length" ` +
-          `FROM ${escapeIdentifier(table)} ` +
+          `FROM ${escapeMainIdentifier(table)} ` +
           `WHERE rowid IN (${chunk.map(() => '?').join(', ')}) ` +
           `AND typeof(${escapedColumn}) IN ('text', 'blob') ` +
           `AND length(CAST(${escapedColumn} AS BLOB)) > ? LIMIT 1`,
@@ -142,7 +142,7 @@ export function buildBatchHistorySizePreflight(
       queries.push({
         sql:
           `SELECT COUNT(*), COALESCE(SUM(${batchHistoryValueBytes(column)}), 0) `
-          + `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+          + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
         params: predicate.params
       });
     }

@@ -19,6 +19,7 @@ type NodeCrypto = typeof import('node:crypto');
  */
 export const DEFAULT_CELL_MATERIALIZATION_QUOTA_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_CELL_MATERIALIZATION_CHUNK_BYTES = MAX_CELL_READ_CHUNK_BYTES;
+export const CELL_MATERIALIZATION_SOURCE_PREFIX_BYTES = 32;
 export const DEFAULT_CELL_MATERIALIZATION_STALE_RUN_AGE_MS = 24 * 60 * 60 * 1000;
 export const CELL_MATERIALIZATION_RUN_PREFIX = 'sqlite-explorer-cell-materializations-';
 export const CELL_MATERIALIZATION_OWNER_MARKER = '.owner.json';
@@ -33,6 +34,8 @@ export interface MaterializedCell {
     /** Bytes in the materialized file. */
     byteLength: number;
     checksumSha256: string;
+    /** Authoritative source bytes captured from the same read snapshot. */
+    sourcePrefix: Uint8Array;
     /** Invalidly encoded SQLite TEXT is exposed honestly as raw database bytes. */
     contentEncoding: 'utf-8' | 'raw-database-bytes';
 }
@@ -150,6 +153,7 @@ export class CellMaterializationService implements vsc.Disposable {
     private readonly ownerFiles = new Map<CellMaterializationOwner, Set<string>>();
     private readonly ownerSubscriptions = new Map<CellMaterializationOwner, vsc.Disposable>();
     private readonly closeDocumentSubscription: vsc.Disposable | undefined;
+    private readonly closeTabSubscription: vsc.Disposable | undefined;
     /** Disk bytes held by live files plus reservations for in-progress writes. */
     private allocatedBytes = 0;
     private runDirectory: string | undefined;
@@ -190,6 +194,18 @@ export class CellMaterializationService implements vsc.Disposable {
         const onDidCloseTextDocument = vsc.workspace.onDidCloseTextDocument;
         this.closeDocumentSubscription = typeof onDidCloseTextDocument === 'function'
             ? onDidCloseTextDocument(document => this.release(document.uri))
+            : undefined;
+
+        // Binary editor tabs do not create a TextDocument, so they need the
+        // tab lifecycle to release their materialized files and quota.
+        const onDidChangeTabs = vsc.window.tabGroups?.onDidChangeTabs;
+        this.closeTabSubscription = typeof onDidChangeTabs === 'function'
+            ? onDidChangeTabs(event => {
+                for (const tab of event.closed) {
+                    const uri = (tab.input as { uri?: vsc.Uri }).uri;
+                    if (uri) this.release(uri);
+                }
+            })
             : undefined;
     }
 
@@ -274,6 +290,10 @@ export class CellMaterializationService implements vsc.Disposable {
                     : undefined;
                 const encoder = decoder ? new TextEncoder() : undefined;
                 const outputHash = crypto.createHash('sha256');
+                const sourcePrefix = new Uint8Array(Math.min(
+                    CELL_MATERIALIZATION_SOURCE_PREFIX_BYTES,
+                    metadata.byteLength
+                ));
                 let sourceOffset = 0;
                 let outputBytes = 0;
 
@@ -290,6 +310,13 @@ export class CellMaterializationService implements vsc.Disposable {
                     );
                     this.assertActive(options.signal);
                     this.validateChunk(chunk, sourceOffset, requestedBytes, metadata.byteLength);
+                    if (sourceOffset < sourcePrefix.byteLength) {
+                        const prefixBytes = Math.min(
+                            chunk.bytes.byteLength,
+                            sourcePrefix.byteLength - sourceOffset
+                        );
+                        sourcePrefix.set(chunk.bytes.subarray(0, prefixBytes), sourceOffset);
+                    }
 
                     const output = decoder && encoder
                         ? encoder.encode(decodeCellText(decoder, chunk.bytes, true))
@@ -310,7 +337,7 @@ export class CellMaterializationService implements vsc.Disposable {
                     await this.writeFully(fileHandle!, finalBytes, outputPosition, options.signal);
                     outputHash.update(finalBytes);
                 }
-                return { outputBytes, outputHash };
+                return { outputBytes, outputHash, sourcePrefix };
             };
 
             let rawDatabaseBytes = false;
@@ -326,7 +353,7 @@ export class CellMaterializationService implements vsc.Disposable {
                 streamed = await streamCell(false);
                 rawDatabaseBytes = true;
             }
-            const { outputBytes, outputHash } = streamed;
+            const { outputBytes, outputHash, sourcePrefix } = streamed;
             this.assertActive(options.signal);
             await fileHandle.sync();
             this.assertActive(options.signal);
@@ -359,6 +386,7 @@ export class CellMaterializationService implements vsc.Disposable {
                 metadata,
                 byteLength: outputBytes,
                 checksumSha256: assembledChecksum,
+                sourcePrefix,
                 contentEncoding: metadata.storageClass === 'text' && !rawDatabaseBytes
                     ? 'utf-8'
                     : 'raw-database-bytes'
@@ -434,6 +462,7 @@ export class CellMaterializationService implements vsc.Disposable {
         if (this.disposed) return;
         this.disposed = true;
         this.closeDocumentSubscription?.dispose();
+        this.closeTabSubscription?.dispose();
         for (const subscription of this.ownerSubscriptions.values()) subscription.dispose();
         this.ownerSubscriptions.clear();
         this.ownerFiles.clear();

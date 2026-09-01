@@ -133,7 +133,15 @@ describe('hot-exit restore forward replay', () => {
         modificationType: 'row_insert',
         targetTable: 'atomic_restore',
         targetRowId: 1,
-        rowData: { name: 'Draft' }
+        rowData: { id: 1, name: 'Draft' },
+        insertedRow: {
+          rowId: 1,
+          row: { id: 1, name: 'Draft' },
+          storageClasses: [
+            { column: 'id', storageClass: 'integer' },
+            { column: 'name', storageClass: 'text' }
+          ]
+        }
       },
       {
         description: 'Malformed cell update',
@@ -144,7 +152,7 @@ describe('hot-exit restore forward replay', () => {
 
     await assert.rejects(
       () => engine.applyModifications(modifications),
-      /Cannot apply cell_update: missing target cell or affected cells/
+      /predates guarded cell history/
     );
 
     const result = await engine.executeQuery('SELECT COUNT(*) FROM atomic_restore');

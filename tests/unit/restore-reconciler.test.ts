@@ -20,7 +20,8 @@ const cellEdit = (
   prior: string,
   next: string,
   op: 'set' | 'json_patch' = 'set',
-  column: string = 'data'
+  column: string = 'data',
+  postStateValue: string = next
 ): LabeledModification => ({
   label,
   description: label,
@@ -30,7 +31,9 @@ const cellEdit = (
   targetColumn: column,
   priorValue: prior,
   newValue: next,
-  operation: op
+  operation: op,
+  priorState: { storageClass: 'text', value: prior },
+  postState: { storageClass: 'text', value: postStateValue }
 });
 
 const roundTripTracker = (
@@ -125,7 +128,14 @@ describe('reconcileRestoredDatabase', () => {
     await ops.updateCell('t', 1, 'data', null, '{"x":9}');
 
     const tracker = new ModificationTracker<LabeledModification>();
-    tracker.record(cellEdit('jp', '{"x":1,"y":2}', '{"x":9}', 'json_patch'));
+    tracker.record(cellEdit(
+      'jp',
+      '{"x":1,"y":2}',
+      '{"x":9}',
+      'json_patch',
+      'data',
+      '{"x":9,"y":2}'
+    ));
     await tracker.createCheckpoint();
     tracker.stepBack();
 
@@ -164,7 +174,14 @@ describe('reconcileRestoredDatabase', () => {
     tracker.record(cellEdit('e2', '{"a":1,"b":0}', '{"a":1,"b":2}'));
     await tracker.createCheckpoint();
     tracker.stepBack();
-    tracker.record(cellEdit('e3', '{"a":1,"b":0}', '{"c":3}', 'json_patch'));
+    tracker.record(cellEdit(
+      'e3',
+      '{"a":1,"b":0}',
+      '{"c":3}',
+      'json_patch',
+      'data',
+      '{"a":1,"b":0,"c":3}'
+    ));
 
     await reconcileRestoredDatabase(ops, roundTripTracker(tracker), 'wasm');
 

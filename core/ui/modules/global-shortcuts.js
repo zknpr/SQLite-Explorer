@@ -98,6 +98,13 @@ export function setupGlobalShortcuts() {
             // Deleting during a reload would act on stale row/column/cell state.
             if (modalOpen || state.isGridReloading || hasActiveTextEditor(event.target)) return;
 
+            if (state.isReadOnly) {
+                if (state.selectedTable && state.selectedTableType === 'table') {
+                    event.preventDefault();
+                }
+                return;
+            }
+
             if (state.selectedTable && state.selectedTableType === 'table') {
                 event.preventDefault();
                 if (state.selectedColumns.size > 0 || state.selectedRowIds.size > 0) {

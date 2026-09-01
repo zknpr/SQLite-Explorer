@@ -5,6 +5,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import type { DatabaseOperations, CellUpdate, ModificationEntry } from '../../src/core/types';
+import { buildIndexDependencyProbeIndexSql } from '../../src/core/schema-ddl';
 
 async function withFreshWasmEngine(
     run: (engine: WasmDatabaseEngine) => Promise<void>
@@ -38,6 +39,371 @@ describe('WasmDatabaseEngine', () => {
         await engine.executeQuery("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, data TEXT)");
     });
 
+    it('rejects an executable tail in untrusted stored index SQL', () => {
+        assert.throws(
+            () => buildIndexDependencyProbeIndexSql(
+                'probe_table',
+                'probe_index',
+                'CREATE INDEX source_index ON source_table(value); DROP TABLE source_table'
+            ),
+            /multiple statements/
+        );
+    });
+
+    it('finds only real index dependencies before dropping a column', () => (
+        withFreshWasmEngine(async dependencyEngine => {
+            await dependencyEngine.executeQuery(
+                'CREATE TABLE wasm_index_dependencies (' +
+                'keep TEXT, removed TEXT, note TEXT); ' +
+                'CREATE UNIQUE INDEX idx_wasm_unrelated ON wasm_index_dependencies(' +
+                'keep /* , removed) */) WHERE note <> \'(removed)\'; ' +
+                'CREATE INDEX idx_wasm_removed_collate ON wasm_index_dependencies(' +
+                '"removed" COLLATE NOCASE); ' +
+                'CREATE INDEX idx_wasm_removed_partial ON wasm_index_dependencies(' +
+                'keep) WHERE removed IS NOT NULL; ' +
+                'CREATE INDEX idx_wasm_removed_constant_partial ON wasm_index_dependencies(' +
+                'note) WHERE removed IS NOT NULL AND 0; ' +
+                "INSERT INTO wasm_index_dependencies VALUES ('same', 'value', 'active')"
+            );
+
+            const dependent = (
+                await dependencyEngine.findDependentIndexes(
+                    'wasm_index_dependencies',
+                    ['removed']
+                )
+            ).sort();
+            assert.deepStrictEqual(dependent, [
+                'idx_wasm_removed_collate',
+                'idx_wasm_removed_constant_partial',
+                'idx_wasm_removed_partial'
+            ]);
+
+            await dependencyEngine.deleteColumns(
+                'wasm_index_dependencies',
+                ['removed'],
+                dependent
+            );
+            const remaining = await dependencyEngine.executeQuery(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' " +
+                "AND tbl_name = 'wasm_index_dependencies' ORDER BY name"
+            );
+            assert.deepStrictEqual(remaining[0].rows, [['idx_wasm_unrelated']]);
+            await assert.rejects(
+                dependencyEngine.executeQuery(
+                    "INSERT INTO wasm_index_dependencies(keep, note) VALUES ('same', 'active')"
+                ),
+                /UNIQUE constraint failed/
+            );
+        })
+    ));
+
+    it('honors requested NOT NULL on a TEXT PRIMARY KEY', () => (
+        withFreshWasmEngine(async schemaEngine => {
+            await schemaEngine.createTable('wasm_text_primary_key', [
+                { name: 'key', type: 'TEXT', primaryKey: true, notNull: true },
+                { name: 'value', type: 'TEXT', primaryKey: false, notNull: false }
+            ]);
+
+            const info = await schemaEngine.executeQuery(
+                'PRAGMA table_info("wasm_text_primary_key")'
+            );
+            assert.strictEqual(info[0].rows[0][3], 1);
+            await assert.rejects(
+                schemaEngine.insertRow('wasm_text_primary_key', { key: null, value: 'invalid' }),
+                /NOT NULL constraint failed/
+            );
+        })
+    ));
+
+    it('builds selected primary-key columns as one NOT NULL composite key', () => (
+        withFreshWasmEngine(async schemaEngine => {
+            await schemaEngine.createTable('wasm_composite_primary_key', [
+                { name: 'tenant', type: 'TEXT', primaryKey: true, notNull: true },
+                { name: 'sequence', type: 'INTEGER', primaryKey: true, notNull: true },
+                { name: 'value', type: 'TEXT', primaryKey: false, notNull: false }
+            ]);
+
+            const info = await schemaEngine.executeQuery(
+                'PRAGMA table_info("wasm_composite_primary_key")'
+            );
+            assert.deepStrictEqual(
+                info[0].rows.map(row => [row[1], row[3], row[5]]),
+                [
+                    ['tenant', 1, 1],
+                    ['sequence', 1, 2],
+                    ['value', 0, 0]
+                ]
+            );
+            await assert.rejects(
+                schemaEngine.insertRow('wasm_composite_primary_key', {
+                    tenant: 'north',
+                    sequence: null,
+                    value: 'invalid'
+                }),
+                /NOT NULL constraint failed/
+            );
+        })
+    ));
+
+    it('preserves Create Table defaults and targets main through a TEMP shadow', () => (
+        withFreshWasmEngine(async schemaEngine => {
+            await schemaEngine.executeQuery(
+                'CREATE TEMP TABLE "shadowed_create" ("temporary_only" TEXT)'
+            );
+            await schemaEngine.createTable('shadowed_create', [
+                {
+                    name: 'value',
+                    type: 'TEXT',
+                    primaryKey: false,
+                    notNull: false,
+                    defaultValue: 'hello'
+                }
+            ]);
+
+            const mainInfo = await schemaEngine.executeQuery(
+                'PRAGMA main.table_info("shadowed_create")'
+            );
+            const tempInfo = await schemaEngine.executeQuery(
+                'PRAGMA temp.table_info("shadowed_create")'
+            );
+            assert.deepStrictEqual(
+                mainInfo[0].rows.map(row => [row[1], row[4]]),
+                [['value', "'hello'"]]
+            );
+            assert.deepStrictEqual(
+                tempInfo[0].rows.map(row => row[1]),
+                ['temporary_only']
+            );
+        })
+    ));
+
+    it('adds and deletes columns only on main through a TEMP table shadow', () => (
+        withFreshWasmEngine(async schemaEngine => {
+            await schemaEngine.executeQuery(
+                'CREATE TABLE "shadowed_ddl" ("keep" TEXT, "removed" TEXT); ' +
+                'CREATE TEMP TABLE "shadowed_ddl" ("temporary_only" TEXT, "removed" TEXT)'
+            );
+
+            await schemaEngine.addColumn('shadowed_ddl', 'added', 'TEXT');
+            await schemaEngine.deleteColumns('shadowed_ddl', ['removed']);
+
+            const mainInfo = await schemaEngine.executeQuery(
+                'PRAGMA main.table_info("shadowed_ddl")'
+            );
+            const tempInfo = await schemaEngine.executeQuery(
+                'PRAGMA temp.table_info("shadowed_ddl")'
+            );
+            assert.deepStrictEqual(
+                mainInfo[0].rows.map(row => row[1]),
+                ['keep', 'added']
+            );
+            assert.deepStrictEqual(
+                tempInfo[0].rows.map(row => row[1]),
+                ['temporary_only', 'removed']
+            );
+        })
+    ));
+
+    it('keeps every table-browser CRUD operation on main through a TEMP shadow', () => (
+        withFreshWasmEngine(async crudEngine => {
+            const table = 'shadowed_crud_target';
+            await crudEngine.executeQuery(
+                `CREATE TABLE main.${table} (id INTEGER PRIMARY KEY, value TEXT); ` +
+                `INSERT INTO main.${table}(id, value) VALUES ` +
+                `(1, 'main-one'), (2, 'main-two'), (5, '0123456789'); ` +
+                `CREATE TEMP TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT); ` +
+                `INSERT INTO temp.${table}(id, value) VALUES ` +
+                `(1, 'temp-one'), (2, 'temp-two'), (5, 'temp-five'), (99, 'temp-only')`
+            );
+
+            const initial = await crudEngine.fetchTableData(table, {
+                columns: ['rowid', 'id', 'value'],
+                orderBy: 'id',
+                limit: 20,
+                offset: 0
+            });
+            assert.deepStrictEqual(initial.rows, [
+                [1, 1, 'main-one'],
+                [2, 2, 'main-two'],
+                [5, 5, '0123456789']
+            ]);
+            assert.strictEqual(
+                (await crudEngine.fetchTableCount(table, { columns: ['id', 'value'] })).count,
+                3
+            );
+
+            await crudEngine.updateCell(table, 1, 'value', 'main-one-updated');
+            await crudEngine.updateCellBatch(table, [{
+                rowId: 2,
+                column: 'value',
+                value: 'main-two-updated'
+            }]);
+            await crudEngine.replaceOversizedCell(
+                table,
+                5,
+                'value',
+                'fit',
+                { storageClass: 'text', byteLength: 10 },
+                4
+            );
+            await crudEngine.insertRow(table, { id: 3, value: 'main-three' });
+            await crudEngine.insertRowBatch(table, [{ id: 4, value: 'main-four' }]);
+            const deleted = await crudEngine.deleteRows(table, [2]);
+            assert.strictEqual(deleted[0]?.row.value, 'main-two-updated');
+
+            assert.deepStrictEqual(
+                (await crudEngine.executeQuery(
+                    `SELECT id, value FROM main.${table} ORDER BY id`
+                ))[0].rows,
+                [
+                    [1, 'main-one-updated'],
+                    [3, 'main-three'],
+                    [4, 'main-four'],
+                    [5, 'fit']
+                ]
+            );
+            assert.deepStrictEqual(
+                (await crudEngine.executeQuery(
+                    `SELECT id, value FROM temp.${table} ORDER BY id`
+                ))[0].rows,
+                [
+                    [1, 'temp-one'],
+                    [2, 'temp-two'],
+                    [5, 'temp-five'],
+                    [99, 'temp-only']
+                ]
+            );
+        })
+    ));
+
+    it('rejects creating a main table that would shadow and break a TEMP dependency', () => (
+        withFreshWasmEngine(async schemaEngine => {
+            await schemaEngine.executeQuery(
+                "ATTACH ':memory:' AS aux; " +
+                'CREATE TABLE aux.created_table_shadow (value TEXT); ' +
+                "INSERT INTO aux.created_table_shadow VALUES ('aux'); " +
+                'CREATE TEMP VIEW created_table_shadow_consumer AS ' +
+                'SELECT value FROM created_table_shadow'
+            );
+
+            await assert.rejects(
+                schemaEngine.createTable('created_table_shadow', [{
+                    name: 'other',
+                    type: 'TEXT',
+                    primaryKey: false,
+                    notNull: false
+                }]),
+                /would break existing view.*created_table_shadow_consumer/is
+            );
+            assert.deepStrictEqual(
+                (await schemaEngine.executeQuery(
+                    'SELECT value FROM temp.created_table_shadow_consumer'
+                ))[0].rows,
+                [['aux']]
+            );
+        })
+    ));
+
+    it('keeps INTEGER PRIMARY KEY auto-rowid assignment when NOT NULL is requested', () => (
+        withFreshWasmEngine(async schemaEngine => {
+            await schemaEngine.createTable('wasm_integer_primary_key', [
+                { name: 'id', type: 'INTEGER', primaryKey: true, notNull: true },
+                { name: 'value', type: 'TEXT', primaryKey: false, notNull: false }
+            ]);
+
+            await schemaEngine.insertRow('wasm_integer_primary_key', {
+                id: null,
+                value: 'auto'
+            });
+            const rows = await schemaEngine.executeQuery(
+                'SELECT id, value FROM "wasm_integer_primary_key"'
+            );
+            assert.deepStrictEqual(rows[0].rows, [[1, 'auto']]);
+        })
+    ));
+
+    it('preserves legal SQLite identifiers across table and column creation', () => (
+        withFreshWasmEngine(async schemaEngine => {
+            const table = ' ui "table" 🚀 ';
+            const firstColumn = ' id "column" 🧩 ';
+            const addedColumn = ' added "column" ✨ ';
+            await schemaEngine.createTable(table, [{
+                name: firstColumn,
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: false
+            }]);
+            await schemaEngine.addColumn(table, addedColumn, 'TEXT');
+            await schemaEngine.insertRow(table, {
+                [firstColumn]: 'first',
+                [addedColumn]: 'second'
+            });
+
+            assert.deepStrictEqual(
+                (await schemaEngine.getTableInfo(table)).map(column => column.identifier),
+                [firstColumn, addedColumn]
+            );
+            assert.deepStrictEqual(
+                (await schemaEngine.fetchTableData(table, {
+                    columns: ['rowid', firstColumn, addedColumn],
+                    limit: 1,
+                    offset: 0
+                })).rows,
+                [[1, 'first', 'second']]
+            );
+        })
+    ));
+
+    it('rejects unusable created identifiers and leaves case equality to SQLite', () => (
+        withFreshWasmEngine(async schemaEngine => {
+            const column = {
+                name: 'value',
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: false
+            };
+            await assert.rejects(
+                schemaEngine.createTable('', [column]),
+                /Table name is required/
+            );
+            await assert.rejects(
+                schemaEngine.createTable('bad\0table', [column]),
+                /Table name cannot contain NUL/
+            );
+            await assert.rejects(
+                schemaEngine.createTable('valid table', [{ ...column, name: 'bad\0column' }]),
+                /Column name cannot contain NUL/
+            );
+            await assert.rejects(
+                schemaEngine.createTable('duplicate column table', [
+                    { ...column, name: 'value' },
+                    { ...column, name: 'VALUE' }
+                ]),
+                /Column "VALUE" is defined more than once/
+            );
+
+            await schemaEngine.createTable('Case Table', [column]);
+            await assert.rejects(
+                schemaEngine.createTable('case table', [column]),
+                /already exists/i
+            );
+            await schemaEngine.createTable('Ä Table', [column]);
+            await schemaEngine.createTable('ä Table', [column]);
+            await assert.rejects(
+                schemaEngine.addColumn('Case Table', '', 'TEXT'),
+                /Column name is required/
+            );
+            await assert.rejects(
+                schemaEngine.addColumn('Case Table', 'bad\0column', 'TEXT'),
+                /Column name cannot contain NUL/
+            );
+            await assert.rejects(
+                schemaEngine.addColumn('Case Table', 'VALUE', 'TEXT'),
+                /Column "VALUE" already exists in table "Case Table"/
+            );
+        })
+    ));
+
     it('replays persistent PRAGMA history for hot-exit and refuses in-memory undo', async () => {
         const opened = await createDatabaseEngine({
             content: null,
@@ -67,24 +433,15 @@ describe('WasmDatabaseEngine', () => {
         }
     });
 
-    it('preserves caller order for heterogeneous batch inserts and trigger side effects', () => (
+    it('preserves caller order for heterogeneous batch inserts', () => (
         withFreshWasmEngine(async batchEngine => {
             const wasmEngine = batchEngine as any;
             await batchEngine.executeQuery('CREATE TABLE batch_target (a TEXT, b TEXT)');
-            await batchEngine.executeQuery(
-                'CREATE TABLE batch_audit (sequence INTEGER PRIMARY KEY, value TEXT NOT NULL)'
-            );
-            await batchEngine.executeQuery(`
-                CREATE TRIGGER audit_batch_insert AFTER INSERT ON batch_target
-                BEGIN
-                    INSERT INTO batch_audit (value) VALUES (COALESCE(NEW.a, NEW.b));
-                END
-            `);
 
             const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
             const insertPrepares: string[] = [];
             wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
-                if (sql.startsWith('INSERT INTO "batch_target"')) insertPrepares.push(sql);
+                if (sql.startsWith('INSERT INTO main."batch_target"')) insertPrepares.push(sql);
                 return originalPrepare(sql, params);
             };
             try {
@@ -100,20 +457,42 @@ describe('WasmDatabaseEngine', () => {
             const target = await batchEngine.executeQuery(
                 'SELECT COALESCE(a, b) FROM batch_target ORDER BY rowid'
             );
-            const audit = await batchEngine.executeQuery(
-                'SELECT value FROM batch_audit ORDER BY sequence'
+            assert.deepStrictEqual(
+                target[0].rows.map(row => row[0]),
+                ['first', 'second', 'third']
             );
-            assert.deepStrictEqual({
-                target: target[0].rows.map(row => row[0]),
-                audit: audit[0].rows.map(row => row[0])
-            }, {
-                target: ['first', 'second', 'third'],
-                audit: ['first', 'second', 'third']
-            });
             assert.deepStrictEqual(insertPrepares, [
-                'INSERT INTO "batch_target" ("a") VALUES (?)',
-                'INSERT INTO "batch_target" ("b") VALUES (?)'
+                'INSERT INTO main."batch_target" ("a") VALUES (?)',
+                'INSERT INTO main."batch_target" ("b") VALUES (?)'
             ]);
+        })
+    ));
+
+    it('rejects batch inserts whose trigger side effects cannot be represented in history', () => (
+        withFreshWasmEngine(async batchEngine => {
+            await batchEngine.executeQuery('CREATE TABLE triggered_batch_target (value TEXT)');
+            await batchEngine.executeQuery('CREATE TABLE triggered_batch_audit (value TEXT)');
+            await batchEngine.executeQuery(
+                'CREATE TRIGGER audit_triggered_batch AFTER INSERT ON triggered_batch_target ' +
+                'BEGIN INSERT INTO triggered_batch_audit VALUES (NEW.value); END'
+            );
+
+            await assert.rejects(
+                batchEngine.insertRowBatch('triggered_batch_target', [{ value: 'blocked' }]),
+                /trigger side effects cannot be represented safely in undo history/i
+            );
+            assert.deepStrictEqual(
+                (await batchEngine.executeQuery(
+                    'SELECT value FROM triggered_batch_target'
+                ))[0].rows,
+                []
+            );
+            assert.deepStrictEqual(
+                (await batchEngine.executeQuery(
+                    'SELECT value FROM triggered_batch_audit'
+                ))[0].rows,
+                []
+            );
         })
     ));
 
@@ -209,7 +588,7 @@ describe('WasmDatabaseEngine', () => {
             await batchEngine.executeQuery('CREATE TABLE prepare_failure_batch (a TEXT, b TEXT)');
             const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
             wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
-                if (sql === 'INSERT INTO "prepare_failure_batch" ("b") VALUES (?)') {
+                if (sql === 'INSERT INTO main."prepare_failure_batch" ("b") VALUES (?)') {
                     throw new Error('simulated second-shape prepare failure');
                 }
                 return originalPrepare(sql, params);
@@ -258,7 +637,7 @@ describe('WasmDatabaseEngine', () => {
             const originalExecuteQuery = batchEngine.executeQuery.bind(batchEngine);
             const transactionCommands: string[] = [];
             batchEngine.executeQuery = async (sql, params, cancellation) => {
-                if (sql === 'BEGIN TRANSACTION' || sql === 'COMMIT' || sql === 'ROLLBACK') {
+                if (/^(?:SAVEPOINT|RELEASE|ROLLBACK TO)\b/.test(sql)) {
                     transactionCommands.push(sql);
                 }
                 return originalExecuteQuery(sql, params, cancellation);
@@ -273,10 +652,11 @@ describe('WasmDatabaseEngine', () => {
             } finally {
                 batchEngine.executeQuery = originalExecuteQuery;
             }
-            assert.deepStrictEqual(
-                transactionCommands,
-                ['BEGIN TRANSACTION', 'COMMIT', 'ROLLBACK']
-            );
+            assert.strictEqual(transactionCommands.length, 4);
+            assert.match(transactionCommands[0], /^SAVEPOINT /);
+            assert.match(transactionCommands[1], /^RELEASE /);
+            assert.match(transactionCommands[2], /^ROLLBACK TO /);
+            assert.match(transactionCommands[3], /^RELEASE /);
             const afterFailure = await batchEngine.executeQuery(
                 'SELECT parent_id, value FROM deferred_child ORDER BY rowid'
             );
@@ -304,7 +684,7 @@ describe('WasmDatabaseEngine', () => {
             let preparedInsertCount = 0;
             wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
                 const statement = originalPrepare(sql, params);
-                if (!sql.startsWith('INSERT INTO "cleanup_failure_batch"')) return statement;
+                if (!sql.startsWith('INSERT INTO main."cleanup_failure_batch"')) return statement;
                 const cleanupIndex = ++preparedInsertCount;
                 const originalFree = statement.free.bind(statement);
                 statement.free = () => {
@@ -348,7 +728,7 @@ describe('WasmDatabaseEngine', () => {
             const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
             wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
                 const statement = originalPrepare(sql, params);
-                if (!sql.startsWith('INSERT INTO "finalize_failure_batch"')) return statement;
+                if (!sql.startsWith('INSERT INTO main."finalize_failure_batch"')) return statement;
                 const originalFree = statement.free.bind(statement);
                 statement.free = () => {
                     originalFree();
@@ -485,7 +865,16 @@ describe('WasmDatabaseEngine', () => {
                 modificationType: 'row_insert',
                 targetTable: 'restored_users',
                 targetRowId: 1,
-                rowData: { id: 1, name: 'Draft', age: 30 }
+                rowData: { id: 1, name: 'Draft', age: 30 },
+                insertedRow: {
+                    rowId: 1,
+                    row: { id: 1n, name: 'Draft', age: 30n },
+                    storageClasses: [
+                        { column: 'id', storageClass: 'integer' },
+                        { column: 'name', storageClass: 'text' },
+                        { column: 'age', storageClass: 'integer' }
+                    ]
+                }
             },
             {
                 description: 'Update restored name',
@@ -494,14 +883,25 @@ describe('WasmDatabaseEngine', () => {
                 targetRowId: 1,
                 targetColumn: 'name',
                 priorValue: 'Draft',
-                newValue: 'Recovered'
+                newValue: 'Recovered',
+                operation: 'set',
+                priorState: { storageClass: 'text', value: 'Draft' },
+                postState: { storageClass: 'text', value: 'Recovered' }
             },
             {
                 description: 'Update restored age',
                 modificationType: 'cell_update',
                 targetTable: 'restored_users',
                 affectedCells: [
-                    { rowId: 1, columnName: 'age', priorValue: 30, newValue: 31 }
+                    {
+                        rowId: 1,
+                        columnName: 'age',
+                        priorValue: 30,
+                        newValue: 31,
+                        operation: 'set',
+                        priorState: { storageClass: 'integer', value: 30n },
+                        postState: { storageClass: 'integer', value: 31n }
+                    }
                 ]
             }
         ];
@@ -528,7 +928,15 @@ describe('WasmDatabaseEngine', () => {
                     modificationType: 'row_insert',
                     targetTable: 'aborted_restore',
                     targetRowId: 1,
-                    rowData: { id: 1, name: 'Should not exist' }
+                    rowData: { id: 1, name: 'Should not exist' },
+                    insertedRow: {
+                        rowId: 1,
+                        row: { id: 1, name: 'Should not exist' },
+                        storageClasses: [
+                            { column: 'id', storageClass: 'integer' },
+                            { column: 'name', storageClass: 'text' }
+                        ]
+                    }
                 }
             ], controller.signal),
             /aborted/i
@@ -544,13 +952,6 @@ describe('WasmDatabaseEngine', () => {
         // before starting another forward replay operation.
         await engine.executeQuery("DROP TABLE IF EXISTS boundary_abort_restore");
         await engine.executeQuery("CREATE TABLE boundary_abort_restore (id INTEGER PRIMARY KEY, name TEXT)");
-
-        const originalInsertRow = engine.insertRow.bind(engine);
-        const startedRowIds: unknown[] = [];
-        engine.insertRow = async (table, data) => {
-            startedRowIds.push(data.id);
-            return originalInsertRow(table, data);
-        };
 
         let checkCount = 0;
         let isAborted = false;
@@ -574,24 +975,40 @@ describe('WasmDatabaseEngine', () => {
                         modificationType: 'row_insert',
                         targetTable: 'boundary_abort_restore',
                         targetRowId: 1,
-                        rowData: { id: 1, name: 'First' }
+                        rowData: { id: 1, name: 'First' },
+                        insertedRow: {
+                            rowId: 1,
+                            row: { id: 1, name: 'First' },
+                            storageClasses: [
+                                { column: 'id', storageClass: 'integer' },
+                                { column: 'name', storageClass: 'text' }
+                            ]
+                        }
                     },
                     {
                         description: 'Insert second row after abort boundary',
                         modificationType: 'row_insert',
                         targetTable: 'boundary_abort_restore',
                         targetRowId: 2,
-                        rowData: { id: 2, name: 'Second' }
+                        rowData: { id: 2, name: 'Second' },
+                        insertedRow: {
+                            rowId: 2,
+                            row: { id: 2, name: 'Second' },
+                            storageClasses: [
+                                { column: 'id', storageClass: 'integer' },
+                                { column: 'name', storageClass: 'text' }
+                            ]
+                        }
                     }
                 ], boundarySignal),
                 /Replay aborted at loop boundary/
             );
 
-            assert.deepStrictEqual(startedRowIds, [1]);
+            assert.ok(checkCount >= 3);
             const result = await engine.executeQuery("SELECT COUNT(*) FROM boundary_abort_restore");
             assert.strictEqual(result[0].rows[0][0], 0);
         } finally {
-            engine.insertRow = originalInsertRow;
+            // The failed replay must leave the engine ready for later tests.
         }
     });
 
@@ -612,7 +1029,12 @@ describe('WasmDatabaseEngine', () => {
             targetColumn: 'data',
             priorValue: prior,
             newValue: forward,
-            operation: 'json_patch'
+            operation: 'json_patch',
+            priorState: { storageClass: 'text', value: prior },
+            postState: {
+                storageClass: 'text',
+                value: JSON.stringify({ status: 'published', owner: 'ada' })
+            }
         });
 
         const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
@@ -638,7 +1060,9 @@ describe('WasmDatabaseEngine', () => {
             targetColumn: 'data',
             priorValue: '{}',
             newValue: forward,
-            operation: 'json_patch'
+            operation: 'json_patch',
+            priorState: { storageClass: 'text', value: '{}' },
+            postState: { storageClass: 'text', value: forward }
         });
 
         const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
@@ -663,7 +1087,12 @@ describe('WasmDatabaseEngine', () => {
             targetColumn: 'data',
             priorValue: prior,
             newValue: forward,
-            operation: 'json_patch'
+            operation: 'json_patch',
+            priorState: { storageClass: 'text', value: prior },
+            postState: {
+                storageClass: 'text',
+                value: JSON.stringify({ a: 2, b: 1 })
+            }
         });
 
         const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
@@ -672,8 +1101,8 @@ describe('WasmDatabaseEngine', () => {
         assert.ok(Object.prototype.hasOwnProperty.call(parsed, 'a'));
     });
 
-    it('undo value-replaces when the cell became non-JSON since the edit (s6)', async () => {
-        // Surgical restore is unsafe when the current cell is not an object, so undo writes the recorded prior.
+    it('refuses JSON undo when the cell became non-JSON since the edit (s6)', async () => {
+        // The current value no longer proves the recorded patch post-state.
         await engine.executeQuery('DELETE FROM users');
         const prior = JSON.stringify({ status: 'draft', owner: 'ada' });
         const forward = JSON.stringify({ status: 'published' });
@@ -681,48 +1110,58 @@ describe('WasmDatabaseEngine', () => {
         await engine.updateCell('users', 1, 'data', null, forward);
         await engine.updateCell('users', 1, 'data', 'plain text');
 
-        await engine.undoModification({
-            modificationType: 'cell_update',
-            description: 'undo non-object current',
-            targetTable: 'users',
-            targetRowId: 1,
-            targetColumn: 'data',
-            priorValue: prior,
-            newValue: forward,
-            operation: 'json_patch'
-        });
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'cell_update',
+                description: 'undo non-object current',
+                targetTable: 'users',
+                targetRowId: 1,
+                targetColumn: 'data',
+                priorValue: prior,
+                newValue: forward,
+                operation: 'json_patch',
+                priorState: { storageClass: 'text', value: prior },
+                postState: {
+                    storageClass: 'text',
+                    value: JSON.stringify({ status: 'published', owner: 'ada' })
+                }
+            }),
+            /changed outside SQLite Explorer history/i
+        );
 
         const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
-        assert.deepStrictEqual(JSON.parse(result[0].rows[0][0] as string), {
-            status: 'draft',
-            owner: 'ada'
-        });
+        assert.strictEqual(result[0].rows[0][0], 'plain text');
     });
 
-    it('undo restores the full prior subtree when the current nested value is not an object', async () => {
-        // The tracked patch only touched meta.reviewed. If the current meta value
-        // has since become a scalar, undo cannot preserve nested current state and
-        // must restore the complete prior meta object, including untouched owner.
+    it('refuses JSON undo when a touched parent subtree changed shape', async () => {
         await engine.executeQuery('DELETE FROM users');
         const prior = JSON.stringify({ meta: { reviewed: false, owner: 'ada' } });
         const forward = JSON.stringify({ meta: { reviewed: true } });
         await engine.insertRow('users', { id: 1, name: 'A', age: 30, data: prior });
         await engine.updateCell('users', 1, 'data', JSON.stringify({ meta: 'archived' }));
 
-        await engine.undoModification({
-            modificationType: 'cell_update',
-            description: 'undo scalar nested current',
-            targetTable: 'users',
-            targetRowId: 1,
-            targetColumn: 'data',
-            priorValue: prior,
-            newValue: forward,
-            operation: 'json_patch'
-        });
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'cell_update',
+                description: 'undo scalar nested current',
+                targetTable: 'users',
+                targetRowId: 1,
+                targetColumn: 'data',
+                priorValue: prior,
+                newValue: forward,
+                operation: 'json_patch',
+                priorState: { storageClass: 'text', value: prior },
+                postState: {
+                    storageClass: 'text',
+                    value: JSON.stringify({ meta: { reviewed: true, owner: 'ada' } })
+                }
+            }),
+            /changed outside SQLite Explorer history/i
+        );
 
         const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
         assert.deepStrictEqual(JSON.parse(result[0].rows[0][0] as string), {
-            meta: { reviewed: false, owner: 'ada' }
+            meta: 'archived'
         });
     });
 
@@ -742,7 +1181,9 @@ describe('WasmDatabaseEngine', () => {
             targetColumn: 'data',
             priorValue: prior,
             newValue: JSON.stringify({ a: 2 }),
-            operation: 'json_patch'
+            operation: 'json_patch',
+            priorState: { storageClass: 'text', value: prior },
+            postState: { storageClass: 'text', value: current }
         });
 
         const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
@@ -766,7 +1207,9 @@ describe('WasmDatabaseEngine', () => {
             targetColumn: 'data',
             priorValue: prior,
             newValue: JSON.stringify({ a: 2 }),
-            operation: 'json_patch'
+            operation: 'json_patch',
+            priorState: { storageClass: 'text', value: prior },
+            postState: { storageClass: 'text', value: current }
         });
 
         const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
@@ -789,7 +1232,9 @@ describe('WasmDatabaseEngine', () => {
             targetColumn: 'data',
             priorValue: prior,
             newValue: JSON.stringify({ a: 2 }),
-            operation: 'json_patch'
+            operation: 'json_patch',
+            priorState: { storageClass: 'text', value: prior },
+            postState: { storageClass: 'text', value: current }
         });
 
         const result = await engine.executeQuery('SELECT data FROM users WHERE id = 1');
@@ -820,14 +1265,24 @@ describe('WasmDatabaseEngine', () => {
                     columnName: 'data',
                     priorValue: p1,
                     newValue: JSON.stringify({ count: 2 }),
-                    operation: 'json_patch'
+                    operation: 'json_patch',
+                    priorState: { storageClass: 'text', value: p1 },
+                    postState: {
+                        storageClass: 'text',
+                        value: JSON.stringify({ count: 2, stable: 'one' })
+                    }
                 },
                 {
                     rowId: 2,
                     columnName: 'data',
                     priorValue: p2,
                     newValue: JSON.stringify({ count: 11 }),
-                    operation: 'json_patch'
+                    operation: 'json_patch',
+                    priorState: { storageClass: 'text', value: p2 },
+                    postState: {
+                        storageClass: 'text',
+                        value: JSON.stringify({ count: 11, stable: 'two' })
+                    }
                 }
             ]
         });
@@ -845,9 +1300,7 @@ describe('WasmDatabaseEngine', () => {
         });
     });
 
-    it('batch json_patch undo writes the computed restored values through updateCellBatch', async () => {
-        // The batch primitive owns SAVEPOINT atomicity. Undo computes restored
-        // values first, then delegates the write set to updateCellBatch once.
+    it('batch json_patch undo uses its guarded internal compare-and-swap path', async () => {
         await engine.executeQuery('DELETE FROM users');
         const p1 = JSON.stringify({ count: 1, stable: 'one' });
         const p2 = JSON.stringify({ count: 10, stable: 'two' });
@@ -879,14 +1332,24 @@ describe('WasmDatabaseEngine', () => {
                         columnName: 'data',
                         priorValue: p1,
                         newValue: JSON.stringify({ count: 2 }),
-                        operation: 'json_patch'
+                        operation: 'json_patch',
+                        priorState: { storageClass: 'text', value: p1 },
+                        postState: {
+                            storageClass: 'text',
+                            value: JSON.stringify({ count: 2, stable: 'one' })
+                        }
                     },
                     {
                         rowId: 2,
                         columnName: 'data',
                         priorValue: p2,
                         newValue: JSON.stringify({ count: 11 }),
-                        operation: 'json_patch'
+                        operation: 'json_patch',
+                        priorState: { storageClass: 'text', value: p2 },
+                        postState: {
+                            storageClass: 'text',
+                            value: JSON.stringify({ count: 11, stable: 'two' })
+                        }
                     }
                 ]
             });
@@ -896,15 +1359,10 @@ describe('WasmDatabaseEngine', () => {
         }
 
         assert.strictEqual(singleCellWrites, 0);
-        assert.strictEqual(batchCalls.length, 1);
-        assert.deepStrictEqual(batchCalls[0].map(update => ({
-            rowId: update.rowId,
-            column: update.column,
-            value: JSON.parse(update.value as string),
-            operation: update.operation
-        })), [
-            { rowId: 1, column: 'data', value: { count: 1, stable: 'one' }, operation: undefined },
-            { rowId: 2, column: 'data', value: { count: 10, stable: 'two' }, operation: undefined }
-        ]);
+        assert.strictEqual(batchCalls.length, 0);
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT data FROM users ORDER BY id'))[0].rows,
+            [[p1], [p2]]
+        );
     });
 });

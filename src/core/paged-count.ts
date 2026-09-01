@@ -22,7 +22,7 @@
  * column named rowid is data, not row identity.
  */
 
-import { escapeIdentifier } from './sql-utils';
+import { escapeMainIdentifier } from './sql-utils';
 
 /**
  * Largest page-on-demand database whose unfiltered COUNT(*) still runs
@@ -89,7 +89,7 @@ export function shouldAnswerCountWithUpperBound(
  * endpoint; combining MIN and MAX in one aggregate would scan every row.
  */
 export function buildCountUpperBoundSql(table: string): string {
-  const escapedTable = escapeIdentifier(table);
+  const escapedTable = escapeMainIdentifier(table);
   return (
     `SELECT (SELECT CAST(min(rowid) AS TEXT) FROM ${escapedTable}), ` +
     `(SELECT CAST(max(rowid) AS TEXT) FROM ${escapedTable})`
@@ -101,7 +101,7 @@ export function buildCountUpperBoundSql(table: string): string {
  * SQLite from replacing this with the non-interruptible full-table OP_Count.
  */
 export function buildCappedCountProbeSql(table: string): string {
-  return `SELECT COUNT(*) FROM (SELECT 1 FROM ${escapeIdentifier(table)} LIMIT ?)`;
+  return `SELECT COUNT(*) FROM (SELECT 1 FROM ${escapeMainIdentifier(table)} LIMIT ?)`;
 }
 
 export interface CappedCountResolution {
