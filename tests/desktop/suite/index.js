@@ -1,5 +1,6 @@
 const path = require('node:path');
-const Mocha = require('mocha');
+// VS Code's embedded Node exposes Mocha 12 through its ESM namespace.
+const { Mocha } = require('mocha');
 
 exports.run = function run() {
   const mocha = new Mocha({

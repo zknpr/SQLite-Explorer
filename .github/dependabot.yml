@@ -2,8 +2,16 @@ version: 2
 updates:
   - package-ecosystem: "npm"
     directory: "/"
+    # Routine version updates belong on integration. GitHub keeps security
+    # updates on the default branch when target-branch is configured.
+    target-branch: "dev"
     schedule:
       interval: "weekly"
+    groups:
+      root-routine-updates:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     ignore:
       # Pinned =1.110.0: must not exceed engines.vscode (^1.110.0) or vsce
       # refuses to package. Raise together with a deliberate engines bump.
@@ -13,8 +21,15 @@ updates:
         update-types: ["version-update:semver-major"]
   - package-ecosystem: "npm"
     directory: "/website"
+    # Keep website version churn off main without delaying security updates.
+    target-branch: "dev"
     schedule:
       interval: "weekly"
+    groups:
+      website-routine-updates:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     ignore:
       # Same TS 7 migration gate as the root manifest.
       - dependency-name: "typescript"
