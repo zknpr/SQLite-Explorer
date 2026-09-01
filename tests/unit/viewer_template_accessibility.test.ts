@@ -5,7 +5,36 @@ import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+function findLabelForExactText(template: string, id: string, text: string): string | undefined {
+    return template.match(
+        new RegExp(`<label\\b(?=[^>]*\\bfor=["']${id}["'])[^>]*>\\s*${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*</label>`, 'i')
+    )?.[0];
+}
+
 describe('viewer template accessibility', () => {
+    it('matches interpolated label text as a RegExp literal', () => {
+        for (const [literal, regexInterpretation] of [
+            ['C+D', 'CCCD'],
+            ['file.name', 'fileXname'],
+            ['left|right', 'left'],
+            [String.raw`path\name`, 'pathname']
+        ]) {
+            const literalLabel = `<label for="fixture">${literal}</label>`;
+            assert.strictEqual(
+                findLabelForExactText(literalLabel, 'fixture', literal),
+                literalLabel
+            );
+            assert.strictEqual(
+                findLabelForExactText(
+                    `<label for="fixture">${regexInterpretation}</label>`,
+                    'fixture',
+                    literal
+                ),
+                undefined
+            );
+        }
+    });
+
     it('keeps sidebar view actions keyboard-focusable while visually hidden', () => {
         const css = readFileSync(
             path.resolve(process.cwd(), 'core/ui/viewer.css'),
@@ -234,9 +263,7 @@ describe('viewer template accessibility', () => {
             ['newColumnDefault', 'Default Value (optional)'],
             ['exportFormat', 'Format']
         ]) {
-            const label = template.match(
-                new RegExp(`<label\\b(?=[^>]*\\bfor=["']${id}["'])[^>]*>\\s*${text.replace(/[()]/g, '\\$&')}\\s*</label>`, 'i')
-            )?.[0];
+            const label = findLabelForExactText(template, id, text);
             assert.ok(label, `${id} must be associated with its visible label`);
         }
 
