@@ -9,6 +9,7 @@ import {
   parseStoredCellState,
   type StoredCellSqlFragment
 } from './cell-history';
+import { foldSqliteIdentifier } from './integer-utils';
 
 export const ROW_HISTORY_CONFLICT_MESSAGE =
   'Row changed outside SQLite Explorer history; undo/redo was not applied.';
@@ -45,7 +46,7 @@ export function rowHistoryStates(snapshot: DeletedRow): RowHistoryState[] {
   const seen = new Set<string>();
   return snapshot.storageClasses.map(entry => {
     const canonicalColumn = typeof entry?.column === 'string'
-      ? entry.column.toLowerCase()
+      ? foldSqliteIdentifier(entry.column)
       : undefined;
     if (
       !entry ||

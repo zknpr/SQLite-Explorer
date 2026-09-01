@@ -3067,6 +3067,96 @@ describe('DatabaseDocument hot-exit restore', () => {
             delete moduleCache[databaseModelModulePath];
         }
     });
+
+    it('rejects document creation when failed hot-exit recovery cannot reopen the database', async () => {
+        const tracker = new ModificationTracker<LabeledModification>(100);
+        tracker.record({
+            label: 'Restore draft',
+            description: 'Restore draft value',
+            modificationType: 'cell_update',
+            targetTable: 'items',
+            targetRowId: 1,
+            targetColumn: 'value',
+            priorValue: 'saved',
+            newValue: 'draft'
+        });
+        const backupData = tracker.serialize();
+        const recoveryError = new Error('read-only recovery failed');
+        const restoreOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            applyModifications: async () => { throw new Error('restore failed'); }
+        };
+        let connectionCalls = 0;
+        let shownDetail = '';
+        const originalFs = mockVscode.workspace.fs;
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        const moduleCache = require('module')._cache;
+        const workerFactoryPath = require.resolve('../../src/workerFactory');
+        const originalWorkerFactoryCacheEntry = moduleCache[workerFactoryPath];
+        const databaseModelModulePath = require.resolve('../../src/databaseModel');
+
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: { ...originalFs, readFile: async () => backupData },
+            writable: true,
+            configurable: true
+        });
+        mockVscode.window.showErrorMessage = async (_message?: string, options?: any) => {
+            shownDetail = options?.detail ?? '';
+            return undefined;
+        };
+        moduleCache[workerFactoryPath] = {
+            id: workerFactoryPath,
+            filename: workerFactoryPath,
+            loaded: true,
+            exports: {
+                createDatabaseConnection: async () => ({
+                    establishConnection: async () => {
+                        connectionCalls += 1;
+                        if (connectionCalls === 1) {
+                            return { databaseOps: restoreOps, isReadOnly: false };
+                        }
+                        throw recoveryError;
+                    },
+                    workerMethods: { [Symbol.dispose]: () => {} }
+                })
+            }
+        };
+        delete moduleCache[databaseModelModulePath];
+
+        try {
+            const { DatabaseDocument } = require('../../src/databaseModel');
+            await assert.rejects(
+                () => DatabaseDocument.create(
+                    {
+                        reporter: undefined,
+                        isVerified: true,
+                        context: { extensionUri: mockVscode.Uri.file('/ext') },
+                        forceReadOnly: false,
+                        outputChannel: undefined
+                    },
+                    mockVscode.Uri.file('/test/unrecoverable-restore.db'),
+                    { backupId: 'vscode-userdata:///backup/unrecoverable-restore.db' }
+                ),
+                (error: unknown) => error === recoveryError
+            );
+
+            assert.strictEqual(connectionCalls, 2);
+            assert.match(shownDetail, /Reopening the saved database also failed/);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            if (originalWorkerFactoryCacheEntry) {
+                moduleCache[workerFactoryPath] = originalWorkerFactoryCacheEntry;
+            } else {
+                delete moduleCache[workerFactoryPath];
+            }
+            delete moduleCache[databaseModelModulePath];
+        }
+    });
 });
 
 

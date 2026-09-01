@@ -463,18 +463,31 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             totalPageCount,
             countWasFetchedForLoad
         );
-        if (!countWasFetchedForLoad && hasClippedCells(dataResult)) {
+        if (!countWasFetchedForLoad) {
+            const returnedRowCount = (dataResult.rows || []).length;
+            const cachedRemainingRows = Math.max(
+                0,
+                totalRecordCount - currentPageIndex * requestedPageSize
+            );
             const staleCountBoundOptions = buildDataQueryOptions(
                 currentPageIndex,
                 countResult,
                 totalPageCount,
                 true
             );
-            if (queryOptions.limit > staleCountBoundOptions.limit) {
-                // A smaller limit could recover a clipped ordinary value, but
-                // the cached count is not authoritative for this request.
-                // Refresh it first so an external insert cannot be hidden by
-                // the containment retry itself.
+            const cachedFinalPageMayHaveGrown = totalRecordCountIsExact
+                && currentPageIndex === totalPageCount - 1
+                && (
+                    returnedRowCount > cachedRemainingRows
+                    || returnedRowCount >= requestedPageSize
+                );
+            const tighterBoundMayRecoverClippedCell = hasClippedCells(dataResult)
+                && queryOptions.limit > staleCountBoundOptions.limit;
+            if (cachedFinalPageMayHaveGrown || tighterBoundMayRecoverClippedCell) {
+                // A full or unexpectedly long cached final page cannot prove
+                // the table still ends here. Refresh before disabling Next.
+                // The same fresh count also keeps the containment retry from
+                // hiding rows inserted by another connection.
                 const storeCount = prepareCountStore(countIdentity);
                 countResult = normalizeCountResult(
                     await backendApi.fetchTableCount(requestedTable, countOptions)

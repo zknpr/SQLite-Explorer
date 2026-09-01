@@ -91,7 +91,7 @@ describe('grid count cache', () => {
         delete (globalThis as any).document;
     });
 
-    it('serves page turns from the cached count with no count fetch, keyset and OFFSET alike', async () => {
+    it('reuses cached counts until a full final page makes the end ambiguous', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
         const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
@@ -109,7 +109,7 @@ describe('grid count cache', () => {
         primeTableState(state, 'items');
 
         try {
-            // First load is the only count fetch of the whole sequence.
+            // Interior page turns reuse the first load's count.
             assert.strictEqual(await loadTableData(false, false), true);
             assert.strictEqual(countCalls.length, 1);
             assert.strictEqual(state.totalRecordCount, 60);
@@ -126,39 +126,39 @@ describe('grid count cache', () => {
             assert.deepStrictEqual(dataRequests.at(-1).keyset, { mode: 'atOrAfter', anchor: 'F2' });
             assert.strictEqual(countCalls.length, 1);
 
-            // last: remainder computed from the cached count
+            // A full purported last page must refresh the count because an
+            // external writer may have appended another page.
             state.currentPageIndex = 2;
             await loadTableData(false, false, 'last');
             assert.deepStrictEqual(dataRequests.at(-1).keyset, { mode: 'last', lastPageRowCount: 20 });
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 2);
 
             // prev with a valid anchor (anchors describe page 2 after 'last')
             state.currentPageIndex = 1;
             await loadTableData(false, false, 'prev');
             assert.deepStrictEqual(dataRequests.at(-1).keyset, { mode: 'before', anchor: 'F4' });
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 2);
 
             // first
             state.currentPageIndex = 0;
             await loadTableData(false, false, 'first');
             assert.deepStrictEqual(dataRequests.at(-1).keyset, { mode: 'first' });
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 2);
 
-            // OFFSET fallback: anchors describing a different page than the
-            // intent expects still turn the page without a count fetch.
+            // An OFFSET fallback on that full final page has the same ambiguity.
             state.currentPageIndex = 2;
             state.keysetAnchors = { table: 'items', pageIndex: 0, first: 'F0', last: 'L0' };
             await loadTableData(false, false, 'next');
             assert.strictEqual(dataRequests.at(-1).keyset, undefined);
             assert.strictEqual(dataRequests.at(-1).offset, 40);
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 3);
 
             // Arbitrary jump without intent (goToPage default): OFFSET, no count.
             state.currentPageIndex = 1;
             state.keysetAnchors = null;
             await loadTableData(false, false);
             assert.strictEqual(dataRequests.at(-1).keyset, undefined);
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 3);
         } finally {
             resetHarness(state, backendApi, originals);
         }
@@ -229,8 +229,46 @@ describe('grid count cache', () => {
             assert.strictEqual(await loadTableData(false, false), true);
 
             assert.strictEqual(state.gridData.length, 100);
-            assert.strictEqual(countCalls, 1);
+            assert.strictEqual(state.totalRecordCount, 100);
+            assert.strictEqual(countCalls, 2);
             assert.deepStrictEqual(dataLimits, [5000, 5000]);
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('refreshes a cached final-page count when fresh data fills the page', async () => {
+        const elements = installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        let countCalls = 0;
+        let databaseRows = 5000;
+        backendApi.fetchTableCount = async () => {
+            countCalls += 1;
+            return { count: databaseRows, isExact: true };
+        };
+        backendApi.fetchTableData = async (_table: string, options: any) => ({
+            rows: Array.from(
+                { length: Math.min(databaseRows, options.limit) },
+                (_, row) => [row + 1, `row-${row + 1}`]
+            )
+        });
+        primeTableState(state, 'externally_grown');
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.strictEqual(countCalls, 1);
+            assert.strictEqual(state.totalPageCount, 1);
+
+            databaseRows = 6000;
+            assert.strictEqual(await loadTableData(false, false), true);
+
+            assert.strictEqual(countCalls, 2);
+            assert.strictEqual(state.totalRecordCount, 6000);
+            assert.strictEqual(state.totalPageCount, 2);
+            assert.strictEqual(state.gridData.length, 5000);
+            assert.strictEqual(elements.btnNext.disabled, false);
         } finally {
             resetHarness(state, backendApi, originals);
         }

@@ -314,6 +314,7 @@ async function saveDraft() {
     const targetView = editingViewName;
     const targetDefinitionSql = editingViewDefinitionSql;
     const targetDefinitionTriggers = editingViewDefinitionTriggers;
+    const targetConnectionGeneration = activeViewConnectionGeneration;
     savingViewSessions.add(modalSession);
     const saveElements = getElements();
     const saveButton = saveElements.save;
@@ -362,24 +363,39 @@ async function saveDraft() {
             if (isCurrentModalSession(modalSession)) setFeedback('Edit cancelled.');
             return;
         }
-        if (!isCurrentModalSession(modalSession)) return;
 
         const changedView = targetView ?? draft.name;
+        const ownsModal = isCurrentModalSession(modalSession);
+        const targetConnectionIsCurrent = () => (
+            targetConnectionGeneration === state.connectionGeneration
+        );
         // A redefined view is a different query — and any OTHER view that
         // projects it changed row set too, without a table switch to
         // invalidate for it (the modal can edit view B while view A stays
         // selected). Wholesale invalidation is the only sound scope here;
         // it costs one count refetch on the next load.
-        invalidateAllCounts();
-        closeModal('viewModal');
-        const closedSession = activeViewModalSession;
-        await refreshSchema();
-        if (state.selectedTable === changedView && state.selectedTableType === 'view') {
+        if (targetConnectionIsCurrent()) invalidateAllCounts();
+        let closedSession;
+        if (ownsModal) {
+            closeModal('viewModal');
+            closedSession = activeViewModalSession;
+        }
+        // A host content refresh can close the editor before this mutation
+        // reply arrives. Its modal session is stale, but the committed schema
+        // change still has to be reconciled against the same live connection.
+        if (!targetConnectionIsCurrent()) return;
+        const schemaRefreshed = await refreshSchema();
+        if (schemaRefreshed
+            && targetConnectionIsCurrent()
+            && state.selectedTable === changedView
+            && state.selectedTableType === 'view') {
             clearSelection();
             persistState();
             if (await loadTableColumns()) await loadTableData(true, false);
         }
-        if (activeViewModalSession === closedSession) {
+        if (ownsModal
+            && activeViewModalSession === closedSession
+            && targetConnectionIsCurrent()) {
             updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - Ctrl+S to save`);
         }
     } catch (err) {

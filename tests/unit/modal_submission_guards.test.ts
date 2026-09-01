@@ -2,6 +2,7 @@ import './vscode_mock_setup';
 
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
+import { createDeferred } from './helpers/deferred';
 
 (globalThis as any).acquireVsCodeApi = () => ({
     getState: () => undefined,
@@ -405,6 +406,66 @@ describe('modal submission re-entry guards', () => {
         }
     });
 
+    it('refreshes the selected table when Add Row closes while its insert is in flight', async () => {
+        const state = await prepareSubmissionState();
+        const { backendApi } = await import(apiModulePath);
+        const { closeModal } = await import(modalsModulePath);
+        const { openAddRowModal, submitAddRow } = await import(crudModulePath);
+        const inserted = createDeferred<void>();
+        const originals = {
+            insertRow: backendApi.insertRow,
+            fetchTableCount: backendApi.fetchTableCount,
+            fetchTableData: backendApi.fetchTableData
+        };
+        const originalConsoleError = console.error;
+        let dataFetches = 0;
+        const modal = {
+            id: 'addRowModal',
+            classList: createClassList(['modal-overlay', 'hidden']),
+            querySelector() { return null; }
+        };
+        const form = { replaceChildren() {} };
+        const grid = {
+            innerHTML: '', scrollLeft: 0, scrollTop: 0,
+            querySelector() { return null; }
+        };
+        (globalThis as any).document = {
+            activeElement: null,
+            getElementById(id: string) {
+                if (id === 'addRowModal') return modal;
+                if (id === 'addRowForm') return form;
+                if (id === 'gridContainer') return grid;
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        backendApi.insertRow = async () => inserted.promise;
+        backendApi.fetchTableCount = async () => ({ count: 1, isExact: true });
+        backendApi.fetchTableData = async () => {
+            dataFetches++;
+            throw new Error('intentional refresh probe');
+        };
+        console.error = () => {};
+        state.tableColumns = [];
+
+        try {
+            openAddRowModal();
+            const pending = submitAddRow();
+            closeModal('addRowModal');
+            inserted.resolve();
+            await pending;
+
+            assert.strictEqual(dataFetches, 1);
+        } finally {
+            backendApi.insertRow = originals.insertRow;
+            backendApi.fetchTableCount = originals.fetchTableCount;
+            backendApi.fetchTableData = originals.fetchTableData;
+            console.error = originalConsoleError;
+        }
+    });
+
     it('does not let an older Create Table completion close a reopened draft', async () => {
         const state = await prepareSubmissionState();
         const { backendApi } = await import(apiModulePath);
@@ -560,6 +621,66 @@ describe('modal submission re-entry guards', () => {
             assert.match(confirm.textContent, /delete 1 row/i);
         } finally {
             backendApi.deleteRows = originalDeleteRows;
+        }
+    });
+
+    it('refreshes the selected table when Delete closes while its RPC is in flight', async () => {
+        const state = await prepareSubmissionState();
+        const { backendApi } = await import(apiModulePath);
+        const { closeModal } = await import(modalsModulePath);
+        const { openDeleteModal, submitDelete } = await import(crudModulePath);
+        const deleted = createDeferred<void>();
+        const originals = {
+            deleteRows: backendApi.deleteRows,
+            fetchTableCount: backendApi.fetchTableCount,
+            fetchTableData: backendApi.fetchTableData
+        };
+        const originalConsoleError = console.error;
+        let dataFetches = 0;
+        const modal = {
+            id: 'deleteModal',
+            classList: createClassList(['modal-overlay', 'hidden']),
+            querySelector() { return null; }
+        };
+        const grid = {
+            innerHTML: '', scrollLeft: 0, scrollTop: 0,
+            querySelector() { return null; }
+        };
+        (globalThis as any).document = {
+            activeElement: null,
+            getElementById(id: string) {
+                if (id === 'deleteModal') return modal;
+                if (id === 'deleteConfirmText') return { textContent: '' };
+                if (id === 'gridContainer') return grid;
+                if (id === 'statusText') return { textContent: '' };
+                return null;
+            },
+            querySelectorAll() { return []; },
+            querySelector() { return null; }
+        };
+        backendApi.deleteRows = async () => deleted.promise;
+        backendApi.fetchTableCount = async () => ({ count: 1, isExact: true });
+        backendApi.fetchTableData = async () => {
+            dataFetches++;
+            throw new Error('intentional refresh probe');
+        };
+        console.error = () => {};
+
+        try {
+            openDeleteModal();
+            const pending = submitDelete();
+            closeModal('deleteModal');
+            state.selectedRowIds = new Set([2]);
+            deleted.resolve();
+            await pending;
+
+            assert.strictEqual(dataFetches, 1);
+            assert.deepStrictEqual([...state.selectedRowIds], [2]);
+        } finally {
+            backendApi.deleteRows = originals.deleteRows;
+            backendApi.fetchTableCount = originals.fetchTableCount;
+            backendApi.fetchTableData = originals.fetchTableData;
+            console.error = originalConsoleError;
         }
     });
 

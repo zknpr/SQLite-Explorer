@@ -218,6 +218,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         // read-only document never displays a half-restored synthetic state.
         forceReadOnlyOnReconnect = true;
         let recoveryError: unknown;
+        let recoveryFailed = false;
         try {
           result = await connectionBundle.establishConnection(
             fileUri,
@@ -231,13 +232,14 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             viewerProvider.outputChannel
           );
         } catch (error) {
+          recoveryFailed = true;
           recoveryError = error;
         }
         await vsc.window.showErrorMessage(
           vsc.l10n.t('[{0}] occurred while applying unsaved changes', errorMsg),
           {
             modal: true,
-            detail: recoveryError === undefined
+            detail: !recoveryFailed
               ? vsc.l10n.t(
                   'The document was restored from backup, but changes could not be applied. '
                   + 'The saved database was reopened in read-only mode.'
@@ -249,6 +251,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                 )
           }
         );
+        if (recoveryFailed) throw recoveryError;
       }
     }
 

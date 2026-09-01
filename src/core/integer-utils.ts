@@ -93,11 +93,14 @@ export function parseRowIdAliasColumn(
 }
 
 /** SQLite folds ASCII identifier case but leaves non-ASCII bytes alone. */
-export function sqliteIdentifiersEqual(left: string, right: string): boolean {
-  const foldAscii = (value: string) => value.replace(/[A-Z]/g, character => (
+export function foldSqliteIdentifier(identifier: string): string {
+  return identifier.replace(/[A-Z]/g, character => (
     String.fromCharCode(character.charCodeAt(0) + 0x20)
   ));
-  return foldAscii(left) === foldAscii(right);
+}
+
+export function sqliteIdentifiersEqual(left: string, right: string): boolean {
+  return foldSqliteIdentifier(left) === foldSqliteIdentifier(right);
 }
 
 export interface ExactNumericTextQuery {

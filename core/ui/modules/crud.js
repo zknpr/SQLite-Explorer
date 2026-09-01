@@ -296,9 +296,18 @@ async function submitAddRowOnce() {
         // demo cache drops it because INSERT triggers can ignore/add rows.
         noteRowCountChanged(targetTable, 1);
 
-        if (isCurrentSession()) {
+        const ownsModal = isCurrentSession();
+        const targetIsCurrent = () => session.connectionGeneration === state.connectionGeneration
+            && state.selectedTable === targetTable
+            && state.selectedTableType === 'table';
+        if (ownsModal) {
             closeModal('addRowModal');
-            if (state.selectedTable === targetTable) await loadTableData();
+        }
+        // A host refresh may close the modal before the mutation reply arrives.
+        // Modal ownership controls modal/status changes, not reconciliation of
+        // the committed insert against the still-selected database target.
+        if (targetIsCurrent()) await loadTableData();
+        if (ownsModal && addRowSession === null && targetIsCurrent()) {
             updateStatus('Row inserted - Ctrl+S to save');
         }
 
@@ -433,17 +442,26 @@ async function submitDeleteRows(session, isCurrentSession) {
         // The demo drops it because DELETE triggers can ignore/cascade rows.
         noteRowCountChanged(targetTable, -rowIds.length);
 
-        if (isCurrentSession()) {
+        const ownsModal = isCurrentSession();
+        const targetIsCurrent = () => session.connectionGeneration === state.connectionGeneration
+            && state.selectedTable === targetTable
+            && state.selectedTableType === 'table';
+        if (ownsModal) {
             closeModal('deleteModal');
-            if (state.selectedTable === targetTable) {
-                state.selectedRowIds.clear();
-                await loadTableData();
-                updateToolbarButtons();
-                const skipped = session.readOnlyCount > 0
-                    ? `; skipped ${session.readOnlyCount} read-only selection${session.readOnlyCount === 1 ? '' : 's'}`
-                    : '';
-                updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''}${skipped} - Ctrl+S to save`);
-            }
+        }
+        // Remove only the identities this request deleted. A newer selection
+        // made while the RPC was pending belongs to the current grid and must
+        // survive this older confirmation's reconciliation.
+        if (targetIsCurrent()) {
+            for (const rowId of rowIds) state.selectedRowIds.delete(rowId);
+            await loadTableData();
+            updateToolbarButtons();
+        }
+        if (ownsModal && deleteSession === null && targetIsCurrent()) {
+            const skipped = session.readOnlyCount > 0
+                ? `; skipped ${session.readOnlyCount} read-only selection${session.readOnlyCount === 1 ? '' : 's'}`
+                : '';
+            updateStatus(`Deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''}${skipped} - Ctrl+S to save`);
         }
 
     } catch (err) {
