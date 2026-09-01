@@ -3,30 +3,43 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import esbuild from 'esbuild';
 
-let demoClientModulePromise: Promise<Record<string, any>> | undefined;
+let demoLifecycleModulePromise: Promise<Record<string, any>> | undefined;
 
-function loadDemoClientModule(): Promise<Record<string, any>> {
-    demoClientModulePromise ??= (async () => {
-        // Bundle the client entry instead of importing TSX into the root
-        // no-JSX typecheck. The test still executes the real exported helpers.
+function loadDemoLifecycleModule(): Promise<Record<string, any>> {
+    demoLifecycleModulePromise ??= (async () => {
+        // Bundle only the framework-free lifecycle boundary. The resolver
+        // guard keeps root unit tests independent of website-only packages.
         const rendered = await esbuild.build({
-            entryPoints: [path.resolve(process.cwd(), 'website/app/demo/DemoClient.tsx')],
+            entryPoints: [path.resolve(process.cwd(), 'website/app/demo/lifecycle.ts')],
             bundle: true,
             platform: 'node',
             format: 'esm',
             target: 'node20',
+            plugins: [{
+                name: 'reject-demo-ui-dependencies',
+                setup(build) {
+                    build.onResolve(
+                        { filter: /^(?:react(?:\/jsx-runtime)?|lucide-react)$/ },
+                        args => ({
+                            errors: [{
+                                text: `Demo lifecycle helpers must not depend on ${args.path}`
+                            }]
+                        })
+                    );
+                }
+            }],
             write: false
         });
         assert.strictEqual(rendered.outputFiles.length, 1);
         const source = Buffer.from(rendered.outputFiles[0].text).toString('base64');
         return import(`data:text/javascript;base64,${source}`);
     })();
-    return demoClientModulePromise;
+    return demoLifecycleModulePromise;
 }
 
 describe('DemoClient worker lifecycle', () => {
     it('cleans up a failed browser download and revokes its object URL', async () => {
-        const DemoClientModule = await loadDemoClientModule();
+        const DemoClientModule = await loadDemoLifecycleModule();
         const originalUrl = globalThis.URL;
         const originalDocument = (globalThis as any).document;
         let appended = false;
@@ -69,7 +82,7 @@ describe('DemoClient worker lifecycle', () => {
     });
 
     it('rejects every pending RPC before terminating a retired worker', async () => {
-        const DemoClientModule = await loadDemoClientModule();
+        const DemoClientModule = await loadDemoLifecycleModule();
         const pending = new Map<string, any>();
         const first = new Promise((resolve, reject) => {
             pending.set('first', { method: 'fetchSchema', resolve, reject });
@@ -105,7 +118,7 @@ describe('DemoClient worker lifecycle', () => {
     });
 
     it('reloads from the retained source and propagates initialization failure', async () => {
-        const DemoClientModule = await loadDemoClientModule();
+        const DemoClientModule = await loadDemoLifecycleModule();
         const source = new Uint8Array([1, 2, 3]);
         const calls: unknown[][] = [];
         const reload = (DemoClientModule as any).reloadDemoDatabase;

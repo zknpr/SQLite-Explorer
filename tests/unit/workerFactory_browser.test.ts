@@ -25,6 +25,7 @@ interface FakeEndpoint {
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   ping(): Promise<boolean>;
+  writeToFile?(path: string, signal?: AbortSignal): Promise<void>;
 }
 
 type EndpointLogger = (
@@ -293,6 +294,11 @@ describe('workerFactory browser WASM connection', () => {
         assert.strictEqual(signal, abortController.signal);
         calls.push('discard');
       },
+      writeToFile: async (targetPath, signal) => {
+        assert.strictEqual(targetPath, '/workspace/copy.db');
+        assert.strictEqual(signal, abortController.signal);
+        calls.push('write');
+      },
       updateCell: async () => {},
       insertRow: async () => 1,
       updateCellBatch: async () => {},
@@ -320,8 +326,9 @@ describe('workerFactory browser WASM connection', () => {
     await connection.databaseOps.redoModification(mod);
     await connection.databaseOps.flushChanges(abortController.signal);
     await connection.databaseOps.discardModifications([mod], abortController.signal);
+    await connection.databaseOps.writeToFile('/workspace/copy.db', abortController.signal);
 
-    assert.deepStrictEqual(calls, ['apply', 'undo', 'redo', 'flush', 'discard']);
+    assert.deepStrictEqual(calls, ['apply', 'undo', 'redo', 'flush', 'discard', 'write']);
   });
 
   it('routes in-process engine diagnostics to the SQLite Explorer output channel', async () => {

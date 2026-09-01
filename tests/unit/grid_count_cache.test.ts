@@ -197,6 +197,45 @@ describe('grid count cache', () => {
         }
     });
 
+    it('does not let a cached exact count hide rows added by an external writer', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const dataLimits: number[] = [];
+        let countCalls = 0;
+        let databaseRows = 1;
+        backendApi.fetchTableCount = async () => {
+            countCalls += 1;
+            return { count: databaseRows, isExact: true };
+        };
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            dataLimits.push(options.limit);
+            return {
+                rows: Array.from(
+                    { length: Math.min(databaseRows, options.limit) },
+                    (_, row) => [row + 1, `row-${row + 1}`]
+                )
+            };
+        };
+        primeTableState(state, 'externally_changed');
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.strictEqual(state.gridData.length, 1);
+            assert.strictEqual(countCalls, 1);
+
+            databaseRows = 100;
+            assert.strictEqual(await loadTableData(false, false), true);
+
+            assert.strictEqual(state.gridData.length, 100);
+            assert.strictEqual(countCalls, 1);
+            assert.deepStrictEqual(dataLimits, [5000, 5000]);
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
     it('refetches a clipped short exact page at its real row bound', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
@@ -235,14 +274,15 @@ describe('grid count cache', () => {
             assert.deepStrictEqual(state.gridOversizedCells, {});
             assert.deepStrictEqual(dataLimits, [5000, 46]);
 
-            // The resolved exact count also prevents the same false clipping
-            // on later reloads without another count request or speculative
-            // oversized response.
+            // A cached count cannot safely shorten the first query because an
+            // external writer may have changed the table. If the unbounded
+            // query clips a cell, refresh the count and retry against the new
+            // load's exact bound.
             assert.strictEqual(await loadTableData(false, false), true);
             assert.strictEqual(state.gridData[0][1], fullPayload);
             assert.deepStrictEqual(state.gridOversizedCells, {});
-            assert.strictEqual(countCalls, 1);
-            assert.deepStrictEqual(dataLimits, [5000, 46, 46]);
+            assert.strictEqual(countCalls, 2);
+            assert.deepStrictEqual(dataLimits, [5000, 46, 5000, 46]);
         } finally {
             resetHarness(state, backendApi, originals);
         }

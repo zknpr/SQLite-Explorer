@@ -792,7 +792,10 @@ export class BlobInspector {
             : blobData instanceof Uint8Array
                 ? blobData
                 : new Uint8Array(blobData);
-        this.currentData = isText ? blobData : data;
+        // Downloads and hex rendering share this value. Keep it byte-based even
+        // for TEXT so native saves cannot reinterpret a JavaScript string as an
+        // ArrayBuffer-like object.
+        this.currentData = data;
 
         // Detect type
         const type = isText

@@ -447,7 +447,7 @@ export const backendApi = {
         sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
 
     // Database operations
-    updateCell: async (table, rowId, column, value, originalValue) => {
+    updateCell: async (table, rowId, column, value, _originalValue) => {
         for (let attempt = 1; attempt <= MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS; attempt++) {
             const metadata = await sendRpcRequest('getCellMetadata', [{
                 table,
@@ -492,7 +492,7 @@ export const backendApi = {
                 rowId,
                 column,
                 value,
-                originalValue,
+                undefined,
                 DEFAULT_MAX_CELL_EDIT_BYTES
             ]);
         }

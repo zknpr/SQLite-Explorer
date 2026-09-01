@@ -15,6 +15,7 @@ import {
 
 type NodeFs = typeof import('node:fs');
 type NodeFileHandle = Awaited<ReturnType<NodeFs['promises']['open']>>;
+type CancellationCheck = Pick<AbortSignal, 'throwIfAborted'>;
 
 export type AtomicDatabaseWriteLogger = (
   level: 'warn',
@@ -219,7 +220,7 @@ export async function writeDatabaseSnapshotAtomically(
   sourcePath: string | undefined,
   targetPath: string,
   writeTemporary: (temporaryPath: string) => Promise<void>,
-  signal?: AbortSignal,
+  signal?: CancellationCheck,
   logger?: AtomicDatabaseWriteLogger
 ): Promise<DatabaseWriteResult> {
   signal?.throwIfAborted();
@@ -284,6 +285,7 @@ export async function writeDatabaseSnapshotAtomically(
         if (target.requiresWriteLock) assertNoWalFrames(fs, target.replacementPath);
       }
 
+      signal?.throwIfAborted();
       fs.renameSync(temporaryPath, target.replacementPath);
       renamed = true;
     } catch (error) {

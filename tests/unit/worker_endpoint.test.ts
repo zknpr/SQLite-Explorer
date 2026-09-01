@@ -1,6 +1,8 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import fs from 'fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // Mock parentPort BEFORE importing createWorkerEndpoint
 import Module from 'module';
@@ -229,6 +231,33 @@ describe('Worker Endpoint', () => {
         assert.deepStrictEqual(count, { count: 1, isExact: true });
 
         await endpoint.writeToFile('/tmp/test_dump.db');
+    });
+
+    it('does not replace a file when a worker save cancellation flag is set', async () => {
+        await endpoint.initializeDatabase('test.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+        await endpoint.runQuery('CREATE TABLE save_probe (value TEXT)');
+        const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-explorer-save-'));
+        const targetPath = path.join(tempDirectory, 'cancelled.sqlite');
+        const cancellationFlag = new Int32Array(
+            new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)
+        );
+        Atomics.store(cancellationFlag, 0, 1);
+
+        try {
+            await assert.rejects(
+                (endpoint.writeToFile as any)(targetPath, cancellationFlag),
+                (error: any) => error?.name === 'AbortError'
+            );
+            assert.strictEqual(fs.existsSync(targetPath), false);
+        } finally {
+            endpoint.dispose();
+            fs.rmSync(tempDirectory, { recursive: true, force: true });
+        }
     });
 
     it('should forward JSON merge patches through updateCell to the WASM engine', async () => {

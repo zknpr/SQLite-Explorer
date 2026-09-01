@@ -294,7 +294,23 @@ export type WasmEngineLogHandler = (
   ...args: unknown[]
 ) => void;
 
-export type WasmQueryCancellation = AbortSignal | Int32Array;
+export type WasmOperationCancellation = AbortSignal | Int32Array;
+export type WasmQueryCancellation = WasmOperationCancellation;
+
+function cancellationCheck(
+  cancellation?: WasmOperationCancellation
+): Pick<AbortSignal, 'throwIfAborted'> | undefined {
+  if (!cancellation || 'aborted' in cancellation) return cancellation;
+  return {
+    throwIfAborted() {
+      if (cancellation.length > 0 && Atomics.load(cancellation, 0) !== 0) {
+        const error = new Error('Database operation cancelled');
+        error.name = 'AbortError';
+        throw error;
+      }
+    }
+  };
+}
 
 interface ExistingViewForIntent {
   storedSql: CellValue | undefined;
@@ -4774,7 +4790,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   async writeToFile(
     path: string,
-    signal?: AbortSignal
+    cancellation?: WasmOperationCancellation
   ): Promise<DatabaseWriteResult | void> {
     if (this.pagedState?.writable) {
       throw new Error(
@@ -4784,6 +4800,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const fs = getNodeFs();
     if (!fs) throw new Error('File system access not available');
 
+    const signal = cancellationCheck(cancellation);
     signal?.throwIfAborted();
     const data = this.exportDatabaseImage();
     return writeDatabaseSnapshotAtomically(

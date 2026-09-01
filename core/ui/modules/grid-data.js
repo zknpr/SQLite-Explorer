@@ -306,7 +306,12 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // clamped, retry), so they can never disagree on anything but the page
         // index and count knowledge. OFFSET always stays in the request: it is
         // the engine's validated fallback whenever the keyset does not hold up.
-        const buildDataQueryOptions = (pageIndex, countResult, pageCount) => {
+        const buildDataQueryOptions = (
+            pageIndex,
+            countResult,
+            pageCount,
+            mayBoundQueryToCount = true
+        ) => {
             const recordCount = countResult?.count;
             const options = {
                 columns: queryColumns,
@@ -315,12 +320,14 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                 globalFilterColumns: columnNames,
                 orderBy: state.sortedColumn,
                 orderDir: state.sortAscending ? 'ASC' : 'DESC',
-                limit: getPageQueryLimit(
-                    recordCount,
-                    countResult?.isExact,
-                    pageIndex,
-                    requestedPageSize
-                ),
+                limit: mayBoundQueryToCount
+                    ? getPageQueryLimit(
+                        recordCount,
+                        countResult?.isExact,
+                        pageIndex,
+                        requestedPageSize
+                      )
+                    : requestedPageSize,
                 offset: pageIndex * requestedPageSize,
                 filters,
                 globalFilter
@@ -341,11 +348,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         };
 
         // Resolve the count: cached when the identity is known, otherwise
-        // fetched — in parallel with the data query wherever possible. From
-        // here on this single totalRecordCount value feeds the clamp, the
-        // page count, the keyset 'last' remainder, the retry check, and the
-        // commit; cached and fetched counts are never mixed within one load.
+        // fetched in parallel with the data query wherever possible. A cached
+        // count can drive pagination metadata, but cannot shorten a new data
+        // query because another native connection may have changed the file.
         let countResult = getCachedCount(countIdentity);
+        let countWasFetchedForLoad = false;
 
         if (countResult === undefined && navIntent === 'last') {
             // 'last' must resolve the count before the data query: both its
@@ -357,6 +364,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             countResult = normalizeCountResult(
                 await backendApi.fetchTableCount(requestedTable, countOptions)
             );
+            countWasFetchedForLoad = true;
             if (isSuperseded()) return; // a newer load started, or the user switched tables
             storeCount(countResult);
         }
@@ -370,15 +378,21 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         let exactBoundStore;
 
         if (countResult !== undefined) {
-            // Count known synchronously (cache hit) or resolved above: page
-            // turns run a single data query and no count RPC at all.
+            // Count known synchronously (cache hit) or resolved above. Cache
+            // hits retain the configured page limit so the data request can
+            // reveal rows written by another connection.
             totalRecordCount = countResult.count;
             totalRecordCountIsExact = countResult.isExact;
             totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
             if (currentPageIndex >= totalPageCount) {
                 currentPageIndex = Math.max(0, totalPageCount - 1);
             }
-            queryOptions = buildDataQueryOptions(currentPageIndex, countResult, totalPageCount);
+            queryOptions = buildDataQueryOptions(
+                currentPageIndex,
+                countResult,
+                totalPageCount,
+                countWasFetchedForLoad
+            );
             if (!totalRecordCountIsExact && keysetModeCanProveInexactCount(queryOptions.keyset)) {
                 exactBoundStore = prepareCountStore(countIdentity);
             }
@@ -406,6 +420,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             if (isSuperseded()) return; // superseded during the parallel fetch
             if (countOutcome.status === 'rejected') throw countOutcome.reason;
             countResult = normalizeCountResult(countOutcome.value);
+            countWasFetchedForLoad = true;
             totalRecordCount = countResult.count;
             totalRecordCountIsExact = countResult.isExact;
             // Store before inspecting the data outcome: the count is engine
@@ -442,11 +457,53 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // retain the one-query fast path. The second request is bounded by the
         // just-resolved count and preserves the containment cap for genuinely
         // large values.
-        const countAwareOptions = buildDataQueryOptions(
+        let countAwareOptions = buildDataQueryOptions(
             currentPageIndex,
             countResult,
-            totalPageCount
+            totalPageCount,
+            countWasFetchedForLoad
         );
+        if (!countWasFetchedForLoad && hasClippedCells(dataResult)) {
+            const staleCountBoundOptions = buildDataQueryOptions(
+                currentPageIndex,
+                countResult,
+                totalPageCount,
+                true
+            );
+            if (queryOptions.limit > staleCountBoundOptions.limit) {
+                // A smaller limit could recover a clipped ordinary value, but
+                // the cached count is not authoritative for this request.
+                // Refresh it first so an external insert cannot be hidden by
+                // the containment retry itself.
+                const storeCount = prepareCountStore(countIdentity);
+                countResult = normalizeCountResult(
+                    await backendApi.fetchTableCount(requestedTable, countOptions)
+                );
+                if (isSuperseded()) return;
+                storeCount(countResult);
+                countWasFetchedForLoad = true;
+                totalRecordCount = countResult.count;
+                totalRecordCountIsExact = countResult.isExact;
+                totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
+                if (currentPageIndex >= totalPageCount) {
+                    currentPageIndex = Math.max(0, totalPageCount - 1);
+                    queryOptions = buildDataQueryOptions(
+                        currentPageIndex,
+                        countResult,
+                        totalPageCount,
+                        true
+                    );
+                    dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
+                    if (isSuperseded()) return;
+                }
+                countAwareOptions = buildDataQueryOptions(
+                    currentPageIndex,
+                    countResult,
+                    totalPageCount,
+                    true
+                );
+            }
+        }
         if (queryOptions.limit > countAwareOptions.limit && hasClippedCells(dataResult)) {
             queryOptions = countAwareOptions;
             dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);

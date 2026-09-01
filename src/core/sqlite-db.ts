@@ -44,6 +44,7 @@ import {
   type WasmDatabaseInstance,
   type WasmEngineModule,
   type WasmEngineLogHandler,
+  type WasmOperationCancellation,
   type WasmQueryCancellation
 } from './engine/wasm/WasmDatabaseEngine';
 import { createChunkedReadCache } from './chunked-read-cache';
@@ -1029,8 +1030,11 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return activeEngine.ping();
     },
 
-    async writeToFile(path: string): Promise<DatabaseWriteResult | void> {
-      return requireEngine().writeToFile(path);
+    async writeToFile(
+      path: string,
+      cancellation?: WasmOperationCancellation
+    ): Promise<DatabaseWriteResult | void> {
+      return requireEngine().writeToFile(path, cancellation);
     },
 
     /**

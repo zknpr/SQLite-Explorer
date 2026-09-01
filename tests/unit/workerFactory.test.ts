@@ -503,6 +503,53 @@ describe('workerFactory error path tests', () => {
     assert.deepStrictEqual(pagedHostSaveCalls, []);
   });
 
+  it('propagates mid-flight cancellation to memory-backed worker saves', async () => {
+    let saveStarted!: () => void;
+    let releaseSave!: () => void;
+    const started = new Promise<void>(resolve => { saveStarted = resolve; });
+    const release = new Promise<void>(resolve => { releaseSave = resolve; });
+    let cancellationFlag: Int32Array | undefined;
+    let committed = false;
+    workerProxy = {
+      initializeDatabase: async () => ({ isReadOnly: false, storage: 'memory' }),
+      writeToFile: async (_targetPath: string, flag?: Int32Array) => {
+        cancellationFlag = flag;
+        saveStarted();
+        await release;
+        if (flag && Atomics.load(flag, 0) !== 0) {
+          const error = new Error('worker save cancelled');
+          error.name = 'AbortError';
+          throw error;
+        }
+        committed = true;
+        return { requiresReopen: false };
+      }
+    };
+
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any,
+      null as any
+    );
+    const { databaseOps } = await bundle.establishConnection(testDbUri(), 'test.sqlite');
+    const controller = new AbortController();
+    const cancellation = new Error('cancelled during memory save');
+    const pending = databaseOps.writeToFile(
+      '/test/cancelled-memory-save.sqlite',
+      controller.signal
+    );
+    await started;
+
+    controller.abort(cancellation);
+    releaseSave();
+    let caught: unknown;
+    await pending.catch((error: unknown) => { caught = error; });
+
+    assert.ok(cancellationFlag instanceof Int32Array);
+    assert.strictEqual(Atomics.load(cancellationFlag, 0), 1);
+    assert.strictEqual(caught, cancellation);
+    assert.strictEqual(committed, false);
+  });
+
   it('routes view history through the desktop worker-backed WASM facade', async () => {
     const views = new Map<string, any>();
     const applyRpcArgumentCounts: number[] = [];

@@ -179,6 +179,47 @@ describe('writeDatabaseSnapshotAtomically', () => {
     });
   });
 
+  it('honors cancellation after validation and before the atomic rename', async () => {
+    await withScratchDirectory(async (directory) => {
+      const targetPath = path.join(directory, 'database.db');
+      const originalBytes = Buffer.from('old database bytes');
+      const replacementBytes = Buffer.from('replacement database bytes');
+      const cancellation = new AbortController();
+      const reason = new Error('cancelled at the commit boundary');
+      await fs.promises.writeFile(targetPath, originalBytes);
+
+      const hookedFs = Object.create(fs) as typeof fs;
+      Object.defineProperty(hookedFs, 'lstatSync', {
+        value(candidatePath: fs.PathLike, options?: unknown) {
+          const result = (fs.lstatSync as (...args: unknown[]) => fs.Stats)(
+            candidatePath,
+            options
+          );
+          if (String(candidatePath).includes('.sqlite-explorer-')) {
+            cancellation.abort(reason);
+          }
+          return result;
+        }
+      });
+
+      await assert.rejects(
+        writeDatabaseSnapshotAtomically(
+          hookedFs,
+          undefined,
+          targetPath,
+          async (temporaryPath) => {
+            await fs.promises.writeFile(temporaryPath, replacementBytes);
+          },
+          cancellation.signal
+        ),
+        reason
+      );
+
+      assert.deepStrictEqual(await fs.promises.readFile(targetPath), originalBytes);
+      await assertNoAtomicTemporaryFiles(directory);
+    });
+  });
+
   it('reports requiresReopen when the active source resolves to the target', async () => {
     await withScratchDirectory(async (directory) => {
       const targetPath = path.join(directory, 'database.db');

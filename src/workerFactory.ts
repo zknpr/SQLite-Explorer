@@ -115,8 +115,8 @@ if (!import.meta.env?.VSCODE_BROWSER_EXT) {
  *
  * Keep every parameter structured-cloneable. AbortSignal is deliberately not
  * part of this RPC contract: worker_threads clones it into a plain object.
- * Bounded query paths mirror it into a probed shared flag; other cancellable
- * operations retain their existing host-side pre-dispatch check.
+ * Bounded query paths and memory-backed saves mirror it into a probed shared
+ * flag; other cancellable operations retain their host-side pre-dispatch check.
  */
 interface WorkerMethods {
   initializeDatabase(
@@ -236,7 +236,10 @@ interface WorkerMethods {
   getPragmas(): Promise<Record<string, CellValue>>;
   setPragma(pragma: string, value: CellValue): Promise<void>;
   ping(): Promise<boolean>;
-  writeToFile(path: string): Promise<DatabaseWriteResult | void>;
+  writeToFile(
+    path: string,
+    cancellationFlag?: Int32Array
+  ): Promise<DatabaseWriteResult | void>;
 }
 
 const WORKER_METHOD_NAMES = [
@@ -779,8 +782,8 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.setPragma(pragma, value),
         ping: () =>
           endpoint.ping(),
-        writeToFile: (path: string) =>
-          endpoint.writeToFile(path)
+        writeToFile: (path: string, signal?: AbortSignal) =>
+          endpoint.writeToFile(path, signal)
       };
 
       return {
@@ -1030,7 +1033,14 @@ async function createWorkerBackedWasmDatabaseConnection(
                 signal
               );
             }
-          : (targetPath: string) => workerProxy.writeToFile(targetPath);
+          : (targetPath: string, signal?: AbortSignal) => (
+              signal
+                ? callWorkerWithCancellation(
+                    signal,
+                    cancellationFlag => workerProxy.writeToFile(targetPath, cancellationFlag)
+                  )
+                : workerProxy.writeToFile(targetPath)
+            );
 
         const operationsFacade: DatabaseOperations = {
           engineKind: Promise.resolve('wasm'),

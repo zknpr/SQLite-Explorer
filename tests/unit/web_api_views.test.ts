@@ -77,7 +77,7 @@ it('uses the transport edit ceiling instead of the inline preview ceiling', asyn
     const { backendApi, handleRpcResponse } = await import(webApiModulePath);
     const replacement = new Uint8Array(DEFAULT_MAX_INLINE_CELL_BYTES + 1);
 
-    const update = backendApi.updateCell('items', 1, 'payload', replacement, null);
+    const update = backendApi.updateCell('items', 1, 'payload', replacement, 'previous text');
     const metadataRequest = await waitForPostedMessage(0);
     assert.strictEqual(metadataRequest.content.targetMethod, 'getCellMetadata');
     handleRpcResponse({
@@ -90,6 +90,7 @@ it('uses the transport edit ceiling instead of the inline preview ceiling', asyn
     const updateRequest = await waitForPostedMessage(1);
     assert.strictEqual(updateRequest.content.targetMethod, 'updateCell');
     assert.strictEqual(updateRequest.content.payload[3].__type, 'Uint8Array');
+    assert.strictEqual(updateRequest.content.payload[4], undefined);
     assert.strictEqual(updateRequest.content.payload[5], MAX_WEBVIEW_BINARY_VALUE_BYTES);
     handleRpcResponse({
         kind: 'response',

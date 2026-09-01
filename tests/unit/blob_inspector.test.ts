@@ -1301,6 +1301,74 @@ describe('BlobInspector oversized containment', () => {
         }
     });
 
+    it('downloads an inspected TEXT value as its UTF-8 bytes', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const originalApi = {
+            getExtensionSettings: backendApi.getExtensionSettings,
+            saveFile: backendApi.saveFile
+        };
+        const saved: unknown[] = [];
+        backendApi.getExtensionSettings = async () => ({ fileOperations: 'native' });
+        backendApi.saveFile = async (_filename: string, data: unknown) => {
+            saved.push(data);
+            return { success: true };
+        };
+        state.selectedTable = 'items';
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                return id === 'statusText' ? { textContent: '' } : null;
+            }
+        };
+        const { inspector } = inspectorHarness(BlobInspector);
+        const text = 'plain text é😀';
+
+        try {
+            inspector.inspect(text, 1, 'body', 0, 0);
+            await inspector.download();
+
+            assert.strictEqual(saved.length, 1);
+            assert.ok(saved[0] instanceof Uint8Array);
+            assert.deepStrictEqual(saved[0], new TextEncoder().encode(text));
+        } finally {
+            Object.assign(backendApi, originalApi);
+        }
+    });
+
+    it('downloads an empty inspected TEXT value as an empty file', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const originalApi = {
+            getExtensionSettings: backendApi.getExtensionSettings,
+            saveFile: backendApi.saveFile
+        };
+        const saved: unknown[] = [];
+        backendApi.getExtensionSettings = async () => ({ fileOperations: 'native' });
+        backendApi.saveFile = async (_filename: string, data: unknown) => {
+            saved.push(data);
+            return { success: true };
+        };
+        state.selectedTable = 'items';
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                return id === 'statusText' ? { textContent: '' } : null;
+            }
+        };
+        const { inspector } = inspectorHarness(BlobInspector);
+
+        try {
+            inspector.inspect('', 1, 'body', 0, 0);
+            await inspector.download();
+
+            assert.strictEqual(saved.length, 1);
+            assert.deepStrictEqual(saved[0], new Uint8Array());
+        } finally {
+            Object.assign(backendApi, originalApi);
+        }
+    });
+
     it('cleans a failed web BLOB download without leaking its object URL', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const originalUrl = globalThis.URL;
