@@ -5101,6 +5101,57 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('keeps demo non-ASCII-distinct persistent and TEMP trigger names separate', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_unicode_trigger_rows (value INTEGER); ' +
+            'CREATE TABLE demo_unicode_trigger_log (source TEXT, value INTEGER); ' +
+            'CREATE VIEW demo_unicode_trigger_view AS ' +
+            'SELECT value FROM demo_unicode_trigger_rows; ' +
+            'CREATE TRIGGER "Ä" INSTEAD OF INSERT ON demo_unicode_trigger_view ' +
+            "BEGIN INSERT INTO demo_unicode_trigger_log VALUES ('main', NEW.value); END; " +
+            'CREATE TEMP TRIGGER "ä" INSTEAD OF INSERT ON demo_unicode_trigger_view ' +
+            "BEGIN INSERT INTO demo_unicode_trigger_log VALUES ('temp', NEW.value); END"
+        );
+
+        const browsed = await worker.invoke('getViewDefinition', 'demo_unicode_trigger_view');
+        assert.deepStrictEqual(
+            Array.from(browsed.triggers, (trigger: any) => [
+                trigger.identifier,
+                trigger.temporary === true
+            ]),
+            [['Ä', false], ['ä', true]]
+        );
+        assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
+
+        const edit = await worker.invoke(
+            'editView',
+            'demo_unicode_trigger_view',
+            'SELECT value * 2 AS value FROM demo_unicode_trigger_rows',
+            true
+        );
+        assert.deepStrictEqual(
+            Array.from(edit.after.triggers, (trigger: any) => [
+                trigger.identifier,
+                trigger.temporary === true
+            ]),
+            [['Ä', false], ['ä', true]]
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO main.demo_unicode_trigger_view VALUES (13)'
+        );
+        const logged = await worker.invoke(
+            'runQuery',
+            'SELECT source, value FROM demo_unicode_trigger_log ORDER BY source'
+        );
+        assert.deepStrictEqual(
+            Array.from(logged[0].rows, (row: unknown[]) => Array.from(row)),
+            [['main', 13], ['temp', 13]]
+        );
+    });
+
     it('refuses to rebind a demo TEMP trigger historically attached elsewhere', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

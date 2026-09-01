@@ -3487,7 +3487,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         // schema-ambiguous even if the DML itself compiles.
         if (triggers.some(candidate => (
           !candidate.temporary
-          && candidate.identifier.toLowerCase() === trigger.identifier.toLowerCase()
+          && sqliteIdentifiersEqual(candidate.identifier, trigger.identifier)
         ))) {
           ambiguousTemporaryTriggerNames.push(trigger.identifier);
           continue;

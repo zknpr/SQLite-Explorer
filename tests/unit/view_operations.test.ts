@@ -446,6 +446,53 @@ describe('view operations', () => {
         }
     });
 
+    it('keeps non-ASCII-distinct persistent and TEMP trigger names separate', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE unicode_trigger_rows (value INTEGER); ' +
+                'CREATE TABLE unicode_trigger_log (source TEXT, value INTEGER); ' +
+                'CREATE VIEW unicode_trigger_view AS SELECT value FROM unicode_trigger_rows; ' +
+                'CREATE TRIGGER "Ä" INSTEAD OF INSERT ON unicode_trigger_view ' +
+                "BEGIN INSERT INTO unicode_trigger_log VALUES ('main', NEW.value); END; " +
+                'CREATE TEMP TRIGGER "ä" INSTEAD OF INSERT ON unicode_trigger_view ' +
+                "BEGIN INSERT INTO unicode_trigger_log VALUES ('temp', NEW.value); END"
+            );
+
+            const browsed = await engine.getViewDefinition('unicode_trigger_view');
+            assert.deepStrictEqual(
+                browsed.triggers.map(trigger => [
+                    trigger.identifier,
+                    trigger.temporary === true
+                ]),
+                [['Ä', false], ['ä', true]]
+            );
+            assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
+
+            const edit = await engine.editView(
+                'unicode_trigger_view',
+                'SELECT value * 2 AS value FROM unicode_trigger_rows',
+                true
+            );
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => [
+                    trigger.identifier,
+                    trigger.temporary === true
+                ]),
+                [['Ä', false], ['ä', true]]
+            );
+            await engine.executeQuery('INSERT INTO main.unicode_trigger_view VALUES (13)');
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT source, value FROM unicode_trigger_log ORDER BY source'
+                ))[0].rows,
+                [['main', 13], ['temp', 13]]
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('preserves a main-qualified TEMP trigger through a same-named TEMP view shadow', async () => {
         const engine = await createEngine();
         try {

@@ -3287,7 +3287,7 @@ async function findViewDefinition(view, allowUnparsed = false) {
     for (const trigger of unqualifiedTemporaryTriggers) {
       if (triggers.some(candidate => (
         !candidate.temporary
-        && candidate.identifier.toLowerCase() === trigger.identifier.toLowerCase()
+        && sqliteIdentifiersEqual(candidate.identifier, trigger.identifier)
       ))) {
         ambiguousTemporaryTriggerNames.push(trigger.identifier);
         continue;

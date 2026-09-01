@@ -4289,6 +4289,51 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             assert.strictEqual(logged[0].rows[0][0], 19);
         });
 
+        await testContext.test('keeps native non-ASCII-distinct trigger names separate', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_unicode_trigger_rows (value INTEGER); ' +
+                'CREATE TABLE native_unicode_trigger_log (source TEXT, value INTEGER); ' +
+                'CREATE VIEW native_unicode_trigger_view AS ' +
+                'SELECT value FROM native_unicode_trigger_rows; ' +
+                'CREATE TRIGGER "Ä" INSTEAD OF INSERT ON native_unicode_trigger_view ' +
+                "BEGIN INSERT INTO native_unicode_trigger_log VALUES ('main', NEW.value); END; " +
+                'CREATE TEMP TRIGGER "ä" INSTEAD OF INSERT ON native_unicode_trigger_view ' +
+                "BEGIN INSERT INTO native_unicode_trigger_log VALUES ('temp', NEW.value); END"
+            );
+
+            const browsed = await engine.getViewDefinition('native_unicode_trigger_view');
+            assert.deepStrictEqual(
+                browsed.triggers.map(trigger => [
+                    trigger.identifier,
+                    trigger.temporary === true
+                ]),
+                [['Ä', false], ['ä', true]]
+            );
+            assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
+
+            const edit = await engine.editView(
+                'native_unicode_trigger_view',
+                'SELECT value * 2 AS value FROM native_unicode_trigger_rows',
+                true
+            );
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => [
+                    trigger.identifier,
+                    trigger.temporary === true
+                ]),
+                [['Ä', false], ['ä', true]]
+            );
+            await engine.executeQuery(
+                'INSERT INTO main.native_unicode_trigger_view VALUES (13)'
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT source, value FROM native_unicode_trigger_log ORDER BY source'
+                ))[0].rows,
+                [['main', 13], ['temp', 13]]
+            );
+        });
+
         await testContext.test('refuses to rebind a native TEMP trigger historically attached elsewhere', async () => {
             await engine.executeQuery("ATTACH DATABASE ':memory:' AS native_aux_history");
             await engine.executeQuery(
