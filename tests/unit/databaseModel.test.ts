@@ -294,6 +294,8 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             outputChannel?: { appendLine(message: string): void };
             initialReadOnly?: boolean;
             initialStorage?: 'memory' | 'paged';
+            activeWorkerMethods?: { [Symbol.dispose](): void };
+            connectionFactory?: () => Promise<any>;
         } = {}
     ) => {
         const mockViewerProvider = {
@@ -308,6 +310,10 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         // Production DatabaseOperations always includes ping. Supply the
         // no-op barrier for focused persistence doubles that omit it.
         dbOps.ping ??= async () => true;
+        const connectionFactory = options.connectionFactory ?? (async () => ({
+            workerMethods: { [Symbol.dispose]: () => {} },
+            establishConnection
+        }));
 
         return new (DatabaseDocument as any)(
             mockViewerProvider,
@@ -319,9 +325,11 @@ describe('DatabaseDocument save/saveAs fallback', () => {
                 isReadOnly: options.initialReadOnly ?? false,
                 storage: options.initialStorage
             },
-            { [Symbol.dispose]: () => {} }, // workerMethods
-            establishConnection,
-            {} // reporter
+            options.activeWorkerMethods ?? { [Symbol.dispose]: () => {} },
+            connectionFactory,
+            {}, // reporter
+            options.forceReadOnly ?? false,
+            ''
         );
     };
 
@@ -1101,6 +1109,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             value: {
                 ...originalFs,
                 stat: async () => ({ type: 1, ctime: 1, mtime: 1, size: 1 }),
+                readFile: async () => new Uint8Array([0]),
                 writeFile: async (_uri: unknown, content: Uint8Array) => { written = content; }
             } as any,
             writable: true,
@@ -1183,6 +1192,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             value: {
                 ...originalFs,
                 stat: async () => ({ type: 1, ctime: 1, mtime: 1, size: 1 }),
+                readFile: async () => new Uint8Array([0]),
                 writeFile: async () => { writeCalled = true; }
             } as any,
             writable: true,
@@ -1381,6 +1391,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
                     }
                     return { type: 1, ctime: 1, mtime: 1, size: bytes.byteLength };
                 },
+                readFile: async (uri: any) => resources.get(uri.toString())!,
                 writeFile: async (uri: any) => {
                     resources.set(uri.toString(), new Uint8Array([4]));
                     throw new Error('provider failed after truncating its write target');
@@ -1433,9 +1444,65 @@ describe('DatabaseDocument save/saveAs fallback', () => {
                     if (uri.toString() === targetKey) return targetGeneration;
                     return { type: 1, ctime: 2, mtime: 2, size: 3 };
                 },
+                readFile: async () => new Uint8Array([1, 2, 3]),
                 writeFile: async (uri: any) => {
                     stagedUri = uri;
                     targetGeneration = { ...targetGeneration, mtime: 2 };
+                },
+                rename: async () => { renameCalled = true; },
+                delete: async (uri: any) => {
+                    assert.strictEqual(uri, stagedUri);
+                    deleted = true;
+                }
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            await assert.rejects(
+                () => doc.saveAs(targetUri, undefined),
+                /destination changed while the database was being saved/i
+            );
+            assert.strictEqual(renameCalled, false);
+            assert.strictEqual(deleted, true);
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('saveAs: refuses a same-size non-file destination change with unchanged provider timestamps', async () => {
+        const sourceUri = createUri('untitled', '/new.sqlite');
+        const targetUri = createUri('vscode-vfs', '/repo/copy.sqlite');
+        const targetKey = targetUri.toString();
+        const unchangedStat = { type: 1, ctime: 1, mtime: 1, size: 3 };
+        let targetBytes = new Uint8Array([1, 2, 3]);
+        let stagedUri: any;
+        let renameCalled = false;
+        let deleted = false;
+        const doc = createDocBypassingFactory({
+            engineKind: Promise.resolve('wasm'),
+            serializeDatabase: async () => new Uint8Array([4, 5, 6])
+        }, sourceUri);
+
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                stat: async () => unchangedStat,
+                readFile: async (uri: any) => {
+                    assert.strictEqual(uri.toString(), targetKey);
+                    return targetBytes;
+                },
+                writeFile: async (uri: any) => {
+                    stagedUri = uri;
+                    // Model a provider whose metadata token does not change within
+                    // its timestamp granularity while another writer replaces bytes.
+                    targetBytes = new Uint8Array([9, 8, 7]);
                 },
                 rename: async () => { renameCalled = true; },
                 delete: async (uri: any) => {
@@ -2213,6 +2280,124 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         assert.strictEqual(doc.isReadOnlyMode, true);
         assert.strictEqual(connectionCalls.length, 1);
         assert.deepStrictEqual(contentChanges, [{ invalidateAllViewDocuments: true }]);
+    });
+
+    it('keeps the active connection usable when a fresh Reload connection fails', async () => {
+        const reloadError = new Error('replacement open failed');
+        let activeUsable = true;
+        let activeReconnectCalled = false;
+        let activeDisposed = false;
+        let failedReplacementDisposed = false;
+        const originalOps = {
+            engineKind: Promise.resolve('wasm' as const),
+            executeQuery: async () => {
+                if (!activeUsable) throw new Error('active connection was retired');
+                return [];
+            }
+        };
+        const doc = createDocBypassingFactory(
+            originalOps,
+            createFileUri('/test/reload-open-failure.db'),
+            async () => {
+                activeReconnectCalled = true;
+                activeUsable = false;
+                throw reloadError;
+            },
+            {
+                activeWorkerMethods: {
+                    [Symbol.dispose]: () => {
+                        activeDisposed = true;
+                        activeUsable = false;
+                    }
+                },
+                connectionFactory: async () => ({
+                    workerMethods: {
+                        [Symbol.dispose]: () => { failedReplacementDisposed = true; }
+                    },
+                    establishConnection: async () => { throw reloadError; }
+                })
+            }
+        );
+
+        await assert.rejects(doc.reloadFromDisk(), error => error === reloadError);
+
+        assert.strictEqual(doc.databaseOperations, originalOps);
+        await assert.doesNotReject(() => originalOps.executeQuery());
+        assert.strictEqual(activeReconnectCalled, false);
+        assert.strictEqual(activeDisposed, false);
+        assert.strictEqual(failedReplacementDisposed, true);
+    });
+
+    it('transfers worker ownership after a successful fresh Reload connection', async () => {
+        let activeDisposed = 0;
+        let replacementDisposed = 0;
+        const originalOps = { engineKind: Promise.resolve('wasm' as const) };
+        const replacementOps = { engineKind: Promise.resolve('wasm' as const) };
+        const doc = createDocBypassingFactory(
+            originalOps,
+            createFileUri('/test/reload-worker-lifecycle.db'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false }),
+            {
+                activeWorkerMethods: {
+                    [Symbol.dispose]: () => { activeDisposed++; }
+                },
+                connectionFactory: async () => ({
+                    workerMethods: {
+                        [Symbol.dispose]: () => { replacementDisposed++; }
+                    },
+                    establishConnection: async () => ({
+                        databaseOps: replacementOps,
+                        isReadOnly: false
+                    })
+                })
+            }
+        );
+
+        await doc.reloadFromDisk();
+
+        assert.strictEqual(activeDisposed, 1);
+        assert.strictEqual(replacementDisposed, 0);
+        await doc.dispose();
+        assert.strictEqual(replacementDisposed, 1);
+    });
+
+    it('disposes a fresh Reload connection that opens after the document is disposed', async () => {
+        const replacementOpenStarted = createDeferred<void>();
+        const finishReplacementOpen = createDeferred<void>();
+        let activeDisposed = 0;
+        let replacementDisposed = 0;
+        const originalOps = { engineKind: Promise.resolve('wasm' as const) };
+        const replacementOps = { engineKind: Promise.resolve('wasm' as const) };
+        const doc = createDocBypassingFactory(
+            originalOps,
+            createFileUri('/test/dispose-during-reload.db'),
+            async () => ({ databaseOps: replacementOps, isReadOnly: false }),
+            {
+                activeWorkerMethods: {
+                    [Symbol.dispose]: () => { activeDisposed++; }
+                },
+                connectionFactory: async () => ({
+                    workerMethods: {
+                        [Symbol.dispose]: () => { replacementDisposed++; }
+                    },
+                    establishConnection: async () => {
+                        replacementOpenStarted.resolve();
+                        await finishReplacementOpen.promise;
+                        return { databaseOps: replacementOps, isReadOnly: false };
+                    }
+                })
+            }
+        );
+
+        const reload = doc.reloadFromDisk();
+        await replacementOpenStarted.promise;
+        await doc.dispose();
+        finishReplacementOpen.resolve();
+
+        await assert.rejects(reload, /disposed while reopening/i);
+        assert.strictEqual(doc.databaseOperations, originalOps);
+        assert.strictEqual(activeDisposed, 1);
+        assert.strictEqual(replacementDisposed, 1);
     });
 
     it('reopens native SQLite so Reload observes an atomically replaced file inode', async () => {

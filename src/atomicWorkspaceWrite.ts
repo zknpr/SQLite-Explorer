@@ -8,6 +8,7 @@ interface WorkspaceFileFingerprint {
   mtime: number;
   size: number;
   permissions: number | undefined;
+  digest: Uint8Array;
 }
 
 export type WorkspaceFileGeneration =
@@ -21,7 +22,7 @@ function isMissingWorkspaceFile(error: unknown): boolean {
   return code === 'FileNotFound' || code === 'ENOENT';
 }
 
-function fingerprint(stat: vsc.FileStat): WorkspaceFileFingerprint {
+function statFingerprint(stat: vsc.FileStat): Omit<WorkspaceFileFingerprint, 'digest'> {
   if ((stat.type & vsc.FileType.SymbolicLink) !== 0) {
     throw new Error('Cannot safely replace a symbolic-link database destination');
   }
@@ -40,9 +41,9 @@ function fingerprint(stat: vsc.FileStat): WorkspaceFileFingerprint {
   };
 }
 
-function sameFingerprint(
-  left: WorkspaceFileFingerprint,
-  right: WorkspaceFileFingerprint
+function sameStatFingerprint(
+  left: Omit<WorkspaceFileFingerprint, 'digest'>,
+  right: Omit<WorkspaceFileFingerprint, 'digest'>
 ): boolean {
   return left.type === right.type
     && left.ctime === right.ctime
@@ -51,13 +52,35 @@ function sameFingerprint(
     && left.permissions === right.permissions;
 }
 
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
 export async function captureWorkspaceFileGeneration(
   target: vsc.Uri
 ): Promise<WorkspaceFileGeneration> {
   try {
+    const initialStat = statFingerprint(await vsc.workspace.fs.stat(target));
+    const bytes = await vsc.workspace.fs.readFile(target);
+    const verifiedStat = statFingerprint(await vsc.workspace.fs.stat(target));
+    if (
+      bytes.byteLength !== initialStat.size
+      || !sameStatFingerprint(initialStat, verifiedStat)
+    ) {
+      throw new Error('The database destination changed while its state was being inspected; retry');
+    }
+    // Copy provider-owned bytes before the asynchronous digest so a mutable
+    // backing buffer cannot change the generation token after capture.
+    const digestInput = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(digestInput).set(bytes);
+    const digest = new Uint8Array(await webCrypto.subtle.digest('SHA-256', digestInput));
     return {
       exists: true,
-      fingerprint: fingerprint(await vsc.workspace.fs.stat(target))
+      fingerprint: { ...verifiedStat, digest }
     };
   } catch (error) {
     if (isMissingWorkspaceFile(error)) return { exists: false };
@@ -74,7 +97,11 @@ async function assertWorkspaceFileGenerationUnchanged(
     if (!current.exists) return;
     throw new Error('The destination appeared while the database was being saved; retry');
   }
-  if (!current.exists || !sameFingerprint(expected.fingerprint, current.fingerprint)) {
+  if (
+    !current.exists
+    || !sameStatFingerprint(expected.fingerprint, current.fingerprint)
+    || !sameBytes(expected.fingerprint.digest, current.fingerprint.digest)
+  ) {
     throw new Error('The destination changed while the database was being saved; retry');
   }
 }
@@ -98,8 +125,8 @@ function siblingTemporaryUri(target: vsc.Uri): vsc.Uri {
 
 /**
  * Replace a workspace-provider resource only after a complete sibling write.
- * FileStat is the strongest conditional-write token exposed by workspace.fs;
- * checking it immediately before rename prevents normal external-edit races.
+ * workspace.fs has no conditional rename primitive, so compare both provider
+ * metadata and content immediately before rename to catch coarse-timestamp races.
  */
 export async function writeWorkspaceFileAtomically(
   target: vsc.Uri,

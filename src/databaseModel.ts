@@ -127,6 +127,8 @@ function withSqlLogging(
     : databaseOps;
 }
 
+type DatabaseConnectionFactory = () => Promise<DatabaseConnectionBundle>;
+
 // ============================================================================
 // Document Class
 // ============================================================================
@@ -160,7 +162,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     let forceReadOnlyOnReconnect = configuredForceReadOnly;
 
     // Use WebAssembly-based worker for database operations
-    const connectionFactory = createDatabaseConnection;
+    const connectionFactory: DatabaseConnectionFactory = () => (
+      createDatabaseConnection(extensionUri, reporter)
+    );
 
     const { filename } = getUriParts(fileUri);
     const documentKey = knownDocumentKey ?? await generateDatabaseDocumentKey(fileUri);
@@ -169,7 +173,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     let connectionBundle: DatabaseConnectionBundle;
     let databaseOps: DatabaseOperations;
 
-    connectionBundle = await connectionFactory(extensionUri, reporter);
+    connectionBundle = await connectionFactory();
     let result = await connectionBundle.establishConnection(
       fileUri,
       filename,
@@ -262,7 +266,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       autoCommit,
       { databaseOps, isReadOnly, storage: result.storage },
       connectionBundle.workerMethods,
-      connectionBundle.establishConnection.bind(connectionBundle),
+      connectionFactory,
       reporter,
       forceReadOnlyOnReconnect,
       documentKey
@@ -297,8 +301,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     tracker: ModificationTracker<DocumentModification> | null,
     public autoCommitEnabled: boolean,
     private connectionState: EstablishedDatabaseConnection,
-    private readonly workerMethods: DatabaseConnectionBundle['workerMethods'],
-    private readonly establishConnection: DatabaseConnectionBundle['establishConnection'],
+    private workerMethods: DatabaseConnectionBundle['workerMethods'],
+    private readonly connectionFactory: DatabaseConnectionFactory,
     private readonly reporter?: TelemetryReporter,
     forceReadOnlyOnReconnect: boolean = viewerProvider.forceReadOnly ?? false,
     documentKey: string = ''
@@ -497,8 +501,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     if (DocumentRegistry.get(key) === this) {
       DocumentRegistry.delete(key);
     }
-    this.workerMethods[Symbol.dispose]();
     this.#workerDisposeRequested = true;
+    this.workerMethods[Symbol.dispose]();
     // Consumers must see disposal before the registered emitter itself is
     // disposed by the base class, otherwise their cleanup callbacks never run.
     this.#disposeEmitter.fire();
@@ -1219,22 +1223,70 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   /** Replace the active engine handle with a newly opened connection to this file. */
   async #reconnectFromDisk(): Promise<DatabaseOperations> {
     const filename = this.fileParts.filename;
-    const result = await this.establishConnection(
-      this.uri,
-      filename,
-      this.#forceReadOnlyOnReconnect,
-      this.autoCommitEnabled
-    );
-    const databaseOps = withSqlLogging(
-      result.databaseOps,
-      filename,
-      this.viewerProvider.outputChannel
-    );
-    this.connectionState = {
+    const replacementBundle = await this.connectionFactory();
+    let result: EstablishedDatabaseConnection;
+    let databaseOps: DatabaseOperations;
+    try {
+      result = await replacementBundle.establishConnection(
+        this.uri,
+        filename,
+        this.#forceReadOnlyOnReconnect,
+        this.autoCommitEnabled
+      );
+      databaseOps = withSqlLogging(
+        result.databaseOps,
+        filename,
+        this.viewerProvider.outputChannel
+      );
+    } catch (error) {
+      try {
+        replacementBundle.workerMethods[Symbol.dispose]();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Opening the replacement database connection failed and its worker could not be disposed'
+        );
+      }
+      throw error;
+    }
+
+    if (this.#workerDisposeRequested) {
+      const disposedError = new Error('Database document was disposed while reopening its connection');
+      try {
+        replacementBundle.workerMethods[Symbol.dispose]();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [disposedError, cleanupError],
+          'The document was disposed while reopening and the replacement worker could not be disposed'
+        );
+      }
+      throw disposedError;
+    }
+
+    const nextConnectionState: EstablishedDatabaseConnection = {
       databaseOps,
       isReadOnly: this.#forceReadOnlyOnReconnect || !!result.isReadOnly,
       storage: result.storage
     };
+
+    const previousWorkerMethods = this.workerMethods;
+    this.workerMethods = replacementBundle.workerMethods;
+    this.connectionState = nextConnectionState;
+    try {
+      previousWorkerMethods[Symbol.dispose]();
+    } catch (error) {
+      // The new connection is already authoritative. Failing the Reload now
+      // would leave callers believing the old database is still active, so
+      // surface cleanup failure diagnostically without rolling back the swap.
+      const message = error instanceof Error ? error.message : String(error);
+      (this.viewerProvider.outputChannel ?? GlobalOutputChannel)?.appendLine(
+        `[Connection cleanup failed] ${message}`
+      );
+      void vsc.window.showErrorMessage(vsc.l10n.t(
+        'The database was reloaded, but its previous worker could not be closed: {0}',
+        message
+      ));
+    }
     return databaseOps;
   }
 
