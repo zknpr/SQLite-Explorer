@@ -22,6 +22,7 @@ export interface BatchHistorySizePreflight {
 // Each query reserves one bind for the edit limit. Staying below SQLite's
 // bundled variable ceiling also bounds SQL text and worker-message size.
 export const BATCH_PRIOR_ROWID_CHUNK_SIZE = SQLITE_MAX_VARIABLE_NUMBER - 1;
+const RAW_TEXT_HISTORY_SIDECAR_KEY_BYTES = 'rawTextBytes'.length * 2;
 
 /**
  * Build metadata-only guards for rowid batches without one query per cell.
@@ -187,7 +188,12 @@ export function assertBatchHistoryFitsUndoBudget(input: {
   if (cellCount !== input.preflight.expectedCellCount) {
     throw new Error(`Cannot update ${input.table}: one or more row identities no longer exist`);
   }
-  if (valueBytes > input.maxPriorValueBytes) {
+  // The provisional history shape already reserves priorState itself, but a
+  // malformed TEXT prior adds this optional key when its exact bytes replace a
+  // lossy JS string. SQL cannot classify malformed encodings portably, so
+  // reserve the key for every cell; valueBytes already covers the byte array.
+  const projectedBytes = valueBytes + cellCount * RAW_TEXT_HISTORY_SIDECAR_KEY_BYTES;
+  if (!Number.isSafeInteger(projectedBytes) || projectedBytes > input.maxPriorValueBytes) {
     throw new Error(
       `Batch update undo snapshot exceeds the ${input.maxPriorValueBytes}-byte memory budget; `
       + 'update fewer cells or increase sqliteExplorer.maxUndoMemory.'

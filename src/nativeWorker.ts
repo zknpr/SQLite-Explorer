@@ -1306,6 +1306,7 @@ export async function createNativeDatabaseConnection(
         insertableColumns: readonly string[]
       ): Promise<DeletedRow> => {
         const predicate = buildRecordIdentityPredicate(rowId, identity);
+        const textEncoding = await readNativeCellTextEncoding();
         const result = await worker.call<NativeQueryResult>('query', [
           `SELECT ${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
           `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
@@ -1315,12 +1316,16 @@ export async function createNativeDatabaseConnection(
         const states = insertableColumns.map((column, index) => parseStoredCellState(
           result.values[0][index * 2],
           result.values[0][index * 2 + 1],
-          `${table}.${column}`
+          `${table}.${column}`,
+          { textEncoding }
         ));
         return {
           rowId,
           row: Object.fromEntries(insertableColumns.map(
-            (column, index) => [column, states[index].value]
+            (column, index) => [
+              column,
+              states[index].rawTextBytes ?? states[index].value
+            ]
           )),
           storageClasses: insertableColumns.map((column, index) => ({
             column,
@@ -1525,12 +1530,19 @@ export async function createNativeDatabaseConnection(
         await worker.call('runSingle', [`${sql}\n${boundary}`, sql, params, boundary]);
       };
 
-      const readNativeCellTextEncoding = async (): Promise<CellTextEncoding> => (
-        normalizeCellTextEncoding((await worker.call<NativeQueryResult>('query', [
+      let nativeCellTextEncoding: CellTextEncoding | undefined;
+      const readNativeCellTextEncoding = async (): Promise<CellTextEncoding> => {
+        if (nativeCellTextEncoding) return nativeCellTextEncoding;
+        const result = await worker.call<NativeQueryResult>('query', [
           'PRAGMA encoding',
           []
-        ])).values[0]?.[0])
-      );
+        ]);
+        // Every caller has already resolved an existing table. SQLite fixes the
+        // database encoding once a table exists, so this connection-local cache
+        // cannot become stale even when arbitrary SQL remains available.
+        nativeCellTextEncoding = normalizeCellTextEncoding(result.values[0]?.[0]);
+        return nativeCellTextEncoding;
+      };
 
       const readNativePrimaryKeyRecordId = async (
         table: string,
@@ -1581,6 +1593,7 @@ export async function createNativeDatabaseConnection(
         editLimitBytes: number,
         isHistoryReplay: boolean
       ): Promise<CellUpdateResult[]> => {
+        const textEncoding = await readNativeCellTextEncoding();
         const updatesByRow = new Map<RecordId, CellUpdate[]>();
         for (const update of updates) {
           const rowId = validateRowId(update.rowId);
@@ -1608,7 +1621,8 @@ export async function createNativeDatabaseConnection(
             const priorState = parseStoredCellState(
               current.values[0][index * 2],
               current.values[0][index * 2 + 1],
-              `${table}.${update.column}`
+              `${table}.${update.column}`,
+              { textEncoding }
             );
             const priorValue = priorState.value;
             const prepared = prepareCellUpdateForStorage(
@@ -1671,7 +1685,8 @@ export async function createNativeDatabaseConnection(
               postState: parseStoredCellState(
                 post.values[0][index * 2],
                 post.values[0][index * 2 + 1],
-                `${table}.${preparedUpdate.update.column}`
+                `${table}.${preparedUpdate.update.column}`,
+                { textEncoding }
               ),
               operation: preparedUpdate.prepared.operation
             });
@@ -1723,6 +1738,7 @@ export async function createNativeDatabaseConnection(
               identity
             );
           }
+          const textEncoding = await readNativeCellTextEncoding();
           const updatesByRow = new Map<RecordId, CellUpdate[]>();
           for (const update of updates) {
             const rowUpdates = updatesByRow.get(update.rowId) ?? [];
@@ -1750,7 +1766,8 @@ export async function createNativeDatabaseConnection(
               const priorState = parseStoredCellState(
                 current.values[0][index * 2],
                 current.values[0][index * 2 + 1],
-                `${table}.${update.column}`
+                `${table}.${update.column}`,
+                { textEncoding }
               );
               const priorValue = priorState.value;
               const prepared = prepareCellUpdateForStorage(
@@ -1823,7 +1840,8 @@ export async function createNativeDatabaseConnection(
                 postState: parseStoredCellState(
                   post.values[0][index * 2],
                   post.values[0][index * 2 + 1],
-                  `${table}.${preparedUpdate.update.column}`
+                  `${table}.${preparedUpdate.update.column}`,
+                  { textEncoding }
                 ),
                 operation: preparedUpdate.prepared.operation
               });
@@ -2128,6 +2146,7 @@ export async function createNativeDatabaseConnection(
         if (!usesPrimaryKey && identity.kind !== 'rowid') {
           throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
         }
+        const textEncoding = await readNativeCellTextEncoding();
 
         const grouped = new Map<RecordId, GuardedCellHistoryEntry[]>();
         for (const cell of cells) {
@@ -2178,7 +2197,8 @@ export async function createNativeDatabaseConnection(
             const currentStates = rowCells.map((cell, index) => parseStoredCellState(
               currentResult.values[0][index * 2],
               currentResult.values[0][index * 2 + 1],
-              `${table}.${cell.columnName}`
+              `${table}.${cell.columnName}`,
+              { textEncoding }
             ));
             const targetStates = rowCells.map((cell, index) => {
               const expected = direction === 'undo' ? cell.postState : cell.priorState;
@@ -2243,7 +2263,8 @@ export async function createNativeDatabaseConnection(
               parseStoredCellState(
                 actualResult.values[0][index * 2],
                 actualResult.values[0][index * 2 + 1],
-                `${table}.${rowCells[index].columnName}`
+                `${table}.${rowCells[index].columnName}`,
+                { textEncoding }
               )
             ));
             if (!exactTarget) {
@@ -3161,6 +3182,7 @@ export async function createNativeDatabaseConnection(
                   maxUndoSnapshotBytes
                 );
               }
+              const textEncoding = await readNativeCellTextEncoding();
               const deletedRows: DeletedRow[] = [];
               for (const predicate of predicates) {
                 const current = await worker.call<NativeQueryResult>('query', [
@@ -3179,15 +3201,19 @@ export async function createNativeDatabaseConnection(
                   const states = insertableColumns.map((column, index) => parseStoredCellState(
                     row[index * 2],
                     row[index * 2 + 1],
-                    `${table}.${column}`
+                    `${table}.${column}`,
+                    { textEncoding }
                   ));
                   const deletedRowId = encodePrimaryKeyRecordId(
                     identity.columns,
                     primaryKeyIndices.map(index => states[index].value)
                   );
-                  const rowData = Object.fromEntries(
-                    insertableColumns.map((column, index) => [column, states[index].value])
-                  );
+                  const rowData = Object.fromEntries(insertableColumns.map(
+                    (column, index) => [
+                      column,
+                      states[index].rawTextBytes ?? states[index].value
+                    ]
+                  ));
                   return {
                     rowId: deletedRowId,
                     row: rowData,
@@ -3237,6 +3263,7 @@ export async function createNativeDatabaseConnection(
                 maxUndoSnapshotBytes
               );
             }
+            const textEncoding = await readNativeCellTextEncoding();
             const deletedRows: DeletedRow[] = [];
             for (const predicate of predicates) {
               const current = await worker.call<NativeQueryResult>('query', [
@@ -3250,10 +3277,14 @@ export async function createNativeDatabaseConnection(
                 const states = insertableColumns.map((column, index) => parseStoredCellState(
                   row[index * 2 + 1],
                   row[index * 2 + 2],
-                  `${table}.${column}`
+                  `${table}.${column}`,
+                  { textEncoding }
                 ));
                 const rowData: Record<string, CellValue> = Object.fromEntries(
-                  insertableColumns.map((column, index) => [column, states[index].value])
+                  insertableColumns.map((column, index) => [
+                    column,
+                    states[index].rawTextBytes ?? states[index].value
+                  ])
                 );
                 return {
                   rowId: deletedRowId,
@@ -4374,6 +4405,7 @@ export async function createNativeDatabaseConnection(
           }
           const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
           const columns = [...new Set(updates.map(update => update.column))];
+          const textEncoding = await readNativeCellTextEncoding();
           const rowIdPredicates = buildRecordIdentityPredicateChunks(rowIds, rowIdIdentity);
           const currentValues = new Map<string, Map<string, StoredCellState>>();
           for (const predicate of rowIdPredicates) {
@@ -4387,7 +4419,8 @@ export async function createNativeDatabaseConnection(
               columns.forEach((column, index) => values.set(column, parseStoredCellState(
                 row[index * 2 + 1],
                 row[index * 2 + 2],
-                `${table}.${column}`
+                `${table}.${column}`,
+                { textEncoding }
               )));
               currentValues.set(String(validateRowId(row[0] as RecordId)), values);
             }
@@ -4486,7 +4519,8 @@ export async function createNativeDatabaseConnection(
               columns.forEach((column, index) => values.set(column, parseStoredCellState(
                 row[index * 2 + 1],
                 row[index * 2 + 2],
-                `${table}.${column}`
+                `${table}.${column}`,
+                { textEncoding }
               )));
               postValues.set(String(validateRowId(row[0] as RecordId)), values);
             }

@@ -60,6 +60,8 @@ export type CellStorageClass = 'null' | 'integer' | 'real' | 'text' | 'blob';
 export interface StoredCellState {
   storageClass: CellStorageClass;
   value: CellValue;
+  /** Present only when malformed TEXT cannot round-trip through a JS string. */
+  rawTextBytes?: Uint8Array;
 }
 
 /** Database encoding used by byte-windowed TEXT reads. */

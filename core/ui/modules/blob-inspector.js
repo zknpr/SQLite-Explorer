@@ -15,6 +15,7 @@ import {
     CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES
 } from '../../../src/core/cell-edit-policy.ts';
+import { MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES } from '../../../src/core/cell-containment.ts';
 import { MAX_CELL_READ_CHUNK_BYTES } from '../../../src/core/cell-read.ts';
 import { getErrorMessage, normalizeBinaryData } from './utils.js';
 
@@ -39,7 +40,7 @@ const FILE_SIGNATURES = {
     AVI: [0x41, 0x56, 0x49, 0x20]
 };
 
-export const MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES = 64 * 1024;
+export const MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES = MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES;
 export const OVERSIZED_INSPECTOR_LOAD_STEP_BYTES = MAX_CELL_READ_CHUNK_BYTES;
 export const MAX_OVERSIZED_INSPECTOR_LOAD_BYTES = 8 * 1024 * 1024;
 
@@ -111,14 +112,16 @@ function isOversizedMediaType(type) {
 /** Keep inspector DOM work bounded and preserve a valid UTF-8 prefix for TEXT. */
 export function capOversizedInspectorPreview(value, storageClass) {
     const bytes = storageClass === 'text'
-        ? new TextEncoder().encode(String(value))
+        ? value instanceof Uint8Array
+            ? value
+            : new TextEncoder().encode(String(value))
         : value instanceof Uint8Array
             ? value
             : new Uint8Array(value);
     if (bytes.byteLength <= MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES) return bytes;
 
     let end = MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES;
-    if (storageClass === 'text') {
+    if (storageClass === 'text' && !(value instanceof Uint8Array)) {
         // If the next byte is a continuation byte, the cap landed inside one
         // UTF-8 sequence. Drop that sequence instead of displaying U+FFFD.
         while (end > 0 && (bytes[end] & 0xC0) === 0x80) end--;
@@ -143,6 +146,9 @@ export class BlobInspector {
         this.currentColName = null;
         this.currentCellInfo = null;
         this.currentOversizedMetadata = null;
+        this.currentStorageClass = null;
+        this.currentInlineRawTextBytes = false;
+        this.currentRawTextCanStream = false;
         this.currentTable = null;
         this.oversizedLoadedBytes = 0;
         this.isLoadingOversized = false;
@@ -241,20 +247,33 @@ export class BlobInspector {
             replaceBtn.title = mutationBlockReason || '';
         }
         if (downloadBtn) {
+            const inlineRawTextOnly = this.currentInlineRawTextBytes
+                && !this.currentRawTextCanStream;
+            const rawTextBytesComplete = inlineRawTextOnly
+                && this.currentData?.byteLength === this.currentOversizedMetadata?.byteLength;
             downloadBtn.disabled = uploading || !!this.activeFullContent;
-            downloadBtn.textContent = this.activeFullContent
-                ? 'Opening...'
-                : this.currentOversizedMetadata
-                    ? 'Open Full Content'
-                : 'Download';
-            downloadBtn.title = this.currentOversizedMetadata
-                ? 'Desktop opens the complete value in VS Code; the web demo is preview-only'
-                : '';
+            if (this.activeFullContent) {
+                downloadBtn.textContent = 'Opening...';
+                downloadBtn.title = '';
+            } else if (inlineRawTextOnly) {
+                downloadBtn.textContent = rawTextBytesComplete
+                    ? 'Download Raw Bytes'
+                    : 'Download Raw Prefix';
+                downloadBtn.title = 'Download the byte-exact data retained from this result row';
+            } else if (this.currentOversizedMetadata) {
+                downloadBtn.textContent = 'Open Full Content';
+                downloadBtn.title =
+                    'Desktop opens the complete value in VS Code; the web demo is preview-only';
+            } else {
+                downloadBtn.textContent = 'Download';
+                downloadBtn.title = '';
+            }
         }
         if (loadMoreBtn) {
             const totalBytes = this.currentOversizedMetadata?.byteLength ?? 0;
             const loadLimit = Math.min(totalBytes, MAX_OVERSIZED_INSPECTOR_LOAD_BYTES);
-            const canLoadMore = this.currentOversizedMetadata?.storageClass === 'text'
+            const canLoadMore = (!this.currentInlineRawTextBytes || this.currentRawTextCanStream)
+                && this.currentOversizedMetadata?.storageClass === 'text'
                 && this.oversizedLoadedBytes < loadLimit;
             const nextBytes = Math.min(
                 OVERSIZED_INSPECTOR_LOAD_STEP_BYTES,
@@ -288,7 +307,10 @@ export class BlobInspector {
             targetColumn: this.currentColName,
             targetCell: { ...this.currentCellInfo },
             originalValue: this.currentData,
-            targetStorageClass: this.currentOversizedMetadata?.storageClass
+            targetStorageClass:
+                this.currentOversizedMetadata?.storageClass
+                ?? this.currentStorageClass
+                ?? (this.currentType?.type === 'text' ? 'text' : undefined)
         };
         this.activeReplacement = operation;
         this.setUploadState(false);
@@ -556,6 +578,9 @@ export class BlobInspector {
         this.activeDownload = null;
         this.isUploading = false;
         this.currentOversizedMetadata = null;
+        this.currentStorageClass = null;
+        this.currentInlineRawTextBytes = false;
+        this.currentRawTextCanStream = false;
         this.currentTable = null;
         this.oversizedLoadedBytes = 0;
         this.oversizedLoadOperation = null;
@@ -605,7 +630,10 @@ export class BlobInspector {
 
     async download() {
         if (!this.currentData) return;
-        if (this.currentOversizedMetadata) {
+        if (
+            this.currentOversizedMetadata
+            && (!this.currentInlineRawTextBytes || this.currentRawTextCanStream)
+        ) {
             await this.openFullContent();
             return;
         }
@@ -778,6 +806,7 @@ export class BlobInspector {
         this.currentRowId = rowId;
         this.currentColName = colName;
         this.currentCellInfo = { rowIdx, colIdx };
+        this.currentStorageClass = isText ? 'text' : 'blob';
         this.setUploadState(false);
 
         // Show modal
@@ -823,6 +852,11 @@ export class BlobInspector {
         this.currentColName = colName;
         this.currentCellInfo = { rowIdx, colIdx };
         this.currentOversizedMetadata = metadata;
+        this.currentStorageClass = metadata.storageClass;
+        this.currentInlineRawTextBytes =
+            metadata.storageClass === 'text' && previewValue instanceof Uint8Array;
+        this.currentRawTextCanStream = this.currentInlineRawTextBytes
+            && state.selectedTableType === 'table';
         this.oversizedLoadedBytes = 0;
         this.setUploadState(false);
         openModal('blob-inspector-modal', this.modal);
@@ -830,10 +864,26 @@ export class BlobInspector {
 
         const data = capOversizedInspectorPreview(previewValue, metadata.storageClass);
         this.currentData = data;
-        const type = metadata.storageClass === 'text'
-            ? { mime: 'text/plain', type: 'text', ext: 'txt' }
-            : this.detectType(data);
+        const type = this.currentInlineRawTextBytes
+            ? { mime: 'application/octet-stream', type: 'binary', ext: 'bin' }
+            : metadata.storageClass === 'text'
+                ? { mime: 'text/plain', type: 'text', ext: 'txt' }
+                : this.detectType(data);
         this.currentType = type;
+        if (this.currentInlineRawTextBytes && !this.currentRawTextCanStream) {
+            this.oversizedLoadedBytes = data.byteLength;
+            const complete = data.byteLength === metadata.byteLength;
+            this.infoContainer.textContent = complete
+                ? `${colName} (Row ${rowId}) | TEXT | Full raw value ${this.formatSize(data.byteLength)} | ` +
+                    'Stored TEXT is not safely representable; Hex is authoritative'
+                : `${colName} (Row ${rowId}) | TEXT | Raw prefix ` +
+                    `${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +
+                    'Stored TEXT is not safely representable; Hex is authoritative';
+            this.renderHex(data);
+            this.renderPreview(data, type);
+            this.setUploadState(false);
+            return Promise.resolve(true);
+        }
         this.infoContainer.textContent =
             `${colName} (Row ${rowId}) | ${metadata.storageClass.toUpperCase()} | ` +
             `Preview ${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +

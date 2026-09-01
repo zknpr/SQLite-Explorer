@@ -28,9 +28,36 @@ describe('grid cell containment limits', () => {
             contained: { rows: [['�', '�']] }
         });
 
-        assert.deepStrictEqual(decoded.rows, [['', '�']]);
+        assert.deepStrictEqual(decoded.rows, [[Uint8Array.of(0x80), '�']]);
         assert.deepStrictEqual(decoded.oversizedCells, {
             0: { 0: { storageClass: 'text', byteLength: 1 } }
+        });
+    });
+
+    it('caps an unrepresentable TEXT raw prefix without changing its bytes', async () => {
+        const {
+            containUnrepresentableTextCells,
+            MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES
+        } = await loadContainmentModule();
+        const raw = new Uint8Array(MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES + 17);
+        raw.fill(0x80);
+        raw[0] = 0xff;
+        raw[MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES - 1] = 0xfe;
+        const decoded = containUnrepresentableTextCells({
+            sourceRows: [['�']],
+            rawTextRows: [[raw]],
+            rawTextColumnIndices: [0],
+            textEncoding: 'utf-8',
+            contained: { rows: [['�']] }
+        });
+        const retained = decoded.rows[0][0];
+
+        assert.ok(retained instanceof Uint8Array);
+        assert.strictEqual(retained.byteLength, MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES);
+        assert.strictEqual(retained[0], 0xff);
+        assert.strictEqual(retained.at(-1), 0xfe);
+        assert.deepStrictEqual(decoded.oversizedCells, {
+            0: { 0: { storageClass: 'text', byteLength: raw.byteLength } }
         });
     });
 
@@ -51,9 +78,33 @@ describe('grid cell containment limits', () => {
                 offset: 0
             });
 
-            assert.deepStrictEqual(page.rows, [[1, ''], [2, '�']]);
+            assert.deepStrictEqual(page.rows, [[1, Uint8Array.of(0x80)], [2, '�']]);
             assert.deepStrictEqual(page.oversizedCells, {
                 0: { 1: { storageClass: 'text', byteLength: 1 } }
+            });
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('retains a byte-exact raw prefix for unrepresentable TEXT returned by a view', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const engine = result.operations!;
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE malformed_view_source (value TEXT); ' +
+                "INSERT INTO malformed_view_source VALUES (CAST(X'80' AS TEXT)); " +
+                'CREATE VIEW malformed_text_view AS SELECT value FROM malformed_view_source'
+            );
+            const page = await engine.fetchTableData('malformed_text_view', {
+                columns: ['value'],
+                limit: 1,
+                offset: 0
+            });
+
+            assert.deepStrictEqual(page.rows, [[Uint8Array.of(0x80)]]);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: { 0: { storageClass: 'text', byteLength: 1 } }
             });
         } finally {
             (engine as WasmDatabaseEngine).shutdown();

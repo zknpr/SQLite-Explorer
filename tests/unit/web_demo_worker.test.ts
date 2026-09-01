@@ -3083,7 +3083,9 @@ describe('web demo view worker', () => {
             'runQuery',
             'CREATE TABLE demo_malformed_text_value (value TEXT); ' +
             "INSERT INTO demo_malformed_text_value VALUES " +
-            "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT))"
+            "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT)); " +
+            'CREATE VIEW demo_malformed_text_view AS ' +
+            'SELECT value FROM demo_malformed_text_value WHERE rowid = 1'
         );
 
         const page = await worker.invoke('fetchTableData', 'demo_malformed_text_value', {
@@ -3096,11 +3098,136 @@ describe('web demo view worker', () => {
 
         assert.deepStrictEqual(
             Array.from(page.rows, (row: unknown[]) => Array.from(row)),
-            [[1, ''], [2, '�']]
+            [[1, Uint8Array.of(0x80)], [2, '�']]
         );
         assert.deepStrictEqual(JSON.parse(JSON.stringify(page.oversizedCells)), {
             0: { 1: { storageClass: 'text', byteLength: 1 } }
         });
+
+        const viewPage = await worker.invoke('fetchTableData', 'demo_malformed_text_view', {
+            columns: ['value'],
+            limit: 1,
+            offset: 0
+        });
+        assert.deepStrictEqual(
+            Array.from(viewPage.rows, (row: unknown[]) => Array.from(row)),
+            [[Uint8Array.of(0x80)]]
+        );
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(viewPage.oversizedCells)), {
+            0: { 0: { storageClass: 'text', byteLength: 1 } }
+        });
+    });
+
+    it('replays demo malformed TEXT history from exact database bytes', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_malformed_text_history (' +
+            "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'80' AS TEXT)))"
+        );
+        const insertedRow = await worker.invoke(
+            'insertRowWithHistory',
+            'demo_malformed_text_history',
+            { id: 1 }
+        );
+        const insertion = {
+            modificationType: 'row_insert',
+            targetTable: 'demo_malformed_text_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert demo malformed TEXT',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await worker.invoke('undoModification', insertion);
+        await worker.invoke('redoModification', insertion);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), hex(CAST(value AS BLOB)) ' +
+                'FROM demo_malformed_text_history'
+            ))[0].rows,
+            [['text', '80']]
+        );
+
+        const deletedRows = await worker.invoke(
+            'deleteRows',
+            'demo_malformed_text_history',
+            [1]
+        );
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_malformed_text_history',
+            description: 'Delete demo malformed TEXT',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), hex(CAST(value AS BLOB)) ' +
+                'FROM demo_malformed_text_history'
+            ))[0].rows,
+            [['text', '80']]
+        );
+    });
+
+    it('replays demo malformed UTF-16LE TEXT without transcoding', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'PRAGMA encoding = "UTF-16le"; ' +
+            'CREATE TABLE demo_malformed_utf16_history (' +
+            "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'00D8' AS TEXT)), " +
+            "note TEXT DEFAULT 'snowman ☃')"
+        );
+        assert.strictEqual(
+            (await worker.invoke('runQuery', 'PRAGMA encoding'))[0].rows[0][0],
+            'UTF-16le'
+        );
+        const insertedRow = await worker.invoke(
+            'insertRowWithHistory',
+            'demo_malformed_utf16_history',
+            { id: 1 }
+        );
+        const insertion = {
+            modificationType: 'row_insert',
+            targetTable: 'demo_malformed_utf16_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert demo malformed UTF-16LE TEXT',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await worker.invoke('undoModification', insertion);
+        await worker.invoke('redoModification', insertion);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                'FROM demo_malformed_utf16_history'
+            ))[0].rows,
+            [['text', '00D8', 'snowman ☃']]
+        );
+
+        const deletedRows = await worker.invoke(
+            'deleteRows',
+            'demo_malformed_utf16_history',
+            [1]
+        );
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_malformed_utf16_history',
+            description: 'Delete demo malformed UTF-16LE TEXT',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                'FROM demo_malformed_utf16_history'
+            ))[0].rows,
+            [['text', '00D8', 'snowman ☃']]
+        );
     });
 
     it('suppresses demo keyset anchors for malformed ordinary TEXT sort keys', async () => {

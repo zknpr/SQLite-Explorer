@@ -278,7 +278,7 @@ describe('grid header rendering', () => {
         };
         state.selectedTableType = 'table';
         state.tableColumns = [{ name: 'unsafe_text', type: 'TEXT', isPrimaryKey: false }];
-        state.gridData = [[1, '']];
+        state.gridData = [[1, Uint8Array.of(0x80)]];
         state.gridOversizedCells = {
             0: { 1: { storageClass: 'text', byteLength: 1 } }
         };
@@ -291,18 +291,19 @@ describe('grid header rendering', () => {
         assert.ok(cell);
         assert.strictEqual(
             cell.title,
-            'Inline editing unavailable because the grid does not contain the full byte-exact value. ' +
-            'Use View Full Content and the Hex view (TEXT, 1 byte).'
+            'Inline text editing unavailable because the stored TEXT cannot be represented safely. ' +
+            'The full byte-exact raw value is available in the Hex inspector. ' +
+            'Use Replace to overwrite it (TEXT, 1 byte).'
         );
         assert.doesNotMatch(cell.title, /too large/i);
         assert.strictEqual(
             collectText(cell),
-            '… · TEXT · 1 byte · full byte-exact value not shown in grid'
+            '80 · TEXT · 1 byte · full byte-exact raw value'
         );
         const expand = findByClass(cell, 'expand-icon');
         assert.ok(expand);
-        assert.strictEqual(expand.title, 'View full content');
-        assert.strictEqual(expand.ariaLabel, 'View full content for unsafe_text, row 1');
+        assert.strictEqual(expand.title, 'Inspect raw TEXT bytes');
+        assert.strictEqual(expand.ariaLabel, 'Inspect raw TEXT bytes for unsafe_text, row 1');
     });
 
     it('renders semantic controls and one keyboard entry point for grid actions', async () => {

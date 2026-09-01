@@ -155,12 +155,24 @@ function setSpacerHeight(spacer, rowCount) {
 // ================================================================
 
 function formatOversizedPreview(value, metadata, ordinaryDisplayValue) {
-    const preview = metadata.storageClass === 'blob' && value instanceof Uint8Array
+    const rawTextBytes = metadata.storageClass === 'text' && value instanceof Uint8Array;
+    const preview = value instanceof Uint8Array
         ? Array.from(value.subarray(0, OVERSIZED_BLOB_PREVIEW_BYTES), byte => (
             byte.toString(16).padStart(2, '0')
         )).join(' ')
         : ordinaryDisplayValue;
     const byteUnit = metadata.byteLength === 1 ? 'byte' : 'bytes';
+    if (rawTextBytes) {
+        const complete = value.byteLength === metadata.byteLength;
+        return {
+            preview,
+            details: complete
+                ? ` · TEXT · ${metadata.byteLength.toLocaleString()} ${byteUnit} · ` +
+                    'full byte-exact raw value'
+                : `… · TEXT · ${metadata.byteLength.toLocaleString()} ${byteUnit} · ` +
+                    'byte-exact raw prefix'
+        };
+    }
     return {
         preview,
         details: (
@@ -493,8 +505,12 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
             const expandButton = document.createElement('button');
             expandButton.type = 'button';
             expandButton.className = 'expand-icon codicon codicon-link-external';
-            expandButton.title = 'View full content';
-            expandButton.ariaLabel = `View full content for ${col.name}, row ${rowNumVal}`;
+            const rawTextBytes = oversizedMetadata?.storageClass === 'text'
+                && value instanceof Uint8Array;
+            expandButton.title = rawTextBytes ? 'Inspect raw TEXT bytes' : 'View full content';
+            expandButton.ariaLabel = rawTextBytes
+                ? `Inspect raw TEXT bytes for ${col.name}, row ${rowNumVal}`
+                : `View full content for ${col.name}, row ${rowNumVal}`;
             td.appendChild(expandButton);
         }
 

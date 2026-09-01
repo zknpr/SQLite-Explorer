@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { ModificationType, LabeledModification } from '../../src/core/types';
+import { assertBatchHistoryFitsUndoBudget } from '../../src/core/batch-update';
 
 // Mock types
 interface MockMod extends LabeledModification {
@@ -10,6 +11,21 @@ interface MockMod extends LabeledModification {
 }
 
 describe('Undo/Redo Memory Limit', () => {
+    it('reserves the optional raw-TEXT sidecar before materializing batch history', () => {
+        assert.throws(
+            () => assertBatchHistoryFitsUndoBudget({
+                table: 'malformed_text',
+                preflight: {
+                    queries: [{ sql: 'metadata only', params: [] }],
+                    expectedCellCount: 1
+                },
+                resultRows: [[1, 2]],
+                maxPriorValueBytes: 25
+            }),
+            /undo snapshot exceeds/i
+        );
+    });
+
     it('blocks additional records when an unsaved barrier segment reaches the entry cap', () => {
         const tracker = new ModificationTracker<MockMod>(3, 1024 * 1024);
         tracker.recordBarrier({

@@ -123,6 +123,7 @@ describe('BlobInspector oversized containment', () => {
         delete (globalThis as any).document;
         const { state } = await import(stateModulePath);
         state.selectedTable = null;
+        state.selectedTableType = 'table';
     });
 
     it('caps BLOB and TEXT previews without splitting a UTF-8 code point', async () => {
@@ -677,6 +678,55 @@ describe('BlobInspector oversized containment', () => {
         assert.strictEqual(hexContainer.ariaLabel, 'BLOB hexadecimal data');
     });
 
+    it('renders retained malformed TEXT bytes without opening a table-only read session', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { state } = await import(stateModulePath);
+        const { inspector, hexed } = inspectorHarness(BlobInspector);
+        const loadMoreOversizedContent = mock.fn(async () => false);
+        inspector.loadMoreOversizedContent = loadMoreOversizedContent;
+        state.selectedTable = 'malformed_text_view';
+        state.selectedTableType = 'view';
+        (globalThis as any).document = { getElementById() { return null; } };
+
+        await inspector.inspectOversized(
+            Uint8Array.of(0x80),
+            { storageClass: 'text', byteLength: 1 },
+            0,
+            'value',
+            0,
+            0
+        );
+
+        assert.deepStrictEqual(inspector.currentData, Uint8Array.of(0x80));
+        assert.deepStrictEqual(hexed.at(-1), Uint8Array.of(0x80));
+        assert.strictEqual(inspector.oversizedLoadedBytes, 1);
+        assert.strictEqual(inspector.currentType.type, 'binary');
+        assert.strictEqual(loadMoreOversizedContent.mock.callCount(), 0);
+    });
+
+    it('keeps retained malformed table TEXT connected to its bounded cell reader', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { state } = await import(stateModulePath);
+        const { inspector } = inspectorHarness(BlobInspector);
+        const loadMoreOversizedContent = mock.fn(async () => true);
+        inspector.loadMoreOversizedContent = loadMoreOversizedContent;
+        state.selectedTable = 'malformed_text_table';
+        state.selectedTableType = 'table';
+        (globalThis as any).document = { getElementById() { return null; } };
+
+        await inspector.inspectOversized(
+            Uint8Array.of(0x80),
+            { storageClass: 'text', byteLength: 1 },
+            7,
+            'value',
+            0,
+            0
+        );
+
+        assert.strictEqual(loadMoreOversizedContent.mock.callCount(), 1);
+        assert.deepStrictEqual(loadMoreOversizedContent.mock.calls[0].arguments, [1]);
+    });
+
     it('rejects an over-edit-limit replacement before reading the file', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const { backendApi } = await import(apiModulePath);
@@ -840,6 +890,70 @@ describe('BlobInspector oversized containment', () => {
             );
             assert.strictEqual(state.gridData[0][1], replacement);
             assert.strictEqual(inspected[0][0], replacement);
+        } finally {
+            backendApi.updateCell = originalUpdateCell;
+            Object.assign(state, originalState);
+        }
+    });
+
+    it('preserves the SQLite TEXT storage class when replacing a regular TEXT cell', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const originalUpdateCell = backendApi.updateCell;
+        const originalState = {
+            isReadOnly: state.isReadOnly,
+            selectedTable: state.selectedTable,
+            selectedTableType: state.selectedTableType,
+            tableColumns: state.tableColumns,
+            gridData: state.gridData,
+            gridExactIntegerTexts: state.gridExactIntegerTexts,
+            gridOversizedCells: state.gridOversizedCells
+        };
+        const replacement = 'regular replacement é😀';
+        const replacementBytes = new TextEncoder().encode(replacement);
+        const updateCell = mock.fn(async () => 1);
+        backendApi.updateCell = updateCell;
+        state.isReadOnly = false;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'body' }];
+        state.gridData = [[1, 'old body']];
+        state.gridExactIntegerTexts = {};
+        state.gridOversizedCells = {};
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                return id === 'statusText' ? { textContent: '' } : null;
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, {
+            currentData: new TextEncoder().encode('old body'),
+            currentType: { mime: 'text/plain', type: 'text', ext: 'txt' },
+            currentRowId: 1,
+            currentColName: 'body',
+            currentCellInfo: { rowIdx: 0, colIdx: 0 },
+            currentOversizedMetadata: null,
+            activeReplacement: null,
+            isUploading: false,
+            setUploadState() {},
+            inspect() {}
+        });
+
+        try {
+            const operation = inspector.beginReplacementOperation();
+            assert.ok(operation);
+            await inspector.uploadFile({
+                name: 'replacement.txt',
+                size: replacementBytes.byteLength,
+                arrayBuffer: async () => replacementBytes.buffer
+            }, operation);
+
+            assert.strictEqual(updateCell.mock.callCount(), 1);
+            assert.strictEqual(
+                (updateCell.mock.calls[0].arguments as unknown as unknown[])[3],
+                replacement
+            );
         } finally {
             backendApi.updateCell = originalUpdateCell;
             Object.assign(state, originalState);

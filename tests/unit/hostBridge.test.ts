@@ -500,7 +500,7 @@ describe('HostBridge', () => {
         }
     });
 
-    it('refuses to overwrite malformed bounded TEXT with a lossy decoded prior', async () => {
+    it('replaces malformed bounded TEXT while retaining byte-exact undo history', async () => {
         const result = await createDatabaseEngine({ content: null, maxSize: 0 });
         const dbOps = result.operations!;
         const recordExternalModification = mock.fn();
@@ -521,17 +521,34 @@ describe('HostBridge', () => {
                 } as any
             );
 
-            await assert.rejects(
-                bridge.updateCell('malformed_prior', 1, 'value', 'replacement'),
-                /not valid UTF-8.*raw.*Hex/i
+            assert.strictEqual(
+                await bridge.updateCell('malformed_prior', 1, 'value', 'replacement'),
+                1
             );
             assert.deepStrictEqual(
                 (await dbOps.executeQuery(
-                    'SELECT hex(CAST(value AS BLOB)) FROM malformed_prior'
+                    'SELECT typeof(value), hex(CAST(value AS BLOB)) FROM malformed_prior'
                 ))[0].rows,
-                [['80']]
+                [['text', '7265706C6163656D656E74']]
             );
-            assert.strictEqual(recordExternalModification.mock.callCount(), 0);
+            assert.strictEqual(recordExternalModification.mock.callCount(), 1);
+            const modification = recordExternalModification.mock.calls[0].arguments[0];
+            assert.deepStrictEqual(modification.priorState.rawTextBytes, Uint8Array.of(0x80));
+
+            await dbOps.undoModification(modification);
+            assert.deepStrictEqual(
+                (await dbOps.executeQuery(
+                    'SELECT typeof(value), hex(CAST(value AS BLOB)) FROM malformed_prior'
+                ))[0].rows,
+                [['text', '80']]
+            );
+            await dbOps.redoModification(modification);
+            assert.deepStrictEqual(
+                (await dbOps.executeQuery(
+                    'SELECT typeof(value), value FROM malformed_prior'
+                ))[0].rows,
+                [['text', 'replacement']]
+            );
         } finally {
             (dbOps as WasmDatabaseEngine).shutdown();
         }

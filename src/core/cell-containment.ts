@@ -19,6 +19,7 @@ export const DEFAULT_MAX_PAGE_RESPONSE_BYTES = 16 * 1024 * 1024;
 export const MIN_SQL_INLINE_CELL_BYTES = 256;
 export const DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES =
   2 * DEFAULT_MAX_PAGE_RESPONSE_BYTES;
+export const MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES = 64 * 1024;
 export const WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES = 40;
 
 // Reserve space outside the per-cell model for response/header keys, row-map
@@ -416,10 +417,10 @@ export function findUnrepresentableTextRows(input: {
 }
 
 /**
- * Remove decoded TEXT cells whose JavaScript string cannot reproduce the
- * stored SQLite bytes. They use the existing sparse sidecar path even when
- * small, so the UI can stream the authoritative bytes into the Hex inspector
- * and can never submit U+FFFD as a lossy prior value.
+ * Replace decoded TEXT cells whose JavaScript string cannot reproduce the
+ * stored SQLite bytes with a bounded authoritative byte prefix. The sparse
+ * sidecar still blocks lossy inline edits, while identityless view rows retain
+ * useful Hex data instead of depending on a table-only streaming locator.
  */
 export function containUnrepresentableTextCells(input: {
   sourceRows: readonly (readonly unknown[])[];
@@ -449,6 +450,11 @@ export function containUnrepresentableTextCells(input: {
       exactIntegerTexts[Number(rowIndexText)] = { ...row };
     }
   }
+  const aggregateBudget =
+    DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES - WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES;
+  let aggregateBytes = estimateRowsWireBytes(rows)
+    + estimateOversizedCellsWireBytes(oversizedCells)
+    + estimateExactIntegerTextsWireBytes(exactIntegerTexts);
   const decoder = new TextDecoder(input.textEncoding, { fatal: true, ignoreBOM: true });
   input.sourceRows.forEach((sourceRow, rowIndex) => {
     const rawRow = input.rawTextRows[rowIndex];
@@ -473,13 +479,46 @@ export function containUnrepresentableTextCells(input: {
         representable = false;
       }
       if (representable) return;
+      const previousValue = rows[rowIndex][columnIndex];
+      const metadataInsertionBytes = oversizedMetadataInsertionWireBytes(
+        oversizedCells,
+        rowIndex,
+        columnIndex
+      );
       oversizedCells ??= {};
       oversizedCells[rowIndex] ??= {};
       oversizedCells[rowIndex][columnIndex] = {
         storageClass: 'text',
         byteLength: rawBytes.byteLength
       };
-      rows[rowIndex][columnIndex] = '';
+      const replacementBudget = Math.max(
+        0,
+        aggregateBudget
+          - aggregateBytes
+          - metadataInsertionBytes
+          + transportedCellWireBytes(previousValue)
+      );
+      const maxRawBytesByWire = replacementBudget > WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES
+        ? Math.floor(
+            (replacementBudget - WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES) / 4
+          ) * 3
+        : 0;
+      const retainedByteLength = Math.min(
+        rawBytes.byteLength,
+        MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES,
+        maxRawBytesByWire
+      );
+      if (retainedByteLength === 0) {
+        throw new Error(
+          `Raw TEXT containment cannot retain an authoritative byte prefix ` +
+          `for row ${rowIndex}, column ${columnIndex} within the webview transport limit`
+        );
+      }
+      const replacementValue = rawBytes.slice(0, retainedByteLength);
+      rows[rowIndex][columnIndex] = replacementValue;
+      aggregateBytes += transportedCellWireBytes(replacementValue)
+        - transportedCellWireBytes(previousValue)
+        + metadataInsertionBytes;
       if (exactIntegerTexts?.[rowIndex]) {
         delete exactIntegerTexts[rowIndex][columnIndex];
         if (Object.keys(exactIntegerTexts[rowIndex]).length === 0) {
@@ -488,6 +527,12 @@ export function containUnrepresentableTextCells(input: {
       }
     });
   });
+  if (aggregateBytes > aggregateBudget) {
+    throw new Error(
+      `Raw TEXT containment cannot fit this page within the ` +
+      `${DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES}-byte transport limit`
+    );
+  }
   return {
     rows,
     ...(oversizedCells ? { oversizedCells } : {}),
@@ -587,6 +632,21 @@ function estimateOversizedCellsWireBytes(oversizedCells: OversizedCellMap | unde
     }
   }
   return bytes;
+}
+
+function oversizedMetadataInsertionWireBytes(
+  oversizedCells: OversizedCellMap | undefined,
+  rowIndex: number,
+  columnIndex: number
+): number {
+  if (oversizedCells?.[rowIndex]?.[columnIndex]) return 0;
+  const columnBytes = objectKeyWireBytes(String(columnIndex))
+    + OVERSIZED_CELL_METADATA_VALUE_BYTES;
+  const existingRow = oversizedCells?.[rowIndex];
+  if (existingRow) return 1 + columnBytes;
+  const rowBytes = objectKeyWireBytes(String(rowIndex)) + 2 + columnBytes;
+  if (oversizedCells) return 1 + rowBytes;
+  return 2 + rowBytes;
 }
 
 function estimateExactIntegerTextsWireBytes(exactIntegerTexts: ExactIntegerTextMap | undefined): number {
@@ -717,17 +777,6 @@ export function decodeCellContainment(
     + estimateOversizedCellsWireBytes(oversizedCells)
     + estimateExactIntegerTextsWireBytes(retainedExactIntegerTexts);
 
-  const metadataInsertionBytes = (rowIndex: number, columnIndex: number): number => {
-    if (oversizedCells?.[rowIndex]?.[columnIndex]) return 0;
-    const columnBytes = objectKeyWireBytes(String(columnIndex))
-      + OVERSIZED_CELL_METADATA_VALUE_BYTES;
-    const existingRow = oversizedCells?.[rowIndex];
-    if (existingRow) return 1 + columnBytes;
-    const rowBytes = objectKeyWireBytes(String(rowIndex)) + 2 + columnBytes;
-    if (oversizedCells) return 1 + rowBytes;
-    return 2 + rowBytes;
-  };
-
   for (
     let index = retainedInlineCells.length - 1;
     index >= 0 && aggregateBytes > aggregateBudget;
@@ -738,7 +787,11 @@ export function decodeCellContainment(
     const emptyValue = emptyInlinePreview(candidate.metadata.storageClass);
     const delta = transportedCellWireBytes(emptyValue)
       - transportedCellWireBytes(currentValue)
-      + metadataInsertionBytes(candidate.rowIndex, candidate.columnIndex);
+      + oversizedMetadataInsertionWireBytes(
+        oversizedCells,
+        candidate.rowIndex,
+        candidate.columnIndex
+      );
     if (delta >= 0) continue;
     recordOversizedCell(candidate.rowIndex, candidate.columnIndex, candidate.metadata);
     rows[candidate.rowIndex][candidate.columnIndex] = emptyValue;

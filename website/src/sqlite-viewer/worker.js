@@ -545,6 +545,10 @@ function buildMainCellChunkQuery(target) {
   };
 }
 
+function getCellTextEncoding() {
+  return normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]);
+}
+
 function queryCellMetadata(target, sqlTarget) {
   const query = buildMainCellMetadataQuery(sqlTarget);
   const result = db.exec(
@@ -552,9 +556,7 @@ function queryCellMetadata(target, sqlTarget) {
     normalizeBindParams(query.params),
     { useBigInt: true }
   );
-  const encodingResult = db.exec('PRAGMA encoding');
-  const textEncoding = normalizeCellTextEncoding(encodingResult[0]?.values?.[0]?.[0]);
-  return decodeCellMetadata(result[0]?.values ?? [], textEncoding, target);
+  return decodeCellMetadata(result[0]?.values ?? [], getCellTextEncoding(), target);
 }
 
 async function getCellMetadata(target) {
@@ -1660,6 +1662,7 @@ function updateRowIdAliasCellBatchWithinSavepoint(
   editLimitBytes,
   isHistoryReplay
 ) {
+  const textEncoding = getCellTextEncoding();
   const updatesByRow = new Map();
   for (const update of updates) {
     const rowId = validateRowId(update.rowId);
@@ -1688,7 +1691,8 @@ function updateRowIdAliasCellBatchWithinSavepoint(
       const priorState = parseStoredCellState(
         current.values[0][index * 2],
         current.values[0][index * 2 + 1],
-        `${table}.${update.column}`
+        `${table}.${update.column}`,
+        { textEncoding }
       );
       const priorValue = priorState.value;
       const prepared = prepareCellUpdateForStorage(
@@ -1753,7 +1757,8 @@ function updateRowIdAliasCellBatchWithinSavepoint(
         postState: parseStoredCellState(
           post.values[0][index * 2],
           post.values[0][index * 2 + 1],
-          `${table}.${preparedUpdate.update.column}`
+          `${table}.${preparedUpdate.update.column}`,
+          { textEncoding }
         ),
         operation: preparedUpdate.prepared.operation
       });
@@ -2353,6 +2358,7 @@ function getInsertableColumnNames(table) {
 }
 
 function readRowHistorySnapshot(table, identity, rowId, insertableColumns) {
+  const textEncoding = getCellTextEncoding();
   const predicate = buildRecordIdentityPredicate(rowId, identity);
   const projections = insertableColumns.map(buildStoredCellStateProjection);
   const result = db.exec(
@@ -2366,13 +2372,15 @@ function readRowHistorySnapshot(table, identity, rowId, insertableColumns) {
   const states = insertableColumns.map((column, index) => parseStoredCellState(
     rows[0][index * 2],
     rows[0][index * 2 + 1],
-    `${table}.${column}`
+    `${table}.${column}`,
+    { textEncoding }
   ));
   return {
     rowId,
-    row: Object.fromEntries(
-      insertableColumns.map((column, index) => [column, states[index].value])
-    ),
+    row: Object.fromEntries(insertableColumns.map((column, index) => [
+      column,
+      states[index].rawTextBytes ?? states[index].value
+    ])),
     storageClasses: insertableColumns.map((column, index) => ({
       column,
       storageClass: states[index].storageClass
@@ -2922,6 +2930,7 @@ async function deleteRows(table, rowIds) {
 
   if (rowIds.length === 0) return [];
   const identity = await resolveTableIdentity(table);
+  const textEncoding = getCellTextEncoding();
 
   if (rowIds.some(isPrimaryKeyRecordId)) {
     if (!rowIds.every(isPrimaryKeyRecordId)) {
@@ -2960,16 +2969,18 @@ async function deleteRows(table, rowIds) {
           const states = insertableColumns.map((column, index) => parseStoredCellState(
             row[index * 2],
             row[index * 2 + 1],
-            `${table}.${column}`
+            `${table}.${column}`,
+            { textEncoding }
           ));
           return {
             rowId: encodePrimaryKeyRecordId(
               identity.columns,
               primaryKeyIndices.map(index => states[index].value)
             ),
-            row: Object.fromEntries(
-              insertableColumns.map((column, index) => [column, states[index].value])
-            ),
+            row: Object.fromEntries(insertableColumns.map((column, index) => [
+              column,
+              states[index].rawTextBytes ?? states[index].value
+            ])),
             storageClasses: insertableColumns.map((column, index) => ({
               column,
               storageClass: states[index].storageClass
@@ -3025,13 +3036,15 @@ async function deleteRows(table, rowIds) {
         const states = insertableColumns.map((column, index) => parseStoredCellState(
           row[index * 2 + 1],
           row[index * 2 + 2],
-          `${table}.${column}`
+          `${table}.${column}`,
+          { textEncoding }
         ));
         return {
           rowId: deletedRowId,
-          row: Object.fromEntries(
-            insertableColumns.map((column, index) => [column, states[index].value])
-          ),
+          row: Object.fromEntries(insertableColumns.map((column, index) => [
+            column,
+            states[index].rawTextBytes ?? states[index].value
+          ])),
           storageClasses: insertableColumns.map((column, index) => ({
             column,
             storageClass: states[index].storageClass
@@ -3753,6 +3766,7 @@ async function replayCellHistory(table, modification, direction) {
   if (!usesPrimaryKey && identity.kind !== 'rowid') {
     throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
   }
+  const textEncoding = getCellTextEncoding();
 
   const grouped = new Map();
   for (const cell of cells) {
@@ -3804,7 +3818,8 @@ async function replayCellHistory(table, modification, direction) {
       const currentStates = rowCells.map((cell, index) => parseStoredCellState(
         current.values[0][index * 2],
         current.values[0][index * 2 + 1],
-        `${table}.${cell.columnName}`
+        `${table}.${cell.columnName}`,
+        { textEncoding }
       ));
       const targetStates = rowCells.map((cell, index) => {
         const expected = direction === 'undo' ? cell.postState : cell.priorState;
@@ -3878,7 +3893,8 @@ async function replayCellHistory(table, modification, direction) {
         parseStoredCellState(
           actual.values[0][index * 2],
           actual.values[0][index * 2 + 1],
-          `${table}.${rowCells[index].columnName}`
+          `${table}.${rowCells[index].columnName}`,
+          { textEncoding }
         )
       ));
       if (!exactTarget) {
@@ -4063,6 +4079,7 @@ async function updateCellBatch(
         updates.map(update => update.value),
         maxEditValueBytes
       );
+  const textEncoding = getCellTextEncoding();
 
   if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {
     if (!updates.every(update => isPrimaryKeyRecordId(update.rowId))) {
@@ -4130,7 +4147,8 @@ async function updateCellBatch(
           const priorState = parseStoredCellState(
             current.values[0][index * 2],
             current.values[0][index * 2 + 1],
-            `${table}.${update.column}`
+            `${table}.${update.column}`,
+            { textEncoding }
           );
           const priorValue = priorState.value;
           const prepared = prepareCellUpdateForStorage(
@@ -4205,7 +4223,8 @@ async function updateCellBatch(
             postState: parseStoredCellState(
               post.values[0][index * 2],
               post.values[0][index * 2 + 1],
-              `${table}.${preparedUpdate.update.column}`
+              `${table}.${preparedUpdate.update.column}`,
+              { textEncoding }
             ),
             operation: preparedUpdate.prepared.operation
           });
@@ -4285,7 +4304,8 @@ async function updateCellBatch(
         columns.forEach((column, index) => values.set(column, parseStoredCellState(
           row[index * 2 + 1],
           row[index * 2 + 2],
-          `${table}.${column}`
+          `${table}.${column}`,
+          { textEncoding }
         )));
         currentValues.set(String(validateRowId(row[0])), values);
       }
@@ -4355,7 +4375,8 @@ async function updateCellBatch(
         columns.forEach((column, index) => values.set(column, parseStoredCellState(
           row[index * 2 + 1],
           row[index * 2 + 2],
-          `${table}.${column}`
+          `${table}.${column}`,
+          { textEncoding }
         )));
         postValues.set(String(validateRowId(row[0])), values);
       }

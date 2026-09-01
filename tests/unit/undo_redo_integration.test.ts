@@ -1392,6 +1392,103 @@ describe('SQLite Engine Undo/Redo', () => {
         );
     });
 
+    it('replays inserted and deleted malformed TEXT from its exact database bytes', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE malformed_text_history (' +
+            "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'80' AS TEXT)))"
+        );
+        const insertedRow = await engine.insertRowWithHistory('malformed_text_history', { id: 1 });
+        assert.deepStrictEqual(insertedRow.row.value, Uint8Array.of(0x80));
+        assert.deepStrictEqual(
+            insertedRow.storageClasses?.find(
+                (entry: { column: string }) => entry.column === 'value'
+            ),
+            { column: 'value', storageClass: 'text' }
+        );
+        const insertion = {
+            modificationType: 'row_insert' as const,
+            targetTable: 'malformed_text_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert malformed TEXT',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await engine.undoModification(insertion);
+        await engine.redoModification(insertion);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), hex(CAST(value AS BLOB)) FROM malformed_text_history'
+            ))[0].rows,
+            [['text', '80']]
+        );
+
+        const deletedRows = await engine.deleteRows('malformed_text_history', [1]);
+        assert.deepStrictEqual(deletedRows[0].row.value, Uint8Array.of(0x80));
+        await engine.undoModification({
+            modificationType: 'row_delete',
+            targetTable: 'malformed_text_history',
+            description: 'Delete malformed TEXT',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), hex(CAST(value AS BLOB)) FROM malformed_text_history'
+            ))[0].rows,
+            [['text', '80']]
+        );
+    });
+
+    it('replays malformed UTF-16LE TEXT without transcoding its database bytes', async () => {
+        engine.shutdown();
+        engine = (await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        })).operations;
+        await engine.executeQuery(
+            'PRAGMA encoding = "UTF-16le"; ' +
+            'CREATE TABLE malformed_utf16_history (' +
+            "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'00D8' AS TEXT)), " +
+            "note TEXT DEFAULT 'snowman ☃')"
+        );
+        assert.strictEqual((await engine.executeQuery('PRAGMA encoding'))[0].rows[0][0], 'UTF-16le');
+        const insertedRow = await engine.insertRowWithHistory('malformed_utf16_history', { id: 1 });
+        const insertion = {
+            modificationType: 'row_insert' as const,
+            targetTable: 'malformed_utf16_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert malformed UTF-16LE TEXT',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await engine.undoModification(insertion);
+        await engine.redoModification(insertion);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                'FROM malformed_utf16_history'
+            ))[0].rows,
+            [['text', '00D8', 'snowman ☃']]
+        );
+
+        const deletedRows = await engine.deleteRows('malformed_utf16_history', [1]);
+        await engine.undoModification({
+            modificationType: 'row_delete',
+            targetTable: 'malformed_utf16_history',
+            description: 'Delete malformed UTF-16LE TEXT',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                'FROM malformed_utf16_history'
+            ))[0].rows,
+            [['text', '00D8', 'snowman ☃']]
+        );
+    });
+
     it('replays row history for a legal empty column identifier', async () => {
         await engine.executeQuery('CREATE TABLE empty_row_history ("" TEXT, normal INTEGER)');
         const insertedRow = await engine.insertRowWithHistory(

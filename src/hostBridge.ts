@@ -683,6 +683,7 @@ export class HostBridge implements ToastService {
         }
       }
 
+      let observedPriorValue = currentRow[2] as CellValue;
       if (storageClass === 'text') {
         const rawText = currentRow[3];
         if (!(rawText instanceof Uint8Array)) {
@@ -703,15 +704,10 @@ export class HostBridge implements ToastService {
           decoded = '';
         }
         if (decoded !== currentRow[2]) {
-          const encodingLabel = databaseTextEncoding === 'utf-8'
-            ? 'UTF-8'
-            : databaseTextEncoding === 'utf-16le'
-              ? 'UTF-16LE'
-              : 'UTF-16BE';
-          throw new Error(
-            `Cannot edit ${table}.${column} as text because its stored bytes are not valid ` +
-            `${encodingLabel} without changing them. Open the cell's raw Hex inspector or export it.`
-          );
+          // The backend now records malformed TEXT as raw bytes. Prevent the
+          // host's JSON-patch heuristic from interpreting a lossy JS string;
+          // the guarded backend snapshot remains authoritative for undo.
+          observedPriorValue = rawText;
         }
       }
 
@@ -720,7 +716,7 @@ export class HostBridge implements ToastService {
         : -1;
       const priorValue = primaryKeyIndex >= 0
         ? predicate.primaryKey!.values[primaryKeyIndex]
-        : currentRow[2];
+        : observedPriorValue;
       const prepared = prepareCellUpdateForStorage(value, priorValue);
 
       this.assertConnectionGeneration(connectionGeneration);

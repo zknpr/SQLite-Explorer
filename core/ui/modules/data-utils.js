@@ -129,6 +129,19 @@ export function getCellMutationBlockReason(
     }
     const oversized = getOversizedCellMetadata(rowIdx, colIdx);
     if (!oversized || allowOversizedReplacement) return undefined;
+    const row = state.gridData?.[rowIdx];
+    const value = row ? getCellValue(row, colIdx) : undefined;
+    if (oversized.storageClass === 'text' && value instanceof Uint8Array) {
+        const byteUnit = oversized.byteLength === 1 ? 'byte' : 'bytes';
+        const retained = value.byteLength === oversized.byteLength
+            ? 'The full byte-exact raw value is available in the Hex inspector.'
+            : 'A byte-exact raw prefix is available in the Hex inspector.';
+        return (
+            `Inline text editing unavailable because the stored TEXT cannot be represented safely. ` +
+            `${retained} Use Replace to overwrite it ` +
+            `(TEXT, ${oversized.byteLength.toLocaleString()} ${byteUnit}).`
+        );
+    }
     // This sidecar covers size/page containment and byte-unrepresentable TEXT.
     // It has no reason discriminator, so describe the shared safety invariant
     // instead of falsely claiming that every contained value is too large.

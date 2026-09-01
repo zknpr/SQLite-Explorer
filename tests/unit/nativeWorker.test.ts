@@ -104,6 +104,22 @@ function isPostUpdateRowIdCall(call: RecordedNativeCall): boolean {
         && /^SELECT CAST\(rowid AS TEXT\) FROM /.test(String(call.args[0]));
 }
 
+function isTextEncodingRead(call: RecordedNativeCall): boolean {
+    return call.method === 'query' && call.args[0] === 'PRAGMA encoding';
+}
+
+function withoutTextEncodingReads(calls: readonly RecordedNativeCall[]): RecordedNativeCall[] {
+    return calls.filter(call => !isTextEncodingRead(call));
+}
+
+function assertSingleTextEncodingRead(calls: readonly RecordedNativeCall[]): void {
+    assert.strictEqual(
+        calls.filter(isTextEncodingRead).length,
+        1,
+        'stored TEXT history must resolve and cache the database encoding exactly once'
+    );
+}
+
 function noRowIdAliasResponse(): RecordedNativeResponse {
     return { result: { columns: ['name'], values: [] } };
 }
@@ -233,6 +249,8 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respo
                     const suppliedResponse = call.method === 'query'
                         && call.args[0] === ROWID_TABLE_AUTHORITY_SQL
                         ? { result: { columns: ['1'], values: [[1]] } }
+                        : call.method === 'query' && call.args[0] === 'PRAGMA encoding'
+                            ? { result: { columns: ['encoding'], values: [['UTF-8']] } }
                         : await respondToCall?.(call);
                     const response = call.method === 'compileBatch'
                         && suppliedResponse?.error === undefined
@@ -1332,8 +1350,10 @@ describe('createNativeDatabaseConnection', () => {
                 1024
             );
 
+            const operationCalls = withoutTextEncodingReads(connection.calls);
+            assertSingleTextEncodingRead(connection.calls);
             assert.deepStrictEqual(
-                connection.calls.map(call => call.method),
+                operationCalls.map(call => call.method),
                 [
                     'query',
                     'run',
@@ -1347,7 +1367,7 @@ describe('createNativeDatabaseConnection', () => {
                     'run'
                 ]
             );
-            const preflightCall = connection.calls[2];
+            const preflightCall = operationCalls[2];
             const [queries] = preflightCall.args as [Array<{ sql: string; params: unknown[] }>];
             assert.strictEqual(queries.length, 2);
             assert.ok(queries.every(query => /rowid\s+IN\s*\(/i.test(query.sql)));
@@ -1851,14 +1871,16 @@ describe('createNativeDatabaseConnection', () => {
                 postState: { storageClass: 'text', value: post }
             });
 
+            const operationCalls = withoutTextEncodingReads(connection.calls);
+            assertSingleTextEncodingRead(connection.calls);
             assert.deepStrictEqual(
-                connection.calls.map(call => call.method),
+                operationCalls.map(call => call.method),
                 ['query', 'run', 'queryBatch', 'query', 'run', 'query', 'run']
             );
-            assert.match(String(connection.calls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
-            assert.strictEqual(isUpdateTriggerGuardCall(connection.calls[2]), true);
+            assert.match(String(operationCalls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.strictEqual(isUpdateTriggerGuardCall(operationCalls[2]), true);
 
-            const update = connection.calls[4];
+            const update = operationCalls[4];
             const [sql, params] = update.args as [string, unknown[]];
             assert.match(sql, /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\) WHERE rowid = \?/);
             assert.match(sql, /typeof\("payload"\) = 'text'/);
@@ -1909,8 +1931,10 @@ describe('createNativeDatabaseConnection', () => {
                 /changed outside SQLite Explorer history/i
             );
 
+            const operationCalls = withoutTextEncodingReads(connection.calls);
+            assertSingleTextEncodingRead(connection.calls);
             assert.deepStrictEqual(
-                connection.calls.map(call => call.method),
+                operationCalls.map(call => call.method),
                 ['query', 'run', 'queryBatch', 'query', 'run', 'run']
             );
             assert.strictEqual(
@@ -1919,8 +1943,8 @@ describe('createNativeDatabaseConnection', () => {
                 )),
                 false
             );
-            assert.match(String(connection.calls[4].args[0]), /^ROLLBACK TO /);
-            assert.match(String(connection.calls[5].args[0]), /^RELEASE /);
+            assert.match(String(operationCalls[4].args[0]), /^ROLLBACK TO /);
+            assert.match(String(operationCalls[5].args[0]), /^RELEASE /);
         } finally {
             connection.dispose();
         }
@@ -1970,12 +1994,14 @@ describe('createNativeDatabaseConnection', () => {
                 `(typeof("value") = 'text' AND CAST("value" AS BLOB) = CAST(? AS BLOB))`
             );
             assert.deepStrictEqual(params, ['before', 7, 'after']);
+            const operationCalls = withoutTextEncodingReads(connection.calls);
+            assertSingleTextEncodingRead(connection.calls);
             assert.deepStrictEqual(
-                connection.calls.map(call => call.method),
+                operationCalls.map(call => call.method),
                 ['query', 'run', 'queryBatch', 'query', 'run', 'run', 'run']
             );
-            assert.match(String(connection.calls[5].args[0]), /^ROLLBACK TO /);
-            assert.match(String(connection.calls[6].args[0]), /^RELEASE /);
+            assert.match(String(operationCalls[5].args[0]), /^ROLLBACK TO /);
+            assert.match(String(operationCalls[6].args[0]), /^RELEASE /);
         } finally {
             connection.dispose();
         }
@@ -2050,10 +2076,12 @@ describe('createNativeDatabaseConnection', () => {
                 ]
             });
 
-            const queryCalls = connection.calls.filter(call => call.method === 'query');
+            const operationCalls = withoutTextEncodingReads(connection.calls);
+            assertSingleTextEncodingRead(connection.calls);
+            const queryCalls = operationCalls.filter(call => call.method === 'query');
             const queryBatchCalls = connection.calls.filter(call => call.method === 'queryBatch');
             assert.deepStrictEqual(
-                connection.calls.map(call => call.method),
+                operationCalls.map(call => call.method),
                 [
                     'query',
                     'run',
@@ -2070,8 +2098,8 @@ describe('createNativeDatabaseConnection', () => {
             assert.strictEqual(queryCalls.length, 5);
             assert.strictEqual(queryBatchCalls.length, 1);
             assert.strictEqual(isUpdateTriggerGuardCall(queryBatchCalls[0]), true);
-            assert.match(String(connection.calls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
-            assert.match(String(connection.calls.at(-1)?.args[0]), /^RELEASE "sp_replay_cell_history_/);
+            assert.match(String(operationCalls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.match(String(operationCalls.at(-1)?.args[0]), /^RELEASE "sp_replay_cell_history_/);
             const updates = connection.calls.filter(call => (
                 call.method === 'run' && /^UPDATE /.test(String(call.args[0]))
             ));
@@ -2096,11 +2124,11 @@ describe('createNativeDatabaseConnection', () => {
         const queryResponse = createDeferred<RecordedNativeResponse>();
         let replayStateReadCount = 0;
         const connection = await createRecordingConnection((call) => {
+            const sql = String(call.args[0]);
             if (
                 call.method === 'query'
-                && String(call.args[0]).startsWith(
-                    `SELECT typeof("payload"), "payload" FROM main."docs" WHERE rowid = ?`
-                )
+                && sql.startsWith(`SELECT typeof("payload"), CASE WHEN typeof("payload") = 'text'`)
+                && sql.includes(`FROM main."docs" WHERE rowid = ?`)
             ) {
                 replayStateReadCount += 1;
                 if (replayStateReadCount === 1) {
@@ -2110,7 +2138,7 @@ describe('createNativeDatabaseConnection', () => {
                 return {
                     result: {
                         columns: ['storage_class', 'payload'],
-                        values: [['text', restored]]
+                        values: [['text', new TextEncoder().encode(restored)]]
                     }
                 };
             }
@@ -2142,8 +2170,10 @@ describe('createNativeDatabaseConnection', () => {
             await new Promise(resolve => setImmediate(resolve));
 
             try {
+                const operationCalls = withoutTextEncodingReads(connection.calls);
+                assertSingleTextEncodingRead(connection.calls);
                 assert.deepStrictEqual(
-                    connection.calls.map(call => call.method),
+                    operationCalls.map(call => call.method),
                     ['query', 'run', 'queryBatch', 'query'],
                     'concurrent updateCell must not write while undo is between read and write'
                 );
@@ -2151,14 +2181,16 @@ describe('createNativeDatabaseConnection', () => {
                 queryResponse.resolve({
                     result: {
                         columns: ['storage_class', 'payload'],
-                        values: [['text', current]]
+                        values: [['text', new TextEncoder().encode(current)]]
                     }
                 });
                 await Promise.allSettled([undoPromise, updatePromise]);
             }
 
+            const operationCalls = withoutTextEncodingReads(connection.calls);
+            assertSingleTextEncodingRead(connection.calls);
             assert.deepStrictEqual(
-                connection.calls.map(call => call.method),
+                operationCalls.map(call => call.method),
                 [
                     'query', 'run', 'queryBatch', 'query', 'run', 'query', 'run',
                     'query', 'run', 'query', 'queryBatch', 'run', 'query', 'run'
@@ -2184,7 +2216,7 @@ describe('createNativeDatabaseConnection', () => {
             queryResponse.resolve({
                 result: {
                     columns: ['storage_class', 'payload'],
-                    values: [['text', current]]
+                    values: [['text', new TextEncoder().encode(current)]]
                 }
             });
             if (undoPromise || updatePromise) {
@@ -2237,12 +2269,14 @@ describe('createNativeDatabaseConnection', () => {
                 postState: { storageClass: 'text', value: post }
             });
 
-            assert.strictEqual(connection.calls.length, 7);
-            assert.match(String(connection.calls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
-            assert.strictEqual(isUpdateTriggerGuardCall(connection.calls[2]), true);
-            assert.strictEqual(connection.calls[3].method, 'query');
-            assert.match(String(connection.calls[6].args[0]), /^RELEASE "sp_replay_cell_history_/);
-            const call = connection.calls[4];
+            const operationCalls = withoutTextEncodingReads(connection.calls);
+            assertSingleTextEncodingRead(connection.calls);
+            assert.strictEqual(operationCalls.length, 7);
+            assert.match(String(operationCalls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.strictEqual(isUpdateTriggerGuardCall(operationCalls[2]), true);
+            assert.strictEqual(operationCalls[3].method, 'query');
+            assert.match(String(operationCalls[6].args[0]), /^RELEASE "sp_replay_cell_history_/);
+            const call = operationCalls[4];
             assert.strictEqual(call.method, 'run');
 
             const [sql, params] = call.args as [string, unknown[]];
@@ -2320,11 +2354,13 @@ describe('createNativeDatabaseConnection', () => {
                 ]
             });
 
-            assert.strictEqual(connection.calls.length, 13);
-            assert.strictEqual(connection.calls[1].method, 'run');
-            assert.match(String(connection.calls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
-            assert.strictEqual(isUpdateTriggerGuardCall(connection.calls[2]), true);
-            assert.match(String(connection.calls.at(-1)?.args[0]), /^RELEASE "sp_replay_cell_history_/);
+            const operationCalls = withoutTextEncodingReads(connection.calls);
+            assertSingleTextEncodingRead(connection.calls);
+            assert.strictEqual(operationCalls.length, 13);
+            assert.strictEqual(operationCalls[1].method, 'run');
+            assert.match(String(operationCalls[1].args[0]), /^SAVEPOINT "sp_replay_cell_history_/);
+            assert.strictEqual(isUpdateTriggerGuardCall(operationCalls[2]), true);
+            assert.match(String(operationCalls.at(-1)?.args[0]), /^RELEASE "sp_replay_cell_history_/);
             const updates = connection.calls.filter(call => (
                 call.method === 'run' && /^UPDATE /.test(String(call.args[0]))
             ));

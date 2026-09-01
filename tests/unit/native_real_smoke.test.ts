@@ -1235,6 +1235,111 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('replays native malformed TEXT history from exact database bytes', async () => {
+            const table = 'native_malformed_text_history';
+            await engine.executeQuery(
+                `CREATE TABLE ${table} (` +
+                "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'80' AS TEXT)))"
+            );
+            const insertedRow = await engine.insertRowWithHistory!(table, { id: 1 });
+            const insertion = {
+                modificationType: 'row_insert' as const,
+                targetTable: table,
+                targetRowId: insertedRow.rowId,
+                description: 'Insert native malformed TEXT',
+                rowData: insertedRow.row,
+                insertedRow
+            };
+
+            await engine.undoModification(insertion);
+            await engine.redoModification(insertion);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    `SELECT typeof(value), hex(CAST(value AS BLOB)) FROM ${table}`
+                ))[0].rows,
+                [['text', '80']]
+            );
+
+            const deletedRows = await engine.deleteRows(table, [1]);
+            await engine.undoModification({
+                modificationType: 'row_delete',
+                targetTable: table,
+                description: 'Delete native malformed TEXT',
+                deletedRows
+            });
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    `SELECT typeof(value), hex(CAST(value AS BLOB)) FROM ${table}`
+                ))[0].rows,
+                [['text', '80']]
+            );
+        });
+
+        await testContext.test('replays native malformed UTF-16LE TEXT without transcoding', async () => {
+            const utf16Path = path.join(testDir, 'native-malformed-utf16.sqlite');
+            fs.closeSync(fs.openSync(utf16Path, 'w'));
+            let utf16Bundle:
+                | Awaited<ReturnType<typeof createNativeDatabaseConnection>>
+                | undefined;
+            try {
+                utf16Bundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                const utf16Connection = await utf16Bundle.establishConnection(
+                    vscode.Uri.file(utf16Path),
+                    'native-malformed-utf16.sqlite'
+                );
+                const utf16Engine = utf16Connection.databaseOps;
+                await utf16Engine.executeQuery(
+                    'PRAGMA encoding = "UTF-16le"; ' +
+                    'CREATE TABLE malformed_utf16_history (' +
+                    "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'00D8' AS TEXT)), " +
+                    "note TEXT DEFAULT 'snowman ☃')"
+                );
+                assert.strictEqual(
+                    (await utf16Engine.executeQuery('PRAGMA encoding'))[0].rows[0][0],
+                    'UTF-16le'
+                );
+                const insertedRow = await utf16Engine.insertRowWithHistory!(
+                    'malformed_utf16_history',
+                    { id: 1 }
+                );
+                const insertion = {
+                    modificationType: 'row_insert' as const,
+                    targetTable: 'malformed_utf16_history',
+                    targetRowId: insertedRow.rowId,
+                    description: 'Insert native malformed UTF-16LE TEXT',
+                    rowData: insertedRow.row,
+                    insertedRow
+                };
+
+                await utf16Engine.undoModification(insertion);
+                await utf16Engine.redoModification(insertion);
+                assert.deepStrictEqual(
+                    (await utf16Engine.executeQuery(
+                        'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                        'FROM malformed_utf16_history'
+                    ))[0].rows,
+                    [['text', '00D8', 'snowman ☃']]
+                );
+
+                const deletedRows = await utf16Engine.deleteRows('malformed_utf16_history', [1]);
+                await utf16Engine.undoModification({
+                    modificationType: 'row_delete',
+                    targetTable: 'malformed_utf16_history',
+                    description: 'Delete native malformed UTF-16LE TEXT',
+                    deletedRows
+                });
+                assert.deepStrictEqual(
+                    (await utf16Engine.executeQuery(
+                        'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                        'FROM malformed_utf16_history'
+                    ))[0].rows,
+                    [['text', '00D8', 'snowman ☃']]
+                );
+            } finally {
+                utf16Bundle?.workerMethods[Symbol.dispose]();
+            }
+        });
+
         await testContext.test('guards native row history against a second WAL writer', async () => {
             const table = 'native_row_history_wal';
             await engine.executeQuery('PRAGMA journal_mode = WAL');
@@ -2013,11 +2118,13 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
-        await testContext.test('routes malformed ordinary native TEXT through the raw-cell sidecar', async () => {
+        await testContext.test('retains raw prefixes for malformed native table and view TEXT', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_malformed_text_value (value TEXT); ' +
                 "INSERT INTO native_malformed_text_value VALUES " +
-                "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT))"
+                "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT)); " +
+                'CREATE VIEW native_malformed_text_view AS ' +
+                'SELECT value FROM native_malformed_text_value WHERE rowid = 1'
             );
             const page = await engine.fetchTableData('native_malformed_text_value', {
                 columns: ['rowid', 'value'],
@@ -2027,9 +2134,19 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 offset: 0
             });
 
-            assert.deepStrictEqual(page.rows, [[1, ''], [2, '�']]);
+            assert.deepStrictEqual(page.rows, [[1, Uint8Array.of(0x80)], [2, '�']]);
             assert.deepStrictEqual(page.oversizedCells, {
                 0: { 1: { storageClass: 'text', byteLength: 1 } }
+            });
+
+            const viewPage = await engine.fetchTableData('native_malformed_text_view', {
+                columns: ['value'],
+                limit: 1,
+                offset: 0
+            });
+            assert.deepStrictEqual(viewPage.rows, [[Uint8Array.of(0x80)]]);
+            assert.deepStrictEqual(viewPage.oversizedCells, {
+                0: { 0: { storageClass: 'text', byteLength: 1 } }
             });
         });
 

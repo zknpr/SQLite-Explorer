@@ -58,12 +58,17 @@ export function rowHistoryStates(snapshot: DeletedRow): RowHistoryState[] {
       throw new LegacyRowHistoryError();
     }
     seen.add(canonicalColumn);
+    const storedValue = snapshot.row[entry.column];
+    const rawTextBytes = entry.storageClass === 'text' && storedValue instanceof Uint8Array
+      ? storedValue
+      : undefined;
     return {
       column: entry.column,
       state: parseStoredCellState(
         entry.storageClass,
-        snapshot.row[entry.column],
-        `row history column ${entry.column}`
+        rawTextBytes ? '' : storedValue,
+        `row history column ${entry.column}`,
+        { rawTextBytes }
       )
     };
   });
