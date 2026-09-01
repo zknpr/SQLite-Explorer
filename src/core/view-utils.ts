@@ -287,13 +287,17 @@ export function readStoredTriggerValidationHeader(
   };
 }
 
-/** Build a non-executing DML statement that makes SQLite compile the trigger event. */
+/**
+ * Build non-executing DML that makes SQLite compile the trigger event.
+ * Undefined identifies a legal UPDATE OF trigger that cannot fire against the
+ * current target columns; callers must record it as valid but inert.
+ */
 export function buildStoredTriggerValidationSql(
   triggerSql: string,
   targetSchema: string,
   target: string,
   writableColumns: readonly string[]
-): string {
+): string | undefined {
   const header = readStoredTriggerValidationHeader(triggerSql);
   const qualifiedTarget = `${escapeIdentifier(targetSchema)}.${escapeIdentifier(target)}`;
   if (header.event === 'insert') {
@@ -306,11 +310,13 @@ export function buildStoredTriggerValidationSql(
   const availableColumns = new Map(
     writableColumns.map(column => [foldSqlIdentifier(column), column])
   );
-  const updateColumn = header.updateOfColumns
+  const matchingUpdateColumn = header.updateOfColumns
     .map(column => availableColumns.get(foldSqlIdentifier(column)))
-    .find((column): column is string => column !== undefined)
-    ?? header.updateOfColumns[0]
-    ?? writableColumns[0];
+    .find((column): column is string => column !== undefined);
+  if (header.updateOfColumns.length > 0 && matchingUpdateColumn === undefined) {
+    return undefined;
+  }
+  const updateColumn = matchingUpdateColumn ?? writableColumns[0];
   if (updateColumn === undefined) {
     throw new Error(`Trigger target ${targetSchema}.${target} has no writable column to probe`);
   }

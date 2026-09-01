@@ -3293,12 +3293,17 @@ async function findViewDefinition(view, allowUnparsed = false) {
         continue;
       }
       try {
-        const probe = db.exec(buildStoredTriggerValidationSql(
+        const validationSql = buildStoredTriggerValidationSql(
           trigger.sql,
           'main',
           view,
           writableColumns
-        ));
+        );
+        if (validationSql === undefined) {
+          ambiguousTemporaryTriggerNames.push(trigger.identifier);
+          continue;
+        }
+        const probe = db.exec(validationSql);
         if (explainIncludesTriggerProgram(probe[0]?.values ?? [], trigger.identifier)) {
           triggers.push({
             ...trigger,
@@ -4393,7 +4398,20 @@ async function addColumn(table, column, type, defaultValue) {
     sql += ` DEFAULT ${formatDefaultValue(defaultValue)}`;
   }
 
-  db.run(sql);
+  const savepointName = createViewSavepointName('sp_add_column');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    runSingleStatement(sql);
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'addColumn');
+    throw error;
+  }
 }
 
 /**

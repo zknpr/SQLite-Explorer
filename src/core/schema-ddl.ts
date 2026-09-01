@@ -26,6 +26,17 @@ function isIdentifierToken(token: SqlToken | undefined): token is SqlToken {
   return token !== undefined && token.kind !== 'symbol';
 }
 
+function isIdentifierStartCharacter(character: string): boolean {
+  // SQLite treats every non-ASCII character as alphabetic for bare-token
+  // purposes; JavaScript's Unicode letter classes would be both narrower and
+  // subject to case-folding rules SQLite does not use.
+  return /[A-Za-z_\u0080-\uFFFF]/.test(character);
+}
+
+function isIdentifierCharacter(character: string): boolean {
+  return /[A-Za-z0-9_$\u0080-\uFFFF]/.test(character);
+}
+
 function readDelimitedToken(
   sql: string,
   start: number,
@@ -117,9 +128,9 @@ function tokenizeIndexDefinition(sql: string): SqlToken[] {
       continue;
     }
 
-    if (/[A-Za-z_]/.test(character)) {
+    if (isIdentifierStartCharacter(character)) {
       let end = cursor + 1;
-      while (end < sql.length && /[A-Za-z0-9_$]/.test(sql[end])) end++;
+      while (end < sql.length && isIdentifierCharacter(sql[end])) end++;
       push({ kind: 'word', value: sql.slice(cursor, end), start: cursor, end });
       cursor = end;
       continue;

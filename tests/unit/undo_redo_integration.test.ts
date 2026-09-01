@@ -349,6 +349,45 @@ describe('SQLite Engine Undo/Redo', () => {
         );
     });
 
+    it('restores dependent indexes with unquoted Unicode identifiers', async () => {
+        const table = 'unicode_index_restore';
+        await engine.executeQuery(
+            `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, removed TEXT, keep TEXT); ` +
+            `CREATE INDEX Äidx ON ${table}(removed); ` +
+            `CREATE INDEX idxÄ ON ${table}(removed); ` +
+            `INSERT INTO ${table} VALUES (7, 'restore me', 'keep me')`
+        );
+        const before = await captureRowidTableState(table);
+        const removedData = (await engine.executeQuery(
+            `SELECT rowid, removed FROM ${table}`
+        ))[0].rows.map((row: any[]) => ({ rowId: row[0], value: row[1] }));
+
+        await engine.deleteColumns(table, ['removed'], ['Äidx', 'idxÄ']);
+        const after = await captureRowidTableState(table);
+        await engine.undoModification({
+            modificationType: 'column_drop',
+            targetTable: table,
+            description: 'Restore Unicode-named indexes',
+            deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+            droppedIndexes: ['Äidx', 'idxÄ'],
+            columnDropSnapshot: { before, after }
+        });
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT id, removed, keep FROM ${table}`
+            ))[0].rows,
+            [[7, 'restore me', 'keep me']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = ? ORDER BY name`,
+                [table]
+            ))[0].rows,
+            [['idxÄ'], ['Äidx']]
+        );
+    });
+
     it('preserves an AUTOINCREMENT high-water mark across positional column-drop undo', async () => {
         const createTableSql =
             'CREATE TABLE column_restore_sequence (' +

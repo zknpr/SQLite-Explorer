@@ -5355,6 +5355,38 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('rejects demo column additions that activate broken UPDATE OF triggers', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_dormant_rows (id INTEGER, label TEXT); ' +
+            'CREATE VIEW demo_dormant_source AS ' +
+            'SELECT id, label FROM demo_dormant_rows; ' +
+            'CREATE TABLE demo_dormant_events (event_id INTEGER); ' +
+            'CREATE TABLE demo_dormant_log (value TEXT); ' +
+            'CREATE TRIGGER demo_dormant_update AFTER UPDATE OF activated ' +
+            'ON demo_dormant_events BEGIN ' +
+            'INSERT INTO demo_dormant_log SELECT label FROM demo_dormant_source; END'
+        );
+
+        await worker.invoke(
+            'editView',
+            'demo_dormant_source',
+            'SELECT id FROM demo_dormant_rows'
+        );
+        await assert.rejects(
+            worker.invoke('addColumn', 'demo_dormant_events', 'activated', 'INTEGER'),
+            /would break existing trigger.*demo_dormant_update/is
+        );
+        assert.deepStrictEqual(
+            Array.from(
+                await worker.invoke('getTableInfo', 'demo_dormant_events'),
+                (column: any) => column.identifier
+            ),
+            ['event_id']
+        );
+    });
+
     it('rejects demo undo and redo that break newer dependent views', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

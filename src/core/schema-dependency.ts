@@ -44,6 +44,12 @@ function foldIdentifier(identifier: string): string {
   return identifier.replace(/[A-Z]/g, character => character.toLowerCase());
 }
 
+function identifierTupleKey(parts: readonly string[]): string {
+  // SQLite identifiers may contain every delimiter character. JSON string
+  // encoding preserves tuple boundaries without applying Unicode case folding.
+  return JSON.stringify(parts.map(foldIdentifier));
+}
+
 function schemaObjectKey(
   kind: SchemaDependencyObjectKind,
   schema: string,
@@ -51,10 +57,10 @@ function schemaObjectKey(
   targetSchema?: string,
   targetIdentifier?: string
 ): string {
-  const base = `${kind}:${foldIdentifier(schema)}:${foldIdentifier(identifier)}`;
+  const base = [kind, schema, identifier];
   return targetSchema === undefined || targetIdentifier === undefined
-    ? base
-    : `${base}:${foldIdentifier(targetSchema)}:${foldIdentifier(targetIdentifier)}`;
+    ? identifierTupleKey(base)
+    : identifierTupleKey([...base, targetSchema, targetIdentifier]);
 }
 
 function errorText(error: unknown): string {
@@ -237,11 +243,29 @@ export async function captureSchemaDependencySnapshot(
         targetIdentifier
       );
       try {
-        const cacheKey = `${foldIdentifier(targetSchema)}:${foldIdentifier(targetIdentifier)}`;
+        const cacheKey = identifierTupleKey([targetSchema, targetIdentifier]);
         let columns = columnCache.get(cacheKey);
         if (!columns) {
           columns = readWritableColumns(adapter, targetSchema, targetIdentifier);
           columnCache.set(cacheKey, columns);
+        }
+        const validationSql = buildStoredTriggerValidationSql(
+          object.sql,
+          targetSchema,
+          targetIdentifier,
+          await columns
+        );
+        if (validationSql === undefined) {
+          snapshot.set(key, {
+            key,
+            kind: 'trigger',
+            schema: object.schema,
+            identifier: object.identifier,
+            targetSchema,
+            targetIdentifier,
+            valid: true
+          });
+          continue;
         }
         pending.push({
           key,
@@ -250,12 +274,7 @@ export async function captureSchemaDependencySnapshot(
           identifier: object.identifier,
           targetSchema,
           targetIdentifier,
-          sql: buildStoredTriggerValidationSql(
-            object.sql,
-            targetSchema,
-            targetIdentifier,
-            await columns
-          )
+          sql: validationSql
         });
       } catch (error) {
         snapshot.set(key, {
@@ -310,7 +329,7 @@ export function assertNoNewBrokenSchemaDependencies(
       ? ` on ${current.targetSchema}.${current.targetIdentifier}`
       : '';
     throw new Error(
-      `View change would break existing ${current.kind} ` +
+      `Schema change would break existing ${current.kind} ` +
       `"${current.schema}.${current.identifier}"${target}: ${current.error ?? 'SQLite rejected it'}`
     );
   }

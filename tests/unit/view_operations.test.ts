@@ -2706,6 +2706,111 @@ describe('view operations', () => {
         }
     });
 
+    it('keeps dependency probes distinct when trigger identity tuples contain colons', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE dependency_key_rows (id INTEGER, label TEXT); ' +
+                "INSERT INTO dependency_key_rows VALUES (7, 'kept'); " +
+                'CREATE VIEW dependency_key_source AS ' +
+                'SELECT id, label FROM dependency_key_rows; ' +
+                'CREATE TABLE "b:main:c" (event_id INTEGER); ' +
+                'CREATE TABLE c (event_id INTEGER); ' +
+                'CREATE TABLE dependency_key_log (value TEXT); ' +
+                'CREATE TRIGGER a AFTER INSERT ON "b:main:c" BEGIN ' +
+                'INSERT INTO dependency_key_log SELECT label FROM dependency_key_source; END; ' +
+                'CREATE TRIGGER "a:main:b" AFTER INSERT ON c BEGIN ' +
+                "INSERT INTO dependency_key_log VALUES ('safe'); END"
+            );
+
+            await assert.rejects(
+                engine.editView(
+                    'dependency_key_source',
+                    'SELECT id FROM dependency_key_rows'
+                ),
+                /would break existing trigger.*main\.a/is
+            );
+            assert.strictEqual(
+                (await engine.getViewDefinition('dependency_key_source')).selectSql,
+                'SELECT id, label FROM dependency_key_rows'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects adding a column that activates a newly broken UPDATE OF trigger', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE dormant_trigger_rows (id INTEGER, label TEXT); ' +
+                'CREATE VIEW dormant_trigger_source AS ' +
+                'SELECT id, label FROM dormant_trigger_rows; ' +
+                'CREATE TABLE dormant_trigger_events (event_id INTEGER); ' +
+                'CREATE TABLE dormant_trigger_log (value TEXT); ' +
+                'CREATE TRIGGER dormant_update AFTER UPDATE OF activated ' +
+                'ON dormant_trigger_events BEGIN ' +
+                'INSERT INTO dormant_trigger_log SELECT label FROM dormant_trigger_source; END'
+            );
+
+            await engine.editView(
+                'dormant_trigger_source',
+                'SELECT id FROM dormant_trigger_rows'
+            );
+            await assert.rejects(
+                engine.addColumn('dormant_trigger_events', 'activated', 'INTEGER'),
+                /would break existing trigger.*dormant_update/is
+            );
+            assert.deepStrictEqual(
+                (await engine.getTableInfo('dormant_trigger_events'))
+                    .map(column => column.identifier),
+                ['event_id']
+            );
+            assert.strictEqual(
+                (await engine.getViewDefinition('dormant_trigger_source')).selectSql,
+                'SELECT id FROM dormant_trigger_rows'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('rejects a view edit that activates a newly broken UPDATE OF trigger', async () => {
+        const engine = await createEngine();
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE dormant_view_rows (id INTEGER, label TEXT); ' +
+                'CREATE VIEW dormant_view_source AS ' +
+                'SELECT id, label FROM dormant_view_rows; ' +
+                'CREATE TABLE dormant_view_event_rows (event_id INTEGER); ' +
+                'CREATE VIEW dormant_view_events AS ' +
+                'SELECT event_id FROM dormant_view_event_rows; ' +
+                'CREATE TABLE dormant_view_log (value TEXT); ' +
+                'CREATE TRIGGER dormant_view_update INSTEAD OF UPDATE OF activated ' +
+                'ON dormant_view_events BEGIN ' +
+                'INSERT INTO dormant_view_log SELECT label FROM dormant_view_source; END'
+            );
+
+            await engine.editView(
+                'dormant_view_source',
+                'SELECT id FROM dormant_view_rows'
+            );
+            await assert.rejects(
+                engine.editView(
+                    'dormant_view_events',
+                    'SELECT event_id, event_id AS activated FROM dormant_view_event_rows'
+                ),
+                /would break existing trigger.*dormant_view_update/is
+            );
+            assert.strictEqual(
+                (await engine.getViewDefinition('dormant_view_events')).selectSql,
+                'SELECT event_id FROM dormant_view_event_rows'
+            );
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('guards both undo and redo view history against newer reverse dependencies', async () => {
         const engine = await createEngine();
         try {

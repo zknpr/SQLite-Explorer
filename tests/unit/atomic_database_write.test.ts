@@ -38,6 +38,70 @@ async function assertNoAtomicTemporaryFiles(directory: string): Promise<void> {
 }
 
 describe('writeDatabaseSnapshotAtomically', () => {
+  it('refuses to replace a clean WAL target while another connection retains it', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX pathname replacement is the corruption path under review');
+      return;
+    }
+
+    await withScratchDirectory(async (directory) => {
+      const targetPath = path.join(directory, 'database.db');
+      const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+      const peer = new DatabaseSync(targetPath);
+      try {
+        peer.exec(
+          'PRAGMA journal_mode=WAL; '
+          + 'CREATE TABLE original (value TEXT); '
+          + "INSERT INTO original VALUES ('keep me')"
+        );
+        assert.deepStrictEqual(
+          { ...peer.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() },
+          { busy: 0, log: 0, checkpointed: 0 },
+          'the peer must retain a clean WAL with no frames for the replacement gate to detect'
+        );
+
+        await assert.rejects(
+          writeDatabaseSnapshotAtomically(
+            fs,
+            undefined,
+            targetPath,
+            async (temporaryPath) => {
+              const replacement = new DatabaseSync(temporaryPath);
+              try {
+                replacement.exec('CREATE TABLE replacement (value TEXT)');
+              } finally {
+                replacement.close();
+              }
+            }
+          ),
+          /exclusive SQLite lock.*close other connections/i
+        );
+
+        assert.deepStrictEqual(
+          peer.prepare('SELECT value FROM original').all().map(row => ({ ...row })),
+          [{ value: 'keep me' }]
+        );
+      } finally {
+        peer.close();
+      }
+
+      const reopened = new DatabaseSync(targetPath, { readOnly: true });
+      try {
+        assert.deepStrictEqual(
+          reopened.prepare('SELECT value FROM original').all().map(row => ({ ...row })),
+          [{ value: 'keep me' }]
+        );
+        assert.throws(
+          () => reopened.prepare('SELECT * FROM replacement').all(),
+          /no such table: replacement/i
+        );
+      } finally {
+        reopened.close();
+      }
+      await assertNoAtomicTemporaryFiles(directory);
+    });
+  });
+
   it('preserves an existing target and removes the temporary file when the producer fails', async () => {
     await withScratchDirectory(async (directory) => {
       const targetPath = path.join(directory, 'database.db');

@@ -1000,8 +1000,18 @@ export async function createNativeDatabaseConnection(
               continue;
             }
             try {
+              const validationSql = buildStoredTriggerValidationSql(
+                trigger.sql,
+                'main',
+                view,
+                writableColumns
+              );
+              if (validationSql === undefined) {
+                ambiguousTemporaryTriggerNames.push(trigger.identifier);
+                continue;
+              }
               const probe = await worker.call<NativeQueryResult>('query', [
-                buildStoredTriggerValidationSql(trigger.sql, 'main', view, writableColumns)
+                validationSql
               ]);
               if (explainIncludesTriggerProgram(probe.values ?? [], trigger.identifier)) {
                 triggers.push({
@@ -4168,7 +4178,9 @@ export async function createNativeDatabaseConnection(
             canonicalTarget = '';
           }
 
-          if (canonicalSource !== '' && canonicalSource === canonicalTarget) {
+          const replacingActiveSource = canonicalSource !== ''
+            && canonicalSource === canonicalTarget;
+          if (replacingActiveSource) {
             let walHasFrames = false;
             try {
               walHasFrames = (
@@ -4179,8 +4191,8 @@ export async function createNativeDatabaseConnection(
             }
             if (walHasFrames) {
               // Only this connection can checkpoint its active source safely.
-              // The atomic writer still takes a separate BEGIN IMMEDIATE lock
-              // and re-checks the WAL, closing the external-writer race between
+              // After snapshotting, this connection is closed so the atomic
+              // writer can prove exclusive ownership and close the race between
               // this checkpoint and the final rename.
               const checkpoint = await worker.call<NativeQueryResult>(
                 'query',
@@ -4203,29 +4215,68 @@ export async function createNativeDatabaseConnection(
             }
           }
 
-          return writeDatabaseSnapshotAtomically(
-            fs,
-            filePath,
-            targetPath,
-            async temporaryPath => {
-              // VACUUM INTO itself refuses an existing path. The atomic helper
-              // keeps that private snapshot off the destination until fsync and
-              // target-generation validation have both succeeded.
-              await worker.call(
-                'vacuumInto',
-                [temporaryPath, queryTimeout],
-                queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS,
-                signal
+          let sourceConnectionClosed = false;
+          let result: DatabaseWriteResult | undefined;
+          let writeError: unknown;
+          let writeCompleted = false;
+          try {
+            result = await writeDatabaseSnapshotAtomically(
+              fs,
+              filePath,
+              targetPath,
+              async temporaryPath => {
+                // VACUUM INTO itself refuses an existing path. The atomic helper
+                // keeps that private snapshot off the destination until fsync and
+                // target-generation validation have both succeeded.
+                await worker.call(
+                  'vacuumInto',
+                  [temporaryPath, queryTimeout],
+                  queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS,
+                  signal
+                );
+                if (replacingActiveSource) {
+                  // A WAL connection keeps a shared main-file lock even with no
+                  // frames. Close both native handles before the helper obtains
+                  // its exclusive lock; serialized operations prevent this
+                  // connection from touching the retired inode before reopen.
+                  sourceConnectionClosed = true;
+                  await worker.call('close');
+                }
+              },
+              signal,
+              (_level, message, error) => {
+                const details = error === undefined
+                  ? ''
+                  : ` ${error instanceof Error ? error.message : String(error)}`;
+                outputChannel?.appendLine(`[NativeWorker] ${message}${details}`);
+              }
+            );
+            writeCompleted = true;
+          } catch (error) {
+            writeError = error;
+          }
+
+          if (sourceConnectionClosed) {
+            try {
+              await worker.call('open', [filePath, readOnly]);
+            } catch (reopenError) {
+              if (!writeCompleted) {
+                throw new AggregateError(
+                  [writeError, reopenError],
+                  'Native database save failed and reopening the source also failed'
+                );
+              }
+              const details = reopenError instanceof Error
+                ? reopenError.message
+                : String(reopenError);
+              outputChannel?.appendLine(
+                `[NativeWorker] Database saved, but the native source connection `
+                + `could not be reopened: ${details}`
               );
-            },
-            signal,
-            (_level, message, error) => {
-              const details = error === undefined
-                ? ''
-                : ` ${error instanceof Error ? error.message : String(error)}`;
-              outputChannel?.appendLine(`[NativeWorker] ${message}${details}`);
             }
-          );
+          }
+          if (!writeCompleted) throw writeError;
+          return result!;
         },
 
         /**
@@ -4490,8 +4541,13 @@ export async function createNativeDatabaseConnection(
               );
             }
             assertColumnNameAvailable(table, column, current.columns);
+            const dependenciesBefore = await captureNativeViewDependencySnapshot();
             await worker.call('run', [sql]);
             const stateAfter = await readNativeColumnDropTableState(table);
+            assertNoNewBrokenSchemaDependencies(
+              dependenciesBefore,
+              await captureNativeViewDependencySnapshot()
+            );
             await worker.call('run', [`RELEASE ${savepointName}`]);
             return stateAfter;
           } catch (error) {

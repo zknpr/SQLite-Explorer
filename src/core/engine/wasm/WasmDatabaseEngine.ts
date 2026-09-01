@@ -3493,12 +3493,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           continue;
         }
         try {
-          const probe = await this.executeQuery(buildStoredTriggerValidationSql(
+          const validationSql = buildStoredTriggerValidationSql(
             trigger.sql,
             'main',
             view,
             writableColumns
-          ));
+          );
+          if (validationSql === undefined) {
+            ambiguousTemporaryTriggerNames.push(trigger.identifier);
+            continue;
+          }
+          const probe = await this.executeQuery(validationSql);
           if (explainIncludesTriggerProgram(probe[0]?.rows ?? [], trigger.identifier)) {
             triggers.push({
               ...trigger,
@@ -4152,8 +4157,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         );
       }
       assertColumnNameAvailable(table, column, current.columns);
+      const dependenciesBefore = await this.captureViewDependencySnapshot();
       await this.executeQuery(sql);
       const stateAfter = await this.readColumnDropTableState(table);
+      assertNoNewBrokenSchemaDependencies(
+        dependenciesBefore,
+        await this.captureViewDependencySnapshot()
+      );
       await this.executeQuery(`RELEASE ${savepointName}`);
       return stateAfter;
     } catch (error) {

@@ -4519,6 +4519,33 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
         });
 
+        await testContext.test('rejects native column additions that activate broken UPDATE OF triggers', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_dormant_rows (id INTEGER, label TEXT); ' +
+                'CREATE VIEW native_dormant_source AS ' +
+                'SELECT id, label FROM native_dormant_rows; ' +
+                'CREATE TABLE native_dormant_events (event_id INTEGER); ' +
+                'CREATE TABLE native_dormant_log (value TEXT); ' +
+                'CREATE TRIGGER native_dormant_update AFTER UPDATE OF activated ' +
+                'ON native_dormant_events BEGIN ' +
+                'INSERT INTO native_dormant_log SELECT label FROM native_dormant_source; END'
+            );
+
+            await engine.editView(
+                'native_dormant_source',
+                'SELECT id FROM native_dormant_rows'
+            );
+            await assert.rejects(
+                engine.addColumn('native_dormant_events', 'activated', 'INTEGER'),
+                /would break existing trigger.*native_dormant_update/is
+            );
+            assert.deepStrictEqual(
+                (await engine.getTableInfo('native_dormant_events'))
+                    .map(column => column.identifier),
+                ['event_id']
+            );
+        });
+
         await testContext.test('rejects native undo and redo that break newer dependent views', async () => {
             const undoBefore = await engine.createView(
                 'native_history_dependency_undo',

@@ -266,6 +266,9 @@ export async function writeDatabaseSnapshotAtomically(
     let primaryError: unknown;
     try {
       if (target.requiresWriteLock) {
+        // Preserve the actionable hot-WAL diagnosis. The same check is repeated
+        // after locking because this preliminary read is not a commit gate.
+        assertNoWalFrames(fs, target.replacementPath);
         writeLock = acquireSqliteWriteLock(target.replacementPath);
       }
       assertTargetUnchanged(fs, target);
