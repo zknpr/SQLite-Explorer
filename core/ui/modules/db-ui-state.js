@@ -31,6 +31,11 @@ const perDbStateDefaults = () => ({
     dbId: null,
     isDbConnected: false,
     isReadOnly: false,
+    // The host retired THIS database's connection (its file was replaced
+    // underneath it) or could not open it; the reason rides its connection
+    // results and belongs to it alone — another database's grid must not
+    // inherit a Reload Database prompt.
+    reloadRequiredReason: null,
     engine: null,
     // Host connection identity and content revision of the database being
     // rendered (state.js). Async UI intents capture both and refuse to

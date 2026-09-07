@@ -110,6 +110,55 @@ describe('viewer connection state', () => {
         }
     });
 
+    it('a reload-required reason forces read-only and a disconnected page gates every mutation control', async () => {
+        const createViewButton = { disabled: false };
+        const pragmaControl = { disabled: false };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                return id === 'btnOpenCreateView' ? createViewButton : null;
+            },
+            querySelectorAll(selector: string) {
+                return selector === '.setting-pragma' ? [pragmaControl] : [];
+            }
+        };
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const connectionStateModulePath = '../../core/ui/modules/connection-state.js';
+        const { state } = await import(stateModulePath);
+        const { applyConnectionResult } = await import(connectionStateModulePath);
+
+        // The host retired the connection (its file was replaced underneath the
+        // engine): still "connected" — the tab exists, Reload is the recovery —
+        // but nothing may edit, whatever the capability flag says.
+        const reason = 'The database file was replaced, moved, deleted, or became unavailable outside SQLite Explorer.';
+        assert.strictEqual(
+            applyConnectionResult({ connected: true, readOnly: false, reloadRequiredReason: reason }),
+            true
+        );
+        assert.strictEqual(state.isDbConnected, true);
+        assert.strictEqual(state.reloadRequiredReason, reason);
+        assert.strictEqual(state.isReadOnly, true);
+        assert.strictEqual(createViewButton.disabled, true);
+        assert.strictEqual(pragmaControl.disabled, true);
+
+        // A malformed reason is no reason.
+        applyConnectionResult({ connected: true, readOnly: false, reloadRequiredReason: 42 });
+        assert.strictEqual(state.reloadRequiredReason, null);
+        assert.strictEqual(state.isReadOnly, false);
+        assert.strictEqual(createViewButton.disabled, false);
+        assert.strictEqual(pragmaControl.disabled, false);
+
+        // Disconnected gates the controls even when the envelope claims writable.
+        assert.strictEqual(applyConnectionResult({ connected: false, readOnly: false }), false);
+        assert.strictEqual(state.isReadOnly, true);
+        assert.strictEqual(createViewButton.disabled, true);
+        assert.strictEqual(pragmaControl.disabled, true);
+
+        // A clean reconnect clears the reason.
+        applyConnectionResult({ connected: true, readOnly: false });
+        assert.strictEqual(state.reloadRequiredReason, null);
+        assert.strictEqual(createViewButton.disabled, false);
+    });
+
     it('fails closed for disconnected or incomplete initialization envelopes', async () => {
         const createViewButton = { disabled: false };
         (globalThis as any).document = {

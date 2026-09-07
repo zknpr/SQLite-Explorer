@@ -648,19 +648,54 @@ test('open → edit → saveToDisk writes exported bytes to the opened path and 
   assert.equal(host.hasUnsavedChanges(), false);
 });
 
-test('openDatabaseViaDialog rejects a file over the maxFileSize cap before reading bytes', async () => {
-  let readCalled = false;
+// The maxFileSize bound is the SHELL's to enforce (read_database_bytes refuses
+// before it allocates, native_open before it spawns): the host's job is to
+// hand the configured bound to both lanes and surface the refusal sentence.
+const SIZE_REFUSAL = "ERR_FILE_TOO_LARGE: File size (5.00 MB) exceeds the maximum allowed size (1.00 MB). "
+  + "Configure 'maxFileSize' in settings.json (0 = unlimited) to increase the limit.";
+const SIZE_SENTENCE = SIZE_REFUSAL.slice('ERR_FILE_TOO_LARGE: '.length);
+
+test('openDatabaseViaDialog hands the configured maxFileSize to the shell read and surfaces its refusal without the code', async () => {
+  const reads: unknown[][] = [];
   const { host } = makeHost(
     {},
     {
       pickDatabase: async () => ({ path: '/tmp/huge.db', name: 'huge.db', size: 5 * 1024 * 1024 }),
-      readDatabaseBytes: async (_p: string) => { readCalled = true; return new Uint8Array([1, 2, 3]); },
-      loadSettings: async () => ({ maxFileSize: 1 })   // 1 MiB cap; picked file reports 5 MiB
+      readDatabaseBytes: async (...args: unknown[]) => { reads.push(args); throw new Error(SIZE_REFUSAL); },
+      loadSettings: async () => ({ maxFileSize: 1 })   // 1 MiB cap
     }
   );
   await host.start();
-  await assert.rejects(() => host.openDatabaseViaDialog(), /maxFileSize/);
-  assert.equal(readCalled, false);   // guard must run before bridge.readDatabaseBytes
+  await assert.rejects(() => host.openDatabaseViaDialog(), (error: Error & { code?: string }) => {
+    assert.equal(error.message, SIZE_SENTENCE);
+    assert.equal(error.code, 'ERR_FILE_TOO_LARGE');
+    return true;
+  });
+  assert.deepEqual(reads, [['/tmp/huge.db', 1024 * 1024]]);     // the bound in bytes rides the read
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['untitled.db']);   // nothing was registered
+});
+
+test('maxFileSize is sanitized before it reaches the shell: 0 = unlimited, non-numbers and negatives fall back to the default, the ceiling is 4000 MiB', async () => {
+  const MIB = 1024 * 1024;
+  for (const [configured, expected] of [
+    [undefined, 4000 * MIB],
+    [0, 0],
+    [1, MIB],
+    [99999, 4000 * MIB],
+    ['abc', 4000 * MIB],
+    [-5, 4000 * MIB],
+    [Number.NaN, 4000 * MIB]
+  ] as Array<[unknown, number]>) {
+    const bounds: unknown[] = [];
+    const { host } = makeHost({}, {
+      readDatabaseBytes: async (_p: string, maxBytes: unknown) => { bounds.push(maxBytes); return new Uint8Array([1]); },
+      loadSettings: async () => (configured === undefined ? {} : { maxFileSize: configured })
+    });
+    await host.start();
+    host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+    await host.openFromShellPath('/tmp/x.db');
+    assert.deepEqual(bounds, [expected], `maxFileSize=${String(configured)}`);
+  }
 });
 
 test('exportDb routes exported bytes through bridge.saveFileAs', async () => {
@@ -1238,27 +1273,47 @@ test('a WASM open alongside a live native database leaves the native sidecar run
   ]);
 });
 
-test('dialog opens skip the maxFileSize cap on the native engine but enforce it on the WASM fallback', async () => {
-  let readCalled = false;
-  const { host } = makeNativeHost({}, {}, {
+test('the configured maxFileSize binds BOTH engines: nativeOpen receives the bound, and its refusal never falls back to WASM', async () => {
+  // A user-selected limit — the VS Code host refuses before choosing an engine
+  // for the same reason: changing engine must not make a refused file admissible.
+  const opens: unknown[][] = [];
+  const reads: unknown[][] = [];
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
+    ping: () => true
+  });
+  let refuse = false;
+  const { host } = makeHost({}, {
+    ...members,
+    nativeOpen: async (...args: unknown[]) => {
+      opens.push(args);
+      if (refuse) throw new Error(SIZE_REFUSAL);
+      return members.nativeOpen(args[0] as string, args[1] as boolean);
+    },
     pickDatabase: async () => ({ path: '/tmp/huge.db', name: 'huge.db', size: 5 * 1024 * 1024 }),
-    readDatabaseBytes: async () => { readCalled = true; return new Uint8Array([1]); },
+    readDatabaseBytes: async (...args: unknown[]) => { reads.push(args); return new Uint8Array([1]); },
     loadSettings: async () => ({ maxFileSize: 1 })
   });
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
-  const opened = await host.openDatabaseViaDialog();    // native: no byte inhaling, no cap
-  assert.equal(opened, true);
-  assert.equal(readCalled, false);
 
-  const { host: wasmHost } = makeNativeHost({}, {}, {
-    pickDatabase: async () => ({ path: '/tmp/huge.db', name: 'huge.db', size: 5 * 1024 * 1024 }),
-    readDatabaseBytes: async () => { readCalled = true; return new Uint8Array([1]); },
-    loadSettings: async () => ({ maxFileSize: 1 })
-  }, { available: false });
-  await wasmHost.start();
-  await assert.rejects(() => wasmHost.openDatabaseViaDialog(), /maxFileSize/);
-  assert.equal(readCalled, false);                      // guard fires before the read
+  refuse = true;
+  await assert.rejects(() => host.openDatabaseViaDialog(), (error: Error & { code?: string }) => {
+    assert.equal(error.message, SIZE_SENTENCE);
+    assert.equal(error.code, 'ERR_FILE_TOO_LARGE');
+    return true;
+  });
+  assert.deepEqual(opens, [['/tmp/huge.db', false, 1024 * 1024]]);   // the bound rides the native open
+  assert.deepEqual(reads, []);                                       // and the refusal is final: no WASM lane
+  assert.equal(log.openedIds.length, 0);
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['untitled.db']);
+
+  // Under the bound the native lane serves as before, still carrying it.
+  refuse = false;
+  assert.equal(await host.openDatabaseViaDialog(), true);
+  assert.deepEqual(opens.at(-1), ['/tmp/huge.db', false, 1024 * 1024]);
+  assert.deepEqual(reads, []);
+  assert.equal((await host.invoke('initialize', []) as Record<string, unknown>).engine, 'native');
 });
 
 test('native txn model: first mutation BEGINs once, save COMMITs without exporting, next mutation BEGINs afresh', async () => {
@@ -1800,6 +1855,11 @@ test('a failed pure-WASM second open before the worker is touched preserves the 
     { exportDatabase: () => new Uint8Array([7]), updateCell: () => 1 },
     {
       pickDatabase: async () => ({ path: '/tmp/huge.db', name: 'huge.db', size: 5 * 1024 * 1024 }),
+      // The shell refuses the oversize read before allocating anything.
+      readDatabaseBytes: async (p: string) => {
+        if (p === '/tmp/huge.db') throw new Error(SIZE_REFUSAL);
+        return new Uint8Array([1, 2, 3]);
+      },
       loadSettings: async () => ({ maxFileSize: 1 })
     }
   );
@@ -1808,7 +1868,7 @@ test('a failed pure-WASM second open before the worker is touched preserves the 
   await host.openFromShellPath('/tmp/keep.db');                  // WASM open (no native bridge)
   await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
 
-  await assert.rejects(() => host.openDatabaseViaDialog(), /maxFileSize/);
+  await assert.rejects(() => host.openDatabaseViaDialog(), /maximum allowed size/);
 
   // The old document survived: still saveable to its own path.
   assert.equal(host.hasUnsavedChanges(), true);
@@ -2145,17 +2205,22 @@ test('init-refusal slice: native open ok, native init refuses, cap fails the WAS
     {
       ...members,
       pickDatabase: async () => ({ path: '/tmp/huge-corrupt.db', name: 'huge-corrupt.db', size: 5 * 1024 * 1024 }),
+      // The shell refuses the WASM lane's oversize read (native init already refused).
+      readDatabaseBytes: async (p: string) => {
+        if (p === '/tmp/huge-corrupt.db') throw new Error(SIZE_REFUSAL);
+        return new Uint8Array([1, 2, 3]);
+      },
       loadSettings: async () => ({ maxFileSize: 1 })
     }
   );
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
-  await host.openFromShellPath('/tmp/precious.db');              // native (shell path: no cap)
+  await host.openFromShellPath('/tmp/precious.db');              // native
   await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
   assert.equal(host.hasUnsavedChanges(), true);
 
   refuseNativeInit = true;
-  await assert.rejects(() => host.openDatabaseViaDialog(), /maxFileSize/);
+  await assert.rejects(() => host.openDatabaseViaDialog(), /maximum allowed size/);
   // Exactly the SECOND sidecar was reaped, by its own id — never the first.
   assert.deepEqual(log.closedIds, [log.openedIds[1]]);
   assert.equal(host.listDatabases().length, 1);                  // no half-built entry survived
@@ -3871,4 +3936,291 @@ test('the import source pick and read ride the bridge, and refuse loudly on a sh
   await old.start();
   await assert.rejects(old.invoke('pickImportSource', []), /shell bridge has no pickImportSource/);
   await assert.rejects(old.invoke('readImportSource', ['/tmp/rows.csv']), /shell bridge has no readImportText/);
+});
+
+// ============================================================================
+// External file replacement — retirement and Reload
+// ============================================================================
+//
+// The SHELL pins each native database's file identity (device + inode) at
+// open and refuses every later native_rpc for that DbId with
+// ERR_NATIVE_FILE_CHANGED once the file at the bound path is no longer that
+// file (an atomic rename over it, a move, a delete). The refusal is a REJECTED
+// bridge promise — the envelope never reached the sidecar — not an in-band
+// worker error, which is what the fakes below model. Ordinary external writes
+// (another process's DML, a WAL checkpoint) keep the inode and never refuse.
+
+const FILE_CHANGED_REFUSAL = 'ERR_NATIVE_FILE_CHANGED: the database file at the bound path is not the file this '
+  + 'sidecar opened (device/inode differ): replaced, moved, or deleted outside SQLite Explorer';
+const FILE_CHANGED_MESSAGE = 'The database file was replaced, moved, deleted, or became unavailable outside SQLite Explorer. '
+  + 'Use Reload Database to open the current file. The previous undo/redo history has been invalidated.';
+
+/**
+ * A native host whose shell can be told to refuse every envelope as
+ * file-changed (`shell.replaced = true`), plus a readDatabaseBytes the test
+ * can fail, so both reload lanes can be driven.
+ */
+function makeReplaceableNativeHost(nativeOpts: { available?: boolean; openError?: string } = {}) {
+  const { txn, exec } = makeTxnFake();
+  const { members, log } = makeNativeBridgeMembers({
+    initializeDatabase: () => { txn.open = false; return { isReadOnly: false, storage: 'memory' }; },
+    runQuery: (args) => exec(args[0]),
+    updateCell: () => 1,
+    undoModification: () => ({ success: true }),
+    fetchSchema: () => ({ tables: [], views: [], indexes: [] }),
+    ping: () => true
+  }, nativeOpts);
+  const shell = { replaced: false, failRead: false };
+  const reads: unknown[][] = [];
+  const refreshes: Array<Record<string, unknown>> = [];
+  const made = makeHost({}, {
+    ...members,
+    nativeRpc: async (dbId: string, json: string) => {
+      if (shell.replaced) throw new Error(FILE_CHANGED_REFUSAL);
+      return members.nativeRpc(dbId, json);
+    },
+    readDatabaseBytes: async (...args: unknown[]) => {
+      reads.push(args);
+      if (shell.failRead) throw new Error('EACCES: permission denied');
+      return new Uint8Array([1, 2, 3]);
+    }
+  });
+  made.host.setWebviewMethods({
+    refreshContent: async (_name: unknown, result: unknown) => {
+      refreshes.push(result as Record<string, unknown>);
+      return { success: true };
+    }
+  });
+  return { ...made, nativeLog: log, txn, shell, reads, refreshes };
+}
+
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+test('the shell\'s ERR_NATIVE_FILE_CHANGED refusal retires the database: typed error, history discarded, sidecar closed, every engine call answers the reason', async () => {
+  const { host, nativeLog, txn, shell, refreshes } = makeReplaceableNativeHost();
+  await host.start();
+  await host.openFromShellPath('/tmp/a.db');
+  const [firstId] = nativeLog.openedIds;
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);   // dirty, session txn open
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(txn.open, true);
+  const before = await host.invoke('initialize', []) as Record<string, unknown>;
+
+  // The file is replaced underneath the sidecar; the NEXT operation is refused
+  // by the shell. A mutation, so the failure also crosses the txn-reconcile
+  // path — which must not fire another envelope at the dead sidecar.
+  shell.replaced = true;
+  const envelopesBefore = nativeLog.envelopes.length;
+  const failure = await host.invoke('updateCell', ['t', 1, 'c', 'w', 'v', 1048576]).then(
+    () => null, (error: Error) => error
+  );
+  assert.ok(failure, 'the mutation must fail');
+  assert.equal(failure!.name, 'DatabaseFileChangedError');
+  assert.equal((failure as { code?: string }).code, 'SQLITE_EXPLORER_DATABASE_FILE_CHANGED');
+  assert.equal(failure!.message, FILE_CHANGED_MESSAGE);
+  assert.equal((failure as { cause?: Error }).cause?.message, FILE_CHANGED_REFUSAL);
+  await settle();
+
+  // Retired: the sidecar is closed (its descriptor pointed at the orphaned
+  // inode), the history is gone, the generation advanced, the page was told.
+  assert.deepEqual(nativeLog.closedIds, [firstId]);
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.deepEqual(host.listDatabases().map(d => [d.name, d.isDirty]), [['a.db', false]]);
+  const retired = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(retired.connected, true);
+  assert.equal(retired.isReadOnly, true);
+  assert.equal(retired.reloadRequiredReason, FILE_CHANGED_MESSAGE);
+  assert.ok((retired.connectionGeneration as number) > (before.connectionGeneration as number));
+  const pushed = refreshes.at(-1)!;
+  assert.equal(pushed.reloadRequiredReason, FILE_CHANGED_MESSAGE);
+  assert.equal(pushed.isReadOnly, true);
+  assert.equal(pushed.connected, true);
+
+  // Every engine-bound method answers the reason, and nothing more reaches the
+  // bridge — the reconcile probe included (exactly the refused envelope's
+  // worth of traffic happened, and that never reached the fake's handlers).
+  const envelopesAfter = nativeLog.envelopes.length;
+  assert.equal(envelopesAfter, envelopesBefore);
+  for (const [method, args] of [
+    ['updateCell', ['t', 1, 'c', 'x', 'w', 1048576]],
+    ['fetchSchema', []],
+    ['runConsole', ['SELECT 1', {}]],
+    ['exportDb', ['a.db']],
+    ['triggerUndo', []],
+    ['setPragma', ['journal_mode', 'wal']]
+  ] as Array<[string, unknown[]]>) {
+    await assert.rejects(() => host.invoke(method, args), { name: 'DatabaseFileChangedError' }, method);
+  }
+  assert.equal(nativeLog.envelopes.length, envelopesAfter);
+  // ⌘S names the reason and the remedy, never "Saved".
+  assert.deepEqual(await host.saveToDisk(), {
+    success: false, reason: 'read-only', savedAs: 'a.db', message: FILE_CHANGED_MESSAGE
+  });
+  // Settings and other host-only methods still answer.
+  assert.equal(typeof await host.invoke('getExtensionSettings', []), 'object');
+});
+
+test('Reload of a retired database reopens the same file in place: a fresh sidecar, the same entry, clean history, no transaction', async () => {
+  const { host, nativeLog, txn, shell } = makeReplaceableNativeHost();
+  await host.start();
+  await host.openFromShellPath('/tmp/a.db');
+  const dbId = host.activeDatabaseId();
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+  shell.replaced = true;
+  await assert.rejects(() => host.invoke('fetchSchema', []), { name: 'DatabaseFileChangedError' });
+  await settle();
+
+  // The replacement settled; the user clicks Reload Database (sidebar.js
+  // reloadFromDisk → backendApi.refreshFile).
+  shell.replaced = false;
+  const reloaded = await host.invoke('refreshFile', []) as Record<string, unknown>;
+  assert.deepEqual(reloaded, {
+    connected: true, filename: 'a.db', readOnly: false,
+    connectionGeneration: reloaded.connectionGeneration
+  });
+  assert.equal(nativeLog.openedIds.length, 2, 'a NEW sidecar, through nativeOpen (the allowlist and OpenFiles gates)');
+  assert.deepEqual(nativeLog.opens.at(-1), { path: '/tmp/a.db', readOnly: false });
+  assert.equal(host.activeDatabaseId(), dbId, 'the same entry');
+  assert.equal(host.listDatabases().length, 1);
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.reloadRequiredReason, undefined);
+  assert.equal(init.isReadOnly, false);
+  assert.equal(init.engine, 'native');
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.equal(txn.open, false);
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: false, reason: 'empty' });
+
+  // …and it is a working database again: edits, undo, save on the new sidecar.
+  await host.invoke('updateCell', ['t', 1, 'c', 'x', 'v', 1048576]);
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(txn.open, true);
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: true });
+  assert.equal((await host.saveToDisk()).success, true);
+  assert.deepEqual(nativeLog.envelopeIds.slice(-3).every(id => id === nativeLog.openedIds[1]), true,
+    'every envelope after the reload is addressed to the NEW sidecar');
+});
+
+test('a failed reopen keeps the database retired with the NEW reason; a later Reload can still succeed (and may land on WASM)', async () => {
+  const nativeOpts: { available?: boolean; openError?: string } = {};
+  const { host, nativeLog, shell, reads } = makeReplaceableNativeHost(nativeOpts);
+  await host.start();
+  await host.openFromShellPath('/tmp/a.db');
+  shell.replaced = true;
+  await assert.rejects(() => host.invoke('fetchSchema', []), { name: 'DatabaseFileChangedError' });
+  await settle();
+  shell.replaced = false;
+
+  // The file is gone for now: the native bind fails, the WASM read fails.
+  nativeOpts.openError = 'ERR_NATIVE_PATH_NOT_ALLOWED: cannot resolve /tmp/a.db';
+  shell.failRead = true;
+  await assert.rejects(() => host.invoke('refreshFile', []), /EACCES/);
+  assert.deepEqual(reads.map(r => r[0]), ['/tmp/a.db']);
+  const stillRetired = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.match(String(stillRetired.reloadRequiredReason), /EACCES/);
+  assert.equal(stillRetired.isReadOnly, true);
+  assert.equal(host.listDatabases().length, 1, 'the tab stays');
+  await assert.rejects(() => host.invoke('fetchSchema', []), /EACCES/);
+  assert.equal(nativeLog.openedIds.length, 1, 'no sidecar was bound');
+
+  // The file is back but the native bind still fails: the reload falls back to
+  // the WASM lane, exactly like a first open would.
+  shell.failRead = false;
+  const reloaded = await host.invoke('refreshFile', []) as Record<string, unknown>;
+  assert.equal(reloaded.connected, true);
+  assert.equal(reloaded.reloadRequiredReason, undefined);
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.engine, 'wasm');
+  assert.equal(init.reloadRequiredReason, undefined);
+  assert.equal(host.listDatabases().length, 1);
+});
+
+test('opening a retired database\'s path again reopens it in place instead of switching to its error state or adding a second entry', async () => {
+  const { host, nativeLog, shell } = makeReplaceableNativeHost();
+  await host.start();
+  await host.openFromShellPath('/tmp/a.db');
+  const dbId = host.activeDatabaseId();
+  shell.replaced = true;
+  await assert.rejects(() => host.invoke('fetchSchema', []), { name: 'DatabaseFileChangedError' });
+  await settle();
+  shell.replaced = false;
+
+  assert.equal(await host.openFromShellPath('/tmp/a.db'), true);
+  assert.equal(host.listDatabases().length, 1);
+  assert.equal(host.activeDatabaseId(), dbId);
+  assert.equal(nativeLog.openedIds.length, 2);
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.reloadRequiredReason, undefined);
+  assert.equal(init.engine, 'native');
+});
+
+test('retirement is per database: the other open databases keep serving, and closing a retired tab is clean', async () => {
+  const { host, nativeLog, shell } = makeReplaceableNativeHost();
+  await host.start();
+  await host.openFromShellPath('/tmp/a.db');
+  const dbA = host.activeDatabaseId()!;
+  await host.openFromShellPath('/tmp/b.db');
+  const dbB = host.activeDatabaseId()!;
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);   // B is dirty
+
+  // Only A's shell refusals: the fake refuses everything, so scope it by
+  // activating A first and restoring afterwards.
+  await host.setActiveDb(dbA);
+  shell.replaced = true;
+  await assert.rejects(() => host.invoke('fetchSchema', []), { name: 'DatabaseFileChangedError' });
+  shell.replaced = false;
+  await settle();
+  assert.deepEqual(nativeLog.closedIds, [nativeLog.openedIds[0]]);
+
+  await host.setActiveDb(dbB);
+  assert.equal(host.hasUnsavedChanges(), true, 'B\'s pending edit survived A\'s retirement');
+  assert.deepEqual(await host.invoke('fetchSchema', []), { tables: [], views: [], indexes: [] });
+  const initB = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(initB.reloadRequiredReason, undefined);
+
+  // Closing the retired tab: nothing to close on the shell (already closed),
+  // no double close, B stays.
+  assert.equal(await host.closeDatabase(dbA), true);
+  assert.deepEqual(nativeLog.closedIds, [nativeLog.openedIds[0]]);
+  assert.deepEqual(host.listDatabases().map(d => d.name), ['b.db']);
+});
+
+test('a WASM save the shell refuses as stale (ERR_FILE_CHANGED) surfaces the sentence and leaves the edits pending and the connection live', async () => {
+  const refusal = 'ERR_FILE_CHANGED: The database file changed on disk since it was opened or last saved. '
+    + 'Your unsaved changes remain available. Use File > Export Database to save them to a different file, '
+    + 'or Reload Database to open the current file.';
+  let stale = true;
+  let writes = 0;
+  const { host } = makeHost(
+    { updateCell: () => 1, exportDatabase: () => new Uint8Array([9]) },
+    { saveDatabase: async () => { if (stale) throw new Error(refusal); writes += 1; } }
+  );
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/w.db');                     // WASM (no native bridge)
+  await host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]);
+
+  await assert.rejects(() => host.saveToDisk(), (error: Error) => {
+    assert.equal(error.message, refusal.slice('ERR_FILE_CHANGED: '.length));
+    return true;
+  });
+  // Nothing was lost and nothing was retired: the image predates another
+  // writer's changes, so the WRITE was refused — the connection is fine.
+  assert.equal(host.hasUnsavedChanges(), true);
+  const init = await host.invoke('initialize', []) as Record<string, unknown>;
+  assert.equal(init.reloadRequiredReason, undefined);
+  assert.equal(init.isReadOnly, false);
+  assert.deepEqual(host.listDatabases().map(d => [d.name, d.isDirty]), [['w.db', true]]);
+
+  // After the user reloads (or the file settles), the same save goes through.
+  stale = false;
+  assert.deepEqual(await host.saveToDisk(), { success: true, savedAs: 'w.db' });
+  assert.equal(writes, 1);
+  assert.equal(host.hasUnsavedChanges(), false);
+});
+
+test('the reload-required reason is per-database UI state', () => {
+  assert.equal(PER_DB_STATE_FIELDS.includes('reloadRequiredReason'), true,
+    'a retired database\'s Reload prompt must not follow the user to another tab');
+  assert.equal(GLOBAL_STATE_FIELDS.includes('reloadRequiredReason'), false);
+  assert.equal(TRANSIENT_STATE_FIELDS.includes('reloadRequiredReason'), false);
 });

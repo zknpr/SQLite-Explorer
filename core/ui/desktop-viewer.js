@@ -407,6 +407,15 @@ async function refreshContentOnce(filename, connectionResult) {
     state.activeCellInput = null;
     updateToolbarButtons();
     try {
+        if (state.reloadRequiredReason) {
+            // The host retired this connection (rpc.js twin): its file was
+            // replaced, moved or deleted underneath the engine, or a reopen
+            // failed. Fetching the schema would only fail again and paint over
+            // the one action that recovers it — the Reload Database button.
+            showErrorState(state.reloadRequiredReason);
+            updateStatus('Reload Database to open the current file.');
+            return { success: false, reloadRequired: true };
+        }
         if (state.isDbConnected) {
             if (connectionReplaced) {
                 // The reopen replaced the logical database even when table
@@ -598,13 +607,16 @@ async function initializeApp() {
         );
         initDragAndDrop();
         initViews();
+        // The mutation controls start disabled and only a connection result
+        // enables them — the same gate the VS Code entry point applies.
+        updateMutationControlCapabilities();
 
         updateStatus('Connecting to database...');
 
         // Initialize connection - the desktop host handles this
         const result = await backendApi.initialize();
         if (!applyConnectionResult(result)) {
-            throw new Error('Failed to connect to database');
+            throw new Error(state.reloadRequiredReason || 'Failed to connect to database');
         }
         updateEngineBadge(result.engine);
 

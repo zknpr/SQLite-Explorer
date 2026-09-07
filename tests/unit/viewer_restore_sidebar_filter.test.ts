@@ -101,6 +101,7 @@ it('restores and renders a saved sidebar filter without a selected table', async
                                 ${harness}.state.isDbConnected = !!result?.connected;
                                 return ${harness}.state.isDbConnected;
                             }
+                            export function updateMutationControlCapabilities() {}
                         `,
                         './modules/global-shortcuts.js': `
                             export function setupGlobalShortcuts() { ${harness}.completed.resolve(); }

@@ -835,7 +835,7 @@ export async function selectTableItem(name, type) {
 }
 
 export async function reloadFromDisk() {
-    if (!state.isDbConnected || isReloadingFromDisk) return;
+    if ((!state.isDbConnected && !state.reloadRequiredReason) || isReloadingFromDisk) return;
 
     isReloadingFromDisk = true;
 
@@ -911,6 +911,10 @@ export async function reloadFromDisk() {
             updateStatus('Reload cancelled');
         } else {
             updateStatus(`Reload failed: ${message}`);
+            if (!state.isDbConnected) {
+                state.reloadRequiredReason = message;
+                showErrorState(message);
+            }
         }
     } finally {
         isReloadingFromDisk = false;

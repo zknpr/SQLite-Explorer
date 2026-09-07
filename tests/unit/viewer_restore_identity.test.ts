@@ -148,6 +148,7 @@ it('restores a saved table identity before loading its columns or data', async (
                                 ${harness}.state.isDbConnected = !!result?.connected;
                                 return ${harness}.state.isDbConnected;
                             }
+                            export function updateMutationControlCapabilities() {}
                         `,
                         './modules/global-shortcuts.js': 'export function setupGlobalShortcuts() {}'
                     };

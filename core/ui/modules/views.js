@@ -13,6 +13,7 @@ import { invalidateAllCounts } from './count-cache.js';
 import { saveHint } from './platform.js';
 import {
     isViewDefinitionConflictError,
+    isViewSourceChangedError,
     isViewDefinitionSnapshotCurrent,
     isViewTriggerSnapshotCurrent
 } from '../../../src/core/view-utils.ts';
@@ -25,6 +26,7 @@ let activeViewModalSession = 0;
 let activePreviewRequest = 0;
 let activeViewConnectionGeneration = 0;
 let activeViewContentGeneration = 0;
+let viewSourceRequiresReload = false;
 const savingViewSessions = new Set();
 const droppingViews = new Set();
 
@@ -146,17 +148,24 @@ function applyViewDefinitionToEditor(definition) {
 }
 
 function hideReloadDefinitionOffer() {
+    viewSourceRequiresReload = false;
     const reloadLatest = getElements().reloadLatest;
     if (reloadLatest) reloadLatest.hidden = true;
 }
 
-function showDefinitionConflict() {
+function showDefinitionConflict(sourceChanged = false) {
+    viewSourceRequiresReload = sourceChanged;
     setFeedback(
-        'This view changed outside this editor. Your draft was not saved. Reload the latest definition before saving again.',
+        sourceChanged
+            ? 'The database file changed on disk. Your draft was not saved. Reload Database to read the latest definition; unsaved database changes require confirmation.'
+            : 'This view changed outside this editor. Your draft was not saved. Reload the latest definition before saving again.',
         true
     );
     const reloadLatest = getElements().reloadLatest;
-    if (reloadLatest) reloadLatest.hidden = false;
+    if (reloadLatest) {
+        reloadLatest.hidden = false;
+        reloadLatest.textContent = sourceChanged ? 'Reload Database' : 'Reload Latest Definition';
+    }
 }
 
 export function initViews() {
@@ -410,7 +419,8 @@ async function saveDraft() {
         }
     } catch (err) {
         if (isCurrentModalSession(modalSession)) {
-            if (targetView && isViewDefinitionConflictError(err)) showDefinitionConflict();
+            if (targetView && isViewSourceChangedError(err)) showDefinitionConflict(true);
+            else if (targetView && isViewDefinitionConflictError(err)) showDefinitionConflict();
             else setFeedback(getErrorMessage(err), true);
         }
         if (modalSession === activeViewModalSession) updateStatus(`Error: ${getErrorMessage(err)}`);
@@ -440,6 +450,16 @@ async function reloadLatestViewDefinition() {
     }
     if (elements.reloadLatest) elements.reloadLatest.disabled = true;
     try {
+        if (viewSourceRequiresReload) {
+            // A WASM snapshot cannot reload just one schema object without
+            // discarding or merging unrelated edits. Use the document's guarded
+            // Reload flow and keep the draft intact if its prompt is cancelled.
+            await backendApi.refreshFile();
+            if (state.contentRefreshPromise) await state.contentRefreshPromise;
+            if (isCurrentModalSession(modalSession)) closeModal('viewModal');
+            updateStatus(`Database reloaded. Reopen "${targetView}" to review its latest definition.`);
+            return;
+        }
         setFeedback('Loading the latest view definition...');
         const definition = await backendApi.getViewDefinition(targetView);
         if (!isCurrentModalSession(modalSession) || editingViewName !== targetView) return;
@@ -450,7 +470,9 @@ async function reloadLatestViewDefinition() {
         setFeedback('Latest definition loaded. Review it before saving.');
     } catch (err) {
         if (isCurrentModalSession(modalSession) && editingViewName === targetView) {
-            setFeedback(getErrorMessage(err), true);
+            const message = getErrorMessage(err);
+            setFeedback(/^(Canceled|Cancelled)$/i.test(message)
+                ? 'Reload cancelled. Your draft is unchanged.' : message, true);
         }
     } finally {
         if (isCurrentModalSession(modalSession) && editingViewName === targetView) {

@@ -5,6 +5,7 @@ import { state, persistState } from './state.js';
 import { backendApi, getVsCodeState } from './api.js';
 import { escapeHtml, getErrorMessage } from './utils.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
+import { reloadFromDisk } from './sidebar.js';
 
 export function updateStatus(message) {
     const el = document.getElementById('statusText');
@@ -42,10 +43,17 @@ export function showErrorState(message) {
         container.innerHTML = `
             <div class="empty-view">
                 <span class="empty-icon codicon codicon-error error-icon"></span>
-                <span class="empty-title">Error</span>
-                <span class="empty-desc">${escapeHtml(message)}</span>
+                <span class="empty-title">${state.reloadRequiredReason ? (state.isDbConnected ? 'Reload required' : 'Database not opened') : 'Error'}</span>
+                <span class="empty-desc">${escapeHtml(state.reloadRequiredReason || message)}</span>
+                ${state.reloadRequiredReason ? `<button id="btnReloadDatabase" class="btn-primary">${state.isDbConnected ? 'Reload Database' : 'Retry Connection'}</button>` : ''}
             </div>
         `;
+        document.getElementById('btnReloadDatabase')?.addEventListener('click', async event => {
+            const button = event.currentTarget;
+            button.disabled = true;
+            try { await reloadFromDisk(); }
+            finally { button.disabled = false; }
+        });
     }
 }
 

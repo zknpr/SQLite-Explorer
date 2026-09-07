@@ -75,6 +75,10 @@ export const state = {
     dbId: null,
     isDbConnected: false,
     isReadOnly: false,
+    // Why the host retired (or never established) this database's connection
+    // — the message the grid's error state shows next to its Reload Database
+    // button. Null while the connection is live.
+    reloadRequiredReason: null,
     // Which engine serves the current open: 'native' (tjs sidecar) or 'wasm'.
     // Desktop-only — set by desktop-viewer.js from the host's connection
     // results; stays null in the VS Code webview and the web demo.

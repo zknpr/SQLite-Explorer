@@ -20,10 +20,10 @@ const MUTATION_CONTROL_IDS = [
 export function updateMutationControlCapabilities() {
     for (const id of MUTATION_CONTROL_IDS) {
         const control = document.getElementById(id);
-        if (control) control.disabled = state.isReadOnly || state.isRefreshingContent;
+        if (control) control.disabled = !state.isDbConnected || state.isReadOnly || state.isRefreshingContent;
     }
     for (const control of document.querySelectorAll?.('.setting-pragma') ?? []) {
-        control.disabled = state.isReadOnly || state.isRefreshingContent;
+        control.disabled = !state.isDbConnected || state.isReadOnly || state.isRefreshingContent;
     }
 }
 
@@ -31,10 +31,12 @@ export function updateMutationControlCapabilities() {
 export function applyConnectionResult(result) {
     const connected = result?.connected === true;
     state.isDbConnected = connected;
+    state.reloadRequiredReason = typeof result?.reloadRequiredReason === 'string'
+        ? result.reloadRequiredReason : null;
     // `readOnly` is the host bridge contract. Keep the older demo envelope key
     // compatible while its built-in client continues to send a writable result.
     // A missing or malformed capability flag must never grant write access.
-    state.isReadOnly = typeof result?.readOnly === 'boolean'
+    state.isReadOnly = !connected || state.reloadRequiredReason ? true : typeof result?.readOnly === 'boolean'
         ? result.readOnly
         : typeof result?.isReadOnly === 'boolean'
             ? result.isReadOnly

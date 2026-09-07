@@ -25,9 +25,23 @@ export interface PickedDatabase {
  */
 export interface DesktopHostBridge {
     pickDatabase(): Promise<PickedDatabase | null>;
-    /** `path` must be session-allowlisted (previously picked/opened). */
-    readDatabaseBytes(path: string): Promise<Uint8Array>;
-    /** Writes `bytes` to `path` atomically. */
+    /**
+     * `path` must be session-allowlisted (previously picked/opened).
+     * `maxBytes` is the configured maxFileSize in bytes (0 = unlimited): the
+     * shell refuses a larger file BEFORE reading it (`ERR_FILE_TOO_LARGE`),
+     * so the cap never means "read it all, then refuse". The shell also
+     * records the file's on-disk generation (device, inode, size, mtime,
+     * ctime) for this window; `saveDatabase` compares against it.
+     */
+    readDatabaseBytes(path: string, maxBytes?: number): Promise<Uint8Array>;
+    /**
+     * Writes `bytes` to `path` atomically — REFUSING (`ERR_FILE_CHANGED`) when
+     * the file's on-disk generation is not the one this window last read or
+     * wrote: the in-memory image predates another writer's changes, and
+     * writing it back would silently discard them. The image stays intact;
+     * the page reports the sentence, whose remedies are Export (a copy) or
+     * Reload. A successful write re-records the new generation.
+     */
     saveDatabase(path: string, bytes: Uint8Array): Promise<void>;
     /**
      * EXPORT route: save dialog → atomic write → the chosen path (null when the
@@ -134,8 +148,20 @@ export interface DesktopHostBridge {
      *
      * The shell does NOT de-duplicate: opening one file twice yields two ids
      * and two writable sidecars. The host de-duplicates by path instead.
+     *
+     * `maxBytes` is the configured maxFileSize in bytes (0 = unlimited); a
+     * larger file is refused with `ERR_FILE_TOO_LARGE` before any sidecar is
+     * spawned — the same limit `readDatabaseBytes` enforces, so no engine can
+     * admit a file the other refused.
+     *
+     * The shell pins the file's identity (device + inode) at open and refuses
+     * every later `nativeRpc` for this `dbId` with `ERR_NATIVE_FILE_CHANGED`
+     * once the file at the bound path is no longer that file (replaced by an
+     * atomic rename, moved, deleted). Ordinary writes by another process keep
+     * the inode and never trigger it. The host retires the database on that
+     * refusal; `refreshFile` reopens it.
      */
-    nativeOpen?(path: string, readOnly: boolean): Promise<{ dbId: string; boundPath: string }>;
+    nativeOpen?(path: string, readOnly: boolean, maxBytes?: number): Promise<{ dbId: string; boundPath: string }>;
     /**
      * Frames one request envelope (the worker protocol, JSON-encoded with the
      * frame-codec value markers) to `dbId`'s sidecar and resolves the response
@@ -199,9 +225,14 @@ export interface OpenDatabase {
  */
 export interface SaveResult {
     success: boolean;
-    /** Basename of the file written. Present exactly when `success` is true. */
+    /**
+     * Basename of the file written when `success` is true; the database's own
+     * name when the save was refused for a stated `message`.
+     */
     savedAs?: string;
-    reason?: 'cancelled' | 'no-database';
+    reason?: 'cancelled' | 'no-database' | 'read-only';
+    /** Why nothing was saved, for `read-only` (including a retired connection). */
+    message?: string;
 }
 
 /** Options accepted by {@link createDesktopHost}. */

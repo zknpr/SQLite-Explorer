@@ -51,6 +51,13 @@ async function refreshContentOnce(filename, connectionResult) {
     state.activeCellInput = null;
     updateToolbarButtons();
     try {
+      if (state.reloadRequiredReason) {
+        // The host has retired this connection. Fetching its schema can only
+        // fail again and hide the action needed to recover it.
+        showErrorState(state.reloadRequiredReason);
+        updateStatus('Reload Database to open the current file.');
+        return { success: false, reloadRequired: true };
+      }
       if (state.isDbConnected) {
         if (connectionReplaced) {
             clearSelection();

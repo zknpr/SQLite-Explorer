@@ -26,9 +26,21 @@ import { ModificationTracker, estimateUndoMemoryBytes } from '../../../src/core/
 // beside the message; rebuilding the typed error is what lets desktop-api.js
 // re-enter the oversized-replacement confirmation instead of failing the edit.
 import { fromCellEditRpcErrorData } from '../../../src/core/cell-edit-policy.ts';
+// The typed refusal the VS Code host raises when a native handle no longer
+// names the file the user opened; the desktop raises the same one so the shared
+// UI's Reload Database flow (state.reloadRequiredReason) reads identically.
+import { DatabaseFileChangedError } from '../../../src/core/database-file-changed.ts';
 
 const DEFAULT_SETTINGS = Object.freeze({
-    maxFileSize: 200,
+    // MiB. Enforced by the SHELL at open on BOTH engines (native_open and
+    // read_database_bytes both refuse a larger file before spawning or
+    // reading anything), like the VS Code host's maxFileSize, which refuses
+    // before choosing an engine: a user-selected limit that changing engine
+    // cannot lift. The desktop's default is the setting's ceiling
+    // (MAX_FILE_SIZE_MB) rather than the extension's 200: its primary engine
+    // maps the file instead of inhaling it, so a 400 MiB database is the
+    // flagship case, not the failure case. 0 = unlimited.
+    maxFileSize: 4000,
     defaultPageSize: 5000,
     instantCommit: 'never',
     doubleClickBehavior: 'inline',
@@ -87,6 +99,30 @@ const DESKTOP_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
 const NATIVE_IMPORT_RESULT_BYTES = MAX_FRAME_BYTES - 2 * 1024 * 1024;
 
 const STARTUP_DB_NAME = 'untitled.db';
+
+/** The largest maxFileSize a user can express, in MiB (src/config.ts MAX_FILE_SIZE_MB). */
+const MAX_FILE_SIZE_MB = 4000;
+const MIB = 1024 * 1024;
+
+// Structured refusals the shell answers with a stable code prefix. The host
+// branches on the code; the user sees the sentence after it.
+const SHELL_ERROR_CODE = /^ERR_[A-Z_]+:\s*/;
+const errorText = (error) => String(error?.message ?? error);
+const shellErrorText = (error) => errorText(error).replace(SHELL_ERROR_CODE, '');
+const isShellError = (error, code) => {
+    const text = errorText(error);
+    return text === code || text.startsWith(`${code}:`);
+};
+/** The configured maxFileSize refusal, with the shell's sentence and a stable code for callers. */
+const sizeRefusal = (error) => Object.assign(
+    new Error(shellErrorText(error), { cause: error }),
+    { code: 'ERR_FILE_TOO_LARGE' }
+);
+
+// The two host methods a RETIRED database (its engine is gone — see
+// retireEntry) still answers: one reports the reason, the other is the
+// recovery. Every engine-bound method throws the reason instead.
+const RETIRED_ENTRY_METHODS = new Set(['initialize', 'refreshFile']);
 
 /**
  * How many databases may be open at once.
@@ -183,6 +219,15 @@ export function createDesktopHost({ bridge, createWorker }) {
             // is its own connection: a global counter would let a reload of
             // one database invalidate what another's modal captured.
             connectionGeneration: 0,
+            // Set when this database's connection was RETIRED: the shell
+            // refused an envelope because the file the sidecar was bound to
+            // is no longer the file at that path (device/inode differ), or a
+            // reopen failed. The engine is gone (worker/nativeDbId null), the
+            // history was discarded, and every engine-bound method answers
+            // with this error until refreshFile reopens the file — the page
+            // shows its message beside a Reload Database button
+            // (state.reloadRequiredReason). Null while the connection is live.
+            invalidatedError: null,
             currentPath: currentPath ?? null,   // absolute path on disk (null = no write-back target)
             currentName: currentName,
             // The session transaction: the native engine executes against the
@@ -211,6 +256,27 @@ export function createDesktopHost({ bridge, createWorker }) {
         && typeof bridge.nativeOpen === 'function'
         && typeof bridge.nativeRpc === 'function'
         && typeof bridge.nativeClose === 'function';
+
+    /**
+     * The configured open bound in BYTES, 0 meaning unlimited — the value both
+     * shell open paths receive. settings.json is webview-writable and may hold
+     * anything: a non-number, NaN, Infinity or a negative value would disable
+     * every `size > limit` comparison, so those fall back to the default
+     * (src/config.ts getMaximumFileSizeBytes applies the same rule), and the
+     * ceiling is the largest value the setting can express.
+     */
+    function maxFileSizeBytes() {
+        const configured = settings.maxFileSize;
+        if (typeof configured !== 'number' || !Number.isFinite(configured) || configured < 0) {
+            return DEFAULT_SETTINGS.maxFileSize * MIB;
+        }
+        return Math.min(configured, MAX_FILE_SIZE_MB) * MIB;
+    }
+
+    /** The reload-required half of a connection result — present only for a retired entry. */
+    const reloadRequired = (entry) => (
+        entry.invalidatedError ? { reloadRequiredReason: entry.invalidatedError.message } : {}
+    );
 
     // ---- worker RPC ---------------------------------------------------------
 
@@ -281,6 +347,10 @@ export function createDesktopHost({ bridge, createWorker }) {
     }
 
     function callWorker(entry, method, args, { maxBinaryBytes, transfer } = {}) {
+        // A retired connection answers every call with the reason it was
+        // retired (the VS Code host rethrows its invalidated error the same
+        // way) — never "closed", which would read as a host bug.
+        if (entry.invalidatedError) throw entry.invalidatedError;
         // Refuse BEFORE a pending entry is registered. A closed database's
         // transport is gone (worker terminated / sidecar id surrendered), and
         // discovering that inside the Promise executor below would reject the
@@ -343,10 +413,24 @@ export function createDesktopHost({ bridge, createWorker }) {
                             + '(foreign messageId or database)'
                         ));
                     },
-                    (error) => rejectPending(
-                        messageId,
-                        error instanceof Error ? error : new Error(String(error))
-                    )
+                    (error) => {
+                        const failure = error instanceof Error ? error : new Error(String(error));
+                        if (isShellError(failure, 'ERR_NATIVE_FILE_CHANGED')) {
+                            // The shell refused to forward: the file at the
+                            // bound path is not the file this sidecar opened.
+                            // Retire synchronously-first so the caller's own
+                            // failure handling (the txn reconcile probe
+                            // included) sees a retired entry rather than
+                            // racing another envelope at the dead sidecar.
+                            const changed = new DatabaseFileChangedError({ cause: failure });
+                            retireEntry(entry, changed).catch(retireError => {
+                                console.warn('Retiring a replaced database failed:', retireError);
+                            });
+                            rejectPending(messageId, changed);
+                            return;
+                        }
+                        rejectPending(messageId, failure);
+                    }
                 );
             } else if (transfer?.length) {
                 entry.worker.postMessage(message, transfer);
@@ -360,7 +444,8 @@ export function createDesktopHost({ bridge, createWorker }) {
         const fullConfig = { queryTimeout: settings.queryTimeout, ...config };
         // Database bytes may legitimately exceed the standard 16 MiB inline cap;
         // bound them by the user's maxFileSize setting instead (0 = unlimited).
-        const capBytes = settings.maxFileSize > 0 ? settings.maxFileSize * 1024 * 1024 : Number.MAX_SAFE_INTEGER;
+        // The shell already refused a larger read; this is the in-page belt.
+        const capBytes = maxFileSizeBytes() || Number.MAX_SAFE_INTEGER;
         const transfer = fullConfig.content ? [fullConfig.content.buffer] : undefined;
         const result = await callWorker(entry, 'initializeDatabase', [name, fullConfig], {
             maxBinaryBytes: capBytes,
@@ -523,6 +608,9 @@ export function createDesktopHost({ bridge, createWorker }) {
      * needs — secondary probe/refresh failures are logged, never propagated.
      */
     async function reconcileTxnAfterMutationFailure(entry) {
+        // A retired connection has no engine to probe and no pending edits
+        // left to describe — the retirement already reset both.
+        if (entry.invalidatedError) return;
         if (entry.engine !== 'native' || !entry.nativeTxnOpen) return;
         try {
             if (await probeTxnOpen(entry)) return;
@@ -791,9 +879,48 @@ export function createDesktopHost({ bridge, createWorker }) {
                 connected: true,
                 engine: entry.engine,
                 connectionGeneration: entry.connectionGeneration,
-                ...entry.connectionInfo
+                ...entry.connectionInfo,
+                ...reloadRequired(entry)
             }
         ]);
+    }
+
+    /**
+     * Retires ONE database's connection: the shell refused an envelope with
+     * ERR_NATIVE_FILE_CHANGED because the file at the sidecar's bound path is
+     * no longer the file it opened — its device/inode differ (an atomic
+     * rename over it, a move, a delete). The sidecar's descriptor still
+     * points at the OLD inode, so every further statement — a COMMIT above
+     * all — would land where the user can never see it. The VS Code host's
+     * answer (nativeWorker.ts retireConnection, databaseModel.ts
+     * #observeConnectionInvalidation) is reproduced here: the engine is
+     * closed, the undo/redo history is discarded (it describes a file that is
+     * gone), the connection generation advances so open modals refuse to
+     * complete, and the page is told the reason so it can offer Reload
+     * Database. Idempotent — the first refusal wins; in-flight calls fail
+     * with the same error.
+     *
+     * Ordinary external writes never reach here: another process's DML, a
+     * WAL checkpoint or a VACUUM keep the inode, and the shell compares
+     * device+inode ONLY — deliberately not size or mtime, which change on
+     * every ordinary SQLite write.
+     */
+    async function retireEntry(entry, error) {
+        if (entry.invalidatedError) return;
+        entry.invalidatedError = error;
+        entry.connectionGeneration += 1;
+        entry.connectionInfo = { isReadOnly: true };
+        entry.tracker = new ModificationTracker(100, settings.maxUndoMemory);
+        entry.nativeTxnOpen = false;
+        entry.cellReadSessionOpen = false;
+        failEntryPendingCalls(entry, error);
+        // The sidecar's open transaction targeted the orphaned inode; closing
+        // it rolls that back by journal semantics and releases the shell's
+        // native hold. The page's own hold (the open-path push) keeps the
+        // file reserved for this window until Reload or close.
+        await disposeEntryTransport(entry);
+        updateTitle();
+        await refreshUi(entry);
     }
 
     function updateTitle() {
@@ -829,7 +956,20 @@ export function createDesktopHost({ bridge, createWorker }) {
             return true;
         }
         const bytes = await callWorker(entry, 'exportDatabase', [entry.currentName]);
-        await bridge.saveDatabase(entry.currentPath, bytes);
+        try {
+            await bridge.saveDatabase(entry.currentPath, bytes);
+        } catch (error) {
+            // The shell refuses to write over a file whose on-disk generation
+            // moved since this window read (or last wrote) it — the in-memory
+            // image predates another writer's changes, and writing it back
+            // would silently discard them. The image and its history are
+            // intact; only the write was refused, and the sentence names
+            // both remedies (export a copy, or reload).
+            if (isShellError(error, 'ERR_FILE_CHANGED')) {
+                throw new Error(shellErrorText(error), { cause: error });
+            }
+            throw error;
+        }
         await entry.tracker.createCheckpoint();
         updateTitle();
         return true;
@@ -1097,6 +1237,37 @@ export function createDesktopHost({ bridge, createWorker }) {
      * proceeds down the WASM lane with no half-open sidecar left behind.
      */
     async function tryOpenNative(path, name) {
+        const opened = await bindNativeSidecar(path);
+        if (!opened) return null;
+        const entry = createEntry({
+            engine: 'native',
+            nativeDbId: opened.dbId,
+            nativeBoundPath: opened.boundPath,
+            currentPath: path,
+            currentName: name
+        });
+        try {
+            await initializeWorkerDatabase(entry, name, { path: opened.boundPath, readOnlyMode: false });
+            return entry;
+        } catch (error) {
+            console.warn(`Native initializeDatabase failed for ${path}; falling back to the WASM engine:`, error);
+            // Never leave a half-open sidecar behind the fallback.
+            await disposeEntryTransport(entry);
+            return null;
+        }
+    }
+
+    /**
+     * The bridge half of a native open: the shell binds a NEW sidecar to
+     * `path` and hands back its routing token plus the canonical path it is
+     * bound to. Resolves null on every failure the WASM lane can still serve
+     * (allowlist refusal, symlinked final component, spawn/handshake failure,
+     * the shell's open cap, version skew) — and THROWS on the one it cannot:
+     * the configured maxFileSize refusal is a user-selected limit that binds
+     * both engines, so falling back cannot make the file admissible (the VS
+     * Code host refuses before choosing an engine for the same reason).
+     */
+    async function bindNativeSidecar(path) {
         let available = false;
         try {
             available = await bridge.nativeAvailable() === true;
@@ -1111,8 +1282,9 @@ export function createDesktopHost({ bridge, createWorker }) {
             // The host always requests a writable session, matching the WASM
             // desktop (which never opens read-only; read-only-ness is reported
             // by the engine, not requested by the user).
-            opened = await bridge.nativeOpen(path, false);
+            opened = await bridge.nativeOpen(path, false, maxFileSizeBytes());
         } catch (error) {
+            if (isShellError(error, 'ERR_FILE_TOO_LARGE')) throw sizeRefusal(error);
             // Allowlist refusal, symlinked final component, spawn/handshake
             // failure, the shell's open cap — all fall back to bytes. Nothing
             // was registered, so there is nothing to clean up.
@@ -1136,22 +1308,77 @@ export function createDesktopHost({ bridge, createWorker }) {
             }
             return null;
         }
+        return opened;
+    }
 
-        const entry = createEntry({
-            engine: 'native',
-            nativeDbId: opened.dbId,
-            nativeBoundPath: opened.boundPath,
-            currentPath: path,
-            currentName: name
-        });
+    /**
+     * The WASM lane's read, bounded by the same maxFileSize the native lane
+     * is: the shell refuses a larger file BEFORE reading it (fstat on the
+     * descriptor, no allocation), so the cap is not "read it all, then
+     * refuse" for either engine.
+     */
+    async function readDatabaseBytes(path) {
         try {
-            await initializeWorkerDatabase(entry, name, { path: opened.boundPath, readOnlyMode: false });
-            return entry;
+            return await bridge.readDatabaseBytes(path, maxFileSizeBytes());
         } catch (error) {
-            console.warn(`Native initializeDatabase failed for ${path}; falling back to the WASM engine:`, error);
-            // Never leave a half-open sidecar behind the fallback.
+            if (isShellError(error, 'ERR_FILE_TOO_LARGE')) throw sizeRefusal(error);
+            throw error;
+        }
+    }
+
+    /**
+     * Reload of a RETIRED database (see retireEntry): the engine is gone, so
+     * this is a fresh open — the same native-then-WASM selection every open
+     * takes, through the same shell gates (the allowlist the original pick or
+     * OS delivery made, the one-editable-copy registry) — bound to the SAME
+     * entry so its tab, dbId and parked UI state survive. A fresh open is a
+     * fresh history and no session transaction (initializeWorkerDatabase
+     * resets both). A failed reopen keeps the entry retired with the NEW
+     * reason, exactly as the VS Code host's #retryInitialConnection does:
+     * nothing live was lost, and the user can retry once the cause is fixed.
+     */
+    async function reopenRetiredEntry(entry) {
+        const retired = entry.invalidatedError;
+        if (!entry.currentPath) throw retired;
+        // callWorker refuses a retired entry, and the reopen IS its recovery.
+        entry.invalidatedError = null;
+        try {
+            await reopenEngineInPlace(entry);
+        } catch (error) {
+            entry.invalidatedError = error instanceof Error ? error : new Error(String(error));
+            throw error;
+        }
+        updateTitle();
+    }
+
+    async function reopenEngineInPlace(entry) {
+        const { currentPath: path, currentName: name } = entry;
+        if (hasNativeBridge()) {
+            const opened = await bindNativeSidecar(path);
+            if (opened) {
+                entry.engine = 'native';
+                entry.worker = null;
+                entry.nativeDbId = opened.dbId;
+                entry.nativeBoundPath = opened.boundPath;
+                try {
+                    await initializeWorkerDatabase(entry, name, { path: opened.boundPath, readOnlyMode: false });
+                    return;
+                } catch (error) {
+                    console.warn(`Native initializeDatabase failed for ${path}; falling back to the WASM engine:`, error);
+                    await disposeEntryTransport(entry);
+                }
+            }
+        }
+        const bytes = await readDatabaseBytes(path);
+        entry.engine = 'wasm';
+        entry.nativeDbId = null;
+        entry.nativeBoundPath = null;
+        bootWorkerFor(entry);
+        try {
+            await initializeWorkerDatabase(entry, name, { content: bytes });
+        } catch (error) {
             await disposeEntryTransport(entry);
-            return null;
+            throw error;
         }
     }
 
@@ -1174,7 +1401,7 @@ export function createDesktopHost({ bridge, createWorker }) {
      *   leave holding a stale image, which is what the old single-document host
      *   needed its invalidate-the-document recovery for.
      */
-    async function openFromPath(path, name, options) {
+    async function openFromPath(path, name) {
         // The dedupe below cannot see an open that has not finished yet, and
         // shell-delivered opens genuinely arrive back to back (an impatient
         // double-click on a Finder file, Open Recent twice). Two concurrent
@@ -1185,7 +1412,7 @@ export function createDesktopHost({ bridge, createWorker }) {
         // boundPath dedupe, one open later.
         const inFlight = openRequests.get(path);
         if (inFlight) return inFlight;
-        const request = openPathOnce(path, name, options)
+        const request = openPathOnce(path, name)
             .finally(() => { openRequests.delete(path); });
         openRequests.set(path, request);
         return request;
@@ -1217,9 +1444,12 @@ export function createDesktopHost({ bridge, createWorker }) {
         );
     }
 
-    async function openPathOnce(path, name, { size } = {}) {
+    async function openPathOnce(path, name) {
         const alreadyOpen = findEntryByPath(path);
         if (alreadyOpen) {
+            // Opening a RETIRED database again is the user asking for it back:
+            // reopen it in place rather than switching to its error state.
+            if (alreadyOpen.invalidatedError) await reopenRetiredEntry(alreadyOpen);
             await activateEntry(alreadyOpen, { snapshotOutgoing: true });
             return true;
         }
@@ -1233,7 +1463,7 @@ export function createDesktopHost({ bridge, createWorker }) {
         // between "no longer reserved" and "in the registry".
         openingEntries++;
         try {
-            return await openEngineFor(path, name, size);
+            return await openEngineFor(path, name);
         } finally {
             openingEntries--;
         }
@@ -1244,7 +1474,7 @@ export function createDesktopHost({ bridge, createWorker }) {
      * committed entry. Split out only so the reservation has an exception-safe
      * release around every exit of it.
      */
-    async function openEngineFor(path, name, size) {
+    async function openEngineFor(path, name) {
         if (hasNativeBridge()) {
             const nativeEntry = await tryOpenNative(path, name);
             if (nativeEntry) {
@@ -1261,14 +1491,10 @@ export function createDesktopHost({ bridge, createWorker }) {
             }
         }
 
-        if (size !== undefined && settings.maxFileSize > 0 && size > settings.maxFileSize * 1024 * 1024) {
-            throw new Error(
-                `Cannot open "${name}": file is ${size} bytes, which exceeds ` +
-                `the ${settings.maxFileSize} MiB cap set by the maxFileSize setting.`
-            );
-        }
         // Read before the entry exists so a read failure has nothing to clean up.
-        const bytes = await bridge.readDatabaseBytes(path);
+        // The maxFileSize refusal happens inside the shell for this lane as for
+        // the native one (see readDatabaseBytes), so no size check lives here.
+        const bytes = await readDatabaseBytes(path);
         const entry = createEntry({ engine: 'wasm', currentPath: path, currentName: name });
         bootWorkerFor(entry);
         try {
@@ -1300,7 +1526,8 @@ export function createDesktopHost({ bridge, createWorker }) {
                 isReadOnly: entry.connectionInfo.isReadOnly === true,
                 filename: entry.currentName,
                 engine: entry.engine,
-                connectionGeneration: entry.connectionGeneration
+                connectionGeneration: entry.connectionGeneration,
+                ...reloadRequired(entry)
             };
         },
         async exportDb(entry, filename) {
@@ -1382,8 +1609,16 @@ export function createDesktopHost({ bridge, createWorker }) {
                 connected: true,
                 filename: entry.currentName,
                 readOnly: entry.connectionInfo.isReadOnly === true,
-                connectionGeneration: entry.connectionGeneration
+                connectionGeneration: entry.connectionGeneration,
+                ...reloadRequired(entry)
             });
+            // A retired database has no engine to roll back or re-init: the
+            // reload is a fresh open of the same file, in place. Its failure
+            // propagates with the entry still retired (new reason).
+            if (entry.invalidatedError) {
+                await reopenRetiredEntry(entry);
+                return connectionResult();
+            }
             // Nothing on disk to re-read (the boot placeholder, a dropped
             // file): report the capabilities it still has rather than pretend
             // a reload happened.
@@ -1647,6 +1882,14 @@ export function createDesktopHost({ bridge, createWorker }) {
             if (global) return global(...args);
 
             const entry = requireActiveEntry();
+            if (entry.invalidatedError && !RETIRED_ENTRY_METHODS.has(method)) {
+                // The engine is gone. Every engine-bound method answers with
+                // the reason — the VS Code host throws its invalidated error
+                // from every document operation the same way — so the page
+                // never sees "closed" or a routing refusal for a database it
+                // still shows a tab for.
+                throw entry.invalidatedError;
+            }
             const local = databaseMethods[method];
             if (local) return local(entry, ...args);
 
@@ -1824,9 +2067,10 @@ export function createDesktopHost({ bridge, createWorker }) {
         async openDatabaseViaDialog() {
             const picked = await bridge.pickDatabase();
             if (!picked) return false;
-            // The maxFileSize cap belongs to the WASM lane inside openFromPath:
-            // it bounds byte inhaling, which the native engine never does.
-            return openFromPath(picked.path, picked.name, { size: picked.size });
+            // The maxFileSize cap is enforced by the shell inside both open
+            // lanes (see bindNativeSidecar / readDatabaseBytes), so the
+            // dialog's `size` is not consulted here.
+            return openFromPath(picked.path, picked.name);
         },
         async openFromShellPath(path) {
             const name = String(path).split('/').pop() || 'database.db';
@@ -1890,6 +2134,18 @@ export function createDesktopHost({ bridge, createWorker }) {
             // nothing — it is editable, it reports dirty, and the close prompt
             // asks about it, so it must have a way to reach disk.
             if (!entry.currentPath) return saveEntryAs(entry);
+            // Retired (its file was replaced underneath the engine): nothing
+            // is pending — the history died with the connection — and the
+            // engine is gone. ⌘S names the reason and the remedy, never
+            // "Saved".
+            if (entry.invalidatedError) {
+                return {
+                    success: false,
+                    reason: 'read-only',
+                    savedAs: entry.currentName,
+                    message: entry.invalidatedError.message
+                };
+            }
             // A read-only database has nothing to commit: every mutation was
             // refused before it reached the engine, so the native COMMIT below
             // would close a transaction that was never opened and report
