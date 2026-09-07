@@ -526,6 +526,15 @@ export function toggleRowPin(event, rowId) {
 // Column Resizing
 export function startColumnResize(event, columnName) {
     event.stopPropagation();
+    // Also cancel the mousedown default action. WebKit — the desktop app's
+    // WKWebView — otherwise starts a native range selection at this mousedown
+    // and extends it across the neighbouring header cells for the whole drag: a
+    // selection-coloured smear over the filter boxes that only clears when
+    // mouseup's re-render replaces the DOM. The user-select:none set on the body
+    // below is too late for WebKit, the selection has already begun. Chromium
+    // never painted it, which is why VS Code and the browser harness never
+    // showed it. Same reason the shift-click and pin handlers preventDefault.
+    event.preventDefault();
     state.resizingColumn = columnName;
     state.resizeStartX = event.clientX;
     state.resizeStartWidth = state.columnWidths[columnName] || 120;

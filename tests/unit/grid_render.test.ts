@@ -371,10 +371,22 @@ describe('grid header rendering', () => {
         (handle as any).classList = { add() {}, remove() {} };
         // The renderer has already measured `b`; a drag moves from THAT width.
         const startWidth = state.columnWidths.b ?? 120;
+        let defaultPrevented = false;
         startColumnResize(
-            { stopPropagation() {}, clientX: 100, target: handle } as never,
+            {
+                stopPropagation() {},
+                preventDefault() { defaultPrevented = true; },
+                clientX: 100,
+                target: handle
+            } as never,
             'b'
         );
+        // The mousedown default action must be cancelled, not just the
+        // propagation: WebKit (the desktop app's WKWebView) otherwise starts a
+        // native range selection here and smears it across the neighbouring
+        // header cells for the whole drag. Chromium never painted it, so this
+        // only ever showed in the real app.
+        assert.ok(defaultPrevented, 'startColumnResize must preventDefault on the mousedown');
         onColumnResize({ clientX: 160 } as never);
 
         assert.strictEqual(state.columnWidths.b, startWidth + 60);
