@@ -400,6 +400,16 @@ export interface ModificationEntry {
   rowData?: Record<string, CellValue>;
   /** Authoritative post-insert row required for guarded undo/redo. */
   insertedRow?: DeletedRow;
+  /** Authoritative post-images for one atomic, guarded bulk insert. */
+  insertedRows?: DeletedRow[];
+  /**
+   * Exact post-images of every row ONE bulk import inserted (a `row_insert`
+   * entry with many rows). A compact twin of `DeletedRow[]`: a 100,000-row
+   * import has to fit the undo memory budget and, on the desktop's native
+   * engine, a single 16 MiB response frame, which per-row
+   * `{column, storageClass}` pairs would not — see `ImportedRowSnapshots`.
+   */
+  importedRows?: ImportedRowSnapshots;
   /** Multiple deleted rows data */
   deletedRows?: DeletedRow[];
   /** Table definition for create/drop undo/redo */
@@ -699,6 +709,29 @@ export interface DeletedRow {
   row: Record<string, CellValue>;
   /** Exact storage classes paired with `row`; absent in legacy history. */
   storageClasses?: Array<{ column: string; storageClass: CellStorageClass }>;
+}
+
+/**
+ * Exact post-images of the rows one bulk import inserted, stored once per
+ * batch rather than once per row. `columns` are the table's insertable columns
+ * in snapshot order; each row's `values` are parallel to them and `pattern`
+ * indexes `storageClassPatterns`, the distinct per-column storage-class rows
+ * the batch produced (most imports have exactly one). Expanding a row back to a
+ * `DeletedRow` is `Object.fromEntries` over `columns`/`values` plus the
+ * pattern's classes, which is what the replay engines do before reusing the
+ * row-history delete/restore paths.
+ */
+export interface ImportedRowSnapshots {
+  columns: string[];
+  storageClassPatterns: CellStorageClass[][];
+  rows: ImportedRowSnapshot[];
+}
+
+/** One row of {@link ImportedRowSnapshots}. */
+export interface ImportedRowSnapshot {
+  rowId: RecordId;
+  values: CellValue[];
+  pattern: number;
 }
 
 /**

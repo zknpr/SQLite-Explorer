@@ -19,7 +19,7 @@ import {
 // response envelopes with exactly this codec (BigInt/Uint8Array/Error markers,
 // ~-escaped scalar sentinels), and the Rust proxy forwards the payload JSON
 // verbatim — importing the same module keeps the two ends incapable of drift.
-import { decodeFrameValue, encodeFrameValue } from '../../native/frame-codec.js';
+import { MAX_FRAME_BYTES, decodeFrameValue, encodeFrameValue } from '../../native/frame-codec.js';
 import { createPerDbStateSnapshot, restorePerDbState, snapshotPerDbState } from './db-ui-state.js';
 import { ModificationTracker, estimateUndoMemoryBytes } from '../../../src/core/undo-history.ts';
 // The worker reports its typed cell-edit refusals as structured `error` data
@@ -55,7 +55,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 // VS Code). DDL and pragma changes cannot be replayed at all, so they insert
 // barriers instead (undo stops there until the next save).
 const UNDOABLE_METHODS = new Set([
-    'updateCellBatch', 'insertRowWithHistory', 'deleteRows',
+    'updateCellBatch', 'insertRowWithHistory', 'importRows', 'deleteRows',
     'createView', 'editView', 'dropView'
 ]);
 const BARRIER_METHODS = new Set([
@@ -73,6 +73,18 @@ const BARRIER_METHODS = new Set([
 // 512 MiB keeps that worst case to ~1 GiB in-page, matching the worker's own
 // 1 GiB hard sanity ceiling on maxExportBytes.
 const DESKTOP_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
+
+// The largest importRows ANSWER the native sidecar may return. Its response
+// crosses the stdio frame, which the transport caps at MAX_FRAME_BYTES and
+// refuses in band when exceeded — AFTER the worker has released the import's
+// savepoint. Rows committed inside the session transaction with no history
+// entry to undo them is the one outcome the import must never produce, so the
+// worker measures its answer against this cap BEFORE releasing (worker.js
+// assertImportSnapshotsWithinBudgets) and rolls the import back instead. The
+// margin covers the response envelope and the estimate's own slack; the WASM
+// worker's structured clone has no frame, so it gets no cap here (the shared
+// aggregate ceiling still applies inside the worker).
+const NATIVE_IMPORT_RESULT_BYTES = MAX_FRAME_BYTES - 2 * 1024 * 1024;
 
 const STARTUP_DB_NAME = 'untitled.db';
 
@@ -613,6 +625,23 @@ export function createDesktopHost({ bridge, createWorker }) {
                     targetRowId: result.rowId,
                     rowData: result.row,
                     insertedRow: result
+                };
+            }
+            case 'importRows': {
+                const [table] = args;
+                // `result.snapshots` is the worker's compact post-image set of
+                // every row the import inserted (the column list once, storage
+                // class patterns deduplicated, values per row), read inside the
+                // import's own savepoint. It rides a `row_insert` entry as
+                // `importedRows`: undo deletes those exact states in reverse
+                // order and redo re-inserts them — one entry, however many rows.
+                const count = result.rowCount;
+                return {
+                    label: `Import ${count} rows`,
+                    description: `Import ${count} rows into ${table}`,
+                    modificationType: 'row_insert',
+                    targetTable: table,
+                    importedRows: result.snapshots
                 };
             }
             case 'deleteRows': {
@@ -1537,6 +1566,43 @@ export function createDesktopHost({ bridge, createWorker }) {
             return dialogOutcome(await bridge.saveFileAs(filename, data));
         },
         /**
+         * CSV/JSON import, the file half (import-data.js drives the flow). Two
+         * shell calls, both dialog-mediated: the pick is a native open dialog
+         * filtered to .csv/.json, and the read returns the picked file's text.
+         * The page never NAMES a file — it hands back exactly the path the
+         * dialog returned, and the shell reads only paths its import dialog
+         * produced this session (a separate, read-only allowlist: an import
+         * source never becomes a database the page could write in place).
+         * Both refuse loudly on a shell that predates them rather than falling
+         * back to an in-page file input, which could not enforce the 64 MiB
+         * cap before reading.
+         */
+        async pickImportSource() {
+            if (typeof bridge.pickImportSource !== 'function') {
+                throw new Error(
+                    'This app build cannot import files: the shell bridge has no pickImportSource. '
+                    + 'Update SQLite Explorer.'
+                );
+            }
+            return (await bridge.pickImportSource()) ?? null;
+        },
+        async readImportSource(path) {
+            if (typeof bridge.readImportText !== 'function') {
+                throw new Error(
+                    'This app build cannot import files: the shell bridge has no readImportText. '
+                    + 'Update SQLite Explorer.'
+                );
+            }
+            if (typeof path !== 'string' || path.length === 0) {
+                throw new Error('readImportSource requires the path the import dialog returned');
+            }
+            const text = await bridge.readImportText(path);
+            if (typeof text !== 'string') {
+                throw new Error('The shell did not return the import source as text');
+            }
+            return text;
+        },
+        /**
          * Persist the dragged sidebar width. Was a no-op, which is why the
          * sidebar snapped back to its default on every relaunch even though the
          * desktop has a real settings store.
@@ -1725,6 +1791,31 @@ export function createDesktopHost({ bridge, createWorker }) {
                 const inserted = await invokeMutation(entry, 'insertRowWithHistory',
                     [table, data, maxEditValueBytes, budget]);
                 return inserted?.rowId;
+            }
+            if (method === 'importRows') {
+                // Host policy over whatever the page sent, like exportTable's
+                // maxExportBytes: the undo budget is what maxUndoMemory leaves
+                // after the entry's own metadata (mirrors insertRow), and the
+                // transport budget exists only where the answer crosses a
+                // capped frame — the native sidecar. A page cannot lift either.
+                const [table, rows, options] = args;
+                const rowCount = Array.isArray(rows) ? rows.length : 0;
+                const budget = Math.max(0, settings.maxUndoMemory - estimateUndoMemoryBytes({
+                    label: `Import ${rowCount} rows`,
+                    description: `Import ${rowCount} rows into ${table}`,
+                    modificationType: 'row_insert',
+                    targetTable: table
+                }));
+                const importOptions = {
+                    ...(options && typeof options === 'object' ? options : {}),
+                    maxUndoSnapshotBytes: budget
+                };
+                if (entry.engine === 'native') {
+                    importOptions.maxSnapshotTransportBytes = NATIVE_IMPORT_RESULT_BYTES;
+                } else {
+                    delete importOptions.maxSnapshotTransportBytes;
+                }
+                return invokeMutation(entry, 'importRows', [table, rows, importOptions]);
             }
             if (UNDOABLE_METHODS.has(method)) return invokeMutation(entry, method, args);
             return callWorker(entry, method, args);

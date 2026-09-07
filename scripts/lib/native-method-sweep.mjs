@@ -639,6 +639,81 @@ const SWEEP = [
             detail(tooBig));
     }],
 
+    ['importRows', async ({ s, check }) => {
+        // The desktop's CSV/JSON import: every row inside ONE savepoint, ONE
+        // compact post-image set back ({rowCount, snapshots}) that the host
+        // records as a single row_insert entry. Undo deletes those exact states,
+        // redo re-inserts them — proven here through the real replay methods,
+        // and the table is left exactly as this entry found it.
+        const count = async () => body(await s.invoke('runQuery', ['SELECT count(*) AS c FROM people']))
+            .data?.[0]?.rows?.[0]?.[0];
+        const before = await count();
+        const imported = await s.invoke('importRows', ['people', [
+            { id: 20, name: 'import-a', r: 1.25 },
+            { id: 21, name: 'import-b' },              // ragged: no `r` → its default
+            { id: 22, name: 'import-c', big: '9007199254740993' }   // exact int64 as text
+        ], { maxEditValueBytes: 1024 * 1024, maxUndoSnapshotBytes: 1024 * 1024 }]);
+        const answer = body(imported).data;
+        const readBack = await s.invoke('runQuery', [
+            'SELECT name, CAST(big AS TEXT), typeof(big) FROM people WHERE id IN (20, 21, 22) ORDER BY id'
+        ]);
+        check(body(imported).success === true
+            && answer?.rowCount === 3
+            && Array.isArray(answer?.snapshots?.columns)
+            && answer.snapshots.columns.includes('name')
+            && answer.snapshots.rows.length === 3
+            && Array.isArray(answer.snapshots.storageClassPatterns)
+            && JSON.stringify(body(readBack).data?.[0]?.rows)
+                === JSON.stringify([['import-a', null, 'null'], ['import-b', null, 'null'], ['import-c', '9007199254740993', 'integer']])
+            && await count() === before + 3,
+            'sweep/importRows/happy-one-call-inserts-every-row-and-returns-compact-post-images',
+            detail(imported));
+
+        // Undo/redo of the SAME entry the host would record: importedRows on a
+        // row_insert entry, through the real replay methods.
+        const entry = { modificationType: 'row_insert', targetTable: 'people', importedRows: answer?.snapshots };
+        const undone = await s.invoke('undoModification', [entry]);
+        const afterUndo = await count();
+        const redone = await s.invoke('redoModification', [entry]);
+        const afterRedo = await count();
+        check(body(undone).success === true && afterUndo === before
+            && body(redone).success === true && afterRedo === before + 3,
+            'sweep/importRows/happy-undo-removes-the-whole-import-and-redo-restores-it',
+            `${detail(undone)} ${detail(redone)} counts=${afterUndo}/${afterRedo}`);
+
+        // Atomicity: a clash on the SECOND row takes the first row back with it.
+        const clash = await s.invoke('importRows', ['people', [
+            { id: 30, name: 'never-lands' }, { id: 20, name: 'dup' }
+        ]]);
+        const stray = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people WHERE id = 30']);
+        check(body(clash).success === false
+            && /constraint/i.test(String(body(clash).errorMessage ?? ''))
+            && body(stray).data?.[0]?.rows?.[0]?.[0] === 0
+            && await count() === before + 3,
+            'sweep/importRows/error-constraint-on-row-2-rolls-row-1-back', detail(clash));
+
+        // The undo budget is enforced BEFORE release: an image that would not
+        // fit is refused and no row lands.
+        const overBudget = await s.invoke('importRows', ['people', [
+            { id: 31, name: 'x'.repeat(4096) }
+        ], { maxUndoSnapshotBytes: 64 }]);
+        const none = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people WHERE id = 31']);
+        check(failed(overBudget, /undo memory budget/) && body(none).data?.[0]?.rows?.[0]?.[0] === 0,
+            'sweep/importRows/error-over-budget-undo-image-refuses-and-rolls-back', detail(overBudget));
+
+        // Shape refusals are the worker's own words, before any SQL runs.
+        const notArray = await s.invoke('importRows', ['people', { id: 40 }]);
+        const badRow = await s.invoke('importRows', ['people', [{ id: 41 }, 'not a row']]);
+        check(failed(notArray, /Import rows must be an array/) && failed(badRow, /row 2 must be an object/),
+            'sweep/importRows/error-malformed-rows-are-named-and-refused',
+            `${detail(notArray)} ${detail(badRow)}`);
+
+        // Leave the fixture as found: the later entries count on 3 people.
+        const cleanup = await s.invoke('undoModification', [entry]);
+        check(body(cleanup).success === true && await count() === before,
+            'sweep/importRows/cleanup-undo-restores-the-fixture', detail(cleanup));
+    }],
+
     ['updateCell', async ({ s, check }) => {
         const edit = await s.invoke('updateCell', ['people', 10, 'name', 'delta-edited']);
         const readBack = await s.invoke('runQuery', ['SELECT name FROM people WHERE id = 10']);

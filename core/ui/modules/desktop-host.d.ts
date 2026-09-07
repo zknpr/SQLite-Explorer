@@ -49,6 +49,21 @@ export interface DesktopHostBridge {
     saveDatabaseAs?(defaultName: string, bytes: Uint8Array): Promise<string | null>;
     loadSettings(): Promise<Record<string, unknown>>;
     saveSettings(settings: Record<string, unknown>): Promise<void>;
+    /**
+     * CSV/JSON import source: a native open dialog filtered to `.csv`/`.json`.
+     * The picked path joins the shell's IMPORT allowlist only — a read-only
+     * grant, distinct from the database session allowlist, so an import source
+     * never becomes a file the page can write in place or reopen as a database.
+     * Resolves null when the user cancelled. Optional like {@link onOpenFile}:
+     * the host refuses import on a shell without it.
+     */
+    pickImportSource?(): Promise<PickedDatabase | null>;
+    /**
+     * The text of a file {@link pickImportSource} returned this session, as
+     * UTF-8; the shell refuses any other path, a non-regular file, non-UTF-8
+     * content, and anything over 64 MiB (checked before the read).
+     */
+    readImportText?(path: string): Promise<string>;
     onMenu(handler: (id: string) => void): void;
     setTitle(title: string): Promise<void>;
     /**

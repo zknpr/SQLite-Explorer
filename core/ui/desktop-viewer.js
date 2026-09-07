@@ -82,6 +82,9 @@ import {
     initDatabaseTabs,
     renderDatabaseTabs
 } from './modules/db-tabs.js';
+// Desktop-only: CSV/JSON import needs the shell's file dialog and bounded file
+// read, which only this build has. Pinned by tests/unit/import_data.test.ts.
+import { initImportData, openImportDialog } from './modules/import-data.js';
 
 // Like the demo, ordinary edits get no host-echoed refreshContent, so
 // optimistic count reuse stays off.
@@ -725,6 +728,7 @@ if (!bridge) {
             else if (id === 'export-db') await exportDatabaseCopy().catch(surface('Database export failed'));
             else if (id === 'refresh-db') await host.refreshFromDisk().catch(surface('Refresh failed'));
             else if (id === 'sql-console') await toggleConsole().catch(surface('SQL console failed'));
+            else if (id === 'import-data') await openImportDialog().catch(surface('Import failed'));
             else if (id.startsWith('theme:')) {
                 const theme = applyTheme(id.slice('theme:'.length));
                 await backendApi.updateExtensionSetting('theme', theme).catch(surface('Theme change failed'));
@@ -842,6 +846,7 @@ if (!bridge) {
         }).catch(console.error);
 
         initSqlConsole(surface);
+        initImportData({ surface });
         // After start(): the first render reads host.listDatabases(), which
         // only holds the boot database once start() has booted it. Both
         // presentations stay hidden at that one database anyway — this is what

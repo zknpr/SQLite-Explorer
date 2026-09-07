@@ -102,6 +102,17 @@ export interface DesktopBackendApi {
         }
     ): Promise<unknown>;
     getTableInfo(table: string): Promise<unknown>;
+    /**
+     * Desktop-only CSV/JSON import. `pickImportSource` shows the shell's open
+     * dialog (null when cancelled); `readImportSource` returns the picked
+     * file's UTF-8 text (the shell refuses paths its import dialog did not
+     * return, and anything over 64 MiB); `importRows` inserts every mapped row
+     * as ONE undoable edit and resolves with the worker's
+     * `{ rowCount, snapshots }` answer.
+     */
+    pickImportSource(): Promise<{ path: string; name: string; size: number } | null>;
+    readImportSource(path: string): Promise<string>;
+    importRows(table: string, rows: Array<Record<string, CellValue>>): Promise<unknown>;
     getPragmas(): Promise<unknown>;
     setPragma(pragma: string, value: unknown): Promise<unknown>;
     getExtensionSettings(): Promise<unknown>;

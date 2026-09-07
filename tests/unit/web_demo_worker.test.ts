@@ -7089,3 +7089,171 @@ describe('web demo worker SQL console query plans and parameters', () => {
         }
     });
 });
+
+describe('web demo worker importRows', () => {
+    const rowCount = async (worker: WorkerHarness, table: string) =>
+        Number(await workerScalar(worker, `SELECT count(*) FROM ${table}`));
+    /** The history entry the desktop host records for an import. */
+    const importEntry = (table: string, result: any) => ({
+        modificationType: 'row_insert',
+        targetTable: table,
+        description: `Import ${result.rowCount} rows into ${table}`,
+        importedRows: result.snapshots
+    });
+
+    it('imports every row in one savepoint and answers compact post-images that undo and redo as one edit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT DEFAULT 'default', note TEXT, " +
+            'doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED)'
+        );
+        // Ragged rows on purpose: an empty object is `DEFAULT VALUES` (rowid 1
+        // on the empty table), a missing key takes the column DEFAULT, and an
+        // exact int64 crosses as text.
+        const rows = [
+            {},
+            { id: 2, value: 'second', note: null },
+            { id: 3 },
+            { id: '9007199254740993', value: 'first' }
+        ];
+        const result = await worker.invoke('importRows', 'items', rows, { maxUndoSnapshotBytes: 1024 * 1024 });
+        assert.equal(result.rowCount, 4);
+        // Generated columns are not insertable and so not part of the post-image.
+        assert.deepEqual(result.snapshots.columns, ['id', 'value', 'note']);
+        assert.equal(result.snapshots.rows.length, 4);
+        // Insertion order, exact identities (the unsafe integer stays a decimal string).
+        assert.deepEqual(result.snapshots.rows.map((row: any) => String(row.rowId)), ['1', '2', '3', '9007199254740993']);
+        // Every row stored [integer, text, null] → ONE storage-class pattern for the batch.
+        assert.deepEqual(result.snapshots.storageClassPatterns, [['integer', 'text', 'null']]);
+        assert.ok(result.snapshots.rows.every((row: any) => row.pattern === 0 && row.values.length === 3));
+
+        // sql.js answers an empty SELECT with no result set at all.
+        const values = async () => (await worker.invoke(
+            'runQuery', 'SELECT CAST(id AS TEXT), value, note, CAST(doubled AS TEXT) FROM items ORDER BY id'
+        ))[0]?.rows ?? [];
+        const imported = [
+            ['1', 'default', null, '2'], ['2', 'second', null, '4'], ['3', 'default', null, '6'],
+            ['9007199254740993', 'first', null, '18014398509481986']
+        ];
+        assert.deepEqual(await values(), imported);
+
+        const entry = importEntry('items', result);
+        await worker.invoke('undoModification', entry);
+        assert.deepEqual(await values(), []);
+        await worker.invoke('redoModification', entry);
+        assert.deepEqual(await values(), imported);
+
+        // The exact-state guard: an external change to one imported row refuses
+        // the undo and must not partly remove the import.
+        await worker.invoke('runQuery', "UPDATE items SET value = 'external change' WHERE id = 2");
+        await assert.rejects(worker.invoke('undoModification', entry));
+        assert.equal(await rowCount(worker, 'items'), 4);
+    });
+
+    it('rolls the whole batch back on any refusal, before any row is released', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT UNIQUE)');
+        const untouched = async () => assert.equal(await rowCount(worker, 'items'), 0);
+
+        // A constraint on the SECOND row takes the first row back with it.
+        await assert.rejects(
+            worker.invoke('importRows', 'items', [{ id: 1, value: 'a' }, { id: 2, value: 'a' }]),
+            /UNIQUE|constraint/i
+        );
+        await untouched();
+        // Per-value edit cap, checked before the first statement.
+        await assert.rejects(
+            worker.invoke('importRows', 'items', [{ id: 1, value: 'x'.repeat(100) }], { maxEditValueBytes: 16 }),
+            (error: unknown) => error instanceof CellEditPolicyError
+        );
+        await untouched();
+        // Undo memory budget and transport budget, both measured on the answer
+        // while the savepoint is still open.
+        await assert.rejects(
+            worker.invoke('importRows', 'items', [{ id: 1, value: 'x'.repeat(4096) }], { maxUndoSnapshotBytes: 64 }),
+            /undo memory budget/
+        );
+        await untouched();
+        await assert.rejects(
+            worker.invoke('importRows', 'items', [{ id: 1, value: 'x'.repeat(4096) }], { maxSnapshotTransportBytes: 64 }),
+            /can return in one edit/
+        );
+        await untouched();
+        // Shape refusals, in the worker's own words.
+        await assert.rejects(worker.invoke('importRows', 'items', { id: 1 }), /Import rows must be an array/);
+        await assert.rejects(worker.invoke('importRows', 'items', []), /at least one row/);
+        await assert.rejects(worker.invoke('importRows', 'items', [{ id: 1 }, 'nope']), /row 2 must be an object/);
+        await assert.rejects(worker.invoke('importRows', 'items', [{ id: 1 }], { maxUndoSnapshotBytes: -1 }), /non-negative safe integer/);
+        await assert.rejects(worker.invoke('importRows', 'items', [{ id: 1 }], 'options'), /options must be an object/);
+        await assert.rejects(worker.invoke('importRows', 'items', [{ '': 1 }]), /Column name/);
+        await assert.rejects(worker.invoke('importRows', 'absent', [{ id: 1 }]), /Table not found/);
+        await assert.rejects(
+            worker.invoke('importRows', 'items', Array.from({ length: 100_001 }, (_, id) => ({ id }))),
+            /100,000 rows/
+        );
+        await untouched();
+
+        const readOnly = await createWorkerHarness({ readOnlyMode: true });
+        await assert.rejects(readOnly.invoke('importRows', 'items', [{ id: 1 }]), /read-only/);
+    });
+
+    it('imports into WITHOUT ROWID composite keys and unwinds self-referencing foreign keys in reverse', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE "odd table" ("group" TEXT, "key" INTEGER, value TEXT NOT NULL DEFAULT \'ok\', ' +
+            'PRIMARY KEY ("group", "key")) WITHOUT ROWID'
+        );
+        const odd = await worker.invoke('importRows', 'odd table', [
+            { group: 'a"b', key: '9223372036854775807' }, { group: 'a"b', key: 2 }
+        ]);
+        assert.equal(odd.rowCount, 2);
+        assert.ok(odd.snapshots.rows.every((row: any) => typeof row.rowId === 'string'), 'primary-key identities are encoded strings');
+        const oddRows = async () => (await worker.invoke(
+            'runQuery', 'SELECT "group", CAST("key" AS TEXT), value FROM "odd table" ORDER BY "key"'
+        ))[0]?.rows ?? [];
+        assert.deepEqual(await oddRows(), [['a"b', '2', 'ok'], ['a"b', '9223372036854775807', 'ok']]);
+        const oddEntry = importEntry('odd table', odd);
+        await worker.invoke('undoModification', oddEntry);
+        assert.deepEqual(await oddRows(), []);
+        await worker.invoke('redoModification', oddEntry);
+        assert.deepEqual(await oddRows(), [['a"b', '2', 'ok'], ['a"b', '9223372036854775807', 'ok']]);
+        // NOT NULL on the second row rolls back the first.
+        await assert.rejects(
+            worker.invoke('importRows', 'odd table', [{ group: 'c', key: 1 }, { group: 'c', key: 2, value: null }]),
+            /NOT NULL|constraint/i
+        );
+        assert.equal(await rowCount(worker, '"odd table"'), 2);
+
+        // foreign_keys is ON by default in this worker: undo must delete the
+        // child (row 2) before its parent (row 1), i.e. in reverse insertion order.
+        await worker.invoke('runQuery', 'CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES nodes(id))');
+        const nodes = await worker.invoke('importRows', 'nodes', [{ id: 1, parent_id: null }, { id: 2, parent_id: 1 }]);
+        const nodesEntry = importEntry('nodes', nodes);
+        await worker.invoke('undoModification', nodesEntry);
+        assert.equal(await rowCount(worker, 'nodes'), 0);
+        await worker.invoke('redoModification', nodesEntry);
+        assert.deepEqual(
+            (await worker.invoke('runQuery', 'SELECT id, parent_id FROM nodes ORDER BY id'))[0].rows,
+            [[1, null], [2, 1]]
+        );
+    });
+
+    it('refuses a malformed importedRows history entry instead of guessing at a predicate', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)');
+        const result = await worker.invoke('importRows', 'items', [{ id: 1, value: 'a' }]);
+        for (const importedRows of [
+            null,
+            { columns: ['id'], storageClassPatterns: [], rows: [] },
+            { ...result.snapshots, rows: [{ rowId: 1, values: [1], pattern: 0 }] },      // width mismatch
+            { ...result.snapshots, rows: [{ rowId: 1, values: [1, 'a'], pattern: 7 }] }  // pattern out of range
+        ]) {
+            await assert.rejects(worker.invoke('undoModification', {
+                modificationType: 'row_insert', targetTable: 'items', description: 'x', importedRows
+            }));
+        }
+        assert.equal(await rowCount(worker, 'items'), 1);
+    });
+});

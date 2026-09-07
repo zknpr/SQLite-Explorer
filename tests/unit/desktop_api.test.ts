@@ -1,6 +1,7 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { initDesktopApi, backendApi, getVsCodeState, saveVsCodeState } from '../../core/ui/modules/desktop-api.js';
+import { initDesktopApi, backendApi, getVsCodeState, saveVsCodeState, getRpcTimeoutMs } from '../../core/ui/modules/desktop-api.js';
+import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../src/core/cell-edit-policy';
 import { encodeFrameValue, decodeFrameValue } from '../../core/native/frame-codec.js';
 import { FakeElement, installFakeDom } from './helpers/fake-dom';
 
@@ -350,4 +351,26 @@ test('the oversized-cell refusals name THIS app and the route that works', async
   const message = String(editor.message);
   assert.doesNotMatch(message, /web demo/);
   assert.match(message, /Load More/);
+});
+
+test('the import methods route through host.invoke: pick/read are bare, importRows carries the edit cap, none has a deadline', async () => {
+  const host = fakeHost();
+  initDesktopApi(host as never);
+  await backendApi.pickImportSource();
+  assert.deepEqual(host.calls.at(-1), { method: 'pickImportSource', args: [] });
+  await backendApi.readImportSource('/tmp/rows.csv');
+  assert.deepEqual(host.calls.at(-1), { method: 'readImportSource', args: ['/tmp/rows.csv'] });
+  await backendApi.importRows('users', [{ id: 1 }]);
+  // The same per-value cap the single-row insert carries; the host adds the
+  // undo and transport budgets itself.
+  assert.deepEqual(host.calls.at(-1), {
+    method: 'importRows',
+    args: ['users', [{ id: 1 }], { maxEditValueBytes: DEFAULT_MAX_CELL_EDIT_BYTES }]
+  });
+  // A client deadline on importRows that rejected while the worker went on to
+  // release the import would leave rows with no history entry; the pick is a
+  // dialog and the read may come off a slow volume.
+  for (const method of ['importRows', 'pickImportSource', 'readImportSource']) {
+    assert.equal(getRpcTimeoutMs(method), undefined, `${method} must not have a client deadline`);
+  }
 });

@@ -335,6 +335,17 @@ export const backendApi = {
     // `{}` keeps the worker's own maxRows clamp in charge of the row cap.
     runConsole: (sql, options) => sendRpcRequest('runConsole', [sql, options ?? {}]),
     getTableInfo: (table) => sendRpcRequest('getTableInfo', [table]),
+    // Desktop-only CSV/JSON import (modules/import-data.js). The pick and the
+    // read are shell dialog/file I/O answered by the host's global methods;
+    // `importRows` is the worker mutation — one call for the whole batch,
+    // carrying the same per-value edit cap the single-row insert does. The host
+    // adds the undo and transport budgets itself (policy the page cannot lift).
+    pickImportSource: () => sendRpcRequest('pickImportSource', []),
+    readImportSource: (path) => sendRpcRequest('readImportSource', [path]),
+    importRows: (table, rows) => sendRpcRequest(
+        'importRows',
+        [table, rows, { maxEditValueBytes: DEFAULT_MAX_CELL_EDIT_BYTES }]
+    ),
     getPragmas: () => sendRpcRequest('getPragmas', []),
     setPragma: (pragma, value) => sendRpcRequest('setPragma', [pragma, value]),
     getExtensionSettings: () => sendRpcRequest('getExtensionSettings', []),

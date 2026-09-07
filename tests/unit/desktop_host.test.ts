@@ -3755,3 +3755,120 @@ test('a refused undo says WHY: a barrier is not an empty history', async () => {
     barrierDescription: 'deleteColumns'
   });
 });
+
+// ---------------------------------------------------------------------------
+// CSV/JSON import: one worker call, one history entry, host-owned budgets
+// ---------------------------------------------------------------------------
+
+const IMPORT_SNAPSHOTS = {
+  columns: ['id', 'name'],
+  storageClassPatterns: [['integer', 'text']],
+  rows: [{ rowId: 1, values: [1, 'a'], pattern: 0 }, { rowId: 2, values: [2, 'b'], pattern: 0 }]
+};
+
+test('importRows is ONE undoable entry: host budgets replace the page\'s, importedRows is recorded, undo/redo replay it', async () => {
+  const undone: unknown[][] = [];
+  const redone: unknown[][] = [];
+  const { host, posted } = makeHost({
+    importRows: () => ({ rowCount: 2, snapshots: IMPORT_SNAPSHOTS }),
+    undoModification: (args) => { undone.push(args); return { success: true }; },
+    redoModification: (args) => { redone.push(args); return { success: true }; }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+
+  const result = await host.invoke('importRows', ['users', [{ id: 1, name: 'a' }, { id: 2, name: 'b' }], {
+    maxEditValueBytes: 1048576,
+    // A page cannot lift the budgets: both are replaced by host policy below.
+    maxUndoSnapshotBytes: 1,
+    maxSnapshotTransportBytes: 1
+  }]);
+  assert.deepEqual(result, { rowCount: 2, snapshots: IMPORT_SNAPSHOTS });
+  assert.equal(host.hasUnsavedChanges(), true);
+
+  const sent = posted.at(-1)!.content;
+  assert.equal(sent.targetMethod, 'importRows');
+  assert.equal(sent.payload[0], 'users');
+  assert.deepEqual(sent.payload[1], [{ id: 1, name: 'a' }, { id: 2, name: 'b' }]);
+  const options = sent.payload[2] as Record<string, unknown>;
+  assert.equal(options.maxEditValueBytes, 1048576, 'the page\'s per-value cap rides through');
+  // maxUndoMemory (50 MiB default) minus the entry's own metadata.
+  assert.ok(Number.isSafeInteger(options.maxUndoSnapshotBytes));
+  assert.ok((options.maxUndoSnapshotBytes as number) > 50 * 1024 * 1024 - 4096);
+  assert.ok((options.maxUndoSnapshotBytes as number) < 50 * 1024 * 1024);
+  // WASM answers cross a structured clone, not a frame: no transport cap.
+  assert.equal('maxSnapshotTransportBytes' in options, false);
+
+  await host.invoke('triggerUndo', []);
+  const undoMod = (undone[0] as unknown[])[0] as Record<string, unknown>;
+  assert.equal(undoMod.modificationType, 'row_insert');
+  assert.equal(undoMod.targetTable, 'users');
+  assert.equal(undoMod.label, 'Import 2 rows');
+  assert.equal(undoMod.description, 'Import 2 rows into users');
+  assert.deepEqual(undoMod.importedRows, IMPORT_SNAPSHOTS);
+  assert.equal(undoMod.insertedRow, undefined);
+  assert.equal(host.hasUnsavedChanges(), false, 'one entry: a single undo clears the import');
+
+  await host.invoke('triggerRedo', []);
+  assert.equal(redone.length, 1);
+  assert.deepEqual(((redone[0] as unknown[])[0] as Record<string, unknown>).importedRows, IMPORT_SNAPSHOTS);
+  assert.equal(host.hasUnsavedChanges(), true);
+});
+
+test('a refused importRows records nothing', async () => {
+  const { host } = makeHost({
+    importRows: () => { throw new Error('UNIQUE constraint failed: users.id'); }
+  });
+  await host.start();
+  await assert.rejects(host.invoke('importRows', ['users', [{ id: 1 }], {}]), /UNIQUE/);
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.deepEqual(await host.invoke('triggerUndo', []), { performed: false, reason: 'empty' });
+});
+
+test('importRows on a native database carries the frame-safe transport cap and opens the session transaction first', async () => {
+  const { host, nativeLog, txn } = makeNativeHost({
+    importRows: () => ({ rowCount: 1, snapshots: { ...IMPORT_SNAPSHOTS, rows: IMPORT_SNAPSHOTS.rows.slice(0, 1) } })
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/import-target.db');
+
+  await host.invoke('importRows', ['t', [{ id: 1, name: 'a' }], { maxEditValueBytes: 10 }]);
+  const envelope = nativeLog.envelopes.find(e => e.content.targetMethod === 'importRows');
+  assert.ok(envelope, 'the import rode the native transport');
+  const options = envelope!.content.payload[2] as Record<string, unknown>;
+  assert.equal(options.maxEditValueBytes, 10);
+  assert.ok(Number.isSafeInteger(options.maxUndoSnapshotBytes));
+  // MAX_FRAME_BYTES (16 MiB) minus the 2 MiB envelope/estimate margin: the
+  // worker refuses an answer over this BEFORE releasing the import, so a
+  // response the frame would drop can never leave committed rows behind.
+  assert.equal(options.maxSnapshotTransportBytes, 14 * 1024 * 1024);
+  // Pending until Save, like every other native mutation.
+  assert.deepEqual(nativeSql(nativeLog), ['BEGIN']);
+  assert.equal(txn.open, true);
+  assert.equal(host.hasUnsavedChanges(), true);
+});
+
+test('the import source pick and read ride the bridge, and refuse loudly on a shell without them', async () => {
+  const reads: string[] = [];
+  const { host } = makeHost({}, {
+    pickImportSource: async () => ({ path: '/tmp/rows.csv', name: 'rows.csv', size: 12 }),
+    readImportText: async (path: string) => { reads.push(path); return 'id,name\n1,a'; }
+  });
+  await host.start();
+  assert.deepEqual(await host.invoke('pickImportSource', []), { path: '/tmp/rows.csv', name: 'rows.csv', size: 12 });
+  assert.equal(await host.invoke('readImportSource', ['/tmp/rows.csv']), 'id,name\n1,a');
+  assert.deepEqual(reads, ['/tmp/rows.csv']);
+  await assert.rejects(host.invoke('readImportSource', ['']), /path the import dialog returned/);
+
+  // A cancelled dialog is null, never an error.
+  const { host: cancelled } = makeHost({}, { pickImportSource: async () => null });
+  await cancelled.start();
+  assert.equal(await cancelled.invoke('pickImportSource', []), null);
+
+  // Older shells: no silent in-page fallback (it could not enforce the 64 MiB cap).
+  const { host: old } = makeHost({});
+  await old.start();
+  await assert.rejects(old.invoke('pickImportSource', []), /shell bridge has no pickImportSource/);
+  await assert.rejects(old.invoke('readImportSource', ['/tmp/rows.csv']), /shell bridge has no readImportText/);
+});

@@ -185,6 +185,16 @@ import {
   shouldAnswerCountWithUpperBound
 } from '../../../src/core/paged-count.ts';
 import { createChunkedReadCache } from '../../../src/core/chunked-read-cache.ts';
+// The bulk-import contract shared with the page (parse/map limits) and the
+// exact memory estimate the host's ModificationTracker charges an entry — so
+// importRows refuses an undo image the tracker could not hold BEFORE the rows
+// are released, instead of the tracker evicting history after the fact.
+import {
+  IMPORT_MAX_CELLS,
+  IMPORT_MAX_COLUMNS,
+  IMPORT_MAX_ROWS
+} from '../../../src/core/bulk-import.ts';
+import { estimateUndoMemoryBytes } from '../../../src/core/undo-history.ts';
 
 // ============================================================================
 // Configuration
@@ -3703,6 +3713,407 @@ async function insertRowWithHistory(
   );
 }
 
+// ============================================================================
+// Bulk import (CSV/JSON rows mapped by the page)
+// ============================================================================
+
+/**
+ * Overhead the native frame codec adds around a value JSON cannot carry
+ * directly (`{"__type":"BigInt","decimal":"…"}`, `{"__type":"Uint8Array",
+ * "base64":"…"}`), counted by `estimateImportTransportBytes` so its answer stays
+ * an upper bound of the encoded frame. Both markers are under 40 bytes.
+ */
+const IMPORT_TRANSPORT_MARKER_BYTES = 40;
+
+/**
+ * Validate the caller's budgets. Every budget is OPTIONAL and, when present,
+ * must be a non-negative safe integer: a budget that cannot be interpreted is
+ * refused rather than treated as "unlimited", because every one of them exists
+ * to stop the import from producing an answer its caller cannot hold.
+ */
+function resolveImportOptions(options) {
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('Import options must be an object');
+  }
+  const budget = (name) => {
+    const value = options[name];
+    if (value === undefined) return undefined;
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Import ${name} must be a non-negative safe integer`);
+    }
+    return value;
+  };
+  return {
+    maxEditValueBytes: options.maxEditValueBytes,
+    maxUndoSnapshotBytes: budget('maxUndoSnapshotBytes'),
+    maxSnapshotTransportBytes: budget('maxSnapshotTransportBytes')
+  };
+}
+
+/**
+ * Shape and limit checks for the rows, all before the first SQL statement:
+ * the array bound, the shared column/cell ceilings (the same constants the
+ * page's parser enforces, re-checked here because the worker is the trust
+ * boundary), one plain object per row, usable column names, and every value
+ * inside the per-value edit cap. Returns each row's column list so the insert
+ * loop reads the keys exactly once.
+ *
+ * @returns {string[][]}
+ */
+function validateImportRows(rows, maxEditValueBytes) {
+  if (!Array.isArray(rows)) throw new Error('Import rows must be an array');
+  if (rows.length === 0) throw new Error('Import requires at least one row');
+  if (rows.length > IMPORT_MAX_ROWS) {
+    throw new Error(`Import supports at most ${IMPORT_MAX_ROWS.toLocaleString('en-US')} rows`);
+  }
+  const editLimit = assertCellValuesWithinEditLimit([], maxEditValueBytes);
+  const rowColumns = new Array(rows.length);
+  let cells = 0;
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+      throw new Error(`Import row ${index + 1} must be an object of column values`);
+    }
+    const columns = Object.keys(row);
+    if (columns.length > IMPORT_MAX_COLUMNS) {
+      throw new Error(`Import supports at most ${IMPORT_MAX_COLUMNS} columns`);
+    }
+    cells += columns.length;
+    if (cells > IMPORT_MAX_CELLS) {
+      throw new Error(
+        `Import supports at most ${IMPORT_MAX_CELLS.toLocaleString('en-US')} cells; ` +
+        'split the file into smaller imports'
+      );
+    }
+    for (const column of columns) {
+      assertUsableSqlIdentifier(column, 'Column name');
+      assertCellValueWithinEditLimit(row[column], editLimit);
+    }
+    rowColumns[index] = columns;
+  }
+  return rowColumns;
+}
+
+/**
+ * The INSERT for one column/placeholder signature. WITHOUT ROWID tables have no
+ * `last_insert_rowid()`, so their identity comes back through RETURNING (the
+ * byte-faithful projection insertRowInternal also uses); rowid tables read it
+ * afterwards, which also lets the same statement serve virtual tables.
+ */
+function buildImportInsertSql(table, columns, placeholders, identity) {
+  const target = escapeMainIdentifier(table);
+  const insert = columns.length === 0
+    ? `INSERT INTO ${target} DEFAULT VALUES`
+    : `INSERT INTO ${target} (${columns.map(escapeIdentifier).join(', ')}) ` +
+      `VALUES (${placeholders.join(', ')})`;
+  if (identity.kind !== 'primaryKey') return insert;
+  return `${insert} RETURNING ${buildByteFaithfulPrimaryKeyProjection(identity)}`;
+}
+
+/**
+ * Re-read every inserted row's exact stored state in identity chunks and pack
+ * it as {@link ImportedRowSnapshots}: the column list once, storage-class
+ * patterns deduplicated, values per row in INSERTION order (the undo path
+ * deletes in reverse, so a self-referencing foreign key unwinds children
+ * before parents).
+ */
+function readImportSnapshots(table, identity, rowIds, textEncoding) {
+  const insertableColumns = getInsertableColumnNames(table);
+  const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
+  const identityProjection = identity.kind === 'rowid'
+    ? 'CAST(rowid AS TEXT)'
+    : buildByteFaithfulPrimaryKeyProjection(identity);
+  const identityWidth = identity.kind === 'rowid' ? 1 : identity.columns.length * 2;
+  const stateProjections = insertableColumns.map(buildStoredCellStateProjection);
+  const indexByRowId = new Map(rowIds.map((rowId, index) => [String(rowId), index]));
+  const storageClassPatterns = [];
+  const patternIndexByKey = new Map();
+  const snapshots = new Array(rowIds.length);
+  let matched = 0;
+  for (const predicate of predicates) {
+    const result = db.exec(
+      `SELECT ${identityProjection}` +
+      `${stateProjections.length > 0 ? ', ' : ''}${stateProjections.join(', ')} ` +
+      `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+      normalizeBindParams(predicate.params),
+      { useBigInt: true }
+    )[0];
+    for (const row of result?.values ?? []) {
+      const rowId = identity.kind === 'rowid'
+        ? validateRowId(row[0])
+        : encodeByteFaithfulPrimaryKeyRecordId(
+            identity,
+            row.slice(0, identityWidth),
+            textEncoding,
+            `Cannot import into ${table}`
+          );
+      const index = indexByRowId.get(String(rowId));
+      if (index === undefined || snapshots[index] !== undefined) {
+        throw new Error(`Import into ${table} could not re-read an inserted row by its identity`);
+      }
+      const states = insertableColumns.map((column, offset) => parseStoredCellState(
+        row[identityWidth + offset * 2],
+        row[identityWidth + offset * 2 + 1],
+        `${table}.${column}`,
+        { textEncoding }
+      ));
+      const classes = states.map(state => state.storageClass);
+      const key = classes.join(',');
+      let pattern = patternIndexByKey.get(key);
+      if (pattern === undefined) {
+        pattern = storageClassPatterns.length;
+        storageClassPatterns.push(classes);
+        patternIndexByKey.set(key, pattern);
+      }
+      snapshots[index] = {
+        rowId,
+        values: states.map(state => state.rawTextBytes ?? state.value),
+        pattern
+      };
+      matched += 1;
+    }
+  }
+  if (matched !== rowIds.length) {
+    throw new Error(
+      `Import into ${table} inserted ${rowIds.length} rows but could re-read only ${matched}`
+    );
+  }
+  return { columns: insertableColumns, storageClassPatterns, rows: snapshots };
+}
+
+/**
+ * Upper bound of the bytes `value` occupies once the native frame codec has
+ * JSON-encoded it (BigInt and bytes become marker objects, bytes as base64).
+ * Structural, not a serialization: measuring 100,000 rows by stringifying them
+ * would cost a second copy of the whole answer.
+ */
+function estimateImportTransportBytes(value) {
+  if (value === null || value === undefined) return 4;
+  switch (typeof value) {
+    case 'string': {
+      // Quotes, plus one escape byte for every character JSON escapes
+      // (`"`, `\`) and the six-byte `\uXXXX` form for controls.
+      let bytes = utf8ByteLength(value) + 2;
+      for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index);
+        if (code === 0x22 || code === 0x5c) bytes += 1;
+        else if (code < 0x20) bytes += 5;
+      }
+      return bytes;
+    }
+    case 'number':
+      return Number.isFinite(value) ? String(value).length : IMPORT_TRANSPORT_MARKER_BYTES;
+    case 'bigint':
+      return String(value).length + IMPORT_TRANSPORT_MARKER_BYTES;
+    case 'boolean':
+      return 5;
+    case 'object': {
+      if (value instanceof Uint8Array) {
+        return Math.ceil(value.byteLength / 3) * 4 + IMPORT_TRANSPORT_MARKER_BYTES;
+      }
+      if (Array.isArray(value)) {
+        let bytes = 2 + Math.max(0, value.length - 1);
+        for (const item of value) bytes += estimateImportTransportBytes(item);
+        return bytes;
+      }
+      let bytes = 2;
+      for (const key of Object.keys(value)) {
+        bytes += utf8ByteLength(key) + 4 + estimateImportTransportBytes(value[key]);
+      }
+      return bytes;
+    }
+    default:
+      return IMPORT_TRANSPORT_MARKER_BYTES;
+  }
+}
+
+/**
+ * The two budgets an import's answer must fit, checked while the savepoint is
+ * still open so a refusal takes every row back with it:
+ *
+ * - undo memory: `estimateUndoMemoryBytes` over the snapshots, which is the
+ *   exact figure the host's ModificationTracker charges the entry;
+ * - transport: the encoded size of the answer against the caller's cap and,
+ *   always, the shared aggregate response ceiling. An answer the transport
+ *   drops after the rows are committed is the one outcome this method must
+ *   never produce — the rows would exist with no history entry to undo them.
+ */
+function assertImportSnapshotsWithinBudgets(table, rowCount, snapshots, limits) {
+  if (limits.maxUndoSnapshotBytes !== undefined) {
+    const bytes = estimateUndoMemoryBytes(snapshots);
+    if (bytes > limits.maxUndoSnapshotBytes) {
+      throw new Error(
+        `Import undo history for ${rowCount} rows into ${table} needs ${bytes} bytes, ` +
+        `over the ${limits.maxUndoSnapshotBytes}-byte undo memory budget; import fewer rows ` +
+        'at a time or increase maxUndoMemory. No rows were imported.'
+      );
+    }
+  }
+  const transportCap = Math.min(
+    limits.maxSnapshotTransportBytes ?? Number.MAX_SAFE_INTEGER,
+    MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES
+  );
+  const encodedBytes = estimateImportTransportBytes({ rowCount, snapshots });
+  if (encodedBytes > transportCap) {
+    throw new Error(
+      `Import undo history for ${rowCount} rows into ${table} is about ${encodedBytes} bytes ` +
+      `encoded, over the ${transportCap}-byte limit this engine can return in one edit; ` +
+      'import fewer rows at a time. No rows were imported.'
+    );
+  }
+}
+
+/**
+ * Insert many rows as ONE guarded edit.
+ *
+ * Why a method of its own rather than N insertRowWithHistory calls: a
+ * 100,000-row import would be 100,000 RPC round trips and 100,000 undo
+ * entries, and a failure at row 60,000 would leave the first 59,999 in place.
+ * Here the whole batch runs inside one SAVEPOINT — any refusal (constraint,
+ * edit limit, undo budget, transport budget) rolls every row back — and the
+ * answer is one compact post-image set the host records as ONE `row_insert`
+ * history entry (`importedRows`). Undo deletes those exact states and redo
+ * re-inserts them through the same row-history paths `deleteRows` uses.
+ *
+ * Rows are plain `{column: value}` objects, already mapped by the page from a
+ * CSV or JSON source; the worker never sees a file or a path. Rows may carry
+ * different column sets (a JSON row without a key takes that column's
+ * DEFAULT), so one statement is prepared per column/placeholder signature and
+ * re-bound per row.
+ *
+ * @param {string} table
+ * @param {Array<Record<string, CellValue>>} rows
+ * @param {{
+ *   maxEditValueBytes?: number,
+ *   maxUndoSnapshotBytes?: number,
+ *   maxSnapshotTransportBytes?: number
+ * }} [options] `maxEditValueBytes` caps every value (the host passes its cell
+ *   edit limit); `maxUndoSnapshotBytes` is the undo memory left for this entry;
+ *   `maxSnapshotTransportBytes` is the largest answer the caller's transport
+ *   carries (the desktop passes it for the native sidecar, whose response
+ *   frame is capped). Both budgets are enforced before the savepoint is
+ *   released, so a refused import leaves no rows behind.
+ * @returns {Promise<{ rowCount: number, snapshots: ImportedRowSnapshots }>}
+ */
+async function importRows(table, rows, options = {}) {
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Row import');
+  assertUsableSqlIdentifier(table, 'Table name');
+  const limits = resolveImportOptions(options ?? {});
+  const rowColumns = validateImportRows(rows, limits.maxEditValueBytes);
+  const identity = await resolveTableIdentity(table);
+  const textEncoding = getCellTextEncoding();
+
+  const savepointName = createViewSavepointName('sp_import_rows');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const rowIds = new Array(rows.length);
+    const statements = new Map();
+    let identityStatement = null;
+    try {
+      for (let index = 0; index < rows.length; index++) {
+        const row = rows[index];
+        const columns = rowColumns[index];
+        const values = columns.map(column => row[column]);
+        const placeholders = values.map(bindPlaceholder);
+        const signature = `${JSON.stringify(columns)}|${placeholders.join(',')}`;
+        let statement = statements.get(signature);
+        if (!statement) {
+          // A trigger program writing the target table behind the insert would
+          // make its post-image unreliable; refused once per column set.
+          assertMutationHasNoUntrackedPrograms('INSERT', table, columns);
+          statement = db.prepare(buildImportInsertSql(table, columns, placeholders, identity));
+          statements.set(signature, statement);
+        }
+        statement.bind(normalizeBindParams(values));
+        if (identity.kind === 'primaryKey') {
+          if (!statement.step()) {
+            throw new Error(`Import into ${table} did not return a primary-key identity`);
+          }
+          const returned = statement.get(null, { useBigInt: true });
+          if (!returned || statement.step()) {
+            throw new Error(
+              `Import into ${table} did not return exactly one primary-key identity`
+            );
+          }
+          statement.reset();
+          const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+            identity,
+            returned,
+            textEncoding,
+            `Cannot import into ${table}`
+          );
+          rowIds[index] = readPrimaryKeyRecordId(
+            table,
+            identity,
+            buildRecordIdentityPredicate(candidateId, identity)
+          );
+          continue;
+        }
+        statement.step();
+        statement.reset();
+        identityStatement ??= db.prepare('SELECT changes(), CAST(last_insert_rowid() AS TEXT)');
+        identityStatement.step();
+        const metadata = identityStatement.get(null, { useBigInt: true });
+        identityStatement.reset();
+        if (!metadata || Number(metadata[0]) !== 1) {
+          throw new Error(`Import into ${table} did not create exactly one row for row ${index + 1}`);
+        }
+        rowIds[index] = validateRowId(metadata[1]);
+      }
+    } finally {
+      for (const statement of statements.values()) statement.free();
+      identityStatement?.free();
+    }
+    const snapshots = readImportSnapshots(table, identity, rowIds, textEncoding);
+    assertImportSnapshotsWithinBudgets(table, rows.length, snapshots, limits);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return { rowCount: rows.length, snapshots };
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'importRows');
+    throw error;
+  }
+}
+
+/**
+ * Expand an import's compact post-images back into the `DeletedRow[]` the
+ * row-history replay paths take. Strict about shape: the entry arrives from the
+ * host's history store, so a malformed one is refused here rather than turned
+ * into a partial predicate downstream.
+ *
+ * @param {import('../../../src/core/types.ts').ImportedRowSnapshots} imported
+ * @returns {import('../../../src/core/types.ts').DeletedRow[]}
+ */
+function expandImportedRows(imported) {
+  if (
+    imported === null || typeof imported !== 'object'
+    || !Array.isArray(imported.columns) || !Array.isArray(imported.storageClassPatterns)
+    || !Array.isArray(imported.rows) || imported.rows.length === 0
+    || imported.columns.some(column => typeof column !== 'string')
+  ) {
+    throw new LegacyRowHistoryError();
+  }
+  const width = imported.columns.length;
+  const patterns = imported.storageClassPatterns.map(pattern => {
+    if (!Array.isArray(pattern) || pattern.length !== width) throw new LegacyRowHistoryError();
+    return imported.columns.map((column, index) => ({ column, storageClass: pattern[index] }));
+  });
+  return imported.rows.map(entry => {
+    if (
+      entry === null || typeof entry !== 'object'
+      || !Array.isArray(entry.values) || entry.values.length !== width
+      || !Number.isInteger(entry.pattern) || entry.pattern < 0 || entry.pattern >= patterns.length
+    ) {
+      throw new LegacyRowHistoryError();
+    }
+    return {
+      rowId: entry.rowId,
+      row: Object.fromEntries(imported.columns.map((column, index) => [column, entry.values[index]])),
+      storageClasses: patterns[entry.pattern]
+    };
+  });
+}
+
 const DELETE_SNAPSHOT_PREFLIGHT_COLUMN_CHUNK_SIZE = 64;
 
 function readDeleteSnapshotPreflightInteger(value, label) {
@@ -4850,6 +5261,16 @@ async function undoModification(modification) {
       await replayCellHistory(targetTable, modification, 'undo');
       return;
     case 'row_insert':
+      if (modification.importedRows) {
+        // One import, one entry: delete the exact post-images in REVERSE
+        // insertion order, so rows that reference earlier rows of the same
+        // batch (a self-referencing foreign key) unwind before their parents.
+        await deleteRowHistorySnapshots(
+          targetTable,
+          expandImportedRows(modification.importedRows).reverse()
+        );
+        return;
+      }
       if (!insertedRow || targetRowId === undefined) {
         throw new LegacyRowHistoryError();
       }
@@ -4922,6 +5343,11 @@ async function redoModification(modification) {
       await replayCellHistory(targetTable, modification, 'redo');
       return;
     case 'row_insert': {
+      if (modification.importedRows) {
+        // Insertion order, the mirror of the undo branch above.
+        await restoreRowHistorySnapshots(targetTable, expandImportedRows(modification.importedRows));
+        return;
+      }
       if (!insertedRow) throw new LegacyRowHistoryError();
       await restoreRowHistorySnapshots(targetTable, [insertedRow]);
       return;
@@ -5419,6 +5845,7 @@ const methods = {
   replaceOversizedCell,
   insertRow,
   insertRowWithHistory,
+  importRows,
   deleteRows,
   findDependentIndexes,
   deleteColumns,

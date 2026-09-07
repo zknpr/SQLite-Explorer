@@ -10,7 +10,11 @@ const MUTATION_CONTROL_IDS = [
     'btnSubmitCreateTable',
     'btnSubmitAddColumn',
     'cellPreviewSaveBtn',
-    'blob-replace-btn'
+    'blob-replace-btn',
+    // Desktop-only toolbar button (ships hidden in the shared template;
+    // import-data.js unhides it). Listed so read-only and mid-refresh
+    // connections gate it exactly like the other mutation controls.
+    'btnImportData'
 ];
 
 export function updateMutationControlCapabilities() {

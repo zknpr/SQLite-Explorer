@@ -20,7 +20,16 @@ const INTERACTIVE_RPC_METHODS = new Set([
     'exportTable',
     'showInformationToast',
     'showWarningToast',
-    'showErrorToast'
+    'showErrorToast',
+    // Desktop CSV/JSON import (import-data.js; the VS Code host never sends
+    // these). `pickImportSource` is a native dialog; `readImportSource` reads
+    // up to 64 MiB from wherever the user's file lives; and `importRows` is a
+    // mutation — a client deadline that rejected while the worker went on to
+    // release the import's savepoint would leave the rows in place with no
+    // history entry to undo them.
+    'pickImportSource',
+    'readImportSource',
+    'importRows'
 ]);
 
 /**
