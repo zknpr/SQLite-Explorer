@@ -40,6 +40,7 @@ describe('viewer connection state', () => {
         state.isReadOnly = false;
         state.selectedTable = 'items';
         state.selectedTableType = 'table';
+        state.renderedTable = 'items';
         state.selectedRowIds = new Set([1]);
 
         applyConnectionResult({ connected: true, readOnly: true });

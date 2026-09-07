@@ -14,6 +14,8 @@ import {
 import { syncSelectionDOM } from './grid-selection.js';
 
 const OVERSIZED_BLOB_PREVIEW_BYTES = 16;
+export const MIN_COLUMN_WIDTH = 30;
+export const MAX_COLUMN_WIDTH = 10000;
 
 // ================================================================
 // VIRTUALIZED ROW WINDOW
@@ -153,16 +155,30 @@ function setSpacerHeight(spacer, rowCount) {
 // ================================================================
 
 function formatOversizedPreview(value, metadata, ordinaryDisplayValue) {
-    const preview = metadata.storageClass === 'blob' && value instanceof Uint8Array
+    const rawTextBytes = metadata.storageClass === 'text' && value instanceof Uint8Array;
+    const preview = value instanceof Uint8Array
         ? Array.from(value.subarray(0, OVERSIZED_BLOB_PREVIEW_BYTES), byte => (
             byte.toString(16).padStart(2, '0')
         )).join(' ')
         : ordinaryDisplayValue;
+    const byteUnit = metadata.byteLength === 1 ? 'byte' : 'bytes';
+    if (rawTextBytes) {
+        const complete = value.byteLength === metadata.byteLength;
+        return {
+            preview,
+            details: complete
+                ? ` · TEXT · ${metadata.byteLength.toLocaleString()} ${byteUnit} · ` +
+                    'full byte-exact raw value'
+                : `… · TEXT · ${metadata.byteLength.toLocaleString()} ${byteUnit} · ` +
+                    'byte-exact raw prefix'
+        };
+    }
     return {
         preview,
         details: (
             `… · ${metadata.storageClass.toUpperCase()} · ` +
-            `${metadata.byteLength.toLocaleString()} bytes · too large to edit inline`
+            `${metadata.byteLength.toLocaleString()} ${byteUnit} · ` +
+            `full byte-exact value not shown in grid`
         )
     };
 }
@@ -198,10 +214,13 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
     rowNumTh.title = 'Click to select all rows';
     const rowHeaderContent = document.createElement('div');
     rowHeaderContent.className = 'header-content';
-    const rowHeaderTop = document.createElement('div');
-    rowHeaderTop.className = 'header-top header-top-center';
-    rowHeaderTop.textContent = '#';
-    rowHeaderContent.appendChild(rowHeaderTop);
+    const selectAllButton = document.createElement('button');
+    selectAllButton.type = 'button';
+    selectAllButton.className = 'grid-icon-button row-select-all-button';
+    selectAllButton.textContent = '#';
+    selectAllButton.title = 'Select all rows on this page';
+    selectAllButton.ariaLabel = 'Select all rows on this page';
+    rowHeaderContent.appendChild(selectAllButton);
     rowNumTh.appendChild(rowHeaderContent);
     headerTr.appendChild(rowNumTh);
 
@@ -237,33 +256,46 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         const headerTop = document.createElement('div');
         headerTop.className = 'header-top';
 
+        const sortButton = document.createElement('button');
+        sortButton.type = 'button';
+        sortButton.className = 'header-sort-button';
+        sortButton.title = `Sort by ${col.name}`;
+        sortButton.ariaLabel = `Sort by ${col.name}`;
+
         if (col.isPrimaryKey) {
             const keyIcon = document.createElement('span');
             keyIcon.className = 'key-icon codicon codicon-key';
             keyIcon.title = 'Primary Key';
-            headerTop.appendChild(keyIcon);
+            sortButton.appendChild(keyIcon);
         }
 
         const headerText = document.createElement('span');
         headerText.className = 'header-text';
         headerText.textContent = col.name;
-        headerTop.appendChild(headerText);
+        sortButton.appendChild(headerText);
 
         if (isSorted) {
             const sortIndicator = document.createElement('span');
             sortIndicator.className = 'sort-indicator';
             sortIndicator.textContent = state.sortAscending ? '▲' : '▼';
-            headerTop.appendChild(sortIndicator);
+            sortButton.appendChild(sortIndicator);
         }
 
-        const selectColumnIcon = document.createElement('span');
+        headerTop.appendChild(sortButton);
+
+        const selectColumnIcon = document.createElement('button');
+        selectColumnIcon.type = 'button';
         selectColumnIcon.className = 'select-column-icon codicon codicon-selection';
         selectColumnIcon.title = 'Select entire column';
+        selectColumnIcon.ariaLabel = `Select column ${col.name}`;
         headerTop.appendChild(selectColumnIcon);
 
-        const pinIcon = document.createElement('span');
+        const pinIcon = document.createElement('button');
+        pinIcon.type = 'button';
         pinIcon.className = `pin-icon codicon codicon-pin ${pinClass}`;
         pinIcon.title = pinTitle;
+        pinIcon.ariaLabel = `${pinTitle} ${col.name}`;
+        pinIcon.setAttribute?.('aria-pressed', String(isPinned));
         headerTop.appendChild(pinIcon);
         headerContent.appendChild(headerTop);
 
@@ -303,6 +335,7 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
         applyFilterButton.type = 'button';
         applyFilterButton.className = 'filter-apply-btn';
         applyFilterButton.title = 'Apply filter — Enter: next match, Shift+Enter: previous';
+        applyFilterButton.ariaLabel = `Search column ${col.name}`;
         const searchIcon = document.createElement('span');
         searchIcon.className = 'codicon codicon-search';
         applyFilterButton.appendChild(searchIcon);
@@ -312,6 +345,14 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
 
         const resizeHandle = document.createElement('div');
         resizeHandle.className = 'resize-handle';
+        resizeHandle.tabIndex = 0;
+        resizeHandle.dataset.column = col.name;
+        resizeHandle.setAttribute?.('role', 'separator');
+        resizeHandle.setAttribute?.('aria-label', `Resize column ${col.name}`);
+        resizeHandle.setAttribute?.('aria-orientation', 'vertical');
+        resizeHandle.setAttribute?.('aria-valuemin', String(MIN_COLUMN_WIDTH));
+        resizeHandle.setAttribute?.('aria-valuemax', String(MAX_COLUMN_WIDTH));
+        resizeHandle.setAttribute?.('aria-valuenow', String(colWidth));
         th.appendChild(resizeHandle);
         headerTr.appendChild(th);
     }
@@ -376,11 +417,19 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
 
     const rowNumVal = state.currentPageIndex * state.rowsPerPage + rowIdx + 1;
     // Use DOM methods instead of innerHTML for consistency with XSS prevention patterns
-    rowNumTd.appendChild(document.createTextNode(String(rowNumVal)));
-    const pinSpan = document.createElement('span');
-    pinSpan.className = `pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}`;
-    pinSpan.title = isRowPinned ? 'Unpin row' : 'Pin row';
-    rowNumTd.appendChild(pinSpan);
+    const rowSelectButton = document.createElement('button');
+    rowSelectButton.type = 'button';
+    rowSelectButton.className = 'row-select-button';
+    rowSelectButton.textContent = String(rowNumVal);
+    rowSelectButton.ariaLabel = `Select row ${rowNumVal}`;
+    rowNumTd.appendChild(rowSelectButton);
+    const pinButton = document.createElement('button');
+    pinButton.type = 'button';
+    pinButton.className = `pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}`;
+    pinButton.title = isRowPinned ? 'Unpin row' : 'Pin row';
+    pinButton.ariaLabel = `${pinButton.title} ${rowNumVal}`;
+    pinButton.setAttribute?.('aria-pressed', String(isRowPinned));
+    rowNumTd.appendChild(pinButton);
     tr.appendChild(rowNumTd);
 
     for (let displayColIdx = 0; displayColIdx < ctx.orderedColumns.length; displayColIdx++) {
@@ -391,7 +440,9 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
         const isCellSelected = dyn.selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
         const isColPinned = state.pinnedColumns.has(col.name);
         const oversizedMetadata = getOversizedCellMetadata(rowIdx, originalColIdx);
-        const hasContent = !oversizedMetadata && !isNull && !(value instanceof Uint8Array);
+        // A bounded grid value is still viewable through the snapshot-backed
+        // inspector. Hiding the affordance made containment look like data loss.
+        const hasContent = !!oversizedMetadata || (!isNull && !(value instanceof Uint8Array));
         const colWidth = state.columnWidths[col.name] || 120;
         const isActiveMatch = !!dyn.activeMatch && dyn.activeMatch.rowIdx === rowIdx
             && dyn.activeMatch.colIdx === originalColIdx;
@@ -411,8 +462,13 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
         td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''} ${isActiveMatch ? 'active-match-cell' : ''} ${oversizedMetadata ? 'oversized-cell' : ''}`;
         td.dataset.rowidx = rowIdx;
         td.dataset.colidx = originalColIdx;
-        if (oversizedMetadata || readOnlyRowReason) {
-            td.title = getCellMutationBlockReason(rowIdx, originalColIdx);
+        const isKeyboardTarget = ctx.keyboardTarget?.rowIdx === rowIdx
+            && ctx.keyboardTarget?.colIdx === originalColIdx;
+        td.tabIndex = isKeyboardTarget ? 0 : -1;
+        td.dataset.gridTabstop = String(isKeyboardTarget);
+        const mutationBlockReason = getCellMutationBlockReason(rowIdx, originalColIdx);
+        if (mutationBlockReason) {
+            td.title = mutationBlockReason;
         }
 
         Object.assign(td.style, {
@@ -446,10 +502,16 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
         td.appendChild(textSpan);
 
         if (hasContent) {
-            const iconSpan = document.createElement('span');
-            iconSpan.className = 'expand-icon codicon codicon-link-external';
-            iconSpan.title = 'View full content';
-            td.appendChild(iconSpan);
+            const expandButton = document.createElement('button');
+            expandButton.type = 'button';
+            expandButton.className = 'expand-icon codicon codicon-link-external';
+            const rawTextBytes = oversizedMetadata?.storageClass === 'text'
+                && value instanceof Uint8Array;
+            expandButton.title = rawTextBytes ? 'Inspect raw TEXT bytes' : 'View full content';
+            expandButton.ariaLabel = rawTextBytes
+                ? `Inspect raw TEXT bytes for ${col.name}, row ${rowNumVal}`
+                : `View full content for ${col.name}, row ${rowNumVal}`;
+            td.appendChild(expandButton);
         }
 
         tr.appendChild(td);
@@ -813,6 +875,26 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
             pinnedRowIndices.length,
             unpinnedRowIndices.length
         )
+    };
+
+    const orderedColumnIndices = orderedColumns.map(column => columnIndexMap.get(column.name));
+    const preferred = state.lastSelectedCell;
+    const preferredRowPosition = preferred
+        ? unpinnedRowIndices.indexOf(preferred.rowIdx)
+        : -1;
+    const preferredRowIsRendered = !!preferred && (
+        pinnedRowIndices.includes(preferred.rowIdx)
+        || !ctx.windowBounds
+        || (preferredRowPosition >= ctx.windowBounds.start
+            && preferredRowPosition < ctx.windowBounds.end)
+    );
+    const fallbackRowIdx = pinnedRowIndices[0]
+        ?? unpinnedRowIndices[ctx.windowBounds?.start ?? 0];
+    ctx.keyboardTarget = {
+        rowIdx: preferredRowIsRendered ? preferred.rowIdx : fallbackRowIdx,
+        colIdx: preferred && orderedColumnIndices.includes(preferred.colIdx)
+            ? preferred.colIdx
+            : orderedColumnIndices[0]
     };
 
     const tbody = createTableBody(ctx, hasActiveFilters);

@@ -339,22 +339,35 @@ function buildOverviewItem(database) {
     item.dataset.dbId = database.dbId;
     item.title = database.path ?? database.name;
 
+    // The row's content lives in a real button, like the schema tree's rows
+    // (sidebar.js renderSidebarList): `.list-item` is a bare flex container
+    // now and `.list-item-select` carries the padding, the hover target and
+    // the keyboard focus. The click listener stays on the row, where a click
+    // on the button bubbles to it — including the synthetic click a keyboard
+    // activation fires.
+    const select = document.createElement('button');
+    select.type = 'button';
+    select.className = 'list-item-select';
+    select.setAttribute('aria-label', `Switch to ${database.name}`);
+    if (database.isActive) select.setAttribute('aria-current', 'true');
+
     const icon = document.createElement('span');
     icon.className = 'item-icon codicon codicon-database';
-    item.appendChild(icon);
+    select.appendChild(icon);
 
     const name = document.createElement('span');
     name.className = 'item-name';
     name.textContent = database.name;
-    item.appendChild(name);
+    select.appendChild(name);
 
     const engine = document.createElement('span');
     engine.className = 'db-item-engine';
     engine.dataset.engine = database.engine;
     engine.textContent = database.engine;
-    item.appendChild(engine);
+    select.appendChild(engine);
 
-    if (database.isDirty) item.appendChild(dirtyMarker('db-item-dirty'));
+    if (database.isDirty) select.appendChild(dirtyMarker('db-item-dirty'));
+    item.appendChild(select);
 
     item.addEventListener('click', () => { void switchTo(database.dbId); });
     return item;

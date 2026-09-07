@@ -96,7 +96,7 @@ export function getBatchSelectionEligibility() {
     let readOnlyCount = 0;
     let readOnlyReason;
     for (const cell of state.selectedCells) {
-        const currentReason = getReadOnlyRowReason(cell.rowIdx);
+        const currentReason = getCellMutationBlockReason(cell.rowIdx, cell.colIdx);
         if (isReadOnlyPrimaryKeyRecordId(cell.rowId) || currentReason) {
             readOnlyCount++;
             readOnlyReason ??= currentReason;
@@ -123,11 +123,34 @@ export function getCellMutationBlockReason(
 ) {
     const rowReason = getReadOnlyRowReason(rowIdx);
     if (rowReason) return rowReason;
+    const column = state.tableColumns[colIdx];
+    if (column?.isGenerated) {
+        return `Generated column ${column.name} is computed by SQLite and is read-only.`;
+    }
     const oversized = getOversizedCellMetadata(rowIdx, colIdx);
     if (!oversized || allowOversizedReplacement) return undefined;
+    const row = state.gridData?.[rowIdx];
+    const value = row ? getCellValue(row, colIdx) : undefined;
+    if (oversized.storageClass === 'text' && value instanceof Uint8Array) {
+        const byteUnit = oversized.byteLength === 1 ? 'byte' : 'bytes';
+        const retained = value.byteLength === oversized.byteLength
+            ? 'The full byte-exact raw value is available in the Hex inspector.'
+            : 'A byte-exact raw prefix is available in the Hex inspector.';
+        return (
+            `Inline text editing unavailable because the stored TEXT cannot be represented safely. ` +
+            `${retained} Use Replace to overwrite it ` +
+            `(TEXT, ${oversized.byteLength.toLocaleString()} ${byteUnit}).`
+        );
+    }
+    // This sidecar covers size/page containment and byte-unrepresentable TEXT.
+    // It has no reason discriminator, so describe the shared safety invariant
+    // instead of falsely claiming that every contained value is too large.
+    const byteUnit = oversized.byteLength === 1 ? 'byte' : 'bytes';
     return (
-        `Too large to edit inline — ${oversized.byteLength.toLocaleString()} bytes ` +
-        `(${oversized.storageClass.toUpperCase()})`
+        `Inline editing unavailable because the grid does not contain the full byte-exact value. ` +
+        `Use View Full Content and the Hex view ` +
+        `(${oversized.storageClass.toUpperCase()}, ` +
+        `${oversized.byteLength.toLocaleString()} ${byteUnit}).`
     );
 }
 

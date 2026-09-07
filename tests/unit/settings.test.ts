@@ -2,6 +2,7 @@ import './vscode_mock_setup';
 
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
+import { createDeferred } from './helpers/deferred';
 
 (globalThis as any).acquireVsCodeApi = () => ({
     getState: () => undefined,
@@ -17,6 +18,8 @@ class TestElement {
     readonly dataset: Record<string, string> = {};
     readonly style: Record<string, string> = {};
     className = '';
+    id = '';
+    htmlFor = '';
     type = '';
     value: any = '';
     selected = false;
@@ -161,6 +164,149 @@ describe('pragma settings', () => {
         } finally {
             backendApi.getPragmas = originalGetPragmas;
             backendApi.getExtensionSettings = originalGetExtensionSettings;
+        }
+    });
+
+    it('honors web-demo extension-setting capabilities', async () => {
+        const { container } = installSettingsDocument();
+        const { backendApi } = await import(apiModulePath);
+        const { openSettingsModal } = await import(settingsModulePath);
+        const originalGetPragmas = backendApi.getPragmas;
+        const originalGetExtensionSettings = backendApi.getExtensionSettings;
+        backendApi.getPragmas = async () => ({ ...effectivePragmas });
+        backendApi.getExtensionSettings = async () => ({
+            autoCommit: false,
+            autoCommitSupported: false,
+            cellEditBehavior: 'inline',
+            cellEditBehaviorOptions: ['inline', 'modal'],
+            fileOperations: 'web'
+        });
+
+        try {
+            await openSettingsModal();
+
+            const autoCommit = findElement(
+                container,
+                element => element.dataset.key === 'autoCommit'
+            );
+            const doubleClick = findElement(
+                container,
+                element => element.dataset.key === 'doubleClickBehavior'
+            );
+            assert.strictEqual(autoCommit?.disabled, true);
+            assert.deepStrictEqual(
+                doubleClick?.children.map(option => option.value),
+                ['inline', 'modal']
+            );
+        } finally {
+            backendApi.getPragmas = originalGetPragmas;
+            backendApi.getExtensionSettings = originalGetExtensionSettings;
+        }
+    });
+
+    it('associates every generated setting control with its visible label', async () => {
+        const { container } = installSettingsDocument();
+        const { backendApi } = await import(apiModulePath);
+        const { openSettingsModal } = await import(settingsModulePath);
+        const originalGetPragmas = backendApi.getPragmas;
+        const originalGetExtensionSettings = backendApi.getExtensionSettings;
+        backendApi.getPragmas = async () => ({ ...effectivePragmas });
+        backendApi.getExtensionSettings = async () => ({
+            autoCommit: false,
+            cellEditBehavior: 'inline'
+        });
+
+        try {
+            await openSettingsModal();
+
+            const controls: TestElement[] = [];
+            const collectControls = (element: TestElement) => {
+                if (element.tagName === 'input' || element.tagName === 'select') {
+                    controls.push(element);
+                }
+                element.children.forEach(collectControls);
+            };
+            collectControls(container);
+            assert.ok(controls.length > 0, 'settings must render form controls');
+
+            for (const control of controls) {
+                assert.notStrictEqual(control.id, '', 'each setting control must have an id');
+                const label = findElement(
+                    container,
+                    element => element.tagName === 'label' && element.htmlFor === control.id
+                );
+                assert.ok(label, `control ${control.id} must have an associated label`);
+            }
+        } finally {
+            backendApi.getPragmas = originalGetPragmas;
+            backendApi.getExtensionSettings = originalGetExtensionSettings;
+        }
+    });
+
+    it('keeps the newest Settings load when an older request resolves last', async () => {
+        const { container } = installSettingsDocument();
+        const { backendApi } = await import(apiModulePath);
+        const { openSettingsModal } = await import(settingsModulePath);
+        const originalGetPragmas = backendApi.getPragmas;
+        const originalGetExtensionSettings = backendApi.getExtensionSettings;
+        const firstPragmas = createDeferred<any>();
+        const secondPragmas = createDeferred<any>();
+        let calls = 0;
+        backendApi.getPragmas = async () => (
+            ++calls === 1 ? firstPragmas.promise : secondPragmas.promise
+        );
+        backendApi.getExtensionSettings = async () => ({
+            autoCommit: false,
+            cellEditBehavior: 'inline'
+        });
+
+        try {
+            const firstOpen = openSettingsModal();
+            const secondOpen = openSettingsModal();
+            secondPragmas.resolve({ ...effectivePragmas, cache_size: -2222 });
+            await secondOpen;
+            firstPragmas.resolve({ ...effectivePragmas, cache_size: -1111 });
+            await firstOpen;
+
+            const cacheSize = findElement(
+                container,
+                element => element.dataset.name === 'cache_size'
+            );
+            assert.strictEqual(String(cacheSize?.value), '-2222');
+        } finally {
+            backendApi.getPragmas = originalGetPragmas;
+            backendApi.getExtensionSettings = originalGetExtensionSettings;
+        }
+    });
+
+    it('clears stale error styling after a later Settings load succeeds', async () => {
+        const { container } = installSettingsDocument();
+        const { backendApi } = await import(apiModulePath);
+        const { openSettingsModal } = await import(settingsModulePath);
+        const originalGetPragmas = backendApi.getPragmas;
+        const originalGetExtensionSettings = backendApi.getExtensionSettings;
+        const originalConsoleError = console.error;
+        let calls = 0;
+        backendApi.getPragmas = async () => {
+            calls += 1;
+            if (calls === 1) throw new Error('temporary settings failure');
+            return { ...effectivePragmas };
+        };
+        backendApi.getExtensionSettings = async () => ({
+            autoCommit: false,
+            cellEditBehavior: 'inline'
+        });
+        console.error = () => {};
+
+        try {
+            await openSettingsModal();
+            assert.strictEqual(container.style.color, 'var(--error-color)');
+            await openSettingsModal();
+            assert.strictEqual(container.style.color, '');
+        } finally {
+            backendApi.getPragmas = originalGetPragmas;
+            backendApi.getExtensionSettings = originalGetExtensionSettings;
+            console.error = originalConsoleError;
         }
     });
 });

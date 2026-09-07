@@ -595,7 +595,7 @@ describe('streamTableExport golden parity', () => {
         }
     });
 
-    it('matches legacy JSON key ordering and __proto__ handling', async () => {
+    it('exports prototype-spelled column names as ordinary JSON properties', async () => {
         const database = await createDatabaseEngine({
             content: null,
             maxSize: 0,
@@ -603,13 +603,14 @@ describe('streamTableExport golden parity', () => {
         });
         const operations = database.operations!;
         await operations.executeQuery(
-            'CREATE TABLE stage_e_json_keys ("__proto__" TEXT, "1" TEXT, normal TEXT)'
+            'CREATE TABLE stage_e_json_keys (' +
+            '"__proto__" TEXT, "constructor" TEXT, "prototype" TEXT, "1" TEXT, normal TEXT)'
         );
         await operations.executeQuery(
-            'INSERT INTO stage_e_json_keys VALUES (?, ?, ?)',
-            ['ignored-by-legacy-object', 'integer-key', 'normal-value']
+            'INSERT INTO stage_e_json_keys VALUES (?, ?, ?, ?, ?)',
+            ['proto-value', 'constructor-value', 'prototype-value', 'integer-key', 'normal-value']
         );
-        const columns = ['normal', '__proto__', '1', 'normal'];
+        const columns = ['normal', '__proto__', 'constructor', 'prototype', '1', 'normal'];
 
         try {
             const exported = await collectStreamingExport(
@@ -618,13 +619,31 @@ describe('streamTableExport golden parity', () => {
                 columns,
                 { format: 'json' }
             );
+            const [row] = JSON.parse(exported.content);
+            assert.deepStrictEqual(Object.keys(row), [
+                '1',
+                'normal',
+                '__proto__',
+                'constructor',
+                'prototype'
+            ]);
+            assert.strictEqual(
+                Object.prototype.propertyIsEnumerable.call(row, '__proto__'),
+                true
+            );
+            assert.deepStrictEqual(row, JSON.parse(
+                '{"1":"integer-key","normal":"normal-value","__proto__":"proto-value",' +
+                '"constructor":"constructor-value","prototype":"prototype-value"}'
+            ));
             assert.strictEqual(
                 exported.content,
                 exportToJson(
                     columns,
                     [[
                         'normal-value',
-                        'ignored-by-legacy-object',
+                        'proto-value',
+                        'constructor-value',
+                        'prototype-value',
                         'integer-key',
                         'normal-value'
                     ]]
@@ -1682,7 +1701,7 @@ describe('streamTableExport cell boundaries', () => {
                         const sql = String(args[0]);
                         if (
                             !mutationInjected &&
-                            sql.includes('FROM "stage_e_pk_race"')
+                            sql.includes('FROM main."stage_e_pk_race"')
                         ) {
                             mutationInjected = true;
                             await target.executeQuery(
@@ -1911,7 +1930,7 @@ describe('streamTableExport cell boundaries', () => {
                         const sql = String(args[0]);
                         if (
                             !mutationQueued &&
-                            sql.includes('FROM "stage_e_cell_snapshot"')
+                            sql.includes('FROM main."stage_e_cell_snapshot"')
                         ) {
                             mutationQueued = true;
                             // Queue through the public facade while the projection is
@@ -2084,6 +2103,137 @@ describe('exportTableCommand atomic streaming', () => {
             nodeFs.promises.rename = originalRename;
             mockVscode.window.showSaveDialog = originalShowSaveDialog;
             DocumentRegistry.delete('stage-e-atomic');
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
+    it('returns the completed export without waiting for notification dismissal', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            "CREATE TABLE notification_export (value TEXT); " +
+            "INSERT INTO notification_export VALUES ('done')"
+        );
+
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const finalPath = path.join(scratch, 'notification.json');
+        const documentUri = mockVscode.Uri.parse('vscode-sqlite://notification-export.db');
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        const originalShowInformationMessage = mockVscode.window.showInformationMessage;
+        let notificationMessage: unknown;
+        let notificationShown!: () => void;
+        const notificationStarted = new Promise<void>(resolve => { notificationShown = resolve; });
+        let dismissNotification!: () => void;
+        const notificationDismissed = new Promise<void>(resolve => {
+            dismissNotification = resolve;
+        });
+        let exportPromise: Promise<unknown> | undefined;
+        DocumentRegistry.set('notification-export', {
+            uri: documentUri,
+            databaseOperations: operations
+        } as any);
+
+        try {
+            mockVscode.window.showSaveDialog = async (): Promise<any> => mockVscode.Uri.file(finalPath);
+            mockVscode.window.showInformationMessage = (...args: unknown[]): any => {
+                notificationMessage = args[0];
+                notificationShown();
+                return notificationDismissed;
+            };
+
+            exportPromise = exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'notification_export', uri: documentUri.toString() },
+                ['value'],
+                undefined,
+                undefined,
+                { format: 'json' }
+            );
+            await notificationStarted;
+            assert.strictEqual(
+                notificationMessage,
+                `Exported 1 row to ${finalPath}`
+            );
+
+            const settled = await Promise.race([
+                exportPromise.then(result => ({ kind: 'resolved' as const, result })),
+                new Promise<{ kind: 'timeout' }>(resolve => {
+                    setTimeout(() => resolve({ kind: 'timeout' }), 50);
+                })
+            ]);
+            assert.notStrictEqual(
+                settled.kind,
+                'timeout',
+                'completed export RPC remained blocked on notification dismissal'
+            );
+            if (settled.kind === 'resolved') {
+                assert.deepStrictEqual(settled.result, {
+                    success: true,
+                    rowCount: 1,
+                    destination: finalPath
+                });
+            }
+        } finally {
+            dismissNotification();
+            await exportPromise?.catch(() => {});
+            mockVscode.window.showInformationMessage = originalShowInformationMessage;
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            DocumentRegistry.delete('notification-export');
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
+    it('refuses to overwrite a local destination changed while the export was streaming', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            "CREATE TABLE export_conflict (value TEXT); INSERT INTO export_conflict VALUES ('exported')"
+        );
+        const scratch = await fsPromises.mkdtemp(path.join(process.cwd(), '.stage-e-export-test-'));
+        const destinationPath = path.join(scratch, 'conflict.csv');
+        await fsPromises.writeFile(destinationPath, 'original');
+        const nodeFs = require('node:fs') as typeof import('node:fs');
+        const originalCreateWriteStream = nodeFs.createWriteStream;
+        let externalWriteDone = false;
+        try {
+            nodeFs.createWriteStream = ((...args: any[]) => {
+                const stream = (originalCreateWriteStream as any)(...args);
+                const originalWrite = stream.write;
+                stream.write = function (this: any, ...writeArgs: any[]) {
+                    if (!externalWriteDone) {
+                        externalWriteDone = true;
+                        nodeFs.writeFileSync(destinationPath, 'external-writer');
+                    }
+                    return originalWrite.apply(this, writeArgs as any);
+                } as typeof stream.write;
+                return stream;
+            }) as typeof nodeFs.createWriteStream;
+
+            await assert.rejects(
+                () => exportTableToLocalFileForTests(
+                    { databaseOperations: operations } as any,
+                    destinationPath,
+                    'export_conflict',
+                    ['value'],
+                    { format: 'csv', header: true }
+                ),
+                /destination changed during the export/i
+            );
+            assert.strictEqual(await fsPromises.readFile(destinationPath, 'utf8'), 'external-writer');
+            assert.deepStrictEqual(await fsPromises.readdir(scratch), ['conflict.csv']);
+        } finally {
+            nodeFs.createWriteStream = originalCreateWriteStream;
             (operations as WasmDatabaseEngine).shutdown();
             await fsPromises.rm(scratch, { recursive: true, force: true });
         }
@@ -2338,6 +2488,101 @@ describe('exportTableCommand atomic streaming', () => {
         }
     });
 
+    it('preserves a non-local destination changed before the staged export is published', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            "CREATE TABLE remote_conflict (value TEXT); INSERT INTO remote_conflict VALUES ('exported')"
+        );
+        const documentUri = mockVscode.Uri.parse('vscode-sqlite://remote-conflict.db');
+        const destination = {
+            ...mockVscode.Uri.file('/remote/conflict.csv'),
+            scheme: 'vscode-remote',
+            toString: () => 'vscode-remote:///remote/conflict.csv'
+        };
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        const originalFs = mockVscode.workspace.fs;
+        let destinationBytes = new TextEncoder().encode('original');
+        let destinationMtime = 1;
+        let renamed = false;
+        let temporaryUri: any;
+        const deleted: any[] = [];
+        let shownError = '';
+        DocumentRegistry.set('remote-conflict', {
+            uri: documentUri,
+            databaseOperations: operations
+        } as any);
+
+        try {
+            mockVscode.window.showSaveDialog = async (): Promise<any> => destination;
+            mockVscode.window.showErrorMessage = async (message: string): Promise<any> => {
+                shownError = message;
+            };
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: {
+                    ...originalFs,
+                    stat: async (uri: any) => {
+                        assert.strictEqual(uri.toString(), destination.toString());
+                        return {
+                            type: mockVscode.FileType.File,
+                            ctime: 1,
+                            mtime: destinationMtime,
+                            size: destinationBytes.byteLength,
+                            permissions: undefined
+                        };
+                    },
+                    readFile: async (uri: any) => {
+                        assert.strictEqual(uri.toString(), destination.toString());
+                        return destinationBytes.slice();
+                    },
+                    writeFile: async (uri: any) => {
+                        temporaryUri = uri;
+                        destinationBytes = new TextEncoder().encode('external-writer');
+                        destinationMtime = 2;
+                    },
+                    rename: async () => { renamed = true; },
+                    delete: async (uri: any) => { deleted.push(uri); }
+                },
+                writable: true,
+                configurable: true
+            });
+
+            const result = await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'remote_conflict', uri: documentUri.toString() },
+                ['value'],
+                undefined,
+                undefined,
+                { format: 'csv' }
+            );
+            assert.deepStrictEqual(result, {
+                success: false,
+                message: 'Export destination changed during the export; retry'
+            });
+            assert.strictEqual(shownError, 'Export failed: Export destination changed during the export; retry');
+            assert.strictEqual(renamed, false);
+            assert.strictEqual(new TextDecoder().decode(destinationBytes), 'external-writer');
+            assert.ok(temporaryUri);
+            assert.deepStrictEqual(deleted, [temporaryUri]);
+        } finally {
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+            DocumentRegistry.delete('remote-conflict');
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('refuses output above the precise non-local memory cap before workspace.fs writes', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -2431,6 +2676,23 @@ describe('exportToJson', () => {
         assert.deepStrictEqual(parsed, [
             { id: 1, data: 'AQID' } // AQID is base64 for [1, 2, 3]
         ]);
+    });
+
+    it('preserves own enumerable prototype-spelled column names', () => {
+        const json = exportToJson(
+            ['__proto__', 'constructor', 'prototype'],
+            [['proto-value', 'constructor-value', 'prototype-value']]
+        );
+
+        assert.strictEqual(
+            json,
+            '[\n  {\n    "__proto__": "proto-value",\n' +
+            '    "constructor": "constructor-value",\n' +
+            '    "prototype": "prototype-value"\n  }\n]'
+        );
+        const [row] = JSON.parse(json);
+        assert.strictEqual(Object.prototype.propertyIsEnumerable.call(row, '__proto__'), true);
+        assert.deepStrictEqual(Object.keys(row), ['__proto__', 'constructor', 'prototype']);
     });
 
     it('should handle empty rows', () => {
@@ -2596,6 +2858,73 @@ describe('exportToSql', () => {
 });
 
 describe('exportTableCommand compatibility and failures', () => {
+    it('fails closed when an explicit database URI no longer identifies an open document', async () => {
+        const otherUri = mockVscode.Uri.parse('vscode-sqlite://other-open.db');
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        let errorMessage = '';
+        let saveDialogCalls = 0;
+        mockVscode.window.showErrorMessage = async (message: string): Promise<any> => {
+            errorMessage = message;
+        };
+        mockVscode.window.showSaveDialog = async (): Promise<any> => {
+            saveDialogCalls++;
+            return undefined;
+        };
+        DocumentRegistry.set('other-open', {
+            uri: otherUri,
+            databaseOperations: {}
+        } as any);
+
+        try {
+            const result = await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'items', uri: 'vscode-sqlite://closed.db' },
+                ['value'],
+                undefined,
+                undefined,
+                { format: 'csv' }
+            );
+            assert.deepStrictEqual(result, {
+                success: false,
+                message: 'The requested database is no longer open'
+            });
+            assert.strictEqual(errorMessage, 'The requested database is no longer open');
+            assert.strictEqual(saveDialogCalls, 0);
+        } finally {
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            DocumentRegistry.delete('other-open');
+        }
+    });
+
+    it('returns an explicit cancellation result when the destination dialog is dismissed', async () => {
+        const documentUri = mockVscode.Uri.parse('vscode-sqlite://cancel-export.db');
+        const originalShowSaveDialog = mockVscode.window.showSaveDialog;
+        mockVscode.window.showSaveDialog = async (): Promise<any> => undefined;
+        DocumentRegistry.set('cancel-export', {
+            uri: documentUri,
+            databaseOperations: {}
+        } as any);
+
+        try {
+            const result = await exportTableCommand(
+                {} as any,
+                undefined,
+                { table: 'items', uri: documentUri.toString() },
+                ['value'],
+                undefined,
+                undefined,
+                { format: 'csv' }
+            );
+            assert.deepStrictEqual(result, { success: false, cancelled: true });
+        } finally {
+            mockVscode.window.showSaveDialog = originalShowSaveDialog;
+            DocumentRegistry.delete('cancel-export');
+        }
+    });
+
     it('exports the minimum signed-int64 rowid in the first keyset batch', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -2815,7 +3144,7 @@ describe('exportTableCommand compatibility and failures', () => {
         DocumentRegistry.set('test', doc as any);
 
         try {
-            await exportTableCommand(
+            const result = await exportTableCommand(
                 {} as any,
                 undefined,
                 { table: 'test_table', uri: 'vscode-sqlite://test.db' },
@@ -2828,6 +3157,10 @@ describe('exportTableCommand compatibility and failures', () => {
             assert.strictEqual(fileWritten, false, 'Should not have written file');
             assert.strictEqual(errorMessageShown, 'Export failed: Simulated query failure for testing');
             assert.strictEqual(consoleErrorCalled, true, 'console.error should have been called');
+            assert.deepStrictEqual(result, {
+                success: false,
+                message: 'Simulated query failure for testing'
+            });
             await assert.rejects(fsPromises.stat(finalPath), (error: any) => error?.code === 'ENOENT');
             assert.deepStrictEqual(await fsPromises.readdir(scratch), []);
         } finally {

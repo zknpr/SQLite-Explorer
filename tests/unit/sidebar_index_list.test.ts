@@ -62,7 +62,7 @@ test('every class an index row renders is actually styled', () => {
     const classes = indexRowClasses();
     // The defect was two of these silently having no rule at all; assert the
     // whole set so a third one cannot be added the same way.
-    assert.deepEqual(classes, ['item-content', 'item-detail', 'item-icon', 'item-name', 'list-item']);
+    assert.deepEqual(classes, ['empty', 'item-content', 'item-detail', 'item-icon', 'item-name', 'list-item']);
     for (const className of classes) {
         assert.match(
             VIEWER_CSS,

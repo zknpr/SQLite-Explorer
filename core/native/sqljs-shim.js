@@ -940,12 +940,39 @@ export function createShimDatabase(config = {}, deps = {}) {
         }
     };
 
+    /**
+     * The stored definition of a view by name, so the missing-table proof can
+     * walk into a broken view's body (see findUnresolvedTableNames). Quiet on
+     * any failure: no definition means no walk, never an accusation.
+     */
+    const storedViewSql = (name) => {
+        let statement;
+        try {
+            statement = backing.prepare(
+                'SELECT sql FROM ('
+                + 'SELECT name, type, sql FROM sqlite_schema '
+                + 'UNION ALL SELECT name, type, sql FROM sqlite_temp_schema'
+                + ") WHERE type = 'view' AND name = ? COLLATE NOCASE LIMIT 1"
+            );
+        } catch {
+            return undefined;
+        }
+        try {
+            const sql = statement.all([String(name)])[0]?.sql;
+            return typeof sql === 'string' ? sql : undefined;
+        } catch {
+            return undefined;
+        } finally {
+            finalizeQuietly(statement);
+        }
+    };
+
     /** See describeBackingError. Bound to THIS connection's catalogs. */
     const describeError = (error, sql) => buildSqliteErrorMessage(
         error.errno,
         error.message,
         sql,
-        { resolves: resolvesAsTable, inCatalog: nameInCatalog }
+        { resolves: resolvesAsTable, inCatalog: nameInCatalog, viewSql: storedViewSql }
     );
 
     const statementContext = {

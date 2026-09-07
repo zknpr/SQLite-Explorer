@@ -10,6 +10,10 @@ export const OVERSIZED_CELL_REPLACEMENT_REQUIRED_CODE =
   'SQLITE_EXPLORER_OVERSIZED_CELL_REPLACEMENT_REQUIRED';
 export const OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE =
   'Oversized cell metadata changed before the confirmed replacement was applied';
+export const MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS = 3;
+export const OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE =
+  'Oversized cell metadata changed repeatedly while replacing it. ' +
+  'Reopen the cell and retry when concurrent writes have stopped.';
 // Writes are bounded by the RPC transport, independently of the configurable
 // inline preview limit. A preview setting must never shrink edit capability.
 export const DEFAULT_MAX_CELL_EDIT_BYTES = MAX_WEBVIEW_BINARY_VALUE_BYTES;

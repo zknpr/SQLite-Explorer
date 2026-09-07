@@ -16,17 +16,30 @@ interface WebviewRpcInvokeMessage {
   channel: 'rpc';
   content: {
     kind: 'invoke';
-    messageId: string;
-    targetMethod: string;
-    payload?: unknown[];
+    messageId: unknown;
+    targetMethod: unknown;
+    payload?: unknown;
   };
 }
 
 interface WebviewLegacyRpcMessage {
   type: 'rpc-request';
-  method: string;
-  id: string | number;
-  args?: unknown[];
+  method: unknown;
+  id: unknown;
+  args?: unknown;
+}
+
+const MAX_WEBVIEW_RPC_IDENTIFIER_LENGTH = 256;
+const MAX_WEBVIEW_RPC_ERROR_MESSAGE_LENGTH = 8192;
+
+function isSafeRpcString(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= MAX_WEBVIEW_RPC_IDENTIFIER_LENGTH;
+}
+
+function isSafeLegacyRpcId(value: unknown): value is string | number {
+  return isSafeRpcString(value) || (typeof value === 'number' && Number.isSafeInteger(value));
 }
 
 function isWebviewRpcInvokeMessage(message: unknown): message is WebviewRpcInvokeMessage {
@@ -43,11 +56,74 @@ function isWebviewLegacyRpcMessage(message: unknown): message is WebviewLegacyRp
 }
 
 /**
- * SECURITY: Set of Object.prototype method names that must never be invoked via RPC.
- * Prevents prototype pollution attacks where a crafted message could invoke
- * inherited methods like 'constructor', '__defineGetter__', or 'toString'.
+ * SECURITY: The webview is an untrusted RPC client. Keep its capability set
+ * explicit so adding a public HostBridge helper cannot silently expose it to
+ * database-controlled script execution or a compromised webview.
  */
-const BLOCKED_METHODS = new Set(Object.getOwnPropertyNames(Object.prototype));
+const WEBVIEW_RPC_METHODS = new Set<string>([
+  'initialize',
+  'ping',
+  'openCellReadSession',
+  'readCellChunk',
+  'closeCellReadSession',
+  'updateCell',
+  'insertRow',
+  'deleteRows',
+  'deleteColumns',
+  'createTable',
+  'getViewDefinition',
+  'validateViewDefinition',
+  'previewViewDefinition',
+  'createView',
+  'editView',
+  'dropView',
+  'updateCellBatch',
+  'addColumn',
+  'fetchTableData',
+  'fetchTableCount',
+  'fetchSchema',
+  'getTableInfo',
+  'getPragmas',
+  'setPragma',
+  'refreshFile',
+  'saveSidebarState',
+  'openCellEditor',
+  'prepareCellMediaPreview',
+  'cancelCellMediaPreview',
+  'releaseCellMediaPreview',
+  'openViewEditor',
+  'confirmLargeSelection',
+  'getExtensionSettings',
+  'updateExtensionSetting',
+  'exportTable',
+  'readWorkspaceFileUri',
+  'saveFile',
+  'selectFile'
+]);
+
+function describeRpcFailure(error: unknown) {
+  let message = 'Unknown error';
+  try {
+    message = error instanceof Error ? error.message : String(error);
+  } catch {
+    // Malformed rejection values must not prevent the terminal response.
+  }
+  if (message.length > MAX_WEBVIEW_RPC_ERROR_MESSAGE_LENGTH) {
+    const originalLength = message.length;
+    message = message.slice(0, MAX_WEBVIEW_RPC_ERROR_MESSAGE_LENGTH)
+      + `... [truncated from ${originalLength} characters]`;
+  }
+
+  let data: ReturnType<typeof toCellEditRpcErrorData>
+    | ReturnType<typeof toWebviewPayloadLimitErrorData>;
+  try {
+    data = toCellEditRpcErrorData(error)
+      ?? toWebviewPayloadLimitErrorData(error);
+  } catch {
+    // Ignore typed metadata when hostile getters make it unsafe to inspect.
+  }
+  return { message, data };
+}
 
 /**
  * Handles messages received from the webview.
@@ -69,10 +145,19 @@ export class WebviewMessageHandler {
 
     // Handle RPC responses (for calls we make to the webview).
     // Pass the per-proxy pending invocations map so responses are routed correctly.
-    processProtocolMessage(message, undefined, undefined, undefined, this.pendingInvocations);
+    if (processProtocolMessage(
+      message,
+      undefined,
+      undefined,
+      undefined,
+      this.pendingInvocations
+    )) return;
 
     if (isWebviewRpcInvokeMessage(message)) {
       this.#handleRpcInvoke(message);
+      // An object must have exactly one dispatch interpretation. Without this
+      // return, a crafted envelope carrying both formats invokes two methods.
+      return;
     }
 
     if (isWebviewLegacyRpcMessage(message)) {
@@ -88,13 +173,25 @@ export class WebviewMessageHandler {
     const { messageId, targetMethod, payload } = message.content;
     const hostBridge = this.hostBridge;
 
+    // The ID is reflected in every response, so reject malformed identities
+    // before invoking a capability or copying attacker-controlled structures.
+    if (!isSafeRpcString(messageId)) return;
+    if (!isSafeRpcString(targetMethod)) {
+      this.#postRpcFailure(messageId, new Error('RPC method name must be a bounded string'));
+      return;
+    }
+    if (payload !== undefined && !Array.isArray(payload)) {
+      this.#postRpcFailure(messageId, new Error('RPC payload must be an array'));
+      return;
+    }
+
     // Deserialize payload to restore Uint8Array instances
     let deserializedPayload: unknown[];
     try {
       assertWebviewTransportPayload(message, {
         surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
       });
-      deserializedPayload = deserializeArgs(payload || [], {
+      deserializedPayload = deserializeArgs(payload ?? [], {
         surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
       });
     } catch (error) {
@@ -102,10 +199,9 @@ export class WebviewMessageHandler {
       return;
     }
 
-    // SECURITY: Block Object.prototype methods to prevent prototype pollution attacks.
-    // Allow class prototype methods (e.g., HostBridge.initialize) but reject inherited
-    // Object methods like 'constructor', '__defineGetter__', 'toString'.
-    if (!BLOCKED_METHODS.has(targetMethod) && targetMethod in hostBridge && typeof (hostBridge as unknown as Record<string, unknown>)[targetMethod] === 'function') {
+    if (WEBVIEW_RPC_METHODS.has(targetMethod)
+        && targetMethod in hostBridge
+        && typeof (hostBridge as unknown as Record<string, unknown>)[targetMethod] === 'function') {
       const fn = (hostBridge as unknown as Record<string, unknown>)[targetMethod] as Function;
       // Start the invocation inside the promise chain so synchronous typed
       // policy refusals take the same serialized error path as async rejects.
@@ -160,45 +256,59 @@ export class WebviewMessageHandler {
    */
   #handleLegacyRpcRequest(message: WebviewLegacyRpcMessage) {
     const hostBridge = this.hostBridge;
-    // SECURITY: Same prototype pollution guard as #handleRpcInvoke
-    if (BLOCKED_METHODS.has(message.method) || !(message.method in hostBridge)) return;
-    const fn = (hostBridge as unknown as Record<string, unknown>)[message.method] as Function;
-    if (typeof fn === 'function') {
-      let deserializedArgs: unknown[];
-      try {
-        assertWebviewTransportPayload(message, {
-          surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
-        });
-        deserializedArgs = deserializeArgs(message.args || [], {
-          surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
-        });
-      } catch (error) {
-        this.#postLegacyFailure(message.id, error);
-        return;
-      }
-      Promise.resolve()
-        .then(() => fn.apply(hostBridge, deserializedArgs))
-        .then(result => {
-          assertWebviewTransportPayload({
-            type: 'rpc-response',
-            id: message.id,
-            result
-          }, {
-            surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
-          });
-          const serializedResult = serializeValue(result, {
-            surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
-          });
-          this.postMessage({
-            type: 'rpc-response',
-            id: message.id,
-            result: serializedResult
-          });
-        })
-        .catch(err => {
-          this.#postLegacyFailure(message.id, err);
-        });
+    if (!isSafeLegacyRpcId(message.id)) return;
+    const responseId = message.id;
+    if (!isSafeRpcString(message.method)) {
+      this.#postLegacyFailure(responseId, new Error('RPC method name must be a bounded string'));
+      return;
     }
+    if (message.args !== undefined && !Array.isArray(message.args)) {
+      this.#postLegacyFailure(responseId, new Error('RPC arguments must be an array'));
+      return;
+    }
+    const candidate = (hostBridge as unknown as Record<string, unknown>)[message.method];
+    if (!WEBVIEW_RPC_METHODS.has(message.method) || typeof candidate !== 'function') {
+      this.#postLegacyFailure(
+        responseId,
+        new Error(`Method '${message.method}' not found on hostBridge`)
+      );
+      return;
+    }
+    const fn = candidate as Function;
+    let deserializedArgs: unknown[];
+    try {
+      assertWebviewTransportPayload(message, {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+      });
+      deserializedArgs = deserializeArgs(message.args ?? [], {
+        surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
+      });
+    } catch (error) {
+      this.#postLegacyFailure(message.id, error);
+      return;
+    }
+    Promise.resolve()
+      .then(() => fn.apply(hostBridge, deserializedArgs))
+      .then(result => {
+        assertWebviewTransportPayload({
+          type: 'rpc-response',
+          id: responseId,
+          result
+        }, {
+          surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
+        });
+        const serializedResult = serializeValue(result, {
+          surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
+        });
+        this.postMessage({
+          type: 'rpc-response',
+          id: responseId,
+          result: serializedResult
+        });
+      })
+      .catch(err => {
+        this.#postLegacyFailure(responseId, err);
+      });
   }
 
   /**
@@ -233,28 +343,26 @@ export class WebviewMessageHandler {
   }
 
   #postRpcFailure(messageId: string, error: unknown): void {
-    const errorData = toCellEditRpcErrorData(error)
-      ?? toWebviewPayloadLimitErrorData(error);
+    const failure = describeRpcFailure(error);
     this.postMessage({
       channel: 'rpc',
       content: {
         kind: 'response',
         messageId,
         success: false,
-        errorMessage: error instanceof Error ? error.message : String(error),
-        ...(errorData ? { error: errorData } : {})
+        errorMessage: failure.message,
+        ...(failure.data ? { error: failure.data } : {})
       }
     });
   }
 
   #postLegacyFailure(id: string | number, error: unknown): void {
-    const errorData = toCellEditRpcErrorData(error)
-      ?? toWebviewPayloadLimitErrorData(error);
+    const failure = describeRpcFailure(error);
     this.postMessage({
       type: 'rpc-response',
       id,
-      error: error instanceof Error ? error.message : String(error),
-      ...(errorData ? { errorData } : {})
+      error: failure.message,
+      ...(failure.data ? { errorData: failure.data } : {})
     });
   }
 }

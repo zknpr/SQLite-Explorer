@@ -25,6 +25,9 @@ export const MAX_WEBVIEW_BINARY_VALUE_BYTES = DEFAULT_MAX_PAGE_RESPONSE_BYTES;
 export const MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES =
   DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES;
 
+/** Keep recursive guards/serializers well below ordinary JS stack limits. */
+export const MAX_WEBVIEW_PAYLOAD_NESTING_DEPTH = 128;
+
 export const WEBVIEW_TRANSPORT_SURFACES = {
   coreSerialization: 'core RPC serialization',
   webviewRequest: 'webview -> extension host request',
@@ -191,7 +194,13 @@ export function assertWebviewTransportPayload(
     add(encodedLength + WEBVIEW_BINARY_MARKER_OVERHEAD_BYTES);
   };
 
-  const visit = (candidate: unknown): void => {
+  const visit = (candidate: unknown, depth = 0): void => {
+    if (depth > MAX_WEBVIEW_PAYLOAD_NESTING_DEPTH) {
+      throw new TypeError(
+        `Webview payload nesting depth exceeds ${MAX_WEBVIEW_PAYLOAD_NESTING_DEPTH} ` +
+        `at ${limits.surface}`
+      );
+    }
     if (candidate instanceof Uint8Array) {
       addBinary(candidate.byteLength, encodedBase64Bytes(candidate.byteLength));
       return;
@@ -240,7 +249,7 @@ export function assertWebviewTransportPayload(
     try {
       if (Array.isArray(candidate)) {
         add(2 + Math.max(0, candidate.length - 1));
-        for (const item of candidate) visit(item);
+        for (const item of candidate) visit(item, depth + 1);
         return;
       }
       if (!isPlainObject(candidate)) {
@@ -272,7 +281,7 @@ export function assertWebviewTransportPayload(
       add(2 + Math.max(0, keys.length - 1));
       for (const key of keys) {
         add(escapedJsonStringByteLength(key) + 1);
-        visit(candidate[key]);
+        visit(candidate[key], depth + 1);
       }
     } finally {
       ancestors.delete(candidate);

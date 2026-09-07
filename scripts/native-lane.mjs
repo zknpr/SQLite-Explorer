@@ -121,11 +121,10 @@ const FORK_ONLY_EXPECTATIONS = {
                 + 'misused construct \u2014 the native engine cannot report SQLite\u2019s detailed message)',
             errno: 1
         },
-        brokenViewNotBlamed: {
-            message: 'SQL logic error (SQLITE_ERROR: a misspelled name, a syntax error, or a '
-                + 'misused construct \u2014 the native engine cannot report SQLite\u2019s detailed message)',
-            errno: 1
-        }
+        // The view itself is never accused (it is in the catalog); the proof
+        // walks into its stored body and names the table it lost, which is
+        // what SQLite's own message would say too ("no such table: main.t").
+        brokenViewNotBlamed: { message: 'no such table: t', errno: 1 }
     }
 };
 

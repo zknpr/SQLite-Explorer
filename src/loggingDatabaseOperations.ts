@@ -196,8 +196,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
-    async serializeDatabase(): Promise<Uint8Array> {
-        return this.logAndDelegate(`Exporting database`, false, 'serializeDatabase');
+    async serializeDatabase(signal?: AbortSignal): Promise<Uint8Array> {
+        return this.logAndDelegate(`Exporting database`, false, 'serializeDatabase', signal);
     }
 
     async applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void> {
@@ -282,6 +282,30 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.insertRow(table, data, maxEditValueBytes);
     }
 
+    async insertRowWithHistory(
+        table: string,
+        data: Record<string, CellValue>,
+        maxEditValueBytes?: number,
+        maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow> {
+        const columns = Object.keys(data);
+        const sql = columns.length === 0
+            ? `INSERT INTO ${escapeIdentifier(table)} DEFAULT VALUES`
+            : `INSERT INTO ${escapeIdentifier(table)} ` +
+              `(${columns.map(escapeIdentifier).join(', ')}) VALUES (` +
+              `${columns.map(column => this.sanitizeValue(data[column])).join(', ')})`;
+        this.log(sql, true);
+        if (typeof this.wrapped.insertRowWithHistory !== 'function') {
+            throw new Error('Backend does not support guarded row insertion history');
+        }
+        return this.wrapped.insertRowWithHistory(
+            table,
+            data,
+            maxEditValueBytes,
+            maxUndoSnapshotBytes
+        );
+    }
+
     async insertRowBatch(
         table: string,
         rows: Record<string, CellValue>[],
@@ -311,7 +335,8 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
     async deleteColumns(
         table: string,
         columns: string[],
-        dropDependentIndexes?: string[]
+        dropDependentIndexes?: string[],
+        expectedCurrentState?: ColumnDropTableState
     ): Promise<ColumnDropTableState> {
         if (dropDependentIndexes && dropDependentIndexes.length > 0) {
             for (const indexName of dropDependentIndexes) {
@@ -321,7 +346,12 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         for (const col of columns) {
             this.log(`ALTER TABLE ${escapeIdentifier(table)} DROP COLUMN ${escapeIdentifier(col)}`, true);
         }
-        return this.wrapped.deleteColumns(table, columns, dropDependentIndexes);
+        return this.wrapped.deleteColumns(
+            table,
+            columns,
+            dropDependentIndexes,
+            expectedCurrentState
+        );
     }
 
     async findDependentIndexes(table: string, columns: string[]): Promise<string[]> {
@@ -329,7 +359,10 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.findDependentIndexes(table, columns);
     }
 
-    async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {
+    async createTable(
+        table: string,
+        columns: ColumnDefinition[]
+    ): Promise<ColumnDropTableState> {
         const columnDefs = columns.map(c => `${c.name} ${c.type}`).join(', ');
         const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columnDefs})`;
         this.log(sql, true);
@@ -433,7 +466,12 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
-    async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {
+    async addColumn(
+        table: string,
+        column: string,
+        type: string,
+        defaultValue?: string
+    ): Promise<ColumnDropTableState> {
         let sql = `ALTER TABLE ${escapeIdentifier(table)} ADD COLUMN ${escapeIdentifier(column)} ${type}`;
         if (defaultValue) {
              sql += ` DEFAULT ${defaultValue}`;

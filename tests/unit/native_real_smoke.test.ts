@@ -16,6 +16,7 @@ import {
     CellEditPolicyError,
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
+import { isReadOnlyPrimaryKeyRecordId } from '../../src/core/row-identity';
 import { streamTableExport } from '../../src/tableExporter';
 import { ModificationTracker } from '../../src/core/undo-history';
 import {
@@ -26,7 +27,12 @@ import {
     reconcileRestoredDatabase,
     revertDatabaseToSaved
 } from '../../src/core/restore-reconciler';
-import type { DatabaseOperations, LabeledModification, TableQueryOptions } from '../../src/core/types';
+import type {
+    ColumnDropTableState,
+    DatabaseOperations,
+    LabeledModification,
+    TableQueryOptions
+} from '../../src/core/types';
 
 const BUNDLED_TXIKI_SQLITE_VERSION = '3.51.2';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
@@ -73,6 +79,22 @@ function getBundledNativeBinary(repoRoot: string): string | undefined {
     return fs.existsSync(binary) ? binary : undefined;
 }
 
+async function captureNativeRowidTableState(
+    engine: DatabaseOperations,
+    table: string
+): Promise<ColumnDropTableState> {
+    const schema = await engine.executeQuery(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+        [table]
+    );
+    return {
+        tableSql: schema[0].rows[0][0] as string,
+        columns: (await engine.getTableInfo(table)).map(column => column.identifier),
+        identity: { kind: 'rowid' },
+        schemaObjects: []
+    };
+}
+
 it('passes the native view smoke lane through the bundled txiki worker', async (testContext) => {
     const repoRoot = process.cwd();
     const binary = getBundledNativeBinary(repoRoot);
@@ -110,6 +132,15 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             const version = String(result.values[0]?.[0] ?? '');
             console.log(`[native smoke] SQLite version: ${version}`);
             assert.strictEqual(version, BUNDLED_TXIKI_SQLITE_VERSION);
+        });
+
+        await testContext.test('honors an explicit read-only native worker open', async () => {
+            await activeRawWorker.call('open', [databasePath, true]);
+            await assert.rejects(
+                activeRawWorker.call('run', ['CREATE TABLE forbidden_read_only_write (value INTEGER)']),
+                /readonly|read-only/i
+            );
+            await activeRawWorker.call('open', [databasePath, false]);
         });
 
         await testContext.test('retains the boundary on multiline SQL and rejects a statement tail', async () => {
@@ -409,11 +440,710 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
         rawWorker = undefined;
 
         bundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+        const readOnlyDatabasePath = path.join(testDir, 'native-smoke-read-only.sqlite');
+        fs.copyFileSync(databasePath, readOnlyDatabasePath);
+        fs.chmodSync(readOnlyDatabasePath, 0o444);
+        await testContext.test('detects an OS-read-only native database before exposing edit controls', async () => {
+            const readOnlyConnection = await bundle!.establishConnection(
+                vscode.Uri.file(readOnlyDatabasePath),
+                'native-smoke-read-only.sqlite'
+            );
+            assert.strictEqual(readOnlyConnection.isReadOnly, true);
+            const result = await readOnlyConnection.databaseOps.executeQuery('PRAGMA integrity_check');
+            assert.strictEqual(result[0]?.rows[0]?.[0], 'ok');
+        });
+        fs.chmodSync(readOnlyDatabasePath, 0o644);
         const connection = await bundle.establishConnection(
             vscode.Uri.file(databasePath),
             'native-smoke.sqlite'
         );
         const engine = connection.databaseOps;
+
+        await testContext.test('serializes through an isolated native snapshot', async () => {
+            const snapshot = await engine.serializeDatabase();
+            assert.strictEqual(
+                Buffer.from(snapshot.subarray(0, 16)).toString('binary'),
+                'SQLite format 3\0'
+            );
+        });
+
+        await testContext.test('marks native rows read-only when a declared rowid shadows identity', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_shadowed_grid_identity ("rowid" INTEGER, value TEXT); ' +
+                "INSERT INTO native_shadowed_grid_identity(rowid, value) VALUES (7, 'first'), (7, 'second')"
+            );
+
+            const page = await engine.fetchTableData('native_shadowed_grid_identity', {
+                columns: ['rowid', 'rowid', 'value'],
+                limit: 10,
+                offset: 0
+            });
+
+            assert.ok(page.rows.every(row => isReadOnlyPrimaryKeyRecordId(row[0])));
+            assert.deepStrictEqual(page.rows.map(row => row.slice(1)), [
+                [7, 'first'],
+                [7, 'second']
+            ]);
+            assert.match(page.readOnlyRowReasons?.[0] ?? '', /read-only.*declared.*rowid/i);
+            assert.match(page.readOnlyRowReasons?.[1] ?? '', /read-only.*declared.*rowid/i);
+        });
+
+        await testContext.test('loads a maximum-width native table whose declared rowid shadows identity', async () => {
+            const dataColumns = Array.from({ length: 1999 }, (_, index) => `c${index}`);
+            await engine.executeQuery(
+                `CREATE TABLE native_shadowed_wide ("rowid" TEXT, ` +
+                `${dataColumns.map(name => `"${name}"`).join(', ')}); ` +
+                "INSERT INTO native_shadowed_wide(rowid, c0) VALUES ('declared', 'visible')"
+            );
+
+            const page = await engine.fetchTableData('native_shadowed_wide', {
+                columns: ['rowid', 'rowid', ...dataColumns],
+                limit: 1,
+                offset: 0
+            });
+
+            assert.strictEqual(page.rows.length, 1);
+            assert.ok(isReadOnlyPrimaryKeyRecordId(page.rows[0][0]));
+            assert.strictEqual(page.rows[0][1], 'declared');
+            assert.strictEqual(page.rows[0][2], 'visible');
+        });
+
+        await testContext.test('keeps a native declared INTEGER PRIMARY KEY rowid alias editable', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_intrinsic_rowid_alias ("rowid" INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO native_intrinsic_rowid_alias(rowid, value) VALUES (7, 'before')"
+            );
+
+            const page = await engine.fetchTableData('native_intrinsic_rowid_alias', {
+                columns: ['rowid', 'rowid', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            assert.strictEqual(page.rows[0][0], 7);
+            assert.strictEqual(isReadOnlyPrimaryKeyRecordId(page.rows[0][0]), false);
+
+            await engine.updateCell('native_intrinsic_rowid_alias', 7, 'value', 'after');
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid, value FROM native_intrinsic_rowid_alias'
+                ))[0].rows,
+                [[7, 'after']]
+            );
+        });
+
+        await testContext.test('tracks native INTEGER PRIMARY KEY rowid changes through history', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_remapped_rowid_history (' +
+                'id INTEGER PRIMARY KEY, ' +
+                'doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED, ' +
+                'note TEXT, payload TEXT); ' +
+                "INSERT INTO native_remapped_rowid_history(id, note, payload) " +
+                "VALUES (3, 'before', '{\"n\":9007199254740993}')"
+            );
+
+            const [singleCell] = await engine.updateCellBatch(
+                'native_remapped_rowid_history',
+                [{ rowId: 3, column: 'id', value: 34 }]
+            );
+            const remapped = singleCell.newRowId ?? singleCell.rowId;
+            assert.strictEqual(remapped, 34);
+            const singleModification = {
+                label: 'Update id',
+                description: 'Update native_remapped_rowid_history.id',
+                modificationType: 'cell_update' as const,
+                targetTable: 'native_remapped_rowid_history',
+                targetRowId: 3,
+                newTargetRowId: remapped,
+                targetColumn: 'id',
+                priorValue: singleCell.priorValue,
+                newValue: singleCell.newValue,
+                operation: singleCell.operation,
+                priorState: singleCell.priorState,
+                postState: singleCell.postState
+            };
+            await engine.undoModification(singleModification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, doubled, note, payload FROM native_remapped_rowid_history'
+                ))[0].rows,
+                [[3, 6, 'before', '{"n":9007199254740993}']]
+            );
+            await engine.redoModification(singleModification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, doubled, note, payload FROM native_remapped_rowid_history'
+                ))[0].rows,
+                [[34, 68, 'before', '{"n":9007199254740993}']]
+            );
+            await engine.undoModification(singleModification);
+
+            const affectedCells = await engine.updateCellBatch(
+                'native_remapped_rowid_history',
+                [
+                    { rowId: 3, column: 'id', value: 44 },
+                    { rowId: 3, column: 'note', value: 'after' },
+                    {
+                        rowId: 3,
+                        column: 'payload',
+                        value: '{"added":true}',
+                        operation: 'json_patch'
+                    }
+                ]
+            );
+            assert.deepStrictEqual(affectedCells.map(cell => cell.newRowId), [44, 44, 44]);
+            const batchModification = {
+                label: 'Update row',
+                description: 'Update native remapped row',
+                modificationType: 'cell_update' as const,
+                targetTable: 'native_remapped_rowid_history',
+                affectedCells
+            };
+            await engine.undoModification(batchModification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, doubled, note, payload FROM native_remapped_rowid_history'
+                ))[0].rows,
+                [[3, 6, 'before', '{"n":9007199254740993}']]
+            );
+            await engine.redoModification(batchModification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, doubled, note, payload FROM native_remapped_rowid_history'
+                ))[0].rows,
+                [[44, 88, 'after', '{"n":9007199254740993,"added":true}']]
+            );
+        });
+
+        await testContext.test('canonicalizes a native exact int64 alias edit from rowid zero', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_coerced_rowid_alias (id INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO native_coerced_rowid_alias(id, value) VALUES (0, 'kept')"
+            );
+            const newRowId = await engine.updateCell(
+                'native_coerced_rowid_alias',
+                0,
+                'id',
+                '09223372036854775807'
+            );
+            assert.strictEqual(newRowId, '9223372036854775807');
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT CAST(id AS TEXT), value FROM native_coerced_rowid_alias'
+                ))[0].rows,
+                [['9223372036854775807', 'kept']]
+            );
+        });
+
+        await testContext.test('rolls back a native alias edit with a substituting trigger', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_triggered_rowid_alias ' +
+                '(id INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO native_triggered_rowid_alias VALUES (5, 'target'), (8, 'decoy'); " +
+                'CREATE TRIGGER native_substitute_rowid_alias ' +
+                'AFTER UPDATE OF id ON native_triggered_rowid_alias BEGIN ' +
+                'UPDATE native_triggered_rowid_alias SET id = 107 WHERE rowid = NEW.rowid; ' +
+                'UPDATE native_triggered_rowid_alias SET id = NEW.id WHERE rowid = 8; ' +
+                'END'
+            );
+            await assert.rejects(
+                engine.updateCell('native_triggered_rowid_alias', 5, 'id', '0007'),
+                /rowid identity.*UPDATE trigger|UPDATE trigger.*rowid identity/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, value FROM native_triggered_rowid_alias ORDER BY id'
+                ))[0].rows,
+                [[5, 'target'], [8, 'decoy']]
+            );
+        });
+
+        await testContext.test('rolls back a native non-alias edit with a substituting trigger', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_triggered_non_alias ' +
+                '(id INTEGER PRIMARY KEY, note TEXT); ' +
+                "INSERT INTO native_triggered_non_alias VALUES (5, 'target'), (8, 'decoy'); " +
+                'CREATE TRIGGER native_substitute_non_alias ' +
+                'AFTER UPDATE OF note ON native_triggered_non_alias BEGIN ' +
+                'UPDATE native_triggered_non_alias SET id = 105 WHERE rowid = NEW.rowid; ' +
+                'UPDATE native_triggered_non_alias SET id = NEW.id WHERE rowid = 8; ' +
+                'END'
+            );
+            await assert.rejects(
+                engine.updateCell('native_triggered_non_alias', 5, 'note', 'changed'),
+                /UPDATE trigger.*target table.*rowid identity/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, note FROM native_triggered_non_alias ORDER BY id'
+                ))[0].rows,
+                [[5, 'target'], [8, 'decoy']]
+            );
+        });
+
+        await testContext.test('rejects a descendant native trigger that can substitute the rowid', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_nested_trigger_target ' +
+                '(id INTEGER PRIMARY KEY, note TEXT); ' +
+                "INSERT INTO native_nested_trigger_target VALUES (5, 'target'), (8, 'decoy'); " +
+                'CREATE VIEW native_nested_trigger_hop AS ' +
+                'SELECT id, note FROM native_nested_trigger_target; ' +
+                'CREATE TRIGGER native_nested_trigger_writer ' +
+                'INSTEAD OF INSERT ON native_nested_trigger_hop BEGIN ' +
+                'UPDATE native_nested_trigger_target SET id = 105 WHERE id = NEW.id; ' +
+                'UPDATE native_nested_trigger_target SET id = NEW.id WHERE id = 8; ' +
+                'END; ' +
+                'CREATE TRIGGER native_nested_trigger_entry ' +
+                'AFTER UPDATE OF note ON native_nested_trigger_target BEGIN ' +
+                'INSERT INTO native_nested_trigger_hop VALUES (NEW.id, NEW.note); ' +
+                'END'
+            );
+            await assert.rejects(
+                engine.updateCell('native_nested_trigger_target', 5, 'note', 'changed'),
+                /UPDATE trigger.*target table.*rowid identity/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, note FROM native_nested_trigger_target ORDER BY id'
+                ))[0].rows,
+                [[5, 'target'], [8, 'decoy']]
+            );
+        });
+
+        await testContext.test('rejects a native trigger side effect that cannot be undone', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_harmless_audit_target ' +
+                '(id INTEGER PRIMARY KEY, note TEXT); ' +
+                'CREATE TABLE native_harmless_audit_events (target_id INTEGER, note TEXT); ' +
+                "INSERT INTO native_harmless_audit_target VALUES (5, 'before'); " +
+                'CREATE TRIGGER native_record_harmless_audit ' +
+                'AFTER UPDATE OF id ON native_harmless_audit_target BEGIN ' +
+                'INSERT INTO native_harmless_audit_events VALUES (NEW.id, NEW.note); ' +
+                'END'
+            );
+            await assert.rejects(
+                engine.updateCell(
+                    'native_harmless_audit_target',
+                    5,
+                    'id',
+                    6
+                ),
+                /UPDATE trigger.*undo history/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, note, (SELECT count(*) FROM native_harmless_audit_events) ' +
+                    'FROM native_harmless_audit_target'
+                ))[0].rows,
+                [[5, 'before', 0]]
+            );
+        });
+
+        await testContext.test('rejects native INSERT/DELETE side effects outside undo history', async () => {
+            await engine.executeQuery(
+                'PRAGMA foreign_keys = ON; ' +
+                'CREATE TABLE native_insert_history_target (id INTEGER PRIMARY KEY); ' +
+                'CREATE TABLE native_insert_history_audit (id INTEGER); ' +
+                'CREATE TRIGGER native_insert_history_trigger ' +
+                'AFTER INSERT ON native_insert_history_target BEGIN ' +
+                'INSERT INTO native_insert_history_audit VALUES (NEW.id); END; ' +
+                'CREATE TABLE native_delete_history_target (id INTEGER PRIMARY KEY); ' +
+                'INSERT INTO native_delete_history_target VALUES (1); ' +
+                'CREATE TRIGGER native_delete_history_trigger ' +
+                'BEFORE DELETE ON native_delete_history_target BEGIN ' +
+                'SELECT RAISE(IGNORE); END; ' +
+                'CREATE TABLE native_delete_parent (id INTEGER PRIMARY KEY); ' +
+                'CREATE TABLE native_delete_child (' +
+                'parent_id INTEGER REFERENCES native_delete_parent(id) ON DELETE CASCADE); ' +
+                'INSERT INTO native_delete_parent VALUES (1); ' +
+                'INSERT INTO native_delete_child VALUES (1)'
+            );
+
+            await assert.rejects(
+                engine.insertRow('native_insert_history_target', { id: 1 }),
+                /INSERT trigger.*undo history/i
+            );
+            await assert.rejects(
+                engine.deleteRows('native_delete_history_target', [1]),
+                /DELETE trigger.*undo history/i
+            );
+            await assert.rejects(
+                engine.deleteRows('native_delete_parent', [1]),
+                /foreign-key.*DELETE.*undo history/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT ' +
+                    '(SELECT count(*) FROM native_insert_history_target), ' +
+                    '(SELECT count(*) FROM native_insert_history_audit), ' +
+                    '(SELECT count(*) FROM native_delete_history_target), ' +
+                    '(SELECT count(*) FROM native_delete_parent), ' +
+                    '(SELECT count(*) FROM native_delete_child)'
+                ))[0].rows,
+                [[0, 0, 1, 1, 1]]
+            );
+        });
+
+        await testContext.test('guards irreversible native UPDATE foreign-key actions', async () => {
+            for (const sql of [
+                'PRAGMA foreign_keys = ON',
+                'CREATE TABLE native_update_set_null_parent (id INTEGER PRIMARY KEY)',
+                'CREATE TABLE native_update_set_null_child (' +
+                    'parent_id INTEGER REFERENCES native_update_set_null_parent(id) ' +
+                    'ON UPDATE SET NULL)',
+                'INSERT INTO native_update_set_null_parent VALUES (1)',
+                'INSERT INTO native_update_set_null_child VALUES (1)',
+                'CREATE TABLE native_update_set_default_parent (id INTEGER PRIMARY KEY)',
+                'CREATE TABLE native_update_set_default_child (' +
+                    'parent_id INTEGER DEFAULT 99 ' +
+                    'REFERENCES native_update_set_default_parent(id) ON UPDATE SET DEFAULT)',
+                'INSERT INTO native_update_set_default_parent VALUES (1), (99)',
+                'INSERT INTO native_update_set_default_child VALUES (1)',
+                'CREATE TABLE native_update_cascade_parent (id INTEGER PRIMARY KEY)',
+                'CREATE TABLE native_update_cascade_child (' +
+                    'parent_id INTEGER REFERENCES native_update_cascade_parent(id) ' +
+                    'ON UPDATE CASCADE)',
+                'INSERT INTO native_update_cascade_parent VALUES (1)',
+                'INSERT INTO native_update_cascade_child VALUES (1)'
+            ]) {
+                await engine.executeQuery(sql);
+            }
+
+            await assert.rejects(
+                engine.updateCell('native_update_set_null_parent', 1, 'id', 2),
+                /foreign-key.*UPDATE.*undo history|UPDATE.*foreign-key.*undo history/i
+            );
+            await assert.rejects(
+                engine.updateCell('native_update_set_default_parent', 1, 'id', 2),
+                /foreign-key.*UPDATE.*undo history|UPDATE.*foreign-key.*undo history/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT ' +
+                    '(SELECT parent_id FROM native_update_set_null_child), ' +
+                    '(SELECT parent_id FROM native_update_set_default_child)'
+                ))[0].rows,
+                [[1, 1]]
+            );
+
+            const [cascadeCell] = await engine.updateCellBatch(
+                'native_update_cascade_parent',
+                [{ rowId: 1, column: 'id', value: 2 }]
+            );
+            assert.strictEqual(cascadeCell.newRowId, 2);
+            const modification = {
+                modificationType: 'cell_update' as const,
+                description: 'Update native cascading parent key',
+                targetTable: 'native_update_cascade_parent',
+                affectedCells: [cascadeCell]
+            };
+            await engine.undoModification(modification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT p.id, c.parent_id FROM native_update_cascade_parent p ' +
+                    'JOIN native_update_cascade_child c'
+                ))[0].rows,
+                [[1, 1]]
+            );
+            await engine.redoModification(modification);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT p.id, c.parent_id FROM native_update_cascade_parent p ' +
+                    'JOIN native_update_cascade_child c'
+                ))[0].rows,
+                [[2, 2]]
+            );
+        });
+
+        await testContext.test('guards native batch and oversized edits against rowid substitution', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_triggered_batch_substitution ' +
+                '(id INTEGER PRIMARY KEY, note TEXT); ' +
+                "INSERT INTO native_triggered_batch_substitution VALUES " +
+                "(5, 'target'), (8, 'decoy'); " +
+                'CREATE TRIGGER native_substitute_batch_rowid ' +
+                'AFTER UPDATE OF note ON native_triggered_batch_substitution BEGIN ' +
+                'UPDATE native_triggered_batch_substitution SET id = 105 ' +
+                'WHERE rowid = NEW.rowid; ' +
+                'UPDATE native_triggered_batch_substitution SET id = NEW.id WHERE rowid = 8; ' +
+                'END'
+            );
+            await assert.rejects(
+                engine.updateCellBatch('native_triggered_batch_substitution', [{
+                    rowId: 5,
+                    column: 'note',
+                    value: 'changed'
+                }]),
+                /UPDATE trigger.*target table.*rowid identity/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, note FROM native_triggered_batch_substitution ORDER BY id'
+                ))[0].rows,
+                [[5, 'target'], [8, 'decoy']]
+            );
+
+            const original = 'x'.repeat(32);
+            await engine.executeQuery(
+                'CREATE TABLE native_triggered_replacement_substitution ' +
+                '(id INTEGER PRIMARY KEY, note TEXT); ' +
+                `INSERT INTO native_triggered_replacement_substitution VALUES ` +
+                `(5, '${original}'), (8, 'decoy'); ` +
+                'CREATE TRIGGER native_substitute_replacement_rowid ' +
+                'AFTER UPDATE OF note ON native_triggered_replacement_substitution BEGIN ' +
+                'UPDATE native_triggered_replacement_substitution SET id = 105 ' +
+                'WHERE rowid = NEW.rowid; ' +
+                'UPDATE native_triggered_replacement_substitution SET id = NEW.id ' +
+                'WHERE rowid = 8; END'
+            );
+            await assert.rejects(
+                engine.replaceOversizedCell(
+                    'native_triggered_replacement_substitution',
+                    5,
+                    'note',
+                    'new',
+                    { storageClass: 'text', byteLength: 32 },
+                    8
+                ),
+                /UPDATE trigger.*target table.*rowid identity/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT id, note FROM native_triggered_replacement_substitution ORDER BY id'
+                ))[0].rows,
+                [[5, original], [8, 'decoy']]
+            );
+        });
+
+        await testContext.test('marks only native SQLite rowid aliases in table metadata', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_metadata_rowid_alias (id INTEGER PRIMARY KEY, value TEXT); ' +
+                'CREATE TABLE native_metadata_desc_pk (id INTEGER PRIMARY KEY DESC, value TEXT); ' +
+                'CREATE TABLE native_metadata_table_desc ' +
+                '(id INTEGER, value TEXT, PRIMARY KEY(id DESC)); ' +
+                'CREATE TABLE native_metadata_named_rowid ' +
+                '("rowid" INTEGER PRIMARY KEY, value TEXT); ' +
+                'CREATE TABLE native_metadata_named_rowid_desc ' +
+                '("rowid" INTEGER PRIMARY KEY DESC, value TEXT)'
+            );
+            const alias = await engine.getTableInfo('native_metadata_rowid_alias');
+            const descending = await engine.getTableInfo('native_metadata_desc_pk');
+            const tableDescending = await engine.getTableInfo('native_metadata_table_desc');
+            const namedRowid = await engine.getTableInfo('native_metadata_named_rowid');
+            const namedRowidDescending = await engine.getTableInfo(
+                'native_metadata_named_rowid_desc'
+            );
+            assert.strictEqual(
+                alias.find(column => column.identifier === 'id')?.isRowidAlias,
+                true
+            );
+            assert.strictEqual(
+                descending.find(column => column.identifier === 'id')?.isRowidAlias,
+                false
+            );
+            assert.strictEqual(
+                tableDescending.find(column => column.identifier === 'id')?.isRowidAlias,
+                true
+            );
+            assert.strictEqual(
+                namedRowid.find(column => column.identifier === 'rowid')?.isRowidAlias,
+                true
+            );
+            assert.strictEqual(
+                namedRowidDescending.find(
+                    column => column.identifier === 'rowid'
+                )?.isRowidAlias,
+                false
+            );
+        });
+
+        await testContext.test('rejects a unique declared native rowid as a cell identity', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_unique_shadowed_cell_identity ' +
+                '("rowid" INTEGER UNIQUE, value TEXT); ' +
+                "INSERT INTO native_unique_shadowed_cell_identity(rowid, value) " +
+                "VALUES (7, 'preserved')"
+            );
+
+            await assert.rejects(
+                engine.updateCell(
+                    'native_unique_shadowed_cell_identity',
+                    7,
+                    'value',
+                    'single'
+                ),
+                /read-only.*declared.*rowid.*identity/i
+            );
+            await assert.rejects(
+                engine.updateCellBatch('native_unique_shadowed_cell_identity', [{
+                    rowId: 7,
+                    column: 'value',
+                    value: 'batch'
+                }]),
+                /read-only.*declared.*rowid.*identity/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT rowid, value FROM native_unique_shadowed_cell_identity'
+                ))[0].rows,
+                [[7, 'preserved']]
+            );
+        });
+
+        await testContext.test('rejects a native edit whose declared rowid shadows intrinsic identity', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_shadowed_edit_identity ("rowid" INTEGER, value TEXT); ' +
+                "INSERT INTO native_shadowed_edit_identity(rowid, value) VALUES (7, 'first'), (7, 'second')"
+            );
+
+            await assert.rejects(
+                engine.updateCell(
+                    'native_shadowed_edit_identity',
+                    7,
+                    'value',
+                    'changed'
+                ),
+                /read-only.*declared.*rowid.*identity/i
+            );
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT _rowid_ AS intrinsic_id, rowid AS declared_id, value ' +
+                    'FROM native_shadowed_edit_identity ORDER BY _rowid_'
+                ))[0].rows,
+                [[1, 7, 'first'], [2, 7, 'second']]
+            );
+        });
+
+        await testContext.test('rolls back a rejected native oversized-cell replacement whose declared rowid matches multiple rows', async () => {
+            const original = 'x'.repeat(32);
+            await engine.executeQuery(
+                'CREATE TABLE native_shadowed_oversized_identity ("rowid" INTEGER, value TEXT); ' +
+                'INSERT INTO native_shadowed_oversized_identity(rowid, value) VALUES ' +
+                `(7, '${original}'), (7, '${original}')`
+            );
+
+            await assert.rejects(
+                engine.replaceOversizedCell(
+                    'native_shadowed_oversized_identity',
+                    7,
+                    'value',
+                    'new',
+                    { storageClass: 'text', byteLength: 32 },
+                    8
+                ),
+                /read-only.*declared.*rowid/i
+            );
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT _rowid_ AS intrinsic_id, rowid AS declared_id, value ' +
+                    'FROM native_shadowed_oversized_identity ORDER BY _rowid_'
+                ))[0].rows,
+                [[1, 7, original], [2, 7, original]]
+            );
+        });
+
+        await testContext.test('finds only real native index dependencies before dropping a column', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_index_dependencies (' +
+                'keep TEXT, removed TEXT, note TEXT); ' +
+                'CREATE UNIQUE INDEX idx_native_unrelated ON native_index_dependencies(' +
+                'keep /* , removed) */) WHERE note <> \'(removed)\'; ' +
+                'CREATE INDEX idx_native_removed_collate ON native_index_dependencies(' +
+                '"removed" COLLATE NOCASE); ' +
+                'CREATE INDEX idx_native_removed_partial ON native_index_dependencies(' +
+                'keep) WHERE removed IS NOT NULL; ' +
+                'CREATE INDEX idx_native_removed_constant_partial ON native_index_dependencies(' +
+                'note) WHERE removed IS NOT NULL AND 0; ' +
+                "INSERT INTO native_index_dependencies VALUES ('same', 'value', 'active')"
+            );
+
+            const dependent = (
+                await engine.findDependentIndexes('native_index_dependencies', ['removed'])
+            ).sort();
+            assert.deepStrictEqual(dependent, [
+                'idx_native_removed_collate',
+                'idx_native_removed_constant_partial',
+                'idx_native_removed_partial'
+            ]);
+
+            await engine.deleteColumns(
+                'native_index_dependencies',
+                ['removed'],
+                dependent
+            );
+            const remaining = await engine.executeQuery(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' " +
+                "AND tbl_name = 'native_index_dependencies' ORDER BY name"
+            );
+            assert.deepStrictEqual(remaining[0].rows, [['idx_native_unrelated']]);
+            await assert.rejects(
+                engine.executeQuery(
+                    "INSERT INTO native_index_dependencies(keep, note) VALUES ('same', 'active')"
+                ),
+                /constraint failed/
+            );
+        });
+
+        await testContext.test('honors requested NOT NULL on a native TEXT PRIMARY KEY', async () => {
+            await engine.createTable('native_text_primary_key', [
+                { name: 'key', type: 'TEXT', primaryKey: true, notNull: true },
+                { name: 'value', type: 'TEXT', primaryKey: false, notNull: false }
+            ]);
+
+            const info = await engine.executeQuery(
+                'PRAGMA table_info("native_text_primary_key")'
+            );
+            assert.strictEqual(info[0].rows[0][3], 1);
+            await assert.rejects(
+                engine.insertRow('native_text_primary_key', { key: null, value: 'invalid' }),
+                /constraint failed/
+            );
+        });
+
+        await testContext.test('builds selected native primary-key columns as one NOT NULL composite key', async () => {
+            await engine.createTable('native_composite_primary_key', [
+                { name: 'tenant', type: 'TEXT', primaryKey: true, notNull: true },
+                { name: 'sequence', type: 'INTEGER', primaryKey: true, notNull: true },
+                { name: 'value', type: 'TEXT', primaryKey: false, notNull: false }
+            ]);
+
+            const info = await engine.executeQuery(
+                'PRAGMA table_info("native_composite_primary_key")'
+            );
+            assert.deepStrictEqual(
+                info[0].rows.map(row => [row[1], row[3], row[5]]),
+                [
+                    ['tenant', 1, 1],
+                    ['sequence', 1, 2],
+                    ['value', 0, 0]
+                ]
+            );
+            await assert.rejects(
+                engine.insertRow('native_composite_primary_key', {
+                    tenant: 'north',
+                    sequence: null,
+                    value: 'invalid'
+                }),
+                /constraint failed/
+            );
+        });
+
+        await testContext.test('keeps native INTEGER PRIMARY KEY auto-rowid assignment with NOT NULL', async () => {
+            await engine.createTable('native_integer_primary_key', [
+                { name: 'id', type: 'INTEGER', primaryKey: true, notNull: true },
+                { name: 'value', type: 'TEXT', primaryKey: false, notNull: false }
+            ]);
+
+            await engine.insertRow('native_integer_primary_key', {
+                id: null,
+                value: 'auto'
+            });
+            const rows = await engine.executeQuery(
+                'SELECT id, value FROM "native_integer_primary_key"'
+            );
+            assert.deepStrictEqual(rows[0].rows, [[1, 'auto']]);
+        });
 
         await testContext.test('rejects direct applyModifications replay on the native backend', async () => {
             await assert.rejects(
@@ -455,6 +1185,215 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 resultRows,
                 maxSnapshotBytes: 1024 * 1024
             }));
+        });
+
+        await testContext.test('rolls back the whole native File Revert when an earlier edit conflicts', async () => {
+            const table = 'native_atomic_file_revert';
+            await engine.executeQuery(
+                `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT); ` +
+                `INSERT INTO ${table} VALUES (1, 'before')`
+            );
+            const [cell] = await engine.updateCellBatch(table, [{
+                rowId: 1,
+                column: 'value',
+                value: 'tracked'
+            }]);
+            const insertedRow = await engine.insertRowWithHistory!(
+                table,
+                { id: 2, value: 'inserted' }
+            );
+            await engine.executeQuery(`UPDATE ${table} SET value = 'external' WHERE id = 1`);
+
+            await assert.rejects(
+                engine.revertModifications!([
+                    {
+                        description: 'Tracked native cell update',
+                        modificationType: 'cell_update',
+                        targetTable: table,
+                        targetRowId: 1,
+                        targetColumn: 'value',
+                        priorValue: cell.priorValue,
+                        newValue: cell.newValue,
+                        priorState: cell.priorState,
+                        postState: cell.postState,
+                        operation: cell.operation
+                    },
+                    {
+                        description: 'Tracked native row insert',
+                        modificationType: 'row_insert',
+                        targetTable: table,
+                        targetRowId: insertedRow.rowId,
+                        rowData: insertedRow.row,
+                        insertedRow
+                    }
+                ], []),
+                /changed outside SQLite Explorer history/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(`SELECT id, value FROM ${table} ORDER BY id`))[0].rows,
+                [[1, 'external'], [2, 'inserted']]
+            );
+        });
+
+        await testContext.test('replays native malformed TEXT history from exact database bytes', async () => {
+            const table = 'native_malformed_text_history';
+            await engine.executeQuery(
+                `CREATE TABLE ${table} (` +
+                "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'80' AS TEXT)))"
+            );
+            const insertedRow = await engine.insertRowWithHistory!(table, { id: 1 });
+            const insertion = {
+                modificationType: 'row_insert' as const,
+                targetTable: table,
+                targetRowId: insertedRow.rowId,
+                description: 'Insert native malformed TEXT',
+                rowData: insertedRow.row,
+                insertedRow
+            };
+
+            await engine.undoModification(insertion);
+            await engine.redoModification(insertion);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    `SELECT typeof(value), hex(CAST(value AS BLOB)) FROM ${table}`
+                ))[0].rows,
+                [['text', '80']]
+            );
+
+            const deletedRows = await engine.deleteRows(table, [1]);
+            await engine.undoModification({
+                modificationType: 'row_delete',
+                targetTable: table,
+                description: 'Delete native malformed TEXT',
+                deletedRows
+            });
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    `SELECT typeof(value), hex(CAST(value AS BLOB)) FROM ${table}`
+                ))[0].rows,
+                [['text', '80']]
+            );
+        });
+
+        await testContext.test('replays native malformed UTF-16LE TEXT without transcoding', async () => {
+            const utf16Path = path.join(testDir, 'native-malformed-utf16.sqlite');
+            fs.closeSync(fs.openSync(utf16Path, 'w'));
+            let utf16Bundle:
+                | Awaited<ReturnType<typeof createNativeDatabaseConnection>>
+                | undefined;
+            try {
+                utf16Bundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                const utf16Connection = await utf16Bundle.establishConnection(
+                    vscode.Uri.file(utf16Path),
+                    'native-malformed-utf16.sqlite'
+                );
+                const utf16Engine = utf16Connection.databaseOps;
+                await utf16Engine.executeQuery(
+                    'PRAGMA encoding = "UTF-16le"; ' +
+                    'CREATE TABLE malformed_utf16_history (' +
+                    "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'00D8' AS TEXT)), " +
+                    "note TEXT DEFAULT 'snowman ☃')"
+                );
+                assert.strictEqual(
+                    (await utf16Engine.executeQuery('PRAGMA encoding'))[0].rows[0][0],
+                    'UTF-16le'
+                );
+                const insertedRow = await utf16Engine.insertRowWithHistory!(
+                    'malformed_utf16_history',
+                    { id: 1 }
+                );
+                const insertion = {
+                    modificationType: 'row_insert' as const,
+                    targetTable: 'malformed_utf16_history',
+                    targetRowId: insertedRow.rowId,
+                    description: 'Insert native malformed UTF-16LE TEXT',
+                    rowData: insertedRow.row,
+                    insertedRow
+                };
+
+                await utf16Engine.undoModification(insertion);
+                await utf16Engine.redoModification(insertion);
+                assert.deepStrictEqual(
+                    (await utf16Engine.executeQuery(
+                        'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                        'FROM malformed_utf16_history'
+                    ))[0].rows,
+                    [['text', '00D8', 'snowman ☃']]
+                );
+
+                const deletedRows = await utf16Engine.deleteRows('malformed_utf16_history', [1]);
+                await utf16Engine.undoModification({
+                    modificationType: 'row_delete',
+                    targetTable: 'malformed_utf16_history',
+                    description: 'Delete native malformed UTF-16LE TEXT',
+                    deletedRows
+                });
+                assert.deepStrictEqual(
+                    (await utf16Engine.executeQuery(
+                        'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                        'FROM malformed_utf16_history'
+                    ))[0].rows,
+                    [['text', '00D8', 'snowman ☃']]
+                );
+            } finally {
+                utf16Bundle?.workerMethods[Symbol.dispose]();
+            }
+        });
+
+        await testContext.test('guards native row history against a second WAL writer', async () => {
+            const table = 'native_row_history_wal';
+            await engine.executeQuery('PRAGMA journal_mode = WAL');
+            await engine.executeQuery(
+                `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT)`
+            );
+            const insertedRow = await engine.insertRowWithHistory!(
+                table,
+                { id: 1, value: 'tracked' }
+            );
+            await engine.insertRow(table, { id: 2, value: 'delete-me' });
+
+            const writer = new NativeWorkerProcess(binary, workerScript);
+            await writer.start();
+            try {
+                await writer.call('open', [databasePath, false]);
+                await writer.call('run', [
+                    `UPDATE ${table} SET value = 'external' WHERE id = 1`
+                ]);
+                await assert.rejects(
+                    engine.undoModification({
+                        modificationType: 'row_insert',
+                        targetTable: table,
+                        targetRowId: insertedRow.rowId,
+                        description: 'Insert tracked row',
+                        rowData: insertedRow.row,
+                        insertedRow
+                    }),
+                    /Row changed outside SQLite Explorer history/i
+                );
+
+                const deletedRows = await engine.deleteRows(table, [2]);
+                await writer.call('run', [
+                    `INSERT INTO ${table} VALUES (2, 'replacement')`
+                ]);
+                await assert.rejects(
+                    engine.undoModification({
+                        modificationType: 'row_delete',
+                        targetTable: table,
+                        description: 'Delete tracked row',
+                        affectedRowIds: [2],
+                        deletedRows
+                    }),
+                    /Row changed outside SQLite Explorer history/i
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        `SELECT id, value FROM ${table} ORDER BY id`
+                    ))[0].rows,
+                    [[1, 'external'], [2, 'replacement']]
+                );
+            } finally {
+                writer.stop();
+            }
         });
 
         await testContext.test(
@@ -535,7 +1474,11 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                         tracker.record(entry);
                     };
 
-                    await historyEngine.updateCell(table, 1, 'value', 'edited');
+                    const [setCell] = await historyEngine.updateCellBatch(table, [{
+                        rowId: 1,
+                        column: 'value',
+                        value: 'edited'
+                    }]);
                     record({
                         label: 'Set native cell',
                         description: 'Set native cell',
@@ -543,12 +1486,19 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                         targetTable: table,
                         targetRowId: 1,
                         targetColumn: 'value',
-                        priorValue: 'kept',
-                        newValue: 'edited',
-                        operation: 'set'
+                        priorValue: setCell.priorValue,
+                        newValue: setCell.newValue,
+                        operation: setCell.operation,
+                        priorState: setCell.priorState,
+                        postState: setCell.postState
                     });
 
-                    await historyEngine.updateCell(table, 1, 'json_value', null, patch);
+                    const [jsonCell] = await historyEngine.updateCellBatch(table, [{
+                        rowId: 1,
+                        column: 'json_value',
+                        value: patch,
+                        operation: 'json_patch'
+                    }]);
                     record({
                         label: 'Patch native JSON cell',
                         description: 'Patch native JSON cell',
@@ -556,23 +1506,26 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                         targetTable: table,
                         targetRowId: 1,
                         targetColumn: 'json_value',
-                        priorValue: baselineJson,
-                        newValue: patch,
-                        operation: 'json_patch'
+                        priorValue: jsonCell.priorValue,
+                        newValue: jsonCell.newValue,
+                        operation: jsonCell.operation,
+                        priorState: jsonCell.priorState,
+                        postState: jsonCell.postState
                     });
 
-                    const insertedRowId = await historyEngine.insertRow(table, {
+                    const insertedRow = await historyEngine.insertRowWithHistory!(table, {
                         value: 'inserted',
                         json_value: '{}'
                     });
-                    assert.strictEqual(insertedRowId, 3);
+                    assert.strictEqual(insertedRow.rowId, 3);
                     record({
                         label: 'Insert native row',
                         description: 'Insert native row',
                         modificationType: 'row_insert',
                         targetTable: table,
-                        targetRowId: insertedRowId,
-                        rowData: { value: 'inserted', json_value: '{}' }
+                        targetRowId: insertedRow.rowId,
+                        rowData: insertedRow.row,
+                        insertedRow
                     });
 
                     const deletedRows = await historyEngine.deleteRows(table, [2]);
@@ -586,11 +1539,18 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                         deletedRows
                     });
 
-                    await historyEngine.addColumn(
+                    const columnAddBeforeSnapshot = {
+                        tableSql: `CREATE TABLE ${table} (value TEXT, json_value TEXT)`,
+                        columns: ['value', 'json_value'],
+                        identity: { kind: 'rowid' as const },
+                        schemaObjects: []
+                    };
+                    const columnAddSnapshot = await historyEngine.addColumn(
                         table,
                         'history_extra',
                         'TEXT',
-                        'history-default'
+                        'history-default',
+                        columnAddBeforeSnapshot
                     );
                     record({
                         label: 'Add native column',
@@ -598,7 +1558,9 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                         modificationType: 'column_add',
                         targetTable: table,
                         targetColumn: 'history_extra',
-                        columnDef: { type: 'TEXT', defaultValue: 'history-default' }
+                        columnDef: { type: 'TEXT', defaultValue: 'history-default' },
+                        columnAddBeforeSnapshot,
+                        columnAddSnapshot
                     });
 
                     const viewDefinition = await historyEngine.createView(
@@ -925,7 +1887,7 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                                 const sql = String(args[0]);
                                 if (
                                     !mutationInjected
-                                    && sql.includes('FROM "native_export_cell_snapshot"')
+                                    && sql.includes('FROM main."native_export_cell_snapshot"')
                                 ) {
                                     mutationInjected = true;
                                     await writer.call('run', [
@@ -1156,6 +2118,38 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('retains raw prefixes for malformed native table and view TEXT', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_malformed_text_value (value TEXT); ' +
+                "INSERT INTO native_malformed_text_value VALUES " +
+                "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT)); " +
+                'CREATE VIEW native_malformed_text_view AS ' +
+                'SELECT value FROM native_malformed_text_value WHERE rowid = 1'
+            );
+            const page = await engine.fetchTableData('native_malformed_text_value', {
+                columns: ['rowid', 'value'],
+                orderBy: 'rowid',
+                orderDir: 'ASC',
+                limit: 10,
+                offset: 0
+            });
+
+            assert.deepStrictEqual(page.rows, [[1, Uint8Array.of(0x80)], [2, '�']]);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: { 1: { storageClass: 'text', byteLength: 1 } }
+            });
+
+            const viewPage = await engine.fetchTableData('native_malformed_text_view', {
+                columns: ['value'],
+                limit: 1,
+                offset: 0
+            });
+            assert.deepStrictEqual(viewPage.rows, [[Uint8Array.of(0x80)]]);
+            assert.deepStrictEqual(viewPage.oversizedCells, {
+                0: { 0: { storageClass: 'text', byteLength: 1 } }
+            });
+        });
+
         await testContext.test('suppresses native keyset anchors for malformed ordinary TEXT sort keys', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_malformed_text_sort (' +
@@ -1244,6 +2238,39 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ['9007199254740992', 'lower'],
                 ['9007199254740993', 'edited']
             ]);
+        });
+
+        await testContext.test('returns an exact unsafe native auto-rowid and undoes only it', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_unsafe_auto_rowid (value TEXT); ' +
+                "INSERT INTO native_unsafe_auto_rowid(rowid, value) VALUES " +
+                "(9007199254740991, 'lower'), (9007199254740992, 'upper')"
+            );
+
+            const insertedRow = await engine.insertRowWithHistory!(
+                'native_unsafe_auto_rowid',
+                { value: 'inserted' }
+            );
+            assert.strictEqual(insertedRow.rowId, '9007199254740993');
+
+            await engine.undoModification({
+                description: 'Undo unsafe native auto-rowid insert',
+                modificationType: 'row_insert',
+                targetTable: 'native_unsafe_auto_rowid',
+                targetRowId: insertedRow.rowId,
+                rowData: insertedRow.row,
+                insertedRow
+            });
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT CAST(rowid AS TEXT), value ' +
+                    'FROM native_unsafe_auto_rowid ORDER BY rowid'
+                ))[0].rows,
+                [
+                    ['9007199254740991', 'lower'],
+                    ['9007199254740992', 'upper']
+                ]
+            );
         });
 
         await testContext.test('pages native tables by keyset without OFFSET', async () => {
@@ -1560,7 +2587,7 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                     'value',
                     'after'
                 ),
-                /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+                    /UPDATE trigger changed or removed.*primary-key identity.*target table.*rolled back/is
             );
             await assert.rejects(
                 engine.replaceOversizedCell(
@@ -1571,7 +2598,7 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                     { storageClass: 'text', byteLength: 6 },
                     5
                 ),
-                /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+                /UPDATE trigger changed or removed.*primary-key identity.*target table.*rolled back/is
             );
             assert.deepStrictEqual(
                 (await engine.executeQuery(
@@ -1614,6 +2641,29 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ))[0].rows,
                 [[7, 5, 10, 15]]
             );
+        });
+
+        await testContext.test('includes generated columns in an implicit native projection', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_generated_projection (' +
+                'base INTEGER, ' +
+                'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+                'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+                '); ' +
+                'INSERT INTO native_generated_projection (base) VALUES (5)'
+            );
+
+            const page = await engine.fetchTableData('native_generated_projection', {
+                columns: ['*'],
+                limit: 10,
+                offset: 0
+            });
+
+            assert.deepStrictEqual(
+                page.headers,
+                ['base', 'stored_value', 'virtual_value']
+            );
+            assert.deepStrictEqual(page.rows, [[5, 10, 15]]);
         });
 
         await testContext.test('restores a deleted native rowid row without generated columns', async () => {
@@ -2083,6 +3133,123 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('rejects stale native table-create undo without deleting replacement data', async () => {
+            const table = 'native_guarded_table_create';
+            const columns = [
+                { name: 'id', type: 'INTEGER', primaryKey: true, notNull: false },
+                { name: 'value', type: 'TEXT', primaryKey: false, notNull: false }
+            ];
+            const tableCreateSnapshot = await engine.createTable(table, columns);
+
+            await engine.executeQuery(`DROP TABLE ${table}`);
+            await engine.executeQuery(
+                `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, replacement BLOB)`
+            );
+            await engine.executeQuery(
+                `INSERT INTO ${table}(id, replacement) VALUES (1, X'CAFE')`
+            );
+
+            await assert.rejects(
+                engine.undoModification({
+                    description: 'Undo stale native table creation',
+                    modificationType: 'table_create',
+                    targetTable: table,
+                    tableDef: { columns },
+                    tableCreateSnapshot
+                } as any),
+                /schema changed/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    `SELECT id, typeof(replacement), hex(replacement) FROM ${table}`
+                ))[0].rows,
+                [[1, 'blob', 'CAFE']]
+            );
+
+            await engine.executeQuery(`DROP TABLE ${table}`);
+            await engine.executeQuery(tableCreateSnapshot.tableSql);
+            await engine.executeQuery(`INSERT INTO ${table}(id, value) VALUES (2, 'kept')`);
+            await assert.rejects(
+                engine.undoModification({
+                    description: 'Undo non-empty native table creation',
+                    modificationType: 'table_create',
+                    targetTable: table,
+                    tableDef: { columns },
+                    tableCreateSnapshot
+                } as any),
+                /contains data/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(`SELECT id, value FROM ${table}`))[0].rows,
+                [[2, 'kept']]
+            );
+        });
+
+        await testContext.test('rejects stale native column-add undo without deleting replacement data', async () => {
+            const table = 'native_guarded_column_add';
+            await engine.executeQuery(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`);
+            await engine.executeQuery(`INSERT INTO ${table}(id) VALUES (1)`);
+            const columnAddSnapshot = await engine.addColumn(table, 'added', 'TEXT');
+
+            await engine.executeQuery(`ALTER TABLE ${table} DROP COLUMN added`);
+            await engine.executeQuery(`ALTER TABLE ${table} ADD COLUMN added BLOB`);
+            await engine.executeQuery(`UPDATE ${table} SET added = X'BEEF' WHERE id = 1`);
+
+            await assert.rejects(
+                engine.undoModification({
+                    description: 'Undo stale native column addition',
+                    modificationType: 'column_add',
+                    targetTable: table,
+                    targetColumn: 'added',
+                    columnDef: { type: 'TEXT' },
+                    columnAddSnapshot
+                } as any),
+                /schema changed/i
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    `SELECT typeof(added), hex(added) FROM ${table} WHERE id = 1`
+                ))[0].rows,
+                [['blob', 'BEEF']]
+            );
+        });
+
+        await testContext.test('rejects stale native column-drop redo without deleting replacement data', async () => {
+            const table = 'native_guarded_column_drop_redo';
+            await engine.executeQuery(
+                `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)`
+            );
+            await engine.executeQuery(
+                `INSERT INTO ${table}(id, removed, tail) VALUES (1, 'original', 'tail')`
+            );
+            const before = await captureNativeRowidTableState(engine, table);
+            const after = await engine.deleteColumns(table, ['removed']);
+            const modification = {
+                description: 'Redo guarded native column deletion',
+                modificationType: 'column_drop',
+                targetTable: table,
+                deletedColumns: [{
+                    name: 'removed',
+                    type: 'TEXT',
+                    data: [{ rowId: 1, value: 'original' }]
+                }],
+                columnDropSnapshot: { before, after }
+            } as any;
+            await engine.undoModification(modification);
+
+            await engine.executeQuery(`ALTER TABLE ${table} DROP COLUMN removed`);
+            await engine.executeQuery(`ALTER TABLE ${table} ADD COLUMN removed BLOB`);
+            await engine.executeQuery(`UPDATE ${table} SET removed = X'FACE' WHERE id = 1`);
+
+            await assert.rejects(engine.redoModification(modification), /schema changed/i);
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    `SELECT typeof(removed), hex(removed), tail FROM ${table} WHERE id = 1`
+                ))[0].rows,
+                [['blob', 'FACE', 'tail']]
+            );
+        });
+
         await testContext.test('preserves an unsafe native INTEGER prior when undoing a typeless cell', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_typeless_undo (' +
@@ -2114,6 +3281,92 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                     'SELECT typeof(value), CAST(value AS TEXT) FROM native_typeless_undo'
                 ))[0].rows,
                 [['integer', '9007199254740993']]
+            );
+        });
+
+        await testContext.test('guards native set and JSON cell history against untracked writes', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_cell_history_cas (value TEXT, payload TEXT); ' +
+                "INSERT INTO native_cell_history_cas VALUES " +
+                "('before', '{\"status\":\"draft\",\"owner\":\"ada\"}')"
+            );
+
+            const setCells = await engine.updateCellBatch('native_cell_history_cas', [{
+                rowId: 1,
+                column: 'value',
+                value: 'after'
+            }]);
+            assert.deepStrictEqual(setCells[0].priorState, {
+                storageClass: 'text',
+                value: 'before'
+            });
+            assert.deepStrictEqual(setCells[0].postState, {
+                storageClass: 'text',
+                value: 'after'
+            });
+            const setModification = {
+                description: 'Guard native set history',
+                modificationType: 'cell_update' as const,
+                targetTable: 'native_cell_history_cas',
+                affectedCells: setCells
+            };
+            await engine.executeQuery(
+                "UPDATE native_cell_history_cas SET value = 'external' WHERE rowid = 1"
+            );
+            await assert.rejects(
+                engine.undoModification(setModification),
+                /changed outside SQLite Explorer history/i
+            );
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    'SELECT value FROM native_cell_history_cas WHERE rowid = 1'
+                ))[0].rows[0][0],
+                'external'
+            );
+
+            const jsonCells = await engine.updateCellBatch('native_cell_history_cas', [{
+                rowId: 1,
+                column: 'payload',
+                value: '{"status":"published"}',
+                operation: 'json_patch'
+            }]);
+            const jsonModification = {
+                description: 'Guard native JSON history',
+                modificationType: 'cell_update' as const,
+                targetTable: 'native_cell_history_cas',
+                affectedCells: jsonCells
+            };
+            await engine.executeQuery(
+                "UPDATE native_cell_history_cas SET payload = " +
+                "json_set(payload, '$.reviewer', 'grace') WHERE rowid = 1"
+            );
+            await engine.undoModification(jsonModification);
+            assert.deepStrictEqual(
+                JSON.parse((await engine.executeQuery(
+                    'SELECT payload FROM native_cell_history_cas WHERE rowid = 1'
+                ))[0].rows[0][0] as string),
+                { status: 'draft', owner: 'ada', reviewer: 'grace' }
+            );
+            await engine.redoModification(jsonModification);
+            assert.deepStrictEqual(
+                JSON.parse((await engine.executeQuery(
+                    'SELECT payload FROM native_cell_history_cas WHERE rowid = 1'
+                ))[0].rows[0][0] as string),
+                { status: 'published', owner: 'ada', reviewer: 'grace' }
+            );
+            await engine.executeQuery(
+                "UPDATE native_cell_history_cas SET payload = " +
+                "json_set(payload, '$.status', 'external') WHERE rowid = 1"
+            );
+            await assert.rejects(
+                engine.undoModification(jsonModification),
+                /changed outside SQLite Explorer history/i
+            );
+            assert.strictEqual(
+                JSON.parse((await engine.executeQuery(
+                    'SELECT payload FROM native_cell_history_cas WHERE rowid = 1'
+                ))[0].rows[0][0] as string).status,
+                'external'
             );
         });
 
@@ -2241,6 +3494,24 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                     'SELECT c0 FROM native_fts_identity_content'
                 ))[0].rows[0][0],
                 'shadow-after'
+            );
+        });
+
+        await testContext.test('surfaces native generated columns as read-only metadata', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_generated_metadata (' +
+                'base INTEGER, ' +
+                'virtual_value INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL, ' +
+                'stored_value INTEGER GENERATED ALWAYS AS (base * 3) STORED)'
+            );
+            const info = await engine.getTableInfo('native_generated_metadata');
+            assert.deepStrictEqual(
+                info.map(column => [column.identifier, column.isGenerated]),
+                [
+                    ['base', false],
+                    ['virtual_value', true],
+                    ['stored_value', true]
+                ]
             );
         });
 
@@ -2505,6 +3776,73 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 'max_item_price'
             ]);
             assert.deepStrictEqual(preview.rows, []);
+        });
+
+        await testContext.test('preserves legal native schema identifiers and rejects unusable names', async () => {
+            const table = ' ui "table" 🚀 ';
+            const firstColumn = ' id "column" 🧩 ';
+            const addedColumn = ' added "column" ✨ ';
+            const view = ' ui "view" 🚀 ';
+            const column = {
+                name: firstColumn,
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: false
+            };
+
+            await engine.createTable(table, [column]);
+            await engine.addColumn(table, addedColumn, 'TEXT');
+            assert.deepStrictEqual(
+                (await engine.getTableInfo(table)).map(metadata => metadata.identifier),
+                [firstColumn, addedColumn]
+            );
+
+            await engine.validateViewDefinition(view, 'SELECT 7 AS value', 'create');
+            const preview = await engine.previewViewDefinition(
+                view,
+                'SELECT 7 AS value',
+                10,
+                'create'
+            );
+            assert.deepStrictEqual(preview.rows, [[7]]);
+            const definition = await engine.createView(view, 'SELECT 7 AS value');
+            assert.strictEqual(definition.identifier, view);
+
+            await assert.rejects(
+                engine.createTable('', [column]),
+                /Table name is required/
+            );
+            await assert.rejects(
+                engine.createTable('valid native table', [{ ...column, name: 'bad\0column' }]),
+                /Column name cannot contain NUL/
+            );
+            await assert.rejects(
+                engine.createTable('native duplicate column table', [
+                    { ...column, name: 'value' },
+                    { ...column, name: 'VALUE' }
+                ]),
+                /Column "VALUE" is defined more than once/
+            );
+            await assert.rejects(
+                engine.addColumn(table, '', 'TEXT'),
+                /Column name is required/
+            );
+            await assert.rejects(
+                engine.addColumn(table, firstColumn, 'TEXT'),
+                /already exists in table/
+            );
+            await assert.rejects(
+                engine.validateViewDefinition('bad\0view', 'SELECT 1', 'create'),
+                /View name cannot contain NUL/
+            );
+            await assert.rejects(
+                engine.previewViewDefinition('', 'SELECT 1', 10, 'create'),
+                /View name is required/
+            );
+            await assert.rejects(
+                engine.createView('bad\0view', 'SELECT 1'),
+                /View name cannot contain NUL/
+            );
         });
 
         await testContext.test('enforces create and edit intent against the installed schema', async () => {
@@ -2993,7 +4331,7 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
                     'SELECT value * 2 AS value FROM native_shadow_trigger_main_rows',
                     true
                 ),
-                /native_shadow_trigger_insert.*drop the TEMP shadow view.*schema-qualified target/is
+                /native_shadow_trigger_insert.*TEMP trigger.*schema-qualified target/is
             );
             const mainRows = await engine.executeQuery(
                 'SELECT value FROM main.native_shadow_trigger_view'
@@ -3010,7 +4348,7 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             assert.strictEqual(logged[0].rows[0][0], 11);
         });
 
-        await testContext.test('rejects native edit and drop for a main-bound TEMP trigger made ambiguous', async () => {
+        await testContext.test('proves and preserves a native main-bound unqualified TEMP trigger', async () => {
             await engine.executeQuery('CREATE TABLE native_ambiguous_main_rows (value INTEGER)');
             await engine.executeQuery('INSERT INTO native_ambiguous_main_rows VALUES (3)');
             await engine.executeQuery('CREATE TABLE native_ambiguous_main_log (value INTEGER)');
@@ -3035,24 +4373,20 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
                 browsed.selectSql,
                 'SELECT value FROM native_ambiguous_main_rows'
             );
-            assert.deepStrictEqual(browsed.triggers, []);
             assert.deepStrictEqual(
-                browsed.ambiguousTemporaryTriggerNames,
+                browsed.triggers.map(trigger => trigger.identifier),
                 ['native_ambiguous_main_insert']
             );
+            assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
 
-            const expectedError = /native_ambiguous_main_insert.*drop the TEMP shadow view.*TEMP trigger.*schema-qualified target/is;
-            await assert.rejects(
-                engine.editView(
-                    'native_ambiguous_trigger_view',
-                    'SELECT value * 2 AS value FROM native_ambiguous_main_rows',
-                    true
-                ),
-                expectedError
+            const edit = await engine.editView(
+                'native_ambiguous_trigger_view',
+                'SELECT value * 2 AS value FROM native_ambiguous_main_rows',
+                true
             );
-            await assert.rejects(
-                engine.dropView('native_ambiguous_trigger_view'),
-                expectedError
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => trigger.identifier),
+                ['native_ambiguous_main_insert']
             );
 
             const mainRows = await engine.executeQuery(
@@ -3061,7 +4395,7 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             const tempRows = await engine.executeQuery(
                 'SELECT value FROM temp.native_ambiguous_trigger_view'
             );
-            assert.strictEqual(mainRows[0].rows[0][0], 3);
+            assert.strictEqual(mainRows[0].rows[0][0], 6);
             assert.strictEqual(tempRows[0].rows[0][0], 7);
             await engine.executeQuery(
                 'INSERT INTO main.native_ambiguous_trigger_view VALUES (19)'
@@ -3070,6 +4404,101 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
                 'SELECT value FROM native_ambiguous_main_log'
             );
             assert.strictEqual(logged[0].rows[0][0], 19);
+        });
+
+        await testContext.test('keeps native non-ASCII-distinct trigger names separate', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_unicode_trigger_rows (value INTEGER); ' +
+                'CREATE TABLE native_unicode_trigger_log (source TEXT, value INTEGER); ' +
+                'CREATE VIEW native_unicode_trigger_view AS ' +
+                'SELECT value FROM native_unicode_trigger_rows; ' +
+                'CREATE TRIGGER "Ä" INSTEAD OF INSERT ON native_unicode_trigger_view ' +
+                "BEGIN INSERT INTO native_unicode_trigger_log VALUES ('main', NEW.value); END; " +
+                'CREATE TEMP TRIGGER "ä" INSTEAD OF INSERT ON native_unicode_trigger_view ' +
+                "BEGIN INSERT INTO native_unicode_trigger_log VALUES ('temp', NEW.value); END"
+            );
+
+            const browsed = await engine.getViewDefinition('native_unicode_trigger_view');
+            assert.deepStrictEqual(
+                browsed.triggers.map(trigger => [
+                    trigger.identifier,
+                    trigger.temporary === true
+                ]),
+                [['Ä', false], ['ä', true]]
+            );
+            assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
+
+            const edit = await engine.editView(
+                'native_unicode_trigger_view',
+                'SELECT value * 2 AS value FROM native_unicode_trigger_rows',
+                true
+            );
+            assert.deepStrictEqual(
+                edit.after.triggers.map(trigger => [
+                    trigger.identifier,
+                    trigger.temporary === true
+                ]),
+                [['Ä', false], ['ä', true]]
+            );
+            await engine.executeQuery(
+                'INSERT INTO main.native_unicode_trigger_view VALUES (13)'
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT source, value FROM native_unicode_trigger_log ORDER BY source'
+                ))[0].rows,
+                [['main', 13], ['temp', 13]]
+            );
+        });
+
+        await testContext.test('refuses to rebind a native TEMP trigger historically attached elsewhere', async () => {
+            await engine.executeQuery("ATTACH DATABASE ':memory:' AS native_aux_history");
+            await engine.executeQuery(
+                'CREATE TABLE native_aux_history.native_historical_rows (value INTEGER)'
+            );
+            await engine.executeQuery(
+                'CREATE VIEW native_aux_history.native_historical_view AS ' +
+                'SELECT value FROM native_historical_rows'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TABLE native_historical_log (value INTEGER)'
+            );
+            await engine.executeQuery(
+                'CREATE TEMP TRIGGER native_historical_aux_insert ' +
+                'INSTEAD OF INSERT ON native_historical_view ' +
+                'BEGIN INSERT INTO native_historical_log VALUES (NEW.value); END'
+            );
+            await engine.executeQuery('CREATE TABLE native_historical_main_rows (value INTEGER)');
+            await engine.executeQuery(
+                'CREATE VIEW native_historical_view AS ' +
+                'SELECT value FROM native_historical_main_rows'
+            );
+
+            const browsed = await engine.getViewDefinition('native_historical_view');
+            assert.deepStrictEqual(browsed.triggers, []);
+            assert.deepStrictEqual(
+                browsed.ambiguousTemporaryTriggerNames,
+                ['native_historical_aux_insert']
+            );
+            await assert.rejects(
+                engine.editView(
+                    'native_historical_view',
+                    'SELECT value * 2 AS value FROM native_historical_main_rows',
+                    true
+                ),
+                /native_historical_aux_insert.*TEMP trigger.*schema-qualified target/is
+            );
+            await assert.rejects(
+                engine.executeQuery('INSERT INTO main.native_historical_view VALUES (23)'),
+                /cannot modify.*view|SQL logic error/i
+            );
+            await engine.executeQuery(
+                'INSERT INTO native_aux_history.native_historical_view VALUES (29)'
+            );
+            const logged = await engine.executeQuery(
+                'SELECT value FROM native_historical_log'
+            );
+            assert.strictEqual(logged[0].rows[0][0], 29);
         });
 
         await testContext.test('preserves a bracket-qualified main TEMP trigger through a temp shadow', async () => {
@@ -3123,6 +4552,172 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
                 'SELECT target, value FROM native_qualified_trigger_log ORDER BY rowid'
             );
             assert.deepStrictEqual(logRows[0].rows, [['main', 13], ['temp', 17]]);
+        });
+
+        await testContext.test('rejects native view changes that break reverse view and trigger dependencies', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_dependency_rows (id INTEGER, label TEXT); ' +
+                "INSERT INTO native_dependency_rows VALUES (41, 'kept'); " +
+                'CREATE VIEW native_dependency_source AS ' +
+                'SELECT id, label FROM native_dependency_rows; ' +
+                'CREATE VIEW native_dependency_consumer AS ' +
+                'SELECT id FROM native_dependency_source'
+            );
+
+            for (const operation of [
+                () => engine.validateViewDefinition(
+                    'native_dependency_source',
+                    'SELECT label FROM native_dependency_rows'
+                ),
+                () => engine.previewViewDefinition(
+                    'native_dependency_source',
+                    'SELECT label FROM native_dependency_rows',
+                    10
+                ),
+                () => engine.editView(
+                    'native_dependency_source',
+                    'SELECT label FROM native_dependency_rows'
+                ),
+                () => engine.dropView('native_dependency_source')
+            ]) {
+                await assert.rejects(
+                    operation(),
+                    /would break existing view.*native_dependency_consumer/is
+                );
+            }
+            assert.strictEqual(
+                (await engine.executeQuery('SELECT id FROM native_dependency_consumer'))[0].rows[0][0],
+                41
+            );
+
+            await engine.executeQuery(
+                'CREATE VIEW native_reverse_trigger_source AS ' +
+                'SELECT id, label FROM native_dependency_rows; ' +
+                'CREATE TABLE native_reverse_trigger_events (event_id INTEGER); ' +
+                'CREATE TABLE native_reverse_trigger_log (seen_id INTEGER); ' +
+                'CREATE TRIGGER native_reverse_trigger_probe ' +
+                'AFTER INSERT ON native_reverse_trigger_events BEGIN ' +
+                'INSERT INTO native_reverse_trigger_log ' +
+                'SELECT id FROM native_reverse_trigger_source; END'
+            );
+
+            await assert.rejects(
+                engine.editView(
+                    'native_reverse_trigger_source',
+                    'SELECT label FROM native_dependency_rows'
+                ),
+                /would break existing trigger.*native_reverse_trigger_probe/is
+            );
+            await assert.rejects(
+                engine.validateViewDefinition(
+                    'native_reverse_trigger_source',
+                    'SELECT label FROM native_dependency_rows'
+                ),
+                /would break existing trigger.*native_reverse_trigger_probe/is
+            );
+            await assert.rejects(
+                engine.previewViewDefinition(
+                    'native_reverse_trigger_source',
+                    'SELECT label FROM native_dependency_rows',
+                    10
+                ),
+                /would break existing trigger.*native_reverse_trigger_probe/is
+            );
+            await assert.rejects(
+                engine.dropView('native_reverse_trigger_source'),
+                /would break existing trigger.*native_reverse_trigger_probe/is
+            );
+            await engine.executeQuery('INSERT INTO native_reverse_trigger_events VALUES (1)');
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    'SELECT seen_id FROM native_reverse_trigger_log'
+                ))[0].rows[0][0],
+                41
+            );
+        });
+
+        await testContext.test('rejects native column additions that activate broken UPDATE OF triggers', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_dormant_rows (id INTEGER, label TEXT); ' +
+                'CREATE VIEW native_dormant_source AS ' +
+                'SELECT id, label FROM native_dormant_rows; ' +
+                'CREATE TABLE native_dormant_events (event_id INTEGER); ' +
+                'CREATE TABLE native_dormant_log (value TEXT); ' +
+                'CREATE TRIGGER native_dormant_update AFTER UPDATE OF activated ' +
+                'ON native_dormant_events BEGIN ' +
+                'INSERT INTO native_dormant_log SELECT label FROM native_dormant_source; END'
+            );
+
+            await engine.editView(
+                'native_dormant_source',
+                'SELECT id FROM native_dormant_rows'
+            );
+            await assert.rejects(
+                engine.addColumn('native_dormant_events', 'activated', 'INTEGER'),
+                /would break existing trigger.*native_dormant_update/is
+            );
+            assert.deepStrictEqual(
+                (await engine.getTableInfo('native_dormant_events'))
+                    .map(column => column.identifier),
+                ['event_id']
+            );
+        });
+
+        await testContext.test('rejects native undo and redo that break newer dependent views', async () => {
+            const undoBefore = await engine.createView(
+                'native_history_dependency_undo',
+                'SELECT id FROM native_dependency_rows'
+            );
+            const undoEdit = await engine.editView(
+                'native_history_dependency_undo',
+                'SELECT id, label FROM native_dependency_rows'
+            );
+            const undoModification = {
+                description: 'Edit native_history_dependency_undo',
+                modificationType: 'view_edit' as const,
+                targetTable: 'native_history_dependency_undo',
+                viewDefBefore: undoBefore,
+                viewDefAfter: undoEdit.after
+            };
+            await engine.executeQuery(
+                'CREATE VIEW native_history_dependency_undo_consumer AS ' +
+                'SELECT label FROM native_history_dependency_undo'
+            );
+            await assert.rejects(
+                engine.undoModification(undoModification),
+                /would break existing view.*native_history_dependency_undo_consumer/is
+            );
+
+            const redoBefore = await engine.createView(
+                'native_history_dependency_redo',
+                'SELECT id, label FROM native_dependency_rows'
+            );
+            const redoEdit = await engine.editView(
+                'native_history_dependency_redo',
+                'SELECT id FROM native_dependency_rows'
+            );
+            const redoModification = {
+                description: 'Edit native_history_dependency_redo',
+                modificationType: 'view_edit' as const,
+                targetTable: 'native_history_dependency_redo',
+                viewDefBefore: redoBefore,
+                viewDefAfter: redoEdit.after
+            };
+            await engine.undoModification(redoModification);
+            await engine.executeQuery(
+                'CREATE VIEW native_history_dependency_redo_consumer AS ' +
+                'SELECT label FROM native_history_dependency_redo'
+            );
+            await assert.rejects(
+                engine.redoModification(redoModification),
+                /would break existing view.*native_history_dependency_redo_consumer/is
+            );
+            assert.strictEqual(
+                (await engine.executeQuery(
+                    'SELECT label FROM native_history_dependency_redo_consumer'
+                ))[0].rows[0][0],
+                'kept'
+            );
         });
     } finally {
         rawWorker?.stop();

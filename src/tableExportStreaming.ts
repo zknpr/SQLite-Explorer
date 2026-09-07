@@ -10,7 +10,7 @@ import type {
   TableIdentity
 } from './core/types';
 import { crypto as webCrypto } from './platform/cryptoShim';
-import { escapeIdentifier, validateRowId } from './core/sql-utils';
+import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './core/sql-utils';
 import { normalizeCellTextEncoding } from './core/cell-read';
 import {
   createCsvTextInspection,
@@ -358,7 +358,7 @@ async function resolveColumns(
 ): Promise<string[]> {
   if (requestedColumns.length > 0) return [...requestedColumns];
   const result = await operations.executeQuery(
-    `SELECT * FROM ${escapeIdentifier(table)} LIMIT 0`
+    `SELECT * FROM ${escapeMainIdentifier(table)} LIMIT 0`
   );
   const headers = result[0]?.headers;
   if (!headers) throw new Error(`Cannot resolve export columns for ${table}`);
@@ -459,7 +459,7 @@ async function* readRowIdTableRows(
       let sql =
         `SELECT CAST(rowid AS TEXT) AS ${escapeIdentifier('__export_rowid__')}` +
         (includeRowIdInProjection && projection ? `, ${projection}` : '') +
-        ` FROM ${escapeIdentifier(table)}`;
+        ` FROM ${escapeMainIdentifier(table)}`;
       if (predicates.length > 0) sql += ` WHERE ${predicates.join(' AND ')}`;
       sql += ` ORDER BY rowid ASC LIMIT ${projectionPlan.rowCount}`;
 
@@ -477,7 +477,7 @@ async function* readRowIdTableRows(
       if (!includeRowIdInProjection) {
         const batchPredicate = buildRecordIdentitiesPredicate(rowIds, { kind: 'rowid' });
         const valuesResult = await operations.executeQuery(
-          `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
+          `SELECT ${projection} FROM ${escapeMainIdentifier(table)} ` +
           `WHERE ${batchPredicate.sql} ORDER BY rowid ASC`,
           batchPredicate.params
         );
@@ -546,7 +546,7 @@ function buildSelectedPrimaryKeyJoin(
   return {
     cte: `WITH ${escapedCte} (${cteColumns}) AS (VALUES ${valueRows.join(', ')})`,
     from:
-      `FROM ${escapeIdentifier(table)} AS ${escapedSource} ` +
+      `FROM ${escapeMainIdentifier(table)} AS ${escapedSource} ` +
       `INNER JOIN ${escapedCte} ON ${join}`,
     orderBy: `ORDER BY ${escapedCte}.${escapeIdentifier(SELECTED_PK_ORDER_COLUMN)}`,
     params
@@ -752,7 +752,7 @@ async function* readPrimaryKeyTableRows(
         // makes that position stable across the bounded cell-window queries.
         const rowOffset = offset + rowIndex;
         const result = await operations.executeQuery(
-          `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
+          `SELECT ${projection} FROM ${escapeMainIdentifier(table)} ` +
           `ORDER BY ${orderBy} LIMIT 1 OFFSET ${rowOffset}`
         );
         const row = result[0]?.rows?.[0];
@@ -794,7 +794,7 @@ async function* readPrimaryKeyTableRows(
       // row after a concurrent equal-cardinality delete+insert.
       const predicate = buildRecordIdentitiesPredicate(groupIds, identity);
       const result = await operations.executeQuery(
-        `SELECT ${projection} FROM ${escapeIdentifier(table)} ` +
+        `SELECT ${projection} FROM ${escapeMainIdentifier(table)} ` +
         `WHERE ${predicate.sql} ORDER BY ${orderBy}`,
         predicate.params
       );
@@ -842,7 +842,7 @@ async function* readUnstableCursorRows(
   const closeQueryReadSession = operations.closeQueryReadSession!;
   const session = await openQueryReadSession.call(
     operations,
-    `SELECT ${projection} FROM ${escapeIdentifier(table)}`
+    `SELECT ${projection} FROM ${escapeMainIdentifier(table)}`
   );
   let primaryError: unknown;
   try {
@@ -913,7 +913,7 @@ async function* readUnstableSpoolRows(
     spoolAttempted = true;
     await operations.executeQuery(
       `CREATE TEMP TABLE ${escapedSpool} AS ` +
-      `SELECT ${projection} FROM ${escapeIdentifier(table)}`,
+      `SELECT ${projection} FROM ${escapeMainIdentifier(table)}`,
       undefined,
       cancellationBinding.signal
     );
@@ -1130,7 +1130,7 @@ async function readPositionedCellChunk(
     .join(', ');
   const result = await operations.executeQuery(
     `SELECT substr(CAST(${escapeIdentifier(cell.column)} AS BLOB), ?, ?) ` +
-    `FROM ${escapeIdentifier(cell.table)} ORDER BY ${orderBy} LIMIT 1 OFFSET ?`,
+    `FROM ${escapeMainIdentifier(cell.table)} ORDER BY ${orderBy} LIMIT 1 OFFSET ?`,
     [byteOffset + 1, maxBytes, position.rowOffset]
   );
   const rows = result[0]?.rows ?? [];
@@ -1558,12 +1558,14 @@ async function writeSqlCell(
 }
 
 function jsonPropertyIndices(columns: readonly string[]): Array<{ name: string; index: number }> {
-  const objectOrder: Record<string, number> = {};
+  // Column names are data, so keep them out of Object.prototype's legacy
+  // __proto__ setter while retaining JSON.stringify's key ordering rules.
+  const objectOrder = Object.create(null) as Record<string, number>;
   columns.forEach((column, index) => {
     objectOrder[column] = index;
   });
   // Object.keys reproduces JSON.stringify's integer-key ordering as well as its
-  // duplicate-column overwrite and legacy __proto__ setter behavior.
+  // duplicate-column overwrite behavior.
   return Object.keys(objectOrder).map(name => ({ name, index: objectOrder[name] }));
 }
 

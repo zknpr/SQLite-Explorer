@@ -165,6 +165,37 @@ describe('missing-table proof', () => {
         }), ['absent']);
     });
 
+    it('walks into a broken view to name the table it lost, when the probe can read definitions', () => {
+        // The view editor validates through the INSTALLED view since 1.7.2, so
+        // the failing statement names only the view — in the catalog, hence
+        // never accused on its own. With the stored definition available the
+        // proof follows the body to the table that is actually missing.
+        const definitions: Record<string, string> = {
+            broken_view: 'CREATE VIEW broken_view AS SELECT * FROM definitely_absent',
+            outer_view: 'CREATE VIEW outer_view(a) AS SELECT a FROM broken_view',
+            cte_view: 'CREATE VIEW cte_view AS WITH x AS (SELECT 1) SELECT * FROM x',
+            self_view: 'CREATE VIEW self_view AS SELECT * FROM self_view'
+        };
+        const probe = {
+            resolves: (name: string) => name === 'users',
+            inCatalog: (name: string) => name === 'users' || name in definitions,
+            viewSql: (name: string) => definitions[name]
+        };
+        assert.deepEqual(findUnresolvedTableNames(['broken_view'], probe), ['definitely_absent']);
+        // Views over views: the walk recurses through the column-listed view.
+        assert.deepEqual(findUnresolvedTableNames(['outer_view'], probe), ['definitely_absent']);
+        assert.equal(
+            buildSqliteErrorMessage(1, 'SQL logic error', 'EXPLAIN SELECT * FROM main."broken_view"', probe),
+            'no such table: definitely_absent'
+        );
+        // A CTE body is not reasoned about (a CTE name is not in any catalog),
+        // and a self-referential definition terminates through the visited set.
+        assert.deepEqual(findUnresolvedTableNames(['cte_view'], probe), []);
+        assert.deepEqual(findUnresolvedTableNames(['self_view'], probe), []);
+        // Without a definition reader the old veto still holds: nothing is said.
+        assert.deepEqual(findUnresolvedTableNames(['broken_view'], probeFor([], ['broken_view'])), []);
+    });
+
     it('reports a proven missing table in SQLite\'s own words', () => {
         assert.equal(
             buildSqliteErrorMessage(1, 'SQL logic error', 'SELECT * FROM absent', probeFor([])),

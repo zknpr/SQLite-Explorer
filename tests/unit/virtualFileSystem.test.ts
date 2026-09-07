@@ -5,7 +5,10 @@ import assert from 'node:assert';
 import { SQLiteFileSystemProvider } from '../../src/virtualFileSystem';
 import { DocumentRegistry } from '../../src/documentRegistry';
 import type { DatabaseDocument } from '../../src/databaseModel';
-import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../src/core/cell-edit-policy';
+import {
+    DEFAULT_MAX_CELL_EDIT_BYTES,
+    OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE
+} from '../../src/core/cell-edit-policy';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import * as vscode from 'vscode';
 
@@ -198,6 +201,38 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(text, 'Alice');
         });
 
+        it('uses the explicit URI column field for a legal empty SQLite identifier', async () => {
+            let queryCount = 0;
+            const dbOps = {
+                getCellMetadata: mock.fn(async (target: any) => {
+                    assert.deepStrictEqual(target, {
+                        table: 'empty_names',
+                        rowId: 1,
+                        column: ''
+                    });
+                    return { storageClass: 'text', byteLength: 5, textEncoding: 'utf-8' };
+                }),
+                executeQuery: mock.fn(async (sql: string, params: any[]) => {
+                    queryCount++;
+                    if (queryCount === 1) return [{ rows: [[1]] }];
+                    assert.match(sql, /SELECT "", CASE WHEN typeof\(""\)/);
+                    assert.deepStrictEqual(params, [1]);
+                    return [{ rows: [['empty', null, new TextEncoder().encode('empty')]] }];
+                })
+            };
+            setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: `/${docKey}/empty_names/group/1/cell.txt`,
+                query: 'column='
+            });
+
+            const content = await provider.readFile(uri);
+
+            assert.strictEqual(new TextDecoder().decode(content), 'empty');
+            assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 1);
+        });
+
         it('reads SQLite-exact unsafe INTEGER text for an external cell editor', async () => {
             const dbOps = {
                 executeQuery: mock.fn(async (sql: string, params: any[]) => {
@@ -279,6 +314,46 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 1);
         });
 
+        it('refuses a writable text document for malformed SQLite TEXT bytes', async () => {
+            const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+            const engine = result.operations!;
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/malformed_vfs/group/1/value.txt`
+            );
+            try {
+                await engine.executeQuery(
+                    'CREATE TABLE malformed_vfs (value TEXT); ' +
+                    "INSERT INTO malformed_vfs VALUES (CAST(X'80' AS TEXT))"
+                );
+
+                await assert.rejects(
+                    provider.readFile(uri),
+                    /not validly encoded.*raw Hex/i
+                );
+                await assert.rejects(
+                    provider.writeFile(
+                        uri,
+                        new TextEncoder().encode('�'),
+                        { create: false, overwrite: true }
+                    ),
+                    /cannot be edited as text.*raw Hex/i
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT hex(CAST(value AS BLOB)) FROM malformed_vfs'
+                    ))[0].rows,
+                    [['80']]
+                );
+                assert.strictEqual(
+                    (document.recordExternalModification as any).mock.callCount(),
+                    0
+                );
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
         it('refuses a direct oversized VFS read before fetching the raw value', async () => {
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({
@@ -336,6 +411,19 @@ describe('SQLiteFileSystemProvider', () => {
     describe('writeFile', () => {
         const provider = new SQLiteFileSystemProvider();
         const docKey = 'test-doc';
+        const successfulBatchUpdate = (priorValue: any, storageClass: 'text' | 'blob') =>
+            mock.fn(async (_table: string, updates: any[]) => {
+                const update = updates[0];
+                return [{
+                    rowId: update.rowId,
+                    columnName: update.column,
+                    priorValue,
+                    newValue: update.value,
+                    priorState: { storageClass, value: priorValue },
+                    postState: { storageClass, value: update.value },
+                    operation: update.operation ?? 'set'
+                }];
+            });
 
         it('should throw NoPermissions if writing to __create__.sql', async () => {
             setupMockDocument(docKey, {});
@@ -355,12 +443,16 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('should map string error to Unavailable', async () => {
             const dbOps = {
-                getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 0 })),
+                getCellMetadata: mock.fn(async () => ({
+                    storageClass: 'text',
+                    byteLength: 0,
+                    textEncoding: 'utf-8'
+                })),
                 executeQuery: mock.fn(async () => [{
-                    headers: ['type', 'bytes', 'value'],
-                    rows: [['text', 0, '']]
+                    headers: ['type', 'bytes', 'value', 'raw_text'],
+                    rows: [['text', 0, '', new Uint8Array()]]
                 }]),
-                updateCell: mock.fn(async () => {
+                updateCellBatch: mock.fn(async () => {
                     throw 'Database write string error';
                 })
             };
@@ -375,12 +467,16 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('should map Error object to Unavailable', async () => {
             const dbOps = {
-                getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 0 })),
+                getCellMetadata: mock.fn(async () => ({
+                    storageClass: 'text',
+                    byteLength: 0,
+                    textEncoding: 'utf-8'
+                })),
                 executeQuery: mock.fn(async () => [{
-                    headers: ['type', 'bytes', 'value'],
-                    rows: [['text', 0, '']]
+                    headers: ['type', 'bytes', 'value', 'raw_text'],
+                    rows: [['text', 0, '', new Uint8Array()]]
                 }]),
-                updateCell: mock.fn(async () => {
+                updateCellBatch: mock.fn(async () => {
                     throw new Error('Database write error');
                 })
             };
@@ -395,7 +491,7 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('should reject read-only documents before updating a cell', async () => {
             const dbOps = {
-                updateCell: mock.fn(async () => {})
+                updateCellBatch: mock.fn(async () => [])
             };
             setupMockDocument(docKey, dbOps);
             const document = DocumentRegistry.get(docKey) as any;
@@ -412,7 +508,7 @@ describe('SQLiteFileSystemProvider', () => {
             await assert.rejects(async () => {
                 await provider.writeFile(uri, content, { create: false, overwrite: true });
             }, (err: any) => err.message.includes('Database is read-only'));
-            assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+            assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
         });
 
         it('rejects a saturated history before an external-editor write reaches SQLite', async () => {
@@ -422,7 +518,7 @@ describe('SQLiteFileSystemProvider', () => {
                     headers: ['type', 'bytes', 'value'],
                     rows: [['text', 0, '']]
                 }]),
-                updateCell: mock.fn(async () => {})
+                updateCellBatch: mock.fn(async () => [])
             };
             const doc = setupMockDocument(docKey, dbOps) as any;
             const blocked = new Error(
@@ -449,18 +545,27 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(doc.runTrackedMutation.mock.callCount(), 1);
             assert.strictEqual(dbOps.getCellMetadata.mock.callCount(), 0);
             assert.strictEqual(dbOps.executeQuery.mock.callCount(), 0);
-            assert.strictEqual(dbOps.updateCell.mock.callCount(), 0);
+            assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 0);
             assert.strictEqual(doc.recordExternalModification.mock.callCount(), 0);
         });
 
         it('should write text content correctly', async () => {
             const dbOps = {
-                getCellMetadata: mock.fn(async () => ({ storageClass: 'text', byteLength: 11 })),
+                getCellMetadata: mock.fn(async () => ({
+                    storageClass: 'text',
+                    byteLength: 11,
+                    textEncoding: 'utf-8'
+                })),
                 executeQuery: mock.fn(async () => [{
-                    headers: ['type', 'bytes', 'value'],
-                    rows: [['text', 11, 'Before Text']]
+                    headers: ['type', 'bytes', 'value', 'raw_text'],
+                    rows: [[
+                        'text',
+                        11,
+                        'Before Text',
+                        new TextEncoder().encode('Before Text')
+                    ]]
                 }]),
-                updateCell: mock.fn(async () => {})
+                updateCellBatch: successfulBatchUpdate('Before Text', 'text')
             };
             const doc = setupMockDocument(docKey, dbOps);
 
@@ -468,16 +573,34 @@ describe('SQLiteFileSystemProvider', () => {
             const content = new TextEncoder().encode('Hello World');
             await provider.writeFile(uri, content, { create: false, overwrite: true });
 
-            assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
-            assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, [
+            assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 1);
+            assert.deepStrictEqual(dbOps.updateCellBatch.mock.calls[0].arguments, [
                 'users',
-                1,
-                'col',
-                'Hello World',
-                undefined,
+                [{ rowId: 1, column: 'col', value: 'Hello World', operation: 'set' }],
                 DEFAULT_MAX_CELL_EDIT_BYTES
             ]);
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);
+        });
+
+        it('preserves BLOB storage class when editor bytes are valid UTF-8', async () => {
+            const priorContent = new TextEncoder().encode('before');
+            const dbOps = {
+                getCellMetadata: mock.fn(async () => ({ storageClass: 'blob', byteLength: priorContent.byteLength })),
+                executeQuery: mock.fn(async () => [{
+                    headers: ['type', 'bytes', 'value'],
+                    rows: [['blob', priorContent.byteLength, priorContent]]
+                }]),
+                updateCellBatch: successfulBatchUpdate(priorContent, 'blob')
+            };
+            setupMockDocument(docKey, dbOps);
+            const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.bin`);
+            const content = new TextEncoder().encode('hello');
+
+            await provider.writeFile(uri, content, { create: false, overwrite: true });
+
+            const saved = dbOps.updateCellBatch.mock.calls[0].arguments[1][0].value;
+            assert.ok(saved instanceof Uint8Array);
+            assert.deepStrictEqual(saved, content);
         });
 
         it('refuses an oversized new external-editor value before metadata or mutation', async () => {
@@ -496,7 +619,7 @@ describe('SQLiteFileSystemProvider', () => {
                     { create: false, overwrite: true }
                 ),
                 new RegExp(
-                    `New TEXT cell value is ${DEFAULT_MAX_CELL_EDIT_BYTES + 1} bytes.*` +
+                    `New (?:TEXT|BLOB) cell value is ${DEFAULT_MAX_CELL_EDIT_BYTES + 1} bytes.*` +
                     `${DEFAULT_MAX_CELL_EDIT_BYTES}-byte edit limit`,
                     'i'
                 )
@@ -558,6 +681,43 @@ describe('SQLiteFileSystemProvider', () => {
                 'priorValue' in (doc.recordExternalModification as any).mock.calls[0].arguments[0],
                 false
             );
+        });
+
+        it('bounds repeated oversized replacement conflicts from an external cell editor', async () => {
+            let replacementAttempts = 0;
+            const dbOps = {
+                getCellMetadata: mock.fn(async () => ({
+                    storageClass: 'blob',
+                    byteLength: DEFAULT_MAX_CELL_EDIT_BYTES + replacementAttempts + 1
+                })),
+                replaceOversizedCell: mock.fn(async () => {
+                    replacementAttempts++;
+                    throw new Error(replacementAttempts < 5
+                        ? OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE
+                        : 'test safety stop for an unbounded retry loop');
+                })
+            };
+            const doc = setupMockDocument(docKey, dbOps);
+            const warning = mock.method(
+                vscode.window,
+                'showWarningMessage',
+                async (...args: any[]) => args[2]
+            );
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/assets/group/1/payload.bin`
+            );
+
+            await assert.rejects(
+                provider.writeFile(
+                    uri,
+                    Uint8Array.of(0xff),
+                    { create: false, overwrite: true }
+                ),
+                /changed repeatedly/i
+            );
+            assert.ok(replacementAttempts > 0 && replacementAttempts < 5);
+            assert.strictEqual(warning.mock.callCount(), replacementAttempts);
+            assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 0);
         });
 
         it('leaves external-editor history untouched when oversized replacement fails', async () => {
@@ -750,7 +910,7 @@ describe('SQLiteFileSystemProvider', () => {
                 );
                 const modification = (document.recordExternalModification as any)
                     .mock.calls[0].arguments[0];
-                assert.strictEqual(modification.priorValue, '9007199254740993');
+                assert.strictEqual(modification.priorValue, 9007199254740993n);
                 assert.notStrictEqual(modification.newTargetRowId, identity);
                 assert.deepStrictEqual(
                     (await engine.executeQuery(
@@ -774,6 +934,56 @@ describe('SQLiteFileSystemProvider', () => {
                     '9007199254740994'
                 );
             } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
+        it('invalidates an open ordinary cell editor when matching history changes its value', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery(
+                'CREATE TABLE invalidated_editor (id INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO invalidated_editor VALUES (1, 'before')"
+            );
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: '/' + [docKey, 'invalidated_editor', 'group', '1', 'value.txt']
+                    .map(part => encodeURIComponent(part))
+                    .join('/')
+            });
+            const changedUris: string[] = [];
+            const subscription = provider.onDidChangeFile(changes => {
+                changedUris.push(...changes.map(change => change.uri.toString()));
+            });
+            const modification = {
+                label: 'Edit Cell',
+                description: 'Update invalidated_editor.value',
+                modificationType: 'cell_update',
+                targetTable: 'invalidated_editor',
+                targetRowId: 1,
+                targetColumn: 'value',
+                priorValue: 'before',
+                newValue: 'after',
+                operation: 'set'
+            };
+
+            try {
+                assert.strictEqual(
+                    new TextDecoder().decode(await provider.readFile(uri)),
+                    'before'
+                );
+                document.fireContentChange(modification, 'undo');
+                document.fireContentChange({ ...modification, targetColumn: 'other' }, 'undo');
+                document.fireContentChange({ ...modification, targetRowId: 2 }, 'undo');
+
+                assert.deepStrictEqual(changedUris, [uri.toString()]);
+            } finally {
+                subscription.dispose();
                 (engine as WasmDatabaseEngine).shutdown();
             }
         });
@@ -912,6 +1122,65 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('retargets an INTEGER PRIMARY KEY rowid editor across saves and history', async () => {
+            const engineResult = await createDatabaseEngine({
+                content: null,
+                maxSize: 0,
+                readOnlyMode: false
+            });
+            const engine = engineResult.operations!;
+            await engine.executeQuery(
+                'CREATE TABLE rowid_alias_editor (' +
+                'id INTEGER PRIMARY KEY, ' +
+                'doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED); ' +
+                'INSERT INTO rowid_alias_editor(id) VALUES (1)'
+            );
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.from({
+                scheme: 'vscode-sqlite',
+                path: `/${docKey}/rowid_alias_editor/group/1/id.txt`
+            });
+
+            try {
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('2'),
+                    { create: false, overwrite: true }
+                );
+                const modification = (document.recordExternalModification as any)
+                    .mock.calls[0].arguments[0];
+                assert.strictEqual(modification.targetRowId, 1);
+                assert.strictEqual(modification.newTargetRowId, 2);
+                assert.strictEqual(new TextDecoder().decode(await provider.readFile(uri)), '2');
+
+                await engine.undoModification(modification);
+                document.fireContentChange(modification, 'undo');
+                assert.strictEqual(new TextDecoder().decode(await provider.readFile(uri)), '1');
+
+                await engine.redoModification(modification);
+                document.fireContentChange(modification, 'forward');
+                assert.strictEqual(new TextDecoder().decode(await provider.readFile(uri)), '2');
+
+                await provider.writeFile(
+                    uri,
+                    new TextEncoder().encode('3'),
+                    { create: false, overwrite: true }
+                );
+                const nextModification = (document.recordExternalModification as any)
+                    .mock.calls[1].arguments[0];
+                assert.strictEqual(nextModification.targetRowId, 2);
+                assert.strictEqual(nextModification.newTargetRowId, 3);
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT id, doubled FROM rowid_alias_editor'
+                    ))[0].rows,
+                    [[3, 6]]
+                );
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
         it('should write binary content if not valid UTF-8', async () => {
             const priorContent = new Uint8Array([1, 2, 3]);
             const dbOps = {
@@ -920,7 +1189,7 @@ describe('SQLiteFileSystemProvider', () => {
                     headers: ['type', 'bytes', 'value'],
                     rows: [['blob', 3, priorContent]]
                 }]),
-                updateCell: mock.fn(async () => {})
+                updateCellBatch: successfulBatchUpdate(priorContent, 'blob')
             };
             const doc = setupMockDocument(docKey, dbOps);
 
@@ -928,13 +1197,10 @@ describe('SQLiteFileSystemProvider', () => {
             const content = new Uint8Array([0xff, 0xff, 0xff]); // Invalid UTF-8
             await provider.writeFile(uri, content, { create: false, overwrite: true });
 
-            assert.strictEqual(dbOps.updateCell.mock.callCount(), 1);
-            assert.deepStrictEqual(dbOps.updateCell.mock.calls[0].arguments, [
+            assert.strictEqual(dbOps.updateCellBatch.mock.callCount(), 1);
+            assert.deepStrictEqual(dbOps.updateCellBatch.mock.calls[0].arguments, [
                 'users',
-                1,
-                'col',
-                content,
-                undefined,
+                [{ rowId: 1, column: 'col', value: content, operation: 'set' }],
                 DEFAULT_MAX_CELL_EDIT_BYTES
             ]);
             assert.strictEqual((doc.recordExternalModification as any).mock.callCount(), 1);

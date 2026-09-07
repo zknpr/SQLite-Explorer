@@ -89,6 +89,8 @@ const originalLoad = (Module as any)._load;
 
 // Let's import config to see the real ID strings
 import * as config from '../../src/config';
+import { DocumentRegistry } from '../../src/documentRegistry';
+import { generateDatabaseDocumentKey } from '../../src/helpers';
 
 // Let's import main via require!
 const main = require('../../src/main');
@@ -116,11 +118,7 @@ describe('main.ts', () => {
         desktopTestApiCreateCount = 0;
 
         // Reset vscode mocks
-        mock.method(vsc.commands, 'registerCommand', (id: string, cb: any) => {
-            // execute callbacks for coverage if it's the refresh command
-            if (id === `${config.ExtensionId}.refresh`) cb();
-            return { dispose: () => {} };
-        });
+        mock.method(vsc.commands, 'registerCommand', () => ({ dispose: () => {} }));
         mock.method(vsc.commands, 'executeCommand', () => Promise.resolve());
         mock.method(vsc.workspace, 'registerFileSystemProvider', () => ({ dispose: () => {} }));
         mock.method(vsc.window, 'createOutputChannel', () => ({ dispose: () => {} } as any));
@@ -135,6 +133,7 @@ describe('main.ts', () => {
     });
 
     afterEach(() => {
+        DocumentRegistry.clear();
         mock.reset();
     });
 
@@ -234,14 +233,11 @@ describe('main.ts', () => {
 
     it('should register commands correctly', async () => {
         const registerCmdSpy = mock.method(vsc.commands, 'registerCommand');
-        const executeCmdSpy = mock.method(vsc.commands, 'executeCommand');
         await main.activate(mockContext);
 
         // Find refresh command call
         const refreshCall = registerCmdSpy.mock.calls.find((call: any) => call.arguments[0] === `${config.ExtensionId}.refresh`);
         assert.ok(refreshCall);
-        assert.strictEqual(executeCmdSpy.mock.calls.length, 1);
-        assert.strictEqual(executeCmdSpy.mock.calls[0].arguments[0], 'workbench.action.webview.reloadWebviewAction');
 
         // Find export table command call
         const exportCall = registerCmdSpy.mock.calls.find((call: any) => call.arguments[0] === `${config.ExtensionId}.exportTable`);
@@ -249,6 +245,39 @@ describe('main.ts', () => {
 
         // Execute export callback for coverage
         exportCall.arguments[1]({} as any, [], undefined, undefined, undefined, undefined);
+    });
+
+    it('refreshes the active SQLite document from disk instead of only recreating its webview', async () => {
+        const registerCmdSpy = mock.method(vsc.commands, 'registerCommand');
+        const executeCmdSpy = mock.method(vsc.commands, 'executeCommand');
+        const uri = vsc.Uri.file('/test/live.sqlite');
+        let reloads = 0;
+        const document = {
+            uri,
+            reloadFromDisk: async () => { reloads++; }
+        };
+        DocumentRegistry.set(await generateDatabaseDocumentKey(uri), document as any);
+        Object.defineProperty(vsc.window, 'tabGroups', {
+            value: {
+                activeTabGroup: {
+                    activeTab: {
+                        input: { uri, viewType: `${config.ExtensionId}.view` }
+                    }
+                }
+            },
+            writable: true,
+            configurable: true
+        });
+
+        await main.activate(mockContext);
+        const refreshCall = registerCmdSpy.mock.calls.find(
+            (call: any) => call.arguments[0] === `${config.ExtensionId}.refresh`
+        );
+        assert.ok(refreshCall);
+        await refreshCall.arguments[1]();
+
+        assert.strictEqual(reloads, 1);
+        assert.strictEqual(executeCmdSpy.mock.calls.length, 0);
     });
 
     it('should activate providers successfully', async () => {

@@ -21,7 +21,11 @@ import {
 // verbatim — importing the same module keeps the two ends incapable of drift.
 import { decodeFrameValue, encodeFrameValue } from '../../native/frame-codec.js';
 import { createPerDbStateSnapshot, restorePerDbState, snapshotPerDbState } from './db-ui-state.js';
-import { ModificationTracker } from '../../../src/core/undo-history.ts';
+import { ModificationTracker, estimateUndoMemoryBytes } from '../../../src/core/undo-history.ts';
+// The worker reports its typed cell-edit refusals as structured `error` data
+// beside the message; rebuilding the typed error is what lets desktop-api.js
+// re-enter the oversized-replacement confirmation instead of failing the edit.
+import { fromCellEditRpcErrorData } from '../../../src/core/cell-edit-policy.ts';
 
 const DEFAULT_SETTINGS = Object.freeze({
     maxFileSize: 200,
@@ -42,11 +46,16 @@ const DEFAULT_SETTINGS = Object.freeze({
     consoleHistory: Object.freeze([])
 });
 
-// Worker methods whose successful result must be recorded for undo. DDL and
-// pragma changes cannot be replayed by the worker's history engine, so they
-// insert barriers instead (undo stops there until the next save).
+// Worker methods whose successful result must be recorded for undo. The
+// worker replays cell and row history as exact-state compare-and-swaps, so
+// every entry here has to carry the stored states the worker captured:
+// `updateCell` and `insertRow` are therefore never sent as themselves —
+// `invoke` routes them through `updateCellBatch` / `insertRowWithHistory`,
+// the two methods that return those states (the route hostBridge.ts takes in
+// VS Code). DDL and pragma changes cannot be replayed at all, so they insert
+// barriers instead (undo stops there until the next save).
 const UNDOABLE_METHODS = new Set([
-    'updateCell', 'updateCellBatch', 'insertRow', 'deleteRows',
+    'updateCellBatch', 'insertRowWithHistory', 'deleteRows',
     'createView', 'editView', 'dropView'
 ]);
 const BARRIER_METHODS = new Set([
@@ -153,6 +162,15 @@ export function createDesktopHost({ bridge, createWorker }) {
             nativeBoundPath: nativeBoundPath ?? null,
             tracker: new ModificationTracker(100, settings.maxUndoMemory),
             connectionInfo: { isReadOnly: false },
+            // Advances on every (re)initialisation of this database's engine
+            // session — open, refresh, fallback — and rides every connection
+            // result. The page's async intents (a confirmation left open, an
+            // in-flight edit) capture it and refuse to complete against a
+            // replaced connection; the VS Code host reports its document
+            // generation the same way. Per entry, because each open database
+            // is its own connection: a global counter would let a reload of
+            // one database invalidate what another's modal captured.
+            connectionGeneration: 0,
             currentPath: currentPath ?? null,   // absolute path on disk (null = no write-back target)
             currentName: currentName,
             // The session transaction: the native engine executes against the
@@ -191,7 +209,7 @@ export function createDesktopHost({ bridge, createWorker }) {
      */
     function settleFromEnvelope(envelope, sourceDbId) {
         if (envelope?.channel !== 'rpc' || envelope.content?.kind !== 'response') return;
-        const { messageId, success, data, errorMessage } = envelope.content;
+        const { messageId, success, data, errorMessage, error } = envelope.content;
         const pending = pendingCalls.get(messageId);
         if (!pending) return;
         if (pending.dbId !== sourceDbId) {
@@ -208,7 +226,12 @@ export function createDesktopHost({ bridge, createWorker }) {
         }
         pendingCalls.delete(messageId);
         if (success) pending.resolve(data);
-        else pending.reject(new Error(errorMessage || `Worker call failed: ${pending.method}`));
+        else {
+            pending.reject(
+                fromCellEditRpcErrorData(error)
+                ?? new Error(errorMessage || `Worker call failed: ${pending.method}`)
+            );
+        }
     }
 
     function rejectPending(messageId, error) {
@@ -332,6 +355,7 @@ export function createDesktopHost({ bridge, createWorker }) {
             transfer
         });
         entry.connectionInfo = { isReadOnly: result?.isReadOnly === true, readOnlyReason: result?.readOnlyReason };
+        entry.connectionGeneration += 1;
         entry.tracker = new ModificationTracker(100, settings.maxUndoMemory);
         // initializeDatabase closes any open cell read session worker-side and
         // opens a fresh engine session with no transaction.
@@ -540,20 +564,6 @@ export function createDesktopHost({ bridge, createWorker }) {
 
     function buildModification(method, args, result) {
         switch (method) {
-            case 'updateCell': {
-                const [table, rowId, column, value, originalValue] = args;
-                return {
-                    label: `Edit ${column}`,
-                    description: `Edit ${column}`,
-                    modificationType: 'cell_update',
-                    targetTable: table,
-                    targetRowId: rowId,
-                    newTargetRowId: result ?? rowId,
-                    targetColumn: column,
-                    priorValue: originalValue,
-                    newValue: value
-                };
-            }
             case 'updateCellBatch': {
                 const [table, updates, label] = args;
                 const summaryLabel = label || `Edit ${updates.length} cells`;
@@ -567,6 +577,10 @@ export function createDesktopHost({ bridge, createWorker }) {
                 // src/core/types.ts: "Identity to use after the update when a PK
                 // member changed"); default to the unchanged rowId there,
                 // matching undoModification's own `cell.newRowId ?? cell.rowId`.
+                // `priorState`/`postState` are the exact stored states the
+                // worker read around the write; its replay refuses an entry
+                // without them (LegacyCellHistoryError), which is why
+                // single-cell edits ride this method too (see UNDOABLE_METHODS).
                 return {
                     label: summaryLabel,
                     description: summaryLabel,
@@ -578,38 +592,40 @@ export function createDesktopHost({ bridge, createWorker }) {
                         columnName: r.columnName,
                         priorValue: r.priorValue,
                         newValue: r.newValue,
+                        priorState: r.priorState,
+                        postState: r.postState,
                         operation: r.operation
                     }))
                 };
             }
-            case 'insertRow': {
-                const [table, data] = args;
+            case 'insertRowWithHistory': {
+                const [table] = args;
+                // `result` is the worker's post-image of the inserted row
+                // ({rowId, row, storageClasses}, captured inside the insert's
+                // own savepoint). Undo deletes it by exact state and redo
+                // re-inserts it by exact state, so the record carries that
+                // image rather than the caller's request data.
                 return {
                     label: 'Insert row',
                     description: 'Insert row',
                     modificationType: 'row_insert',
                     targetTable: table,
-                    targetRowId: result,
-                    // redoModification's row_insert case reads `rowData` (not
-                    // args) to reconstruct the insert; without it, redo silently
-                    // inserts an empty row.
-                    rowData: data
+                    targetRowId: result.rowId,
+                    rowData: result.row,
+                    insertedRow: result
                 };
             }
             case 'deleteRows': {
-                const [table, rowIds] = args;
+                const [table] = args;
+                // Each entry is the worker's exact pre-delete image
+                // ({rowId, row, storageClasses}); undo re-inserts from it and
+                // redo re-deletes by matching it, so nothing else is needed.
                 return {
                     label: 'Delete rows',
                     description: 'Delete rows',
                     modificationType: 'row_delete',
                     targetTable: table,
-                    deletedRows: result,
-                    // Self-discovered while auditing insertRow's analogous gap
-                    // above (not one of the review's 3 listed defects — flagged
-                    // separately in the report): redoModification's row_delete
-                    // case reads `affectedRowIds` (not deletedRows) to
-                    // re-delete; without it, redo silently deletes nothing.
-                    affectedRowIds: rowIds
+                    deletedRows: result
                 };
             }
             case 'createView': {
@@ -720,11 +736,34 @@ export function createDesktopHost({ bridge, createWorker }) {
      * late-completing operation must not repaint the page with data from a
      * file the user is not looking at.
      */
+    /**
+     * The outcome of a dialog-mediated write, in the shape the shared UI
+     * reads (export.js, blob-inspector.js — the VS Code host's saveFile
+     * contract): `{ success: false, cancelled: true }` when the user dismissed
+     * the dialog and nothing was written, `{ success: true, savedAs }` naming
+     * the file otherwise. A genuine failure REJECTS before reaching here.
+     */
+    function dialogOutcome(target) {
+        if (target === null || target === undefined) return { success: false, cancelled: true };
+        return { success: true, savedAs: basename(target) };
+    }
+
+    /** Same contract for the shell's out-of-band native export routes, whose `{success:false}` is a clean dialog cancel. */
+    function shellDialogOutcome(result) {
+        if (result?.success !== true) return { success: false, cancelled: true };
+        return { success: true, savedAs: result.savedAs };
+    }
+
     async function refreshUi(entry) {
         if (entry.dbId !== activeId) return;
         await notifyWebview('refreshContent', [
             entry.currentName,
-            { connected: true, engine: entry.engine, ...entry.connectionInfo }
+            {
+                connected: true,
+                engine: entry.engine,
+                connectionGeneration: entry.connectionGeneration,
+                ...entry.connectionInfo
+            }
         ]);
     }
 
@@ -1231,7 +1270,8 @@ export function createDesktopHost({ bridge, createWorker }) {
                 connected: true,
                 isReadOnly: entry.connectionInfo.isReadOnly === true,
                 filename: entry.currentName,
-                engine: entry.engine
+                engine: entry.engine,
+                connectionGeneration: entry.connectionGeneration
             };
         },
         async exportDb(entry, filename) {
@@ -1251,7 +1291,7 @@ export function createDesktopHost({ bridge, createWorker }) {
                         'This database has unsaved changes. Exporting requires saving them first.\n\n'
                         + 'Save the pending changes and continue the export?'
                     );
-                    if (saveFirst !== true) return { success: false };
+                    if (saveFirst !== true) return { success: false, cancelled: true };
                     await saveToDisk(entry);
                 }
                 // Out-of-band file route: the sidecar VACUUM INTOs the whole-DB
@@ -1263,11 +1303,10 @@ export function createDesktopHost({ bridge, createWorker }) {
                 // shell owns the dialog and returns savedAs already basenamed;
                 // { success:false } is a clean dialog-cancel no-op.
                 const result = await bridge.nativeExportDatabase(entry.nativeDbId);
-                return { success: result?.success === true, savedAs: result?.savedAs };
+                return shellDialogOutcome(result);
             }
             const bytes = await callWorker(entry, 'exportDatabase', [entry.currentName]);
-            const target = await bridge.saveFileAs(filename || entry.currentName, bytes);
-            return { success: target !== null, savedAs: target ? basename(target) : undefined };
+            return dialogOutcome(await bridge.saveFileAs(filename || entry.currentName, bytes));
         },
         async exportTable(entry, ...args) {
             // Host policy overrides anything UI-passed (nothing passes one today):
@@ -1287,12 +1326,13 @@ export function createDesktopHost({ bridge, createWorker }) {
                 // error; { success:false } is a clean dialog-cancel no-op. The
                 // shell owns the dialog and returns savedAs already basenamed.
                 const result = await bridge.nativeExportTable(entry.nativeDbId, JSON.stringify(args));
-                return { success: result?.success === true, savedAs: result?.savedAs };
+                return shellDialogOutcome(result);
             }
             const result = await callWorker(entry, 'exportTable', args);
             const text = result.contentChunks.join('');
-            const target = await bridge.saveFileAs(result.filename, new TextEncoder().encode(text));
-            return { success: target !== null, savedAs: target ? basename(target) : undefined };
+            return dialogOutcome(
+                await bridge.saveFileAs(result.filename, new TextEncoder().encode(text))
+            );
         },
         /**
          * Answers the VS Code host's contract (hostBridge.ts refreshFile):
@@ -1312,7 +1352,8 @@ export function createDesktopHost({ bridge, createWorker }) {
             const connectionResult = () => ({
                 connected: true,
                 filename: entry.currentName,
-                readOnly: entry.connectionInfo.isReadOnly === true
+                readOnly: entry.connectionInfo.isReadOnly === true,
+                connectionGeneration: entry.connectionGeneration
             });
             // Nothing on disk to re-read (the boot placeholder, a dropped
             // file): report the capabilities it still has rather than pretend
@@ -1418,6 +1459,13 @@ export function createDesktopHost({ bridge, createWorker }) {
                 autoCommit: settings.instantCommit === 'always',
                 cellEditBehavior: settings.doubleClickBehavior,
                 fileOperations: settings.fileOperations,
+                // The settings panel builds its double-click picker from this
+                // list (the hosts own it since 1.7.2): the desktop has no VS
+                // Code editor tab to open a cell in, so 'vscode' is not offered.
+                cellEditBehaviorOptions: ['inline', 'modal'],
+                // Auto-commit is real here (instantCommit → saveToDisk), unlike
+                // the web demo, which has no file to commit into.
+                autoCommitSupported: true,
                 theme: settings.theme,
                 // Declared in DEFAULT_SETTINGS since the port and never
                 // delivered to anyone, so both read as inert: the page could not
@@ -1486,10 +1534,8 @@ export function createDesktopHost({ bridge, createWorker }) {
             return { success: true };
         },
         async saveFile(filename, data) {
-            const target = await bridge.saveFileAs(filename, data);
-            return { success: target !== null, savedAs: target ? basename(target) : undefined };
+            return dialogOutcome(await bridge.saveFileAs(filename, data));
         },
-        async fireEditEvent() { return { success: true }; },
         /**
          * Persist the dragged sidebar width. Was a no-op, which is why the
          * sidebar snapped back to its default on every relaunch even though the
@@ -1640,6 +1686,37 @@ export function createDesktopHost({ bridge, createWorker }) {
                 if (settings.instantCommit === 'always' && entry.currentPath) await saveToDisk(entry);
                 updateTitle();
                 return result;
+            }
+            if (method === 'updateCell') {
+                // Single-cell edits ride updateCellBatch so the history entry
+                // carries the worker's exact prior/post states (see
+                // UNDOABLE_METHODS). Same argument order as the worker's own
+                // updateCell — (table, rowId, column, value, originalValue,
+                // maxEditValueBytes) — and the same answer: the row identity
+                // after the edit. The batch's unread `label` slot is the one
+                // interior hole the JSON lane may carry (it crosses as null);
+                // an absent byte cap is left absent rather than sent as null.
+                const [table, rowId, column, value, originalValue, maxEditValueBytes] = args;
+                const updates = [{ rowId, column, value, originalValue }];
+                const outcomes = await invokeMutation(entry, 'updateCellBatch',
+                    maxEditValueBytes === undefined
+                        ? [table, updates]
+                        : [table, updates, undefined, maxEditValueBytes]);
+                return outcomes?.[0]?.newRowId ?? rowId;
+            }
+            if (method === 'insertRow') {
+                // Same reason: insertRowWithHistory captures the inserted row's
+                // exact post-image inside the insert's own savepoint. The
+                // snapshot budget mirrors hostBridge.ts — whatever the undo
+                // memory limit leaves after the entry's own metadata.
+                const [table, data, maxEditValueBytes] = args;
+                const budget = Math.max(
+                    0,
+                    settings.maxUndoMemory - estimateUndoMemoryBytes({ table, rowData: data })
+                );
+                const inserted = await invokeMutation(entry, 'insertRowWithHistory',
+                    [table, data, maxEditValueBytes, budget]);
+                return inserted?.rowId;
             }
             if (UNDOABLE_METHODS.has(method)) return invokeMutation(entry, method, args);
             return callWorker(entry, method, args);

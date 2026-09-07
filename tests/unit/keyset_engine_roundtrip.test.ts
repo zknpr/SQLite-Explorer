@@ -578,7 +578,7 @@ describe('keyset engine round-trip (WASM)', () => {
             limit: 5,
             offset: 500
         });
-        assert.ok(/SCAN eqp_fallback$/m.test(unsorted), `expected a plain scan:\n${unsorted}`);
+        assert.ok(/SCAN (?:main\.)?eqp_fallback$/m.test(unsorted), `expected a plain scan:\n${unsorted}`);
         assert.ok(!unsorted.includes('TEMP B-TREE'), `unexpected sort step:\n${unsorted}`);
     });
 });

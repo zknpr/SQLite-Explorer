@@ -25,8 +25,17 @@ const columns: BatchColumnDef[] = [
 const cell = (rowIdx: number, colIdx: number, value: unknown): BatchSelectedCell =>
   ({ rowId: rowIdx + 1, rowIdx, colIdx, value });
 
-const input = (value: string, opts: { isnull?: boolean; ispatch?: boolean } = {}): BatchInputLike =>
-  ({ value, dataset: { isnull: opts.isnull ? 'true' : 'false', ispatch: opts.ispatch ? 'true' : 'false' } });
+const input = (
+  value: string,
+  opts: { isnull?: boolean; ispatch?: boolean; mode?: string } = {}
+): BatchInputLike => ({
+  value,
+  dataset: {
+    isnull: opts.isnull ? 'true' : 'false',
+    ispatch: opts.ispatch ? 'true' : 'false',
+    ...(opts.mode ? { mode: opts.mode } : {})
+  }
+});
 
 describe('groupSelectedCellsByColumn', () => {
   it('groups cells by column with distinct value sets', () => {
@@ -49,6 +58,9 @@ describe('summarizeColumnValue', () => {
   it('shows NULL for null and [BLOB] for binary', () => {
     assert.strictEqual(summarizeColumnValue(new Set([null])), 'NULL');
     assert.strictEqual(summarizeColumnValue(new Set([new Uint8Array([1, 2])])), '[BLOB]');
+  });
+  it('distinguishes an empty string from an untouched empty field', () => {
+    assert.strictEqual(summarizeColumnValue(new Set([''])), '(empty string)');
   });
   it('shows (mixed values) when the selection spans differing values', () => {
     assert.strictEqual(summarizeColumnValue(new Set(['a', 'b'])), '(mixed values)');
@@ -75,6 +87,18 @@ describe('prepareBatchUpdates', () => {
       true
     );
     assert.strictEqual(u.value, '9007199254740993');
+  });
+  it('keeps an unsafe INTEGER PRIMARY KEY rowid alias exact in batch edits', () => {
+    const rowidAliasColumns: BatchColumnDef[] = [
+      { name: 'id', type: 'INTEGER', isPrimaryKey: true, isRowidAlias: true }
+    ];
+    const [u] = prepareBatchUpdates(
+      [cell(0, 0, '9223372036854775806')],
+      new Map([[0, input('9223372036854775807')]]),
+      rowidAliasColumns,
+      false
+    );
+    assert.strictEqual(u.value, '9223372036854775807');
   });
   it('keeps unsafe WITHOUT ROWID NUMERIC-affinity keys exact in batch edits', () => {
     for (const type of ['NUMERIC', 'DECIMAL(20, 0)']) {
@@ -114,6 +138,41 @@ describe('prepareBatchUpdates', () => {
   });
   it('skips cells left blank unless explicitly NULL', () => {
     assert.strictEqual(prepareBatchUpdates([cell(0, 1, 'x')], new Map([[1, input('')]]), columns).length, 0);
+  });
+  it('sets an empty string when the blank field is explicitly in value mode', () => {
+    const [update] = prepareBatchUpdates(
+      [cell(0, 1, 'x')],
+      new Map([[1, input('', { mode: 'value' })]]),
+      columns
+    );
+    assert.strictEqual(update.value, '');
+    assert.strictEqual(update.operation, 'set');
+  });
+  it('keeps unchanged, NULL, and patch modes mutually exclusive', () => {
+    assert.strictEqual(
+      prepareBatchUpdates(
+        [cell(0, 1, 'x')],
+        new Map([[1, input('ignored', { mode: 'unchanged', isnull: true })]]),
+        columns
+      ).length,
+      0
+    );
+    assert.strictEqual(
+      prepareBatchUpdates(
+        [cell(0, 1, 'x')],
+        new Map([[1, input('ignored', { mode: 'null', ispatch: true })]]),
+        columns
+      )[0].value,
+      null
+    );
+    assert.strictEqual(
+      prepareBatchUpdates(
+        [cell(0, 3, '{}')],
+        new Map([[3, input('{"a":1}', { mode: 'patch', isnull: true })]]),
+        columns
+      )[0].operation,
+      'json_patch'
+    );
   });
   it('skips cells whose column has no input', () => {
     assert.strictEqual(prepareBatchUpdates([cell(0, 1, 'x')], new Map(), columns).length, 0);

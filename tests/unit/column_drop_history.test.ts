@@ -21,7 +21,7 @@ describe('column-drop undo history preflight', () => {
 
     assert.strictEqual(preflight.queries.filter(query => query.kind === 'values').length, 3);
     assert.strictEqual(preflight.queries.filter(query => query.kind === 'identity').length, 1);
-    assert.match(preflight.queries[0].sql, /FROM "odd"" table"/);
+    assert.match(preflight.queries[0].sql, /FROM main\."odd"" table"/);
     assert.match(preflight.queries[0].sql, /typeof\("value""x"\)/);
     assert.doesNotMatch(preflight.queries[0].sql, /^SELECT\s+"value/i);
   });

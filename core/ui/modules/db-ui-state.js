@@ -19,7 +19,7 @@
  * defining defect of this design: one database's grid, filters or row selection
  * would be shown for another.
  */
-import { state } from './state.js';
+import { createSafeColumnState, state } from './state.js';
 
 /**
  * Fields owned by ONE open database. The factory returns FRESH container
@@ -32,6 +32,16 @@ const perDbStateDefaults = () => ({
     isDbConnected: false,
     isReadOnly: false,
     engine: null,
+    // Host connection identity and content revision of the database being
+    // rendered (state.js). Async UI intents capture both and refuse to
+    // complete against a replaced connection or changed content. Per
+    // database, because on the desktop each open database IS its own
+    // connection with its own edit stream: the host reports one generation
+    // per entry, and a global counter would let a reload of database A
+    // invalidate what B's open modal captured, or carry B's content revision
+    // into A's guards.
+    connectionGeneration: 0,
+    contentGeneration: 0,
     // Selection + the page of rows on screen.
     selectedTable: null,
     selectedTableType: 'table',
@@ -58,8 +68,11 @@ const perDbStateDefaults = () => ({
     lastSelectedColumnIndex: null,
     lastSelectedRowIndex: null,
     // Column layout and predicates: both are per-schema by construction.
-    columnWidths: {},
-    columnFilters: {},
+    // Null-prototype dictionaries, as state.js seeds them: their keys are
+    // column names read out of an untrusted file, and a plain object would
+    // let a column literally named `__proto__` retarget the dictionary.
+    columnWidths: createSafeColumnState(),
+    columnFilters: createSafeColumnState(),
     lastSuccessfulFilterState: null,
     lastGridLoadError: null,
     pinnedColumns: new Set(),
@@ -96,6 +109,11 @@ const transientStateDefaults = () => ({
     activeCellInput: null,
     isSavingCell: false,
     isLoadingData: false,
+    // "A column-metadata fetch / a host content broadcast is in flight" —
+    // guards over async work against the OUTGOING database's DOM, which the
+    // switch abandons (the fetch itself is refused by the dbId gate).
+    isLoadingColumns: false,
+    isRefreshingContent: false,
     isGridReloading: false,
     lastDoubleClickTime: 0,
     isTransitioningEdit: false,

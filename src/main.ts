@@ -8,6 +8,8 @@ import { registerEditorProvider } from './editorController';
 import { SQLiteFileSystemProvider } from './virtualFileSystem';
 import { CellMaterializationService } from './cellMaterialization';
 import { createDesktopTestApi, type DesktopTestApi } from './desktopTestApi';
+import { DocumentRegistry } from './documentRegistry';
+import { generateDatabaseDocumentKey } from './helpers';
 
 export let GlobalOutputChannel: vsc.OutputChannel|null = null;
 
@@ -38,9 +40,7 @@ export async function activate(
 
   // Register refresh command
   context.subscriptions.push(
-    vsc.commands.registerCommand(`${ExtensionId}.refresh`, () => {
-      vsc.commands.executeCommand('workbench.action.webview.reloadWebviewAction');
-    }),
+    vsc.commands.registerCommand(`${ExtensionId}.refresh`, refreshActiveDatabase),
   );
 
   // Register export table command
@@ -75,6 +75,26 @@ export async function activate(
     context.subscriptions.push(desktopTest);
     return { desktopTest };
   }
+}
+
+/** Reload the database backing the active SQLite custom editor. */
+export async function refreshActiveDatabase(): Promise<void> {
+  const input = vsc.window.tabGroups.activeTabGroup.activeTab?.input as {
+    readonly uri?: vsc.Uri;
+    readonly viewType?: string;
+  } | undefined;
+  if (!input?.uri || (input.viewType !== `${ExtensionId}.view`
+    && input.viewType !== `${ExtensionId}.option`)) {
+    await vsc.window.showInformationMessage(vsc.l10n.t('No active SQLite database to refresh.'));
+    return;
+  }
+
+  const documentKey = await generateDatabaseDocumentKey(input.uri);
+  const document = DocumentRegistry.get(documentKey);
+  if (!document) {
+    throw new Error(vsc.l10n.t('The active SQLite document is no longer available.'));
+  }
+  await document.reloadFromDisk();
 }
 
 /**

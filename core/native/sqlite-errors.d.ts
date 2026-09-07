@@ -14,6 +14,11 @@ export interface SqliteNameProbe {
     resolves(name: string): boolean;
     /** Does the name have a row in `sqlite_schema` or `sqlite_temp_schema`? */
     inCatalog(name: string): boolean;
+    /**
+     * The stored `CREATE VIEW` text of a view with this name, when the name is a
+     * view; lets the missing-table proof walk into a broken view's body.
+     */
+    viewSql?(name: string): string | undefined;
 }
 
 export interface SqlWordToken {

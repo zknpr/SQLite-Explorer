@@ -10,6 +10,7 @@ import {
     onPageSizeChange,
     onDateFormatChange,
     startColumnResize,
+    onColumnResizeKeydown,
     onColumnFilterKeydown,
     applyColumnFilter,
     onColumnHeaderClick,
@@ -23,8 +24,9 @@ import {
 } from './grid-actions.js';
 import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
-import { scheduleVirtualGridUpdate } from './grid-render.js';
+import { ensureGridRowMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
 import { validateRowId } from './utils.js';
+import { getOrderedColumnIndices, getOrderedRowIndices } from './data-utils.js';
 
 export function initGridControls() {
     const globalFilter = document.getElementById('filterInput');
@@ -54,6 +56,7 @@ export function initGridInteraction() {
     container.addEventListener('input', handleFilterInput);
     container.addEventListener('compositionend', handleFilterInput);
     container.addEventListener('keydown', handleKeydown);
+    container.addEventListener('focusin', handleFocusin);
     container.addEventListener('click', handleClick);
     container.addEventListener('dblclick', handleDoubleClick);
     container.addEventListener('mouseover', handleMouseover);
@@ -119,17 +122,95 @@ function handleKeydown(event) {
         return;
     }
 
+    if (event.target?.classList?.contains('resize-handle')) {
+        const columnName = event.target.closest('.header-cell')?.dataset.column;
+        if (columnName) onColumnResizeKeydown(event, columnName);
+        return;
+    }
+
+    const interactiveControl = event.target?.closest?.(
+        'input, textarea, button, select, a, [contenteditable="true"]'
+    );
+    if (interactiveControl) return;
+
+    const cell = event.target?.closest?.('.data-cell');
+    if (cell && !cell.classList.contains('row-number')) {
+        if (state.isGridReloading && (event.key === ' ' || event.key === 'Enter')) {
+            event.preventDefault();
+            return;
+        }
+        const rowIdx = parseInt(cell.dataset.rowidx, 10);
+        const colIdx = parseInt(cell.dataset.colidx, 10);
+        const rowId = resolveRowIdType(cell.closest('.data-row')?.dataset.rowid);
+
+        if (event.key.startsWith('Arrow')) {
+            if (moveGridCellFocus(event, rowIdx, colIdx)) return;
+        } else if (event.key === ' ') {
+            event.preventDefault();
+            onCellClick(event, rowIdx, colIdx, rowId);
+            return;
+        } else if (event.key === 'Enter' && !event.isComposing) {
+            event.preventDefault();
+            if (event.altKey) openCellPreview(rowIdx, colIdx, rowId);
+            else onCellDoubleClick(event, rowIdx, colIdx, rowId);
+            return;
+        }
+    }
+
     if (event.key === 'Enter' && !event.isComposing) {
-        const isInteractiveControl = event.target?.closest?.(
-            'input, textarea, button, select, a, [contenteditable="true"]'
-        );
-        if (isInteractiveControl || state.editingCellInfo) return;
+        if (state.editingCellInfo) return;
         const pending = applyCurrentFilter(event.shiftKey ? -1 : 1);
         if (pending) {
             event.preventDefault();
             return pending;
         }
     }
+}
+
+function handleFocusin(event) {
+    if (event.target?.classList?.contains('data-cell')
+        && !event.target.classList.contains('row-number')) {
+        setGridTabstop(event.target, false);
+    }
+}
+
+function setGridTabstop(cell, focus = true) {
+    const container = document.getElementById('gridContainer');
+    const previous = container?.querySelector?.('.data-cell[data-grid-tabstop="true"]');
+    if (previous && previous !== cell) {
+        previous.tabIndex = -1;
+        previous.dataset.gridTabstop = 'false';
+    }
+    cell.tabIndex = 0;
+    cell.dataset.gridTabstop = 'true';
+    if (focus) cell.focus?.();
+}
+
+function moveGridCellFocus(event, rowIdx, colIdx) {
+    const rows = getOrderedRowIndices();
+    const columns = getOrderedColumnIndices();
+    let rowPosition = rows.indexOf(rowIdx);
+    let columnPosition = columns.indexOf(colIdx);
+    if (rowPosition < 0 || columnPosition < 0) return false;
+
+    if (event.key === 'ArrowUp') rowPosition--;
+    else if (event.key === 'ArrowDown') rowPosition++;
+    else if (event.key === 'ArrowLeft') columnPosition--;
+    else if (event.key === 'ArrowRight') columnPosition++;
+    else return false;
+
+    if (rowPosition < 0 || rowPosition >= rows.length
+        || columnPosition < 0 || columnPosition >= columns.length) return false;
+
+    event.preventDefault();
+    event.stopPropagation();
+    const targetRowIdx = rows[rowPosition];
+    const targetColIdx = columns[columnPosition];
+    ensureGridRowMaterialized(targetRowIdx);
+    const target = document.getElementById(`cell-${targetRowIdx}-${targetColIdx}`);
+    if (!target) return false;
+    setGridTabstop(target);
+    return true;
 }
 
 function handleClick(event) {
@@ -202,10 +283,10 @@ function handleHeaderClick(event, target) {
         return;
     }
 
-    // 7. Sort (Header Top)
-    const headerTop = target.closest('.header-top');
-    if (headerTop) {
-        const headerCell = headerTop.closest('.header-cell');
+    // 7. Sort
+    const sortButton = target.closest('.header-sort-button');
+    if (sortButton) {
+        const headerCell = sortButton.closest('.header-cell');
         if (headerCell && headerCell.dataset.column) {
             onColumnSort(headerCell.dataset.column);
         }
@@ -255,6 +336,7 @@ function handleBodyClick(event, target) {
         const colIdx = parseInt(cellEl.dataset.colidx, 10);
         const rowEl = cellEl.closest('.data-row');
         const rowId = resolveRowIdType(rowEl.dataset.rowid);
+        setGridTabstop(cellEl, false);
         onCellClick(event, rowIdx, colIdx, rowId);
         return;
     }

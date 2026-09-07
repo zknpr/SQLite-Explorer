@@ -4,6 +4,9 @@ import assert from 'node:assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import { ModificationTracker } from '../../src/core/undo-history';
+import { revertDatabaseToSaved } from '../../src/core/restore-reconciler';
+import type { LabeledModification } from '../../src/core/types';
 import {
     assertNoNewColumnDropForeignKeyViolations,
     captureColumnDropForeignKeyBaseline,
@@ -37,28 +40,88 @@ describe('SQLite Engine Undo/Redo', () => {
         }
     });
 
+    it('rolls back the whole File Revert when an earlier history entry conflicts', async () => {
+        const tracker = new ModificationTracker<LabeledModification>(100);
+        await engine.updateCell('users', 1, 'name', 'Edited');
+        tracker.record({
+            label: 'Edit Alice',
+            description: 'Edit Alice',
+            modificationType: 'cell_update',
+            targetTable: 'users',
+            targetRowId: 1,
+            targetColumn: 'name',
+            priorValue: 'Alice',
+            newValue: 'Edited',
+            priorState: { storageClass: 'text', value: 'Alice' },
+            postState: { storageClass: 'text', value: 'Edited' }
+        });
+        const insertedRow = await engine.insertRowWithHistory('users', { id: 3, name: 'Carol' });
+        tracker.record({
+            label: 'Insert Carol',
+            description: 'Insert Carol',
+            modificationType: 'row_insert',
+            targetTable: 'users',
+            targetRowId: insertedRow.rowId,
+            rowData: insertedRow.row,
+            insertedRow
+        });
+        await engine.executeQuery("UPDATE users SET name = 'External' WHERE id = 1");
+
+        await assert.rejects(
+            revertDatabaseToSaved(engine, tracker),
+            /changed outside SQLite Explorer history/i
+        );
+
+        const rows = await engine.executeQuery('SELECT id, name FROM users ORDER BY id');
+        assert.deepStrictEqual(rows[0].rows, [
+            [1, 'External'],
+            [2, 'Bob'],
+            [3, 'Carol']
+        ]);
+        assert.strictEqual(tracker.hasUncommittedChanges(), true);
+    });
+
+    async function captureRowidTableState(table: string) {
+        const schema = await engine.executeQuery(
+            "SELECT type, name, sql FROM main.sqlite_schema " +
+            "WHERE (type = 'table' AND name = ?) OR " +
+            "(tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL) " +
+            "ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name",
+            [table, table]
+        );
+        const tableInfo = await engine.getTableInfo(table);
+        const generatedColumns = tableInfo
+            .filter((column: any) => column.isGenerated)
+            .map((column: any) => column.identifier);
+        return {
+            tableSql: schema[0].rows[0][2] as string,
+            columns: tableInfo.map((column: any) => column.identifier),
+            ...(generatedColumns.length > 0 ? { generatedColumns } : {}),
+            identity: { kind: 'rowid' as const },
+            schemaObjects: schema[0].rows.slice(1).map((row: any[]) => ({
+                type: row[0] as 'index' | 'trigger',
+                identifier: row[1] as string,
+                sql: row[2] as string
+            }))
+        };
+    }
+
     it('should undo/redo row deletion', async () => {
         // 1. Delete Row 2
-        // Emulate HostBridge logic to capture data
-        const rows = await engine.executeQuery("SELECT rowid, * FROM users WHERE rowid = 2");
-        const deletedRowData = rows[0].rows[0]; // [2, 2, 'Bob'] (rowid, id, name)
-        const headers = rows[0].headers; // ['id', 'id', 'name'] or ['rowid', 'id', 'name'] depending on engine
-
-        // Manual mapping logic from HostBridge (simplified for test verification)
-        const rowData = { id: 2, name: 'Bob' };
-
-        await engine.deleteRows('users', [2]);
+        const deletedRows = await engine.deleteRows('users', [2]);
 
         const verifyGone = await engine.fetchTableCount('users', {});
         assert.deepStrictEqual(verifyGone, { count: 1, isExact: true });
 
         // 2. Undo Delete
-        await engine.undoModification({
+        const modification = {
             modificationType: 'row_delete',
             targetTable: 'users',
             description: 'Delete row',
-            deletedRows: [{ rowId: 2, row: rowData }]
-        });
+            affectedRowIds: [2],
+            deletedRows
+        };
+        await engine.undoModification(modification);
 
         const verifyRestored = await engine.fetchTableCount('users', {});
         assert.deepStrictEqual(verifyRestored, { count: 2, isExact: true });
@@ -67,12 +130,7 @@ describe('SQLite Engine Undo/Redo', () => {
         assert.strictEqual(restoredRow[0].rows[0][0], 'Bob');
 
         // 3. Redo Delete
-        await engine.redoModification({
-            modificationType: 'row_delete',
-            targetTable: 'users',
-            description: 'Delete row',
-            affectedRowIds: [2]
-        });
+        await engine.redoModification(modification);
 
         const verifyDeletedAgain = await engine.fetchTableCount('users', {});
         assert.deepStrictEqual(verifyDeletedAgain, { count: 1, isExact: true });
@@ -288,6 +346,45 @@ describe('SQLite Engine Undo/Redo', () => {
         assert.deepStrictEqual(
             (await engine.executeQuery('SELECT value FROM column_restore_audit'))[0].rows,
             [['changed']]
+        );
+    });
+
+    it('restores dependent indexes with unquoted Unicode identifiers', async () => {
+        const table = 'unicode_index_restore';
+        await engine.executeQuery(
+            `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, removed TEXT, keep TEXT); ` +
+            `CREATE INDEX Äidx ON ${table}(removed); ` +
+            `CREATE INDEX idxÄ ON ${table}(removed); ` +
+            `INSERT INTO ${table} VALUES (7, 'restore me', 'keep me')`
+        );
+        const before = await captureRowidTableState(table);
+        const removedData = (await engine.executeQuery(
+            `SELECT rowid, removed FROM ${table}`
+        ))[0].rows.map((row: any[]) => ({ rowId: row[0], value: row[1] }));
+
+        await engine.deleteColumns(table, ['removed'], ['Äidx', 'idxÄ']);
+        const after = await captureRowidTableState(table);
+        await engine.undoModification({
+            modificationType: 'column_drop',
+            targetTable: table,
+            description: 'Restore Unicode-named indexes',
+            deletedColumns: [{ name: 'removed', type: 'TEXT', data: removedData }],
+            droppedIndexes: ['Äidx', 'idxÄ'],
+            columnDropSnapshot: { before, after }
+        });
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT id, removed, keep FROM ${table}`
+            ))[0].rows,
+            [[7, 'restore me', 'keep me']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = ? ORDER BY name`,
+                [table]
+            ))[0].rows,
+            [['idxÄ'], ['Äidx']]
         );
     });
 
@@ -567,9 +664,333 @@ describe('SQLite Engine Undo/Redo', () => {
         );
     });
 
+    it('rejects table-create undo after the created table was replaced', async () => {
+        const table = 'guarded_table_create';
+        const columns = [
+            { name: 'id', type: 'INTEGER', primaryKey: true, notNull: false },
+            { name: 'value', type: 'TEXT', primaryKey: false, notNull: false }
+        ];
+        const tableCreateSnapshot = await engine.createTable(table, columns);
+
+        await engine.executeQuery(`DROP TABLE ${table}`);
+        await engine.executeQuery(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY, replacement BLOB)`);
+        await engine.executeQuery(`INSERT INTO ${table}(id, replacement) VALUES (1, X'CAFE')`);
+
+        await assert.rejects(
+            engine.undoModification({
+                description: 'Undo stale table creation',
+                modificationType: 'table_create',
+                targetTable: table,
+                tableDef: { columns },
+                tableCreateSnapshot
+            } as any),
+            /schema changed/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT id, typeof(replacement), hex(replacement) FROM ${table}`
+            ))[0].rows,
+            [[1, 'blob', 'CAFE']]
+        );
+
+        await engine.executeQuery(`DROP TABLE ${table}`);
+        await engine.executeQuery(tableCreateSnapshot.tableSql);
+        await engine.executeQuery(`INSERT INTO ${table}(id, value) VALUES (2, 'kept')`);
+        await assert.rejects(
+            engine.undoModification({
+                description: 'Undo non-empty table creation',
+                modificationType: 'table_create',
+                targetTable: table,
+                tableDef: { columns },
+                tableCreateSnapshot
+            } as any),
+            /contains data/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(`SELECT id, value FROM ${table}`))[0].rows,
+            [[2, 'kept']]
+        );
+    });
+
+    it('undoes table creation only in main through a TEMP table shadow', async () => {
+        const table = 'shadowed_table_create_undo';
+        const columns = [{
+            name: 'main_only',
+            type: 'TEXT',
+            primaryKey: false,
+            notNull: false
+        }];
+        const tableCreateSnapshot = await engine.createTable(table, columns);
+        await engine.executeQuery(
+            `CREATE TEMP TABLE ${table} (temporary_only TEXT)`
+        );
+
+        await engine.undoModification({
+            description: 'Undo main table creation through TEMP shadow',
+            modificationType: 'table_create',
+            targetTable: table,
+            tableDef: { columns },
+            tableCreateSnapshot
+        } as any);
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT name FROM main.sqlite_schema WHERE type = \'table\' AND name = ?',
+                [table]
+            ))[0].rows,
+            []
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(`PRAGMA temp.table_info(${table})`))[0].rows
+                .map((column: any[]) => column[1]),
+            ['temporary_only']
+        );
+    });
+
+    it('refuses table-create undo that would break a newer dependent view', async () => {
+        const table = 'created_table_with_new_dependency';
+        const columns = [{
+            name: 'value',
+            type: 'TEXT',
+            primaryKey: false,
+            notNull: false
+        }];
+        const tableCreateSnapshot = await engine.createTable(table, columns);
+        await engine.executeQuery(
+            `CREATE VIEW created_table_consumer AS SELECT value FROM ${table}`
+        );
+
+        await assert.rejects(
+            engine.undoModification({
+                description: 'Undo table creation with newer dependency',
+                modificationType: 'table_create',
+                targetTable: table,
+                tableDef: { columns },
+                tableCreateSnapshot
+            } as any),
+            /would break existing view.*created_table_consumer/is
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                "SELECT name FROM main.sqlite_schema WHERE name IN " +
+                "('created_table_with_new_dependency', 'created_table_consumer') ORDER BY name"
+            ))[0].rows,
+            [['created_table_consumer'], ['created_table_with_new_dependency']]
+        );
+    });
+
+    it('refuses legacy table-create undo without an identity snapshot', async () => {
+        const table = 'legacy_table_create_without_snapshot';
+        await engine.executeQuery(
+            `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, retained TEXT)`
+        );
+        await engine.executeQuery(
+            `INSERT INTO ${table}(id, retained) VALUES (1, 'must survive')`
+        );
+
+        await assert.rejects(
+            engine.undoModification({
+                description: 'Legacy table creation without a guard',
+                modificationType: 'table_create',
+                targetTable: table,
+                tableDef: { columns: [] }
+            } as any),
+            /lacks the required schema snapshot/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(`SELECT id, retained FROM ${table}`))[0].rows,
+            [[1, 'must survive']]
+        );
+    });
+
+    it('rejects column-add undo after the added column was replaced', async () => {
+        const table = 'guarded_column_add';
+        await engine.executeQuery(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`);
+        await engine.executeQuery(`INSERT INTO ${table}(id) VALUES (1)`);
+        const columnAddSnapshot = await engine.addColumn(table, 'added', 'TEXT');
+
+        await engine.executeQuery(`ALTER TABLE ${table} DROP COLUMN added`);
+        await engine.executeQuery(`ALTER TABLE ${table} ADD COLUMN added BLOB`);
+        await engine.executeQuery(`UPDATE ${table} SET added = X'BEEF' WHERE id = 1`);
+
+        await assert.rejects(
+            engine.undoModification({
+                description: 'Undo stale column addition',
+                modificationType: 'column_add',
+                targetTable: table,
+                targetColumn: 'added',
+                columnDef: { type: 'TEXT' },
+                columnAddSnapshot
+            } as any),
+            /schema changed/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT typeof(added), hex(added) FROM ${table} WHERE id = 1`
+            ))[0].rows,
+            [['blob', 'BEEF']]
+        );
+    });
+
+    it('rejects column-add redo after the original table was replaced', async () => {
+        const table = 'guarded_column_add_redo';
+        await engine.executeQuery(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`);
+        const columnAddBeforeSnapshot = await captureRowidTableState(table);
+        const columnAddSnapshot = await engine.addColumn(table, 'added', 'TEXT');
+        const modification = {
+            description: 'Redo guarded column addition',
+            modificationType: 'column_add',
+            targetTable: table,
+            targetColumn: 'added',
+            columnDef: { type: 'TEXT' },
+            columnAddBeforeSnapshot,
+            columnAddSnapshot
+        } as any;
+        await engine.undoModification(modification);
+
+        await engine.executeQuery(`DROP TABLE ${table}`);
+        await engine.executeQuery(
+            `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, replacement BLOB)`
+        );
+        await engine.executeQuery(
+            `INSERT INTO ${table}(id, replacement) VALUES (1, X'CAFE')`
+        );
+
+        await assert.rejects(engine.redoModification(modification), /schema changed/i);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT id, typeof(replacement), hex(replacement) FROM ${table}`
+            ))[0].rows,
+            [[1, 'blob', 'CAFE']]
+        );
+    });
+
+    it('rejects column-drop redo after the restored column was replaced', async () => {
+        const table = 'guarded_column_drop_redo';
+        await engine.executeQuery(
+            `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, removed TEXT, tail TEXT)`
+        );
+        await engine.executeQuery(
+            `INSERT INTO ${table}(id, removed, tail) VALUES (1, 'original', 'tail')`
+        );
+        const before = await captureRowidTableState(table);
+        const after = await engine.deleteColumns(table, ['removed']);
+        const modification = {
+            description: 'Redo guarded column deletion',
+            modificationType: 'column_drop',
+            targetTable: table,
+            deletedColumns: [{
+                name: 'removed',
+                type: 'TEXT',
+                data: [{ rowId: 1, value: 'original' }]
+            }],
+            columnDropSnapshot: { before, after }
+        } as any;
+        await engine.undoModification(modification);
+
+        await engine.executeQuery(`ALTER TABLE ${table} DROP COLUMN removed`);
+        await engine.executeQuery(`ALTER TABLE ${table} ADD COLUMN removed BLOB`);
+        await engine.executeQuery(`UPDATE ${table} SET removed = X'FACE' WHERE id = 1`);
+
+        await assert.rejects(engine.redoModification(modification), /schema changed/i);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT typeof(removed), hex(removed), tail FROM ${table} WHERE id = 1`
+            ))[0].rows,
+            [['blob', 'FACE', 'tail']]
+        );
+    });
+
+    it('restores main column-drop schema objects through a TEMP table shadow', async () => {
+        const table = 'shadowed_column_restore';
+        await engine.executeQuery(
+            `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, removed TEXT, keep TEXT); ` +
+            `CREATE INDEX shadowed_restore_idx ON ${table}(keep); ` +
+            `CREATE TRIGGER shadowed_restore_trg AFTER UPDATE ON ${table} ` +
+            'BEGIN SELECT NEW.keep; END; ' +
+            `INSERT INTO ${table}(id, removed, keep) VALUES (1, 'restore-me', 'kept')`
+        );
+        const before = await captureRowidTableState(table);
+        const after = await engine.deleteColumns(table, ['removed']);
+        await engine.executeQuery(
+            `CREATE TEMP TABLE ${table} (temporary_only TEXT, keep TEXT)`
+        );
+
+        await engine.undoModification({
+            description: 'Restore a dropped main column through TEMP shadow',
+            modificationType: 'column_drop',
+            targetTable: table,
+            deletedColumns: [{
+                name: 'removed',
+                type: 'TEXT',
+                data: [{ rowId: 1, value: 'restore-me' }]
+            }],
+            columnDropSnapshot: { before, after }
+        } as any);
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                `SELECT id, removed, keep FROM main.${table}`
+            ))[0].rows,
+            [[1, 'restore-me', 'kept']]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                "SELECT type, name FROM main.sqlite_schema " +
+                "WHERE name IN ('shadowed_restore_idx', 'shadowed_restore_trg') ORDER BY name"
+            ))[0].rows,
+            [
+                ['index', 'shadowed_restore_idx'],
+                ['trigger', 'shadowed_restore_trg']
+            ]
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(`PRAGMA temp.table_info(${table})`))[0].rows
+                .map((column: any[]) => column[1]),
+            ['temporary_only', 'keep']
+        );
+    });
+
+    it('restores a dropped column without inserting generated columns', async () => {
+        for (const storage of ['VIRTUAL', 'STORED']) {
+            const table = `generated_column_restore_${storage.toLowerCase()}`;
+            await engine.executeQuery(
+                `CREATE TABLE ${table} (` +
+                'id INTEGER PRIMARY KEY, base TEXT, removed TEXT, ' +
+                `calculated TEXT GENERATED ALWAYS AS (base || '!') ${storage}); ` +
+                `INSERT INTO ${table}(id, base, removed) VALUES (1, 'source', 'restore-me')`
+            );
+            const before = await captureRowidTableState(table);
+            const after = await engine.deleteColumns(table, ['removed']);
+
+            await engine.undoModification({
+                description: `Restore column beside ${storage} generated column`,
+                modificationType: 'column_drop',
+                targetTable: table,
+                deletedColumns: [{
+                    name: 'removed',
+                    type: 'TEXT',
+                    data: [{ rowId: 1, value: 'restore-me' }]
+                }],
+                columnDropSnapshot: { before, after }
+            } as any);
+
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    `SELECT id, base, removed, calculated FROM ${table}`
+                ))[0].rows,
+                [[1, 'source', 'restore-me', 'source!']]
+            );
+        }
+    });
+
     it('should undo/redo cell update', async () => {
         // 1. Update Cell (id=1, name='Alice' -> 'Alice Updated')
-        await engine.updateCell('users', 1, 'name', 'Alice Updated');
+        const affectedCells = await engine.updateCellBatch('users', [{
+            rowId: 1,
+            column: 'name',
+            value: 'Alice Updated'
+        }]);
 
         const verifyUpdate = await engine.executeQuery("SELECT name FROM users WHERE id = 1");
         assert.strictEqual(verifyUpdate[0].rows[0][0], 'Alice Updated');
@@ -579,7 +1000,7 @@ describe('SQLite Engine Undo/Redo', () => {
             modificationType: 'cell_update',
             targetTable: 'users',
             description: 'Update cell',
-            affectedCells: [{ rowId: 1, columnName: 'name', priorValue: 'Alice', newValue: 'Alice Updated' }]
+            affectedCells
         });
 
         const verifyRestored = await engine.executeQuery("SELECT name FROM users WHERE id = 1");
@@ -590,11 +1011,245 @@ describe('SQLite Engine Undo/Redo', () => {
             modificationType: 'cell_update',
             targetTable: 'users',
             description: 'Update cell',
-            affectedCells: [{ rowId: 1, columnName: 'name', priorValue: 'Alice', newValue: 'Alice Updated' }]
+            affectedCells
         });
 
         const verifyRedone = await engine.executeQuery("SELECT name FROM users WHERE id = 1");
         assert.strictEqual(verifyRedone[0].rows[0][0], 'Alice Updated');
+    });
+
+    it('rejects set undo after an external cell change and preserves that value', async () => {
+        const affectedCells = await engine.updateCellBatch('users', [{
+            rowId: 1,
+            column: 'name',
+            value: 'Tracked'
+        }]);
+        await engine.executeQuery("UPDATE users SET name = 'External' WHERE rowid = 1");
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'cell_update',
+                targetTable: 'users',
+                description: 'Tracked cell edit',
+                affectedCells
+            }),
+            /changed outside SQLite Explorer history/i
+        );
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT name FROM users WHERE rowid = 1'))[0].rows,
+            [['External']]
+        );
+    });
+
+    it('rejects set redo after an external cell change and preserves that value', async () => {
+        const affectedCells = await engine.updateCellBatch('users', [{
+            rowId: 1,
+            column: 'name',
+            value: 'Tracked'
+        }]);
+        const modification = {
+            modificationType: 'cell_update' as const,
+            targetTable: 'users',
+            description: 'Tracked cell edit',
+            affectedCells
+        };
+        await engine.undoModification(modification);
+        await engine.executeQuery("UPDATE users SET name = 'External' WHERE rowid = 1");
+
+        await assert.rejects(
+            engine.redoModification(modification),
+            /changed outside SQLite Explorer history/i
+        );
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT name FROM users WHERE rowid = 1'))[0].rows,
+            [['External']]
+        );
+    });
+
+    it('rolls back a multi-cell undo when any expected cell changed externally', async () => {
+        await engine.executeQuery("UPDATE users SET name = 'Alice' WHERE rowid = 1");
+        const affectedCells = await engine.updateCellBatch('users', [
+            { rowId: 1, column: 'name', value: 'Tracked Alice' },
+            { rowId: 2, column: 'name', value: 'Tracked Bob' }
+        ]);
+        await engine.executeQuery("UPDATE users SET name = 'External Bob' WHERE rowid = 2");
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'cell_update',
+                targetTable: 'users',
+                description: 'Tracked batch edit',
+                affectedCells
+            }),
+            /changed outside SQLite Explorer history/i
+        );
+
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT rowid, name FROM users ORDER BY rowid'))[0].rows,
+            [[1, 'Tracked Alice'], [2, 'External Bob']]
+        );
+    });
+
+    it('preserves untouched JSON siblings while undoing and redoing a tracked patch', async () => {
+        await engine.executeQuery(
+            "CREATE TABLE history_json_siblings (id INTEGER PRIMARY KEY, payload TEXT); " +
+            "INSERT INTO history_json_siblings VALUES (1, '{\"status\":\"draft\",\"owner\":\"ada\"}')"
+        );
+        const affectedCells = await engine.updateCellBatch('history_json_siblings', [{
+            rowId: 1,
+            column: 'payload',
+            value: '{"status":"published"}',
+            operation: 'json_patch'
+        }]);
+        const modification = {
+            modificationType: 'cell_update' as const,
+            targetTable: 'history_json_siblings',
+            description: 'Tracked JSON patch',
+            affectedCells
+        };
+        await engine.executeQuery(
+            `UPDATE history_json_siblings SET payload = json_patch(payload, '{"reviewer":"grace"}') WHERE rowid = 1`
+        );
+
+        await engine.undoModification(modification);
+        assert.deepStrictEqual(
+            JSON.parse((await engine.executeQuery(
+                'SELECT payload FROM history_json_siblings WHERE rowid = 1'
+            ))[0].rows[0][0] as string),
+            { status: 'draft', owner: 'ada', reviewer: 'grace' }
+        );
+
+        await engine.redoModification(modification);
+        assert.deepStrictEqual(
+            JSON.parse((await engine.executeQuery(
+                'SELECT payload FROM history_json_siblings WHERE rowid = 1'
+            ))[0].rows[0][0] as string),
+            { status: 'published', owner: 'ada', reviewer: 'grace' }
+        );
+    });
+
+    it('rejects JSON undo when an externally changed touched path differs from the recorded post-state', async () => {
+        await engine.executeQuery(
+            "CREATE TABLE history_json_conflict (id INTEGER PRIMARY KEY, payload TEXT); " +
+            "INSERT INTO history_json_conflict VALUES (1, '{\"status\":\"draft\",\"owner\":\"ada\"}')"
+        );
+        const affectedCells = await engine.updateCellBatch('history_json_conflict', [{
+            rowId: 1,
+            column: 'payload',
+            value: '{"status":"published"}',
+            operation: 'json_patch'
+        }]);
+        await engine.executeQuery(
+            `UPDATE history_json_conflict SET payload = '{"status":"archived","owner":"ada","reviewer":"grace"}' WHERE rowid = 1`
+        );
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'cell_update',
+                targetTable: 'history_json_conflict',
+                description: 'Tracked JSON patch',
+                affectedCells
+            }),
+            /changed outside SQLite Explorer history/i
+        );
+        assert.deepStrictEqual(
+            JSON.parse((await engine.executeQuery(
+                'SELECT payload FROM history_json_conflict WHERE rowid = 1'
+            ))[0].rows[0][0] as string),
+            { status: 'archived', owner: 'ada', reviewer: 'grace' }
+        );
+    });
+
+    it('distinguishes an absent JSON patch path from an explicit null', async () => {
+        await engine.executeQuery(
+            "CREATE TABLE history_json_missing (id INTEGER PRIMARY KEY, payload TEXT); " +
+            "INSERT INTO history_json_missing VALUES (1, '{\"removed\":1,\"keep\":2}')"
+        );
+        const affectedCells = await engine.updateCellBatch('history_json_missing', [{
+            rowId: 1,
+            column: 'payload',
+            value: '{"removed":null}',
+            operation: 'json_patch'
+        }]);
+        await engine.executeQuery(
+            `UPDATE history_json_missing SET payload = '{"removed":null,"keep":2}' WHERE rowid = 1`
+        );
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'cell_update',
+                targetTable: 'history_json_missing',
+                description: 'Tracked JSON delete',
+                affectedCells
+            }),
+            /changed outside SQLite Explorer history/i
+        );
+    });
+
+    it('fails closed for legacy cell history entries without stored-state guards', async () => {
+        await engine.updateCell('users', 1, 'name', 'Tracked');
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'cell_update',
+                targetTable: 'users',
+                targetRowId: 1,
+                targetColumn: 'name',
+                description: 'Legacy cell edit',
+                priorValue: 'Alice',
+                newValue: 'Tracked',
+                operation: 'set'
+            }),
+            /predates guarded cell history/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT name FROM users WHERE rowid = 1'))[0].rows,
+            [['Tracked']]
+        );
+    });
+
+    it('captures and restores authoritative storage classes on typeless cells', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE history_typeless (value); ' +
+            'INSERT INTO history_typeless(value) VALUES (CAST(1 AS REAL))'
+        );
+        const affectedCells = await engine.updateCellBatch('history_typeless', [{
+            rowId: 1,
+            column: 'value',
+            value: 2
+        }]);
+        assert.deepStrictEqual(affectedCells[0].priorState, {
+            storageClass: 'real',
+            value: 1
+        });
+        assert.deepStrictEqual(affectedCells[0].postState, {
+            storageClass: 'integer',
+            value: 2n
+        });
+        const modification = {
+            modificationType: 'cell_update' as const,
+            targetTable: 'history_typeless',
+            description: 'Typeless edit',
+            affectedCells
+        };
+
+        await engine.undoModification(modification);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), value FROM history_typeless WHERE rowid = 1'
+            ))[0].rows,
+            [['real', 1]]
+        );
+
+        await engine.redoModification(modification);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), value FROM history_typeless WHERE rowid = 1'
+            ))[0].rows,
+            [['integer', 2]]
+        );
     });
 
     it('should undo/redo row insert', async () => {
@@ -617,33 +1272,276 @@ describe('SQLite Engine Undo/Redo', () => {
 
         // Wait, insertRow was done above. Let's do another one.
         const row4 = { id: 4, name: 'Dave' };
-        await engine.insertRow('users', row4);
+        const insertedRow = await engine.insertRowWithHistory('users', row4);
 
         const countAfter = (await engine.executeQuery("SELECT COUNT(*) FROM users"))[0].rows[0][0] as number;
         assert.strictEqual(countAfter, countBefore + 1);
 
         // 2. Undo Insert
-        await engine.undoModification({
+        const modification = {
             modificationType: 'row_insert',
             targetTable: 'users',
             description: 'Insert row',
             targetRowId: 4,
-            rowData: row4
-        });
+            rowData: insertedRow.row,
+            insertedRow
+        };
+        await engine.undoModification(modification);
 
         const countRestored = (await engine.executeQuery("SELECT COUNT(*) FROM users"))[0].rows[0][0] as number;
         assert.strictEqual(countRestored, countBefore);
 
         // 3. Redo Insert
-        await engine.redoModification({
-            modificationType: 'row_insert',
-            targetTable: 'users',
-            description: 'Insert row',
-            targetRowId: 4,
-            rowData: row4
-        });
+        await engine.redoModification(modification);
 
         const countRedone = (await engine.executeQuery("SELECT COUNT(*) FROM users"))[0].rows[0][0] as number;
         assert.strictEqual(countRedone, countBefore + 1);
+    });
+
+    it('refuses to undo an insert after that row changed externally', async () => {
+        const insertedRow = await engine.insertRowWithHistory('users', { id: 3, name: 'tracked' });
+        const modification = {
+            modificationType: 'row_insert' as const,
+            targetTable: 'users',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert tracked row',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+        await engine.executeQuery("UPDATE users SET name = 'external' WHERE id = 3");
+
+        await assert.rejects(
+            engine.undoModification(modification),
+            /Row changed outside SQLite Explorer history/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT id, name FROM users WHERE id = 3'))[0].rows,
+            [[3, 'external']]
+        );
+    });
+
+    it('refuses to restore a deleted row after its identity was reused', async () => {
+        const deletedRows = await engine.deleteRows('users', [2]);
+        await engine.insertRow('users', { id: 2, name: 'replacement' });
+
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'row_delete',
+                targetTable: 'users',
+                description: 'Delete Bob',
+                affectedRowIds: [2],
+                deletedRows
+            }),
+            /Row changed outside SQLite Explorer history/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT id, name FROM users WHERE id = 2'))[0].rows,
+            [[2, 'replacement']]
+        );
+    });
+
+    it('refuses to redo a delete after the restored row changed externally', async () => {
+        const deletedRows = await engine.deleteRows('users', [2]);
+        const modification = {
+            modificationType: 'row_delete' as const,
+            targetTable: 'users',
+            description: 'Delete Bob',
+            affectedRowIds: [2],
+            deletedRows
+        };
+        await engine.undoModification(modification);
+        await engine.executeQuery("UPDATE users SET name = 'external' WHERE id = 2");
+
+        await assert.rejects(
+            engine.redoModification(modification),
+            /Row changed outside SQLite Explorer history/i
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT id, name FROM users WHERE id = 2'))[0].rows,
+            [[2, 'external']]
+        );
+    });
+
+    it('captures defaulted row values and exact storage classes for insert history', async () => {
+        await engine.executeQuery(
+            "CREATE TABLE history_defaults (id INTEGER PRIMARY KEY, value DEFAULT 7, note TEXT DEFAULT 'x')"
+        );
+        const insertedRow = await engine.insertRowWithHistory('history_defaults', { id: 1 });
+        const modification = {
+            modificationType: 'row_insert' as const,
+            targetTable: 'history_defaults',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert defaulted row',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        assert.deepStrictEqual(insertedRow.row, { id: 1n, value: 7n, note: 'x' });
+        assert.deepStrictEqual(insertedRow.storageClasses, [
+            { column: 'id', storageClass: 'integer' },
+            { column: 'value', storageClass: 'integer' },
+            { column: 'note', storageClass: 'text' }
+        ]);
+        await engine.undoModification(modification);
+        await engine.redoModification(modification);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), value, typeof(note), note FROM history_defaults'
+            ))[0].rows,
+            [['integer', 7, 'text', 'x']]
+        );
+    });
+
+    it('replays inserted and deleted malformed TEXT from its exact database bytes', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE malformed_text_history (' +
+            "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'80' AS TEXT)))"
+        );
+        const insertedRow = await engine.insertRowWithHistory('malformed_text_history', { id: 1 });
+        assert.deepStrictEqual(insertedRow.row.value, Uint8Array.of(0x80));
+        assert.deepStrictEqual(
+            insertedRow.storageClasses?.find(
+                (entry: { column: string }) => entry.column === 'value'
+            ),
+            { column: 'value', storageClass: 'text' }
+        );
+        const insertion = {
+            modificationType: 'row_insert' as const,
+            targetTable: 'malformed_text_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert malformed TEXT',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await engine.undoModification(insertion);
+        await engine.redoModification(insertion);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), hex(CAST(value AS BLOB)) FROM malformed_text_history'
+            ))[0].rows,
+            [['text', '80']]
+        );
+
+        const deletedRows = await engine.deleteRows('malformed_text_history', [1]);
+        assert.deepStrictEqual(deletedRows[0].row.value, Uint8Array.of(0x80));
+        await engine.undoModification({
+            modificationType: 'row_delete',
+            targetTable: 'malformed_text_history',
+            description: 'Delete malformed TEXT',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), hex(CAST(value AS BLOB)) FROM malformed_text_history'
+            ))[0].rows,
+            [['text', '80']]
+        );
+    });
+
+    it('replays malformed UTF-16LE TEXT without transcoding its database bytes', async () => {
+        engine.shutdown();
+        engine = (await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        })).operations;
+        await engine.executeQuery(
+            'PRAGMA encoding = "UTF-16le"; ' +
+            'CREATE TABLE malformed_utf16_history (' +
+            "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'00D8' AS TEXT)), " +
+            "note TEXT DEFAULT 'snowman ☃')"
+        );
+        assert.strictEqual((await engine.executeQuery('PRAGMA encoding'))[0].rows[0][0], 'UTF-16le');
+        const insertedRow = await engine.insertRowWithHistory('malformed_utf16_history', { id: 1 });
+        const insertion = {
+            modificationType: 'row_insert' as const,
+            targetTable: 'malformed_utf16_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert malformed UTF-16LE TEXT',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await engine.undoModification(insertion);
+        await engine.redoModification(insertion);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                'FROM malformed_utf16_history'
+            ))[0].rows,
+            [['text', '00D8', 'snowman ☃']]
+        );
+
+        const deletedRows = await engine.deleteRows('malformed_utf16_history', [1]);
+        await engine.undoModification({
+            modificationType: 'row_delete',
+            targetTable: 'malformed_utf16_history',
+            description: 'Delete malformed UTF-16LE TEXT',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                'FROM malformed_utf16_history'
+            ))[0].rows,
+            [['text', '00D8', 'snowman ☃']]
+        );
+    });
+
+    it('replays row history for a legal empty column identifier', async () => {
+        await engine.executeQuery('CREATE TABLE empty_row_history ("" TEXT, normal INTEGER)');
+        const insertedRow = await engine.insertRowWithHistory(
+            'empty_row_history',
+            { '': 'empty-name', normal: 7 }
+        );
+        const modification = {
+            modificationType: 'row_insert' as const,
+            targetTable: 'empty_row_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert empty-name column row',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await engine.undoModification(modification);
+        await engine.redoModification(modification);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT "", normal FROM empty_row_history'
+            ))[0].rows,
+            [['empty-name', 7]]
+        );
+
+        const deletedRows = await engine.deleteRows(
+            'empty_row_history',
+            [insertedRow.rowId]
+        );
+        await engine.undoModification({
+            modificationType: 'row_delete',
+            targetTable: 'empty_row_history',
+            description: 'Delete empty-name column row',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT "", normal FROM empty_row_history'
+            ))[0].rows,
+            [['empty-name', 7]]
+        );
+    });
+
+    it('fails closed for legacy row history without storage guards', async () => {
+        await engine.insertRow('users', { id: 3, name: 'legacy' });
+        await assert.rejects(
+            engine.undoModification({
+                modificationType: 'row_insert',
+                targetTable: 'users',
+                targetRowId: 3,
+                description: 'Legacy insert',
+                rowData: { id: 3, name: 'legacy' }
+            }),
+            /predates guarded row history/i
+        );
     });
 });

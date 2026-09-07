@@ -62,6 +62,20 @@ export interface FormatHelper {
   exportMemory(headers: string[], rows: CellValue[][]): string;
 }
 
+export type ExportTableCommandResult =
+  | { success: true; rowCount: number; destination: string }
+  | { success: false; cancelled: true }
+  | { success: false; cancelled?: false; message: string };
+
+function showExportNotification(notification: PromiseLike<unknown> | unknown): void {
+  // VS Code notification promises resolve only after dismissal. The export RPC
+  // must settle when the file operation does, or the webview remains stuck on
+  // "Exporting..." while a completed notification is waiting for the user.
+  void Promise.resolve(notification).catch(error => {
+    console.error('Failed to show export notification:', error);
+  });
+}
+
 export function getFormatHelper(format: string, tableName: string, includeHeader: boolean, includeTableName: boolean): FormatHelper {
   switch (format) {
     case 'csv':
@@ -413,6 +427,89 @@ function nodeErrorCode(error: unknown): string | undefined {
 interface ResolvedLocalExportDestination {
   replacementPath: string;
   metadata?: ReplacementFileMetadata;
+  generation: LocalExportGeneration;
+}
+
+interface LocalExportFingerprint {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  mode: bigint;
+  uid: bigint;
+  gid: bigint;
+}
+
+type LocalExportGeneration =
+  | { exists: true; fingerprint: LocalExportFingerprint }
+  | { exists: false };
+
+function localExportFingerprint(stats: {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  mode: bigint;
+  uid: bigint;
+  gid: bigint;
+}): LocalExportFingerprint {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+    mode: stats.mode,
+    uid: stats.uid,
+    gid: stats.gid
+  };
+}
+
+function sameLocalExportFingerprint(
+  left: LocalExportFingerprint,
+  right: LocalExportFingerprint
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid;
+}
+
+function assertLocalExportDestinationUnchanged(
+  fs: NodeFs,
+  destination: ResolvedLocalExportDestination
+): void {
+  if (!destination.generation.exists) {
+    try {
+      fs.lstatSync(destination.replacementPath);
+    } catch (error) {
+      if (nodeErrorCode(error) === 'ENOENT') return;
+      throw new Error('Cannot verify the export destination before replacement', {
+        cause: error
+      });
+    }
+    throw new Error('Export destination appeared during the export; retry');
+  }
+
+  let current: LocalExportFingerprint;
+  try {
+    current = localExportFingerprint(
+      fs.statSync(destination.replacementPath, { bigint: true })
+    );
+  } catch (error) {
+    throw new Error('Export destination changed during the export; retry', {
+      cause: error
+    });
+  }
+  if (!sameLocalExportFingerprint(destination.generation.fingerprint, current)) {
+    throw new Error('Export destination changed during the export; retry');
+  }
 }
 
 async function resolveLocalExportDestination(
@@ -427,7 +524,8 @@ async function resolveLocalExportDestination(
     return {
       replacementPath,
       // Read metadata from the resolved target, not the symlink directory entry.
-      metadata: replacementFileMetadataFromStats(targetStats)
+      metadata: replacementFileMetadataFromStats(targetStats),
+      generation: { exists: true, fingerprint: localExportFingerprint(targetStats) }
     };
   } catch (error) {
     if (nodeErrorCode(error) !== 'ENOENT') throw error;
@@ -436,7 +534,9 @@ async function resolveLocalExportDestination(
   try {
     await fs.promises.lstat(finalPath);
   } catch (error) {
-    if (nodeErrorCode(error) === 'ENOENT') return { replacementPath: finalPath };
+    if (nodeErrorCode(error) === 'ENOENT') {
+      return { replacementPath: finalPath, generation: { exists: false } };
+    }
     throw error;
   }
 
@@ -511,6 +611,7 @@ async function exportLocalAtomic(
     }
     await sink.close();
     assertExportNotCancelled(cancellation);
+    assertLocalExportDestinationUnchanged(fs, destination);
     await fs.promises.rename(tempPath, destinationPath);
     if (ownershipPreservationFailure) {
       warnAfterSuccessfulLocalExportRename(ownershipPreservationFailure);
@@ -573,6 +674,106 @@ async function removeWorkspaceTemp(
   throw primaryError;
 }
 
+interface WorkspaceExportFingerprint {
+  type: number;
+  ctime: number;
+  mtime: number;
+  size: number;
+  permissions: number | undefined;
+  digest: Uint8Array;
+}
+
+type WorkspaceExportGeneration =
+  | { exists: true; fingerprint: WorkspaceExportFingerprint }
+  | { exists: false };
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function sameWorkspaceStat(
+  left: Omit<WorkspaceExportFingerprint, 'digest'>,
+  right: Omit<WorkspaceExportFingerprint, 'digest'>
+): boolean {
+  return left.type === right.type
+    && left.ctime === right.ctime
+    && left.mtime === right.mtime
+    && left.size === right.size
+    && left.permissions === right.permissions;
+}
+
+async function captureWorkspaceExportGeneration(
+  uri: vsc.Uri
+): Promise<WorkspaceExportGeneration> {
+  let stat: vsc.FileStat;
+  try {
+    stat = await vsc.workspace.fs.stat(uri);
+  } catch (error) {
+    if (isMissingWorkspaceFile(error)) return { exists: false };
+    throw new Error('Cannot inspect the export destination before writing', { cause: error });
+  }
+  if ((stat.type & vsc.FileType.SymbolicLink) !== 0) {
+    throw new Error('Cannot safely replace a symbolic-link destination through this workspace provider');
+  }
+  if ((stat.type & vsc.FileType.File) === 0
+    || !Number.isSafeInteger(stat.size)
+    || stat.size < 0
+    || stat.size > NON_LOCAL_EXPORT_MAX_BYTES) {
+    throw new Error(
+      'Existing non-local export destination cannot be safely conflict-checked; '
+      + `it must be a regular file no larger than ${NON_LOCAL_CAP_DESCRIPTION}`
+    );
+  }
+  const bytes = await vsc.workspace.fs.readFile(uri);
+  if (bytes.byteLength !== stat.size) {
+    throw new Error('Export destination changed while its initial state was being inspected');
+  }
+  const verifiedStat = await vsc.workspace.fs.stat(uri);
+  const statFingerprint = {
+    type: verifiedStat.type,
+    ctime: verifiedStat.ctime,
+    mtime: verifiedStat.mtime,
+    size: verifiedStat.size,
+    permissions: verifiedStat.permissions
+  };
+  if (!sameWorkspaceStat(
+    {
+      type: stat.type,
+      ctime: stat.ctime,
+      mtime: stat.mtime,
+      size: stat.size,
+      permissions: stat.permissions
+    },
+    statFingerprint
+  )) {
+    throw new Error('Export destination changed while its initial state was being inspected');
+  }
+  const digestInput = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(digestInput).set(bytes);
+  const digest = new Uint8Array(await webCrypto.subtle.digest('SHA-256', digestInput));
+  return { exists: true, fingerprint: { ...statFingerprint, digest } };
+}
+
+async function assertWorkspaceExportDestinationUnchanged(
+  uri: vsc.Uri,
+  initial: WorkspaceExportGeneration
+): Promise<void> {
+  const current = await captureWorkspaceExportGeneration(uri);
+  if (!initial.exists) {
+    if (!current.exists) return;
+    throw new Error('Export destination appeared during the export; retry');
+  }
+  if (!current.exists
+    || !sameWorkspaceStat(initial.fingerprint, current.fingerprint)
+    || !sameBytes(initial.fingerprint.digest, current.fingerprint.digest)) {
+    throw new Error('Export destination changed during the export; retry');
+  }
+}
+
 async function exportWorkspaceAtomic(
   uri: vsc.Uri,
   document: DatabaseDocument,
@@ -581,6 +782,7 @@ async function exportWorkspaceAtomic(
   options: ExportOptions,
   cancellation?: ExportCancellation
 ): Promise<number> {
+  const destinationGeneration = await captureWorkspaceExportGeneration(uri);
   const sink = new CappedWorkspaceSink();
   const rowCount = await streamTableExport(
     document.databaseOperations,
@@ -596,6 +798,7 @@ async function exportWorkspaceAtomic(
   try {
     await vsc.workspace.fs.writeFile(tempUri, bytes);
     assertExportNotCancelled(cancellation);
+    await assertWorkspaceExportDestinationUnchanged(uri, destinationGeneration);
     await vsc.workspace.fs.rename(tempUri, uri, { overwrite: true });
     return rowCount;
   } catch (error) {
@@ -624,12 +827,13 @@ export async function exportTableCommand(
   _tableStore?: unknown,
   _exportOptions?: ExportOptions,
   _extras?: unknown
-) {
+): Promise<ExportTableCommandResult> {
   try {
     const tableName = dbParams.table;
     if (!tableName) {
-      await vsc.window.showErrorMessage('No table specified for export');
-      return;
+      const message = 'No table specified for export';
+      showExportNotification(vsc.window.showErrorMessage(message));
+      return { success: false, message };
     }
 
     let formatValue: string | undefined = _exportOptions?.format;
@@ -646,7 +850,7 @@ export async function exportTableCommand(
           title: `Export "${tableName}"`
         }
       );
-      if (!formatPick) return; // User cancelled
+      if (!formatPick) return { success: false, cancelled: true };
       formatValue = formatPick.value;
     }
 
@@ -658,8 +862,12 @@ export async function exportTableCommand(
           break;
         }
       }
-    }
-    if (!document) {
+      if (!document) {
+        const message = 'The requested database is no longer open';
+        showExportNotification(vsc.window.showErrorMessage(message));
+        return { success: false, message };
+      }
+    } else {
       for (const [, doc] of DocumentRegistry) {
         document = doc;
         break;
@@ -667,8 +875,9 @@ export async function exportTableCommand(
     }
 
     if (!document || !document.databaseOperations) {
-      await vsc.window.showErrorMessage('No active database connection');
-      return;
+      const message = 'No active database connection';
+      showExportNotification(vsc.window.showErrorMessage(message));
+      return { success: false, message };
     }
 
     const includeHeader = _exportOptions?.header ?? true;
@@ -682,8 +891,9 @@ export async function exportTableCommand(
         includeTableName
       );
     } catch (e) {
-      await vsc.window.showErrorMessage((e as Error).message);
-      return;
+      const message = (e as Error).message;
+      showExportNotification(vsc.window.showErrorMessage(message));
+      return { success: false, message };
     }
 
     const uri = await vsc.window.showSaveDialog({
@@ -699,7 +909,7 @@ export async function exportTableCommand(
       },
       title: `Export "${tableName}" as ${formatValue.toUpperCase()}`
     });
-    if (!uri) return; // User cancelled
+    if (!uri) return { success: false, cancelled: true };
 
     const options: ExportOptions = {
       ..._exportOptions,
@@ -736,18 +946,25 @@ export async function exportTableCommand(
         );
       }
     );
-    await vsc.window.showInformationMessage(
-      `Exported ${rowCount} rows to ${uri.fsPath || uri.toString()}`
-    );
+    showExportNotification(vsc.window.showInformationMessage(
+      `Exported ${rowCount} row${rowCount === 1 ? '' : 's'} to `
+      + `${uri.fsPath || uri.toString()}`
+    ));
+    return {
+      success: true,
+      rowCount,
+      destination: uri.fsPath || uri.toString()
+    };
 
   } catch (err) {
     if (isCancellationError(err)) {
-      await vsc.window.showInformationMessage('Export cancelled');
-      return;
+      showExportNotification(vsc.window.showInformationMessage('Export cancelled'));
+      return { success: false, cancelled: true };
     }
     const message = err instanceof Error ? err.message : String(err);
-    await vsc.window.showErrorMessage(`Export failed: ${message}`);
+    showExportNotification(vsc.window.showErrorMessage(`Export failed: ${message}`));
     console.error('Export error:', err);
+    return { success: false, message };
   }
 }
 
@@ -780,7 +997,7 @@ export function exportToCsv(columns: string[], rows: CellValue[][], includeHeade
  */
 export function exportToJson(columns: string[], rows: CellValue[][]): string {
   const objects = rows.map(row => {
-    const obj: Record<string, CellValue> = {};
+    const obj = Object.create(null) as Record<string, CellValue>;
     columns.forEach((col, idx) => {
       const value = row[idx];
       // Convert Uint8Array to base64 for JSON

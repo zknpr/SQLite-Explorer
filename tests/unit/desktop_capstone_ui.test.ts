@@ -97,7 +97,13 @@ function makeHost(
         initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
         ping: () => true,
         exportDatabase: () => new Uint8Array([9, 9]),
-        insertRow: () => 1,
+        // The host routes `insertRow` through insertRowWithHistory (the
+        // method that answers with the exact post-image the replay needs).
+        insertRowWithHistory: (args: unknown[]) => ({
+            rowId: 1,
+            row: { ...(args[1] as Record<string, unknown>) },
+            storageClasses: Object.keys(args[1] as object).map(column => ({ column, storageClass: 'text' }))
+        }),
         ...handlers
     };
     const posted: Envelope[] = [];
@@ -356,8 +362,10 @@ test('FIXED D3: refreshFile answers {connected, filename, readOnly} like the VS 
     await host.start();
     await host.openFromShellPath('/tmp/real.db');
 
+    // connectionGeneration: 1 for the open, 2 for the refresh — the page's
+    // async intents capture it, and a reload must read as a replaced connection.
     assert.deepEqual(await host.invoke('refreshFile', []), {
-        connected: true, filename: 'real.db', readOnly: false
+        connected: true, filename: 'real.db', readOnly: false, connectionGeneration: 2
     });
 });
 
@@ -369,7 +377,7 @@ test('FIXED D3: a file that comes back READ-ONLY re-gates the sidebar through ap
 
     readOnly = true;                                    // permissions changed on disk
     const result = await host.invoke('refreshFile', []) as Record<string, unknown>;
-    assert.deepEqual(result, { connected: true, filename: 'real.db', readOnly: true });
+    assert.deepEqual(result, { connected: true, filename: 'real.db', readOnly: true, connectionGeneration: 2 });
 
     // The guard the sidebar actually uses, against the module that owns it.
     const { applyConnectionResult } = await import(connectionStateModulePath);
@@ -386,8 +394,9 @@ test('FIXED D3: a file that comes back READ-ONLY re-gates the sidebar through ap
 test('FIXED D3: a path-less database reports its capabilities rather than faking a reload', async () => {
     const { host } = makeHost();
     await host.start();
+    // No reload happened, so the generation is still the boot open's.
     assert.deepEqual(await host.invoke('refreshFile', []), {
-        connected: true, filename: 'untitled.db', readOnly: false
+        connected: true, filename: 'untitled.db', readOnly: false, connectionGeneration: 1
     });
 });
 
@@ -620,10 +629,10 @@ async function runExport(result: unknown) {
 test('FIXED U1: a CANCELLED table export says so instead of reporting success', async () => {
     // export.js awaited backendApi.exportTable and then wrote "Export
     // initiated" unconditionally, dropping the {success, savedAs} the desktop
-    // host returns. On the desktop `success:false` is exactly "the user pressed
-    // Cancel in the save dialog", so Cancel was indistinguishable from a real
-    // export.
-    const { status, calls } = await runExport({ success: false });
+    // host returns. The desktop host answers a dismissed dialog with
+    // `{success:false, cancelled:true}` (the VS Code host's saveFile contract),
+    // so Cancel was indistinguishable from a real export.
+    const { status, calls } = await runExport({ success: false, cancelled: true });
     assert.equal(status, 'Export cancelled');
     // The RPC payload itself was already correct — pin it as a regression test.
     assert.equal((calls[0][0] as any).table, 'items');
@@ -690,7 +699,7 @@ test('FIXED U2: a cancelled blob download no longer claims the file was saved', 
     // PROPOSED filename precisely when savedAs was absent — the cancelled case
     // — so it named a file that was never written. Worse than U1: the flag was
     // returned and actively masked.
-    assert.equal(await runBlobDownload({ success: false }), 'Save cancelled');
+    assert.equal(await runBlobDownload({ success: false, cancelled: true }), 'Save cancelled');
 });
 
 test('FIXED U2: a successful blob download names the file the host wrote', async () => {

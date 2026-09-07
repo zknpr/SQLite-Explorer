@@ -30,11 +30,13 @@ import {
     updateStatus,
     showEmptyState,
     showErrorState,
+    showLoading,
     initSidebarResize,
     syncPageSizeSelect
 } from './modules/ui.js';
 import {
     closeAllModals,
+    closeDatabaseTargetModals,
     initModals
 } from './modules/modals.js';
 import {
@@ -55,7 +57,10 @@ import {
     initDragAndDrop
 } from './modules/dnd.js';
 import { initViews } from './modules/views.js';
-import { applyConnectionResult } from './modules/connection-state.js';
+import {
+    applyConnectionResult,
+    updateMutationControlCapabilities
+} from './modules/connection-state.js';
 import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 // Desktop-only. This is the ONLY file allowed to import the console modules:
 // console.js bundles CodeMirror 6, and an import from any shared module would
@@ -343,47 +348,88 @@ function initSqlConsole(surface) {
 const webviewMethods = {
     async refreshContent(filename, connectionResult) {
         // Same contract as the VS Code twin in rpc.js: this broadcast means
-        // the database changed in a way this webview didn't perform itself,
-        // so no cached count survives it. (Currently unused by the demo
-        // host, but the parity keeps it safe to wire.)
+        // the database changed in a way this webview didn't perform itself
+        // (the host also echoes one after this page's own edits), so no
+        // cached count survives it, every positional intent is dropped, and
+        // the content revision advances so a delayed destructive intent
+        // captured before it refuses to complete.
         invalidateAllCounts();
+        const contentGeneration = ++state.contentGeneration;
+        state.isRefreshingContent = true;
+        updateMutationControlCapabilities();
+        const priorConnectionGeneration = state.connectionGeneration;
         if (connectionResult) {
             applyConnectionResult(connectionResult);
             updateEngineBadge(connectionResult.engine);
             reportReadOnlyReason(connectionResult.readOnlyReason);
         }
-        if (state.isDbConnected) {
-            // A broadcast view refresh may change projection and row order.
-            // Clear positional state before the first await so controls cannot
-            // target cells from the previous result while schema reloads.
-            if (state.selectedTable && state.selectedTableType === 'view') {
-                clearSelection();
-                persistState();
-            }
+        // The host advances its generation only on a real (re)open, so this
+        // is true for a refresh/reload and false for an ordinary edit echo.
+        const connectionReplaced = !!connectionResult
+            && state.connectionGeneration !== priorConnectionGeneration;
+        closeDatabaseTargetModals({ connectionReplaced });
+        clearSelection();
+        state.pinnedRowIds.clear();
+        state.editingCellInfo = null;
+        state.activeCellInput = null;
+        updateToolbarButtons();
+        try {
+            if (state.isDbConnected) {
+                if (connectionReplaced) {
+                    // The reopen replaced the logical database even when table
+                    // names and rowids collide: nothing rendered from the old
+                    // one may survive into the reload below.
+                    state.pinnedColumns.clear();
+                    state.tableColumns = [];
+                    state.gridData = [];
+                    state.gridExactIntegerTexts = {};
+                    state.gridOversizedCells = {};
+                    state.gridReadOnlyRowReasons = {};
+                    state.keysetAnchors = null;
+                    state.renderedTable = null;
+                    showLoading();
+                    updateToolbarButtons();
+                    persistState();
+                }
+                // A broadcast view refresh may change projection and row order.
+                if (state.selectedTable && state.selectedTableType === 'view') persistState();
 
-            await refreshSchema();
-            const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
-                                state.schemaCache.views.some(v => v.name === state.selectedTable);
-            if (!tableExists && state.selectedTable) {
-                clearSelection();
-                state.selectedTable = null;
-                state.selectedTableType = null;
-                document.getElementById('tableNameLabel').textContent = 'No table selected';
-                showEmptyState();
-                persistState();
-            } else if (state.selectedTable) {
-                await loadTableColumns();
-                await loadTableData(false);
+                if (!await refreshSchema()) return { success: false, superseded: true };
+                const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
+                                    state.schemaCache.views.some(v => v.name === state.selectedTable);
+                if (!tableExists && state.selectedTable) {
+                    clearSelection();
+                    state.selectedTable = null;
+                    state.selectedTableType = null;
+                    state.selectedTableIdentity = null;
+                    document.getElementById('tableNameLabel').textContent = 'No table selected';
+                    showEmptyState();
+                    persistState();
+                    updateToolbarButtons();
+                } else if (state.selectedTable) {
+                    if (await loadTableColumns()) {
+                        await loadTableData(false);
+                    } else if (connectionReplaced) {
+                        showErrorState('Could not load table columns after reloading the database.');
+                    }
+                }
+            }
+            // Closes the console-DDL loop: a mutating console run makes the host
+            // call back here, and the autocompletion schema rebuilds from the
+            // freshly loaded schemaCache. Placed after loadTableColumns rather
+            // than immediately after refreshSchema() so the selected table's
+            // columns are the new ones too.
+            refreshConsoleSchema();
+            if (isConsoleOpen()) applyConsoleAvailability();
+            return { success: true };
+        } finally {
+            // A newer broadcast owns the flag now; only the latest one clears it.
+            if (state.contentGeneration === contentGeneration) {
+                state.isRefreshingContent = false;
+                updateMutationControlCapabilities();
+                updateToolbarButtons();
             }
         }
-        // Closes the console-DDL loop: a mutating console run makes the host
-        // call back here, and the autocompletion schema rebuilds from the
-        // freshly loaded schemaCache. Placed after loadTableColumns rather
-        // than immediately after refreshSchema() so the selected table's
-        // columns are the new ones too.
-        refreshConsoleSchema();
-        if (isConsoleOpen()) applyConsoleAvailability();
-        return { success: true };
     },
 
     /**

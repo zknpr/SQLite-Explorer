@@ -3,7 +3,11 @@ import './vscode_mock_setup';
 import { after, beforeEach, it } from 'node:test';
 import assert from 'node:assert';
 import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../src/core/cell-containment';
-import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../src/core/cell-edit-policy';
+import {
+    DEFAULT_MAX_CELL_EDIT_BYTES,
+    OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE
+} from '../../src/core/cell-edit-policy';
+import { VIEW_DEFINITION_CONFLICT_MESSAGE } from '../../src/core/view-utils';
 import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
 import { createDeferred } from './helpers/deferred';
 
@@ -73,7 +77,7 @@ it('uses the transport edit ceiling instead of the inline preview ceiling', asyn
     const { backendApi, handleRpcResponse } = await import(webApiModulePath);
     const replacement = new Uint8Array(DEFAULT_MAX_INLINE_CELL_BYTES + 1);
 
-    const update = backendApi.updateCell('items', 1, 'payload', replacement, null);
+    const update = backendApi.updateCell('items', 1, 'payload', replacement, 'previous text');
     const metadataRequest = await waitForPostedMessage(0);
     assert.strictEqual(metadataRequest.content.targetMethod, 'getCellMetadata');
     handleRpcResponse({
@@ -86,6 +90,7 @@ it('uses the transport edit ceiling instead of the inline preview ceiling', asyn
     const updateRequest = await waitForPostedMessage(1);
     assert.strictEqual(updateRequest.content.targetMethod, 'updateCell');
     assert.strictEqual(updateRequest.content.payload[3].__type, 'Uint8Array');
+    assert.strictEqual(updateRequest.content.payload[4], undefined);
     assert.strictEqual(updateRequest.content.payload[5], MAX_WEBVIEW_BINARY_VALUE_BYTES);
     handleRpcResponse({
         kind: 'response',
@@ -95,6 +100,54 @@ it('uses the transport edit ceiling instead of the inline preview ceiling', asyn
     });
 
     assert.strictEqual(await update, 1);
+});
+
+it('bounds repeated oversized-cell replacement conflicts instead of retrying forever', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi, handleRpcResponse } = await import(webApiModulePath);
+    const originalPostMessage = (globalThis as any).window.parent.postMessage;
+    let replacementAttempts = 0;
+    confirmResult = true;
+
+    (globalThis as any).window.parent.postMessage = (message: any) => {
+        originalPostMessage.call((globalThis as any).window.parent, message);
+        queueMicrotask(() => {
+            const method = message.content.targetMethod;
+            if (method === 'getCellMetadata') {
+                handleRpcResponse({
+                    kind: 'response',
+                    messageId: message.content.messageId,
+                    success: true,
+                    data: {
+                        storageClass: 'blob',
+                        byteLength: DEFAULT_MAX_CELL_EDIT_BYTES + replacementAttempts + 1
+                    }
+                });
+                return;
+            }
+            if (method === 'replaceOversizedCell') {
+                replacementAttempts++;
+                handleRpcResponse({
+                    kind: 'response',
+                    messageId: message.content.messageId,
+                    success: false,
+                    errorMessage: replacementAttempts < 5
+                        ? OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE
+                        : 'test safety stop for an unbounded retry loop'
+                });
+            }
+        });
+    };
+
+    try {
+        await assert.rejects(
+            backendApi.updateCell('items', 1, 'payload', Uint8Array.of(1), null),
+            /changed repeatedly/i
+        );
+        assert.ok(replacementAttempts > 0 && replacementAttempts < 5);
+    } finally {
+        (globalThis as any).window.parent.postMessage = originalPostMessage;
+    }
 });
 
 it('rejects an oversized demo file selection before reading it', async () => {
@@ -135,6 +188,137 @@ it('rejects an oversized demo file selection before reading it', async () => {
         await assert.rejects(selected, /exceeds the 16777216-byte edit limit/);
         assert.strictEqual(arrayBufferCalls, 0);
     } finally {
+        delete (globalThis as any).document;
+    }
+});
+
+it('settles a cancelled demo file selection without racing slow picker interaction', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi } = await import(webApiModulePath);
+    let input: any;
+    let appended = false;
+    let removals = 0;
+    (globalThis as any).document = {
+        createElement() {
+            input = {
+                type: '',
+                style: {},
+                onchange: undefined,
+                oncancel: undefined,
+                click() {}
+            };
+            return input;
+        },
+        body: {
+            appendChild() {
+                appended = true;
+            },
+            removeChild() {
+                removals += 1;
+                appended = false;
+            }
+        }
+    };
+
+    try {
+        const selected = backendApi.selectFile();
+        assert.strictEqual(appended, true, 'the picker input must remain live while the dialog is open');
+        assert.strictEqual(removals, 0);
+        assert.strictEqual(typeof input.oncancel, 'function');
+
+        input.oncancel();
+
+        assert.strictEqual(await selected, undefined);
+        assert.strictEqual(appended, false);
+        assert.strictEqual(removals, 1);
+    } finally {
+        delete (globalThis as any).document;
+    }
+});
+
+it('removes the demo file input when opening the picker throws', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi } = await import(webApiModulePath);
+    let appended = false;
+    let removals = 0;
+    (globalThis as any).document = {
+        createElement() {
+            return {
+                type: '',
+                style: {},
+                onchange: undefined,
+                oncancel: undefined,
+                click() {
+                    throw new Error('file picker unavailable');
+                }
+            };
+        },
+        body: {
+            appendChild() {
+                appended = true;
+            },
+            removeChild() {
+                removals += 1;
+                appended = false;
+            }
+        }
+    };
+
+    try {
+        await assert.rejects(backendApi.selectFile(), /file picker unavailable/);
+        assert.strictEqual(appended, false);
+        assert.strictEqual(removals, 1);
+    } finally {
+        delete (globalThis as any).document;
+    }
+});
+
+it('cleans up a failed demo download without leaking its object URL', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi } = await import(webApiModulePath);
+    const originalUrl = globalThis.URL;
+    let appended = false;
+    let removals = 0;
+    const revoked: string[] = [];
+    (globalThis as any).URL = {
+        createObjectURL() {
+            return 'blob:failed-download';
+        },
+        revokeObjectURL(url: string) {
+            revoked.push(url);
+        }
+    };
+    (globalThis as any).document = {
+        createElement() {
+            return {
+                href: '',
+                download: '',
+                click() {
+                    throw new Error('download blocked');
+                }
+            };
+        },
+        body: {
+            appendChild() {
+                appended = true;
+            },
+            removeChild() {
+                removals += 1;
+                appended = false;
+            }
+        }
+    };
+
+    try {
+        await assert.rejects(
+            () => backendApi.saveFile('payload.bin', Uint8Array.of(1)),
+            /download blocked/
+        );
+        assert.strictEqual(appended, false);
+        assert.strictEqual(removals, 1);
+        assert.deepStrictEqual(revoked, ['blob:failed-download']);
+    } finally {
+        (globalThis as any).URL = originalUrl;
         delete (globalThis as any).document;
     }
 });
@@ -199,6 +383,52 @@ it('names demo view triggers before a confirmed drop and forwards that snapshot'
     assert.strictEqual(postedMessages.length, 3);
 });
 
+it('bounds repeated demo view-drop conflicts instead of confirming forever', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi, handleRpcResponse } = await import(webApiModulePath);
+    const originalPostMessage = (globalThis as any).window.parent.postMessage;
+    let dropAttempts = 0;
+    confirmResult = true;
+
+    (globalThis as any).window.parent.postMessage = (message: any) => {
+        originalPostMessage.call((globalThis as any).window.parent, message);
+        queueMicrotask(() => {
+            const method = message.content.targetMethod;
+            if (method === 'getViewDefinition') {
+                handleRpcResponse({
+                    kind: 'response',
+                    messageId: message.content.messageId,
+                    success: true,
+                    data: {
+                        sql: `CREATE VIEW changing_view AS SELECT ${dropAttempts}`,
+                        triggers: []
+                    }
+                });
+                return;
+            }
+            if (method === 'dropView') {
+                dropAttempts++;
+                handleRpcResponse({
+                    kind: 'response',
+                    messageId: message.content.messageId,
+                    success: false,
+                    errorMessage: dropAttempts < 5
+                        ? VIEW_DEFINITION_CONFLICT_MESSAGE
+                        : 'test safety stop for an unbounded retry loop'
+                });
+            }
+        });
+    };
+
+    try {
+        await assert.rejects(backendApi.dropView('changing_view'), /changed repeatedly/i);
+        assert.ok(dropAttempts > 0 && dropAttempts < 5);
+        assert.strictEqual(confirmations.length, dropAttempts);
+    } finally {
+        (globalThis as any).window.parent.postMessage = originalPostMessage;
+    }
+});
+
 it('uses a plain confirmation when a demo view has no triggers', async () => {
     const webApiModulePath = '../../core/ui/modules/web-api.js';
     const { backendApi, handleRpcResponse } = await import(webApiModulePath);
@@ -235,6 +465,55 @@ it('uses a plain confirmation when a demo view has no triggers', async () => {
         data: { dropped: true }
     });
     assert.deepStrictEqual(await dropPromise, { dropped: true });
+});
+
+it('confirms exact dependent-index definitions before a demo column deletion', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi, handleRpcResponse } = await import(webApiModulePath);
+    const dependencies = [{
+        identifier: 'demo_removed_idx',
+        sql: 'CREATE INDEX demo_removed_idx ON demo_rows(removed)'
+    }];
+
+    const cancelledDelete = backendApi.deleteColumns('demo_rows', ['removed']);
+    const cancelledLookup = await waitForPostedMessage(0);
+    assert.strictEqual(cancelledLookup.content.targetMethod, 'findDependentIndexes');
+    handleRpcResponse({
+        kind: 'response',
+        messageId: cancelledLookup.content.messageId,
+        success: true,
+        data: dependencies
+    });
+
+    assert.deepStrictEqual(await cancelledDelete, { cancelled: true });
+    assert.strictEqual(postedMessages.length, 1);
+    assert.match(confirmations[0], /demo_removed_idx/);
+    assert.match(confirmations[0], /permanently/i);
+
+    confirmResult = true;
+    const acceptedDelete = backendApi.deleteColumns('demo_rows', ['removed']);
+    const acceptedLookup = await waitForPostedMessage(1);
+    assert.strictEqual(acceptedLookup.content.targetMethod, 'findDependentIndexes');
+    handleRpcResponse({
+        kind: 'response',
+        messageId: acceptedLookup.content.messageId,
+        success: true,
+        data: dependencies
+    });
+
+    const deleteRequest = await waitForPostedMessage(2);
+    assert.strictEqual(deleteRequest.content.targetMethod, 'deleteColumns');
+    assert.deepStrictEqual(deleteRequest.content.payload, [
+        'demo_rows',
+        ['removed'],
+        dependencies
+    ]);
+    handleRpcResponse({
+        kind: 'response',
+        messageId: deleteRequest.content.messageId,
+        success: true
+    });
+    assert.strictEqual(await acceptedDelete, undefined);
 });
 
 it('confirms the named demo triggers before an edit can discard them', async () => {
@@ -283,7 +562,12 @@ it('confirms the named demo triggers before an edit can discard them', async () 
         kind: 'response',
         messageId: acceptedLookup.content.messageId,
         success: true,
-        data: { triggers: [{ identifier: 'demo_insert' }] }
+        data: {
+            triggers: [{
+                identifier: 'demo_insert',
+                sql: 'CREATE TRIGGER demo_insert'
+            }]
+        }
     });
 
     const editRequest = await waitForPostedMessage(2);
@@ -303,4 +587,46 @@ it('confirms the named demo triggers before an edit can discard them', async () 
     });
     assert.deepStrictEqual(await acceptedEdit, { updated: true });
     assert.strictEqual(confirmations.length, 2);
+});
+
+it('guards the exact current demo triggers named by the discard confirmation', async () => {
+    const webApiModulePath = '../../core/ui/modules/web-api.js';
+    const { backendApi, handleRpcResponse } = await import(webApiModulePath);
+    const staleTriggers = [{
+        identifier: 'demo_insert',
+        sql: 'CREATE TRIGGER demo_insert AS SELECT 1'
+    }];
+    const currentTriggers = [
+        ...staleTriggers,
+        {
+            identifier: 'demo_update',
+            sql: 'CREATE TRIGGER demo_update AS SELECT 2'
+        }
+    ];
+    confirmResult = true;
+
+    const edit = backendApi.editView(
+        'demo_view',
+        'SELECT 2 AS value',
+        false,
+        'CREATE VIEW demo_view AS SELECT 1 AS value',
+        staleTriggers
+    );
+    const lookup = await waitForPostedMessage(0);
+    handleRpcResponse({
+        kind: 'response',
+        messageId: lookup.content.messageId,
+        success: true,
+        data: { triggers: currentTriggers }
+    });
+
+    const editRequest = await waitForPostedMessage(1);
+    assert.deepStrictEqual(editRequest.content.payload[4], currentTriggers);
+    handleRpcResponse({
+        kind: 'response',
+        messageId: editRequest.content.messageId,
+        success: true,
+        data: { updated: true }
+    });
+    assert.deepStrictEqual(await edit, { updated: true });
 });

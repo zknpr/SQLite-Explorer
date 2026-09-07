@@ -413,7 +413,7 @@ describe('WITHOUT ROWID primary-key identity', () => {
                 'value',
                 'after'
             ),
-            /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+                /UPDATE trigger changed or removed.*primary-key identity.*target table.*rolled back/is
         );
         await assert.rejects(
             engine.replaceOversizedCell(
@@ -424,7 +424,7 @@ describe('WITHOUT ROWID primary-key identity', () => {
                 { storageClass: 'text', byteLength: 6 },
                 5
             ),
-            /UPDATE trigger changed or removed.*primary-key identity.*rolled back.*cannot safely identify/is
+            /UPDATE trigger changed or removed.*primary-key identity.*target table.*rolled back/is
         );
         assert.deepStrictEqual(
             (await engine.executeQuery(
@@ -537,6 +537,38 @@ describe('WITHOUT ROWID primary-key identity', () => {
             [
                 ['9007199254740992', 'lower'],
                 ['9007199254740993', 'edited']
+            ]
+        );
+    });
+
+    it('returns an exact unsafe auto-rowid and undoes only that inserted row', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE unsafe_auto_rowid (value TEXT); ' +
+            "INSERT INTO unsafe_auto_rowid(rowid, value) VALUES " +
+            "(9007199254740991, 'lower'), (9007199254740992, 'upper')"
+        );
+
+        const insertedRow = await engine.insertRowWithHistory!(
+            'unsafe_auto_rowid',
+            { value: 'inserted' }
+        );
+        assert.strictEqual(insertedRow.rowId, '9007199254740993');
+
+        await engine.undoModification({
+            description: 'Undo unsafe auto-rowid insert',
+            modificationType: 'row_insert',
+            targetTable: 'unsafe_auto_rowid',
+            targetRowId: insertedRow.rowId,
+            rowData: insertedRow.row,
+            insertedRow
+        });
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT CAST(rowid AS TEXT), value FROM unsafe_auto_rowid ORDER BY rowid'
+            ))[0].rows,
+            [
+                ['9007199254740991', 'lower'],
+                ['9007199254740992', 'upper']
             ]
         );
     });
@@ -655,7 +687,15 @@ describe('WITHOUT ROWID primary-key identity', () => {
             await engine.fetchTableCount('row_lifecycle', {}),
             { count: 0, isExact: true }
         );
-        assert.deepStrictEqual(deletedRows, [{ rowId: identity, row }]);
+        assert.deepStrictEqual(deletedRows, [{
+            rowId: identity,
+            row,
+            storageClasses: [
+                { column: 'namespace', storageClass: 'blob' },
+                { column: 'key', storageClass: 'text' },
+                { column: 'value', storageClass: 'text' }
+            ]
+        }]);
 
         await engine.undoModification({
             description: 'Delete PK row',
@@ -674,7 +714,8 @@ describe('WITHOUT ROWID primary-key identity', () => {
             description: 'Delete PK row',
             modificationType: 'row_delete',
             targetTable: 'row_lifecycle',
-            affectedRowIds: [identity]
+            affectedRowIds: [identity],
+            deletedRows
         });
         assert.deepStrictEqual(
             await engine.fetchTableCount('row_lifecycle', {}),

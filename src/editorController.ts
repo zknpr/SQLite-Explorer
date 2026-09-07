@@ -18,7 +18,11 @@ import { DocumentRegistry } from './documentRegistry';
 
 import { SupportsWriteMode, IsRemoteWorkspaceMode, DatabaseDocument, isAutoCommitEnabled } from './databaseModel';
 
-import { buildMethodProxy } from './core/rpc';
+import {
+  buildMethodProxy,
+  rejectPendingInvocations,
+  type ProxyWithPendingInvocations
+} from './core/rpc';
 import { WEBVIEW_TRANSPORT_SURFACES, assertWebviewTransportPayload } from './core/webview-transport';
 import { WebviewMessageHandler } from './webviewMessageHandler';
 import { HostBridge } from './hostBridge';
@@ -70,7 +74,7 @@ interface WebviewBridgeFunctions {
   updateCellEditBehavior(value: string): Promise<void>;
   refreshContent(
     filename: string,
-    connection?: { connected: boolean; readOnly: boolean }
+    connection?: { connected: boolean; readOnly: boolean; connectionGeneration: number }
   ): Promise<void>;
 }
 
@@ -161,7 +165,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
    */
   protected configureEventHandlers(document: DatabaseDocument) {
     // Update webview color scheme when VS Code theme changes
-    this._register(vsc.window.onDidChangeActiveColorTheme((theme) => {
+    document.registerLifecycleDisposable(vsc.window.onDidChangeActiveColorTheme((theme) => {
       const value = themeToCss(theme);
       for (const bridge of this.#iterateWebviewBridges(document.uri)) {
         bridge.updateColorScheme(value).catch(console.warn);
@@ -169,7 +173,7 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     }));
 
     // Update webview settings when configuration changes
-    this._register(vsc.workspace.onDidChangeConfiguration(e => {
+    document.registerLifecycleDisposable(vsc.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration(`${ConfigurationSection}.instantCommit`)) {
         document.autoCommitEnabled = isAutoCommitEnabled();
       }
@@ -201,6 +205,15 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
    */
   #createPanelDisposeHandler(webviewPanel: vsc.WebviewPanel, document: DatabaseDocument) {
     return () => {
+      const bridge = this.webviewBridges.get(webviewPanel);
+      const pending = (bridge as Partial<ProxyWithPendingInvocations<WebviewBridgeFunctions>> | undefined)
+        ?.__pendingInvocations;
+      if (pending) {
+        rejectPendingInvocations(
+          pending,
+          new Error('Webview closed before its RPC completed')
+        );
+      }
       this.webviewBridges.delete(webviewPanel);
       document.removeViewer(webviewPanel);
     };
@@ -214,7 +227,10 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       // If the webview panel is active and there is a pending save, save the document
       document.setViewerActive(webviewPanel, webviewPanel.active);
       if (webviewPanel.active && document.hasPendingSave) {
-        document.triggerSave().catch(() => { });
+        document.triggerSave().catch(error => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.outputChannel?.appendLine(`[Pending auto-save failed] ${message}`);
+        });
       }
     };
   }
@@ -407,20 +423,32 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
     // custom-document model per viewType, so each model needs the edit stream.
     // DatabaseDocument keeps the copied callbacks synchronized against its one
     // shared history tracker.
-    this._register(document.onDidChange(edit => {
+    document.registerLifecycleDisposable(document.onDidChange(edit => {
       this.#editEventEmitter.fire({ document, ...edit });
     }));
 
     // Update webviews when document content changes
-    this._register(document.onDidChangeContent(async change => {
+    document.registerLifecycleDisposable(document.onDidChangeContent(change => {
       const { filename } = document.fileParts;
       const connection = change.invalidateAllViewDocuments
-        ? { connected: true, readOnly: this.isReadOnly || document.isReadOnlyMode }
+        ? {
+            connected: true,
+            readOnly: this.isReadOnly || document.isReadOnlyMode,
+            connectionGeneration: document.connectionGeneration
+          }
         : undefined;
-      for (const panel of this.webviews.get(document.uri)) {
-        const bridge = this.webviewBridges.get(panel);
-        await bridge?.refreshContent(filename, connection);
-      }
+      void (async () => {
+        for (const panel of this.webviews.get(document.uri)) {
+          const bridge = this.webviewBridges.get(panel);
+          try {
+            await bridge?.refreshContent(filename, connection);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.outputChannel?.appendLine(`[Webview refresh] ${message}`);
+            console.error('SQLite Explorer webview refresh failed:', error);
+          }
+        }
+      })();
     }));
   }
 

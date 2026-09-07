@@ -98,12 +98,56 @@ function makeFakeBridge(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * The host never sends `updateCell` or `insertRow` as themselves: single-cell
+ * edits ride `updateCellBatch` and inserts ride `insertRowWithHistory`, the
+ * two methods that answer with the exact stored states the worker's replay
+ * requires. A fake written for the direct call answers the routed one on its
+ * behalf, with the states a real worker would have captured, so a test can
+ * keep describing the edit it makes rather than the wire it produces.
+ */
+function withHistoryRoutes<T extends Record<string, (args: any[], ...rest: any[]) => unknown>>(handlers: T): T {
+  const routed: Record<string, (args: any[], ...rest: any[]) => unknown> = { ...handlers };
+  if (!routed.updateCellBatch && routed.updateCell) {
+    routed.updateCellBatch = (args, ...rest) => {
+      const [table, updates] = args as [string, Array<Record<string, unknown>>];
+      return updates.map(update => {
+        const newRowId = routed.updateCell(
+          [table, update.rowId, update.column, update.value, update.originalValue], ...rest
+        );
+        return {
+          rowId: update.rowId,
+          newRowId: newRowId ?? update.rowId,
+          columnName: update.column,
+          priorValue: update.originalValue,
+          newValue: update.value,
+          operation: 'set',
+          priorState: { storageClass: 'text', value: update.originalValue },
+          postState: { storageClass: 'text', value: update.value }
+        };
+      });
+    };
+  }
+  if (!routed.insertRowWithHistory && routed.insertRow) {
+    routed.insertRowWithHistory = (args, ...rest) => {
+      const [table, data] = args as [string, Record<string, unknown>];
+      const rowId = routed.insertRow([table, data], ...rest);
+      return {
+        rowId,
+        row: { ...data },
+        storageClasses: Object.keys(data).map(column => ({ column, storageClass: 'text' }))
+      };
+    };
+  }
+  return routed as T;
+}
+
 function makeHost(handlers: Record<string, (args: unknown[]) => unknown>, bridgeOverrides = {}) {
-  const workerHandlers = {
+  const workerHandlers = withHistoryRoutes({
     initializeDatabase: () => ({ isReadOnly: false, storage: 'memory' }),
     ping: () => true,
     ...handlers
-  };
+  });
   const posted: Envelope[] = [];
   const workers: FakeWorker[] = [];
   const { bridge, saved } = makeFakeBridge(bridgeOverrides);
@@ -127,7 +171,11 @@ test('start boots an empty database and initialize reports connected', async () 
   assert.equal(posted[0].content.targetMethod, 'initializeDatabase');
   const init = await host.invoke('initialize', []);
   // `engine` drives the desktop status-bar badge; the empty startup DB is WASM.
-  assert.deepEqual(init, { connected: true, isReadOnly: false, filename: 'untitled.db', engine: 'wasm' });
+  // `connectionGeneration` is what the page's async intents capture: 1 after
+  // the boot open, and it advances only on a real (re)open.
+  assert.deepEqual(init, {
+    connected: true, isReadOnly: false, filename: 'untitled.db', engine: 'wasm', connectionGeneration: 1
+  });
 });
 
 test('unknown methods forward to the worker verbatim', async () => {
@@ -147,10 +195,15 @@ test('getExtensionSettings maps stored keys onto the VS Code wire shape', async 
   // defaultPageSize/maxInlineCellBytes/sidebarWidth were declared in
   // DEFAULT_SETTINGS and delivered to nobody, which is exactly why all three
   // read as inert settings; they are part of the wire shape now.
+  // cellEditBehaviorOptions/autoCommitSupported are the 1.7.2 keys the
+  // settings panel builds its controls from: no VS Code editor tab here, and
+  // auto-commit is real (unlike the web demo).
   assert.deepEqual(settings, {
     autoCommit: true,
     cellEditBehavior: 'modal',
     fileOperations: 'native',
+    cellEditBehaviorOptions: ['inline', 'modal'],
+    autoCommitSupported: true,
     theme: 'system',
     defaultPageSize: 5000,
     maxInlineCellBytes: 1048576,
@@ -211,10 +264,17 @@ test('updateCell records an undoable modification; triggerUndo replays it and re
   const mod = (calls[0] as unknown[])[0] as Record<string, unknown>;
   assert.equal(mod.modificationType, 'cell_update');
   assert.equal(mod.targetTable, 'users');
-  assert.equal(mod.targetRowId, 7);
-  assert.equal(mod.targetColumn, 'name');
-  assert.equal(mod.priorValue, 'Alice');
-  assert.equal(mod.newValue, 'Alice2');
+  // A single-cell edit rides updateCellBatch (the host never sends updateCell
+  // itself), so the record is the batch shape: one affected cell carrying the
+  // worker's exact prior/post states, which the replay refuses to run without.
+  const cells = mod.affectedCells as Array<Record<string, unknown>>;
+  assert.equal(cells.length, 1);
+  assert.equal(cells[0].rowId, 7);
+  assert.equal(cells[0].columnName, 'name');
+  assert.equal(cells[0].priorValue, 'Alice');
+  assert.equal(cells[0].newValue, 'Alice2');
+  assert.deepEqual(cells[0].priorState, { storageClass: 'text', value: 'Alice' });
+  assert.deepEqual(cells[0].postState, { storageClass: 'text', value: 'Alice2' });
 });
 
 test('triggerRedo replays the undone modification via redoModification', async () => {
@@ -321,33 +381,44 @@ test('updateCellBatch descriptor survives undo→redo intact: affectedCells (inc
   assert.equal(cells[0].operation, 'set');
 });
 
-test('insertRow records rowData for redo; undo deletes via targetRowId, redo re-inserts via rowData', async () => {
+test('insertRow rides insertRowWithHistory and records the exact inserted image for undo and redo', async () => {
   const undone: unknown[][] = [];
   const redone: unknown[][] = [];
-  const { host } = makeHost({
-    insertRow: () => 42,   // worker returns only the new rowId, never the row data
+  const { host, posted } = makeHost({
+    insertRow: () => 42,   // the direct call's answer; the routed fake wraps it in the post-image
     undoModification: (args) => { undone.push(args); return { success: true }; },
     redoModification: (args) => { redone.push(args); return { success: true }; }
   });
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
 
-  await host.invoke('insertRow', ['users', { name: 'Bob' }]);
+  assert.equal(await host.invoke('insertRow', ['users', { name: 'Bob' }]), 42);
   assert.equal(host.hasUnsavedChanges(), true);
+  // The wire carries the history-capturing method, with the undo memory
+  // budget the worker enforces before releasing the insert.
+  const sent = posted.at(-1)!.content;
+  assert.equal(sent.targetMethod, 'insertRowWithHistory');
+  assert.equal(sent.payload[0], 'users');
+  assert.deepEqual(sent.payload[1], { name: 'Bob' });
+  assert.ok(Number.isSafeInteger(sent.payload[3]) && (sent.payload[3] as number) > 0);
 
   await host.invoke('triggerUndo', []);
   const undoMod = (undone[0] as unknown[])[0] as Record<string, unknown>;
   assert.equal(undoMod.modificationType, 'row_insert');
   assert.equal(undoMod.targetTable, 'users');
   assert.equal(undoMod.targetRowId, 42);
-  assert.deepEqual(undoMod.rowData, { name: 'Bob' });   // needed for redo, not undo itself
+  assert.deepEqual(undoMod.rowData, { name: 'Bob' });
+  // The worker's replay deletes by exact state: it refuses an entry without
+  // the post-image (LegacyRowHistoryError), so the record must carry it.
+  assert.deepEqual(undoMod.insertedRow, {
+    rowId: 42, row: { name: 'Bob' }, storageClasses: [{ column: 'name', storageClass: 'text' }]
+  });
 
   await host.invoke('triggerRedo', []);
   assert.equal(redone.length, 1);
   const redoMod = (redone[0] as unknown[])[0] as Record<string, unknown>;
   assert.equal(redoMod.modificationType, 'row_insert');
-  assert.deepEqual(redoMod.rowData, { name: 'Bob' });   // same recorded entry — redoModification's
-                                                          // row_insert case reads `rowData`, not args
+  assert.deepEqual((redoMod.insertedRow as Record<string, unknown>).row, { name: 'Bob' });
 });
 
 test('deleteRows records deletedRows from the worker result for undo', async () => {
@@ -368,14 +439,12 @@ test('deleteRows records deletedRows from the worker result for undo', async () 
   assert.deepEqual(mod.deletedRows, deleted);
 });
 
-// Self-discovered while auditing insertRow's rowData gap (see desktop-host.js
-// comment on the deleteRows case) — not one of the review's 3 listed critical
-// defects, fixed and covered separately. redoModification's row_delete case
-// reads `affectedRowIds` (worker.js ~line 2202), not `deletedRows`; without
-// it, redo after undo silently deletes nothing.
-test('deleteRows records affectedRowIds so triggerRedo can re-delete after undo', async () => {
+// redoModification's row_delete case re-deletes by matching the exact
+// `deletedRows` images (the 1.7.2 replay), so the same recorded entry must
+// reach it intact after an undo.
+test('deleteRows keeps its exact images through undo→redo so triggerRedo can re-delete', async () => {
   const redone: unknown[][] = [];
-  const deleted = [{ rowId: 1, row: { name: 'Alice' } }];
+  const deleted = [{ rowId: 1, row: { name: 'Alice' }, storageClasses: [{ column: 'name', storageClass: 'text' }] }];
   const { host } = makeHost({
     deleteRows: () => deleted,
     undoModification: () => ({ success: true }),
@@ -388,7 +457,8 @@ test('deleteRows records affectedRowIds so triggerRedo can re-delete after undo'
   await host.invoke('triggerRedo', []);
   assert.equal(redone.length, 1);
   const mod = (redone[0] as unknown[])[0] as Record<string, unknown>;
-  assert.deepEqual(mod.affectedRowIds, [1]);
+  assert.deepEqual(mod.deletedRows, deleted);
+  assert.equal('affectedRowIds' in mod, false);
 });
 
 test('DDL operations are barriers: undo stops at them', async () => {
@@ -862,6 +932,7 @@ function makeNativeBridgeMembers(
   const requireLive = (dbId: string) => {
     if (!live.has(dbId)) throw new Error(`ERR_NATIVE_UNKNOWN_DB: ${String(dbId)}`);
   };
+  handlers = withHistoryRoutes(handlers);
   const members = {
     nativeAvailable: async () => opts.available ?? true,
     nativeOpen: async (path: string, readOnly: boolean) => {
@@ -1331,7 +1402,8 @@ test('a genuine BEGIN failure fails the mutation before it executes', async () =
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
   await host.openFromShellPath('/tmp/y.db');
   await assert.rejects(() => host.invoke('updateCell', ['t', 1, 'c', 'v', 'o', 1048576]), /database is locked/);
-  assert.equal(nativeMethods(nativeLog).includes('updateCell'), false);
+  // The edit rides updateCellBatch on the wire; neither spelling may have gone out.
+  assert.equal(nativeMethods(nativeLog).some(m => m === 'updateCell' || m === 'updateCellBatch'), false);
   assert.equal(host.hasUnsavedChanges(), false);
 });
 
@@ -1454,10 +1526,13 @@ test('native export dialog cancel ({success:false}) is a clean no-op — no erro
   await host.start();
   host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
   await host.openFromShellPath('/tmp/y.db');
+  // `{success:false, cancelled:true}` is the shape export.js and the blob
+  // inspector read (the VS Code host's saveFile contract): "Export cancelled",
+  // not "Export failed".
   const db = await host.invoke('exportDb', ['y.db']) as Record<string, unknown>;
-  assert.deepEqual(db, { success: false, savedAs: undefined });
+  assert.deepEqual(db, { success: false, cancelled: true });
   const table = await host.invoke('exportTable', [{ table: 't' }, ['a'], null, null, { format: 'csv' }]) as Record<string, unknown>;
-  assert.deepEqual(table, { success: false, savedAs: undefined });
+  assert.deepEqual(table, { success: false, cancelled: true });
 });
 
 test('native empty-table export surfaces as a successful (0-byte) export, not an error', async () => {
@@ -1565,7 +1640,7 @@ test('outbound native envelopes are frame-codec encoded: Uint8Array args become 
   const innerRpc = members.nativeRpc;
   members.nativeRpc = async (dbId: string, json: string) => {
     const envelope = JSON.parse(json) as Envelope;
-    if (envelope.content.targetMethod === 'updateCell') rawJson = json;
+    if (envelope.content.targetMethod === 'updateCellBatch') rawJson = json;
     return innerRpc(dbId, json);
   };
   const { host } = makeHost({}, {
@@ -1579,9 +1654,11 @@ test('outbound native envelopes are frame-codec encoded: Uint8Array args become 
   // A blob write: the bytes must cross as the codec's exact-two-key marker,
   // which is what the sidecar's reader decodes back into a Uint8Array.
   await host.invoke('updateCell', ['t', 1, 'c', new Uint8Array([7, 8]), null, 1048576])
-    .catch(() => { /* no updateCell fake — the send is what matters */ });
-  const parsed = JSON.parse(rawJson) as { content: { payload: unknown[] } };
-  assert.deepEqual(parsed.content.payload[3], { __type: 'Uint8Array', base64: 'Bwg=' });
+    .catch(() => { /* no updateCellBatch fake — the send is what matters */ });
+  // The single edit rides updateCellBatch: the value sits inside the first
+  // update entry rather than at the updateCell argument position.
+  const parsed = JSON.parse(rawJson) as { content: { payload: [string, Array<{ value: unknown }>] } };
+  assert.deepEqual(parsed.content.payload[1][0].value, { __type: 'Uint8Array', base64: 'Bwg=' });
 });
 
 // ============================================================================
@@ -2325,7 +2402,10 @@ test('an undo replay failure that KEEPS the transaction restores the stepped ent
   assert.equal(res.performed, true);
   assert.equal(undoPayloads.length, 2);
   assert.deepEqual(undoPayloads[1], undoPayloads[0]);
-  assert.equal((undoPayloads[0] as { newValue?: unknown }).newValue, 'v2');
+  assert.equal(
+    (undoPayloads[0] as { affectedCells: Array<{ newValue?: unknown }> }).affectedCells[0].newValue,
+    'v2'
+  );
   assert.deepEqual(txn.applied, ['BEGIN']);               // one txn throughout
 });
 
@@ -2514,13 +2594,17 @@ test('setActiveDb restores the incoming database\'s UI state and preserves the o
 
   await host.openFromShellPath('/tmp/b.db');
   const dbB = host.activeDatabaseId()!;
-  // B starts clean: nothing of A's survived into it.
+  // B starts clean: nothing of A's survived into it. The column dictionaries
+  // are null-prototype (state.js createSafeColumnState), so a column named
+  // `__proto__` stays a key — hence the prototype-exact comparison.
   assert.equal(state.selectedTable, null);
-  assert.deepEqual(state.columnFilters, {});
+  assert.deepEqual(state.columnFilters, Object.create(null));
+  assert.equal(Object.getPrototypeOf(state.columnFilters), null);
   assert.equal(state.filterQuery, '');
   assert.equal(state.selectedRowIds.size, 0);
   assert.notEqual(state.selectedRowIds, aRowIds);          // a fresh Set, not A's
-  assert.deepEqual(state.columnWidths, {});
+  assert.deepEqual(state.columnWidths, Object.create(null));
+  assert.equal(Object.getPrototypeOf(state.columnWidths), null);
   assert.deepEqual(state.gridData, []);
   assert.deepEqual(state.schemaCache, { tables: [], views: [], indexes: [] });
   assert.equal(state.sidebarFilter, '');

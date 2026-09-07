@@ -88,13 +88,13 @@ describe('paged count policy (shared layer)', () => {
   it('escapes the upper-bound query identifier', () => {
     assert.strictEqual(
       buildCountUpperBoundSql('fixtures'),
-      'SELECT (SELECT CAST(min(rowid) AS TEXT) FROM "fixtures"), ' +
-      '(SELECT CAST(max(rowid) AS TEXT) FROM "fixtures")'
+      'SELECT (SELECT CAST(min(rowid) AS TEXT) FROM main."fixtures"), ' +
+      '(SELECT CAST(max(rowid) AS TEXT) FROM main."fixtures")'
     );
     assert.strictEqual(
       buildCountUpperBoundSql('we"ird'),
-      'SELECT (SELECT CAST(min(rowid) AS TEXT) FROM "we""ird"), ' +
-      '(SELECT CAST(max(rowid) AS TEXT) FROM "we""ird")'
+      'SELECT (SELECT CAST(min(rowid) AS TEXT) FROM main."we""ird"), ' +
+      '(SELECT CAST(max(rowid) AS TEXT) FROM main."we""ird")'
     );
   });
 
@@ -207,12 +207,12 @@ describe('desktop engine paged count policy', () => {
       const details = plan.map((row: unknown[]) => String(row[3]));
 
       assert.strictEqual(
-        details.filter((detail: string) => detail === 'SEARCH endpoint_plan').length,
+        details.filter((detail: string) => detail === 'SEARCH main.endpoint_plan').length,
         2,
         `each endpoint must be a single b-tree search; plan: ${details.join(' | ')}`
       );
       assert.ok(
-        !details.includes('SCAN endpoint_plan'),
+        !details.includes('SCAN main.endpoint_plan'),
         `the span query must not scan the table; plan: ${details.join(' | ')}`
       );
       assert.deepStrictEqual(db.exec(sql)[0]?.values, [['3', '11']]);

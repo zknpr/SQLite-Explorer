@@ -17,7 +17,10 @@ import {
     CellEditPolicyError,
     DEFAULT_MAX_CELL_EDIT_BYTES,
     formatOversizedCellReplacementWarning,
-    isOversizedCellReplacementConflictError
+    isOversizedCellReplacementConflictError,
+    isOversizedCellReplacementRequiredError,
+    MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS,
+    OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE
 } from '../../../src/core/cell-edit-policy.ts';
 
 export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
@@ -115,13 +118,14 @@ export const backendApi = {
     saveSidebarState: (side, position) => sendRpcRequest('saveSidebarState', [side, position]),
     exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
     refreshFile: () => sendRpcRequest('refreshFile', []),
-    fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
     exportTable: (dbParams, columns, dbOptions, tableStore, exportOptions, extras) =>
         sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
 
     // Database operations
     updateCell: async (table, rowId, column, value, originalValue) => {
-        while (true) {
+        // Bounded like web-api.js: a prior that keeps changing under the
+        // confirmation is reported, not chased forever.
+        for (let attempt = 1; attempt <= MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS; attempt++) {
             const metadata = await sendRpcRequest('getCellMetadata', [{
                 table,
                 rowId,
@@ -152,19 +156,39 @@ export const backendApi = {
                         DEFAULT_MAX_CELL_EDIT_BYTES
                     ]);
                 } catch (error) {
-                    if (isOversizedCellReplacementConflictError(error)) continue;
+                    if (isOversizedCellReplacementConflictError(error)) {
+                        if (attempt < MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS) continue;
+                        throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE, {
+                            cause: error
+                        });
+                    }
                     throw error;
                 }
             }
-            return sendRpcRequest('updateCell', [
-                table,
-                rowId,
-                column,
-                value,
-                originalValue,
-                DEFAULT_MAX_CELL_EDIT_BYTES
-            ]);
+            try {
+                return await sendRpcRequest('updateCell', [
+                    table,
+                    rowId,
+                    column,
+                    value,
+                    originalValue,
+                    DEFAULT_MAX_CELL_EDIT_BYTES
+                ]);
+            } catch (error) {
+                // The prior grew past the limit between the metadata read and
+                // the write (a console script, another window): back through
+                // the confirmation rather than failing the edit — the same
+                // re-entry hostBridge.ts performs for VS Code.
+                if (isOversizedCellReplacementRequiredError(error)) {
+                    if (attempt < MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS) continue;
+                    throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE, {
+                        cause: error
+                    });
+                }
+                throw error;
+            }
         }
+        throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE);
     },
     getCellMetadata: (target) => sendRpcRequest('getCellMetadata', [target]),
     openCellReadSession: (target) => sendRpcRequest('openCellReadSession', [target]),
@@ -194,26 +218,36 @@ export const backendApi = {
      *    column-drop undo, so ⌘Z will not bring the column back. Saying so
      *    before the drop is the difference between a decision and a surprise.
      *
-     * Views and triggers that mention the column are ADVISORY: SQLite decides,
-     * and the match is a name match, so they are reported as "may" and never
-     * used to refuse.
+     * The list comes from the worker's `findDependentIndexes` (SQLite itself
+     * is the parser), and the exact definitions go back with the drop: the
+     * worker re-derives the list inside the drop's savepoint and refuses if
+     * an index changed while this prompt was open. Views and triggers that
+     * reference the column are SQLite's own refusal; the worker names them
+     * in that error (describeColumnDropFailure), which matters on the native
+     * engine, whose message alone is "SQL logic error".
      */
     deleteColumns: async (table, columns) => {
-        const dependencies = await sendRpcRequest('findColumnDependencies', [table, columns]);
-        const indexes = dependencies?.indexes ?? [];
-        const dependentObjects = dependencies?.dependentObjects ?? [];
+        const dependentIndexes = await sendRpcRequest('findDependentIndexes', [table, columns]);
+        if (!Array.isArray(dependentIndexes)) {
+            throw new Error('Invalid dependent-index response from the worker');
+        }
+        const indexNames = dependentIndexes.map(index => {
+            if (
+                !index
+                || typeof index !== 'object'
+                || typeof index.identifier !== 'string'
+                || typeof index.sql !== 'string'
+            ) {
+                throw new Error('Invalid dependent-index definition from the worker');
+            }
+            return index.identifier;
+        });
         const columnList = columns.join(', ');
         const lines = [`Drop ${columns.length === 1 ? 'column' : 'columns'} ${columnList} from "${table}"?`, ''];
-        if (indexes.length > 0) {
+        if (indexNames.length > 0) {
             lines.push(
                 `These indexes depend on ${columns.length === 1 ? 'it' : 'them'} and will be dropped `
-                + `first: ${indexes.join(', ')}.`
-            );
-        }
-        if (dependentObjects.length > 0) {
-            lines.push(
-                'These schema objects mention the name and may block the drop: '
-                + `${dependentObjects.map(object => `${object.type} ${object.identifier}`).join(', ')}.`
+                + `first: ${indexNames.join(', ')}.`
             );
         }
         lines.push('This cannot be undone with ' + modLabel('Z') + ' — it ends the undo history for this database.');
@@ -223,17 +257,16 @@ export const backendApi = {
             confirmLabel: columns.length === 1 ? 'Drop column' : 'Drop columns'
         });
         if (!approved) return { cancelled: true };
-        // OMIT the third argument rather than pass `undefined` for it: on the
-        // native lane the argument list is serialised as JSON, which has no
-        // `undefined`, so a trailing hole would arrive at the worker as an
-        // explicit `null` and trip its `dropDependentIndexes !== undefined`
-        // guard — the common case (a column with no dependent index) failed
-        // for every desktop user. `sendRpcRequest` also truncates trailing
-        // holes, but building the list correctly is what makes the intent
-        // legible here.
+        // OMIT the third argument when there is nothing to confirm rather than
+        // pass `undefined`: on the native lane the argument list is serialised
+        // as JSON, which has no `undefined`, so a trailing hole would arrive
+        // at the worker as an explicit `null` — which its confirmation
+        // validator rightly refuses as "not an array". `sendRpcRequest` also
+        // truncates trailing holes, but building the list correctly is what
+        // makes the intent legible here.
         return sendRpcRequest(
             'deleteColumns',
-            indexes.length > 0 ? [table, columns, indexes] : [table, columns]
+            dependentIndexes.length > 0 ? [table, columns, dependentIndexes] : [table, columns]
         );
     },
     createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
@@ -323,10 +356,23 @@ export const backendApi = {
                 `Inline media preview is unavailable for ${sourceBytes}: it exceeds the ` +
                 `${MAX_WEBVIEW_BINARY_VALUE_BYTES}-byte webview binary limit, and the desktop ` +
                 'shell exposes no host-owned temporary file to render from. ' +
-                'Use Load More on the Hex preview to read the value in chunks.'
+                'Use Load More in the cell inspector to read the value in chunks.'
         });
     },
+    cancelCellMediaPreview: () => Promise.resolve(),
     releaseCellMediaPreview: () => Promise.resolve(),
+    /**
+     * The grid asks before materialising a very large selection. In-page like
+     * every other desktop confirmation: `window.confirm` does not present in
+     * this webview (see modals.js confirmDestructiveAction).
+     */
+    confirmLargeSelection: (itemCount, unit) => confirmDestructiveAction({
+        title: 'Large selection',
+        message:
+            `Selecting ${Number(itemCount).toLocaleString()} ${unit} may slow or freeze this window. `
+            + 'Use Export for large data operations.',
+        confirmLabel: 'Continue'
+    }),
     openCellEditor: (_params, _rowId, _colName, _colTypes, options = {}) => Promise.resolve({
         success: false,
         message:

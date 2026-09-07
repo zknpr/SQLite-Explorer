@@ -13,7 +13,7 @@ import { ConfigurationSection, ExtensionId, getMaxInlineCellBytes, getMaxUndoMem
 import { IsCursorIDE } from './helpers';
 
 import type { DatabaseDocument } from './databaseModel';
-import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, TableQueryOptions, TableCountOptions, TableCountResult, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity, ColumnDropTableState } from './core/types';
+import type { CellValue, RecordId, DialogConfig, DialogButton, CellUpdate, CellUpdateResult, TableQueryOptions, TableCountOptions, TableCountResult, QueryResultSet, WebviewQueryResultSet, SchemaSnapshot, ColumnMetadata, CellContentType, DbParams, ExportOptions, ViewDefinitionIntent, ViewTriggerDefinition, TableIdentity, ColumnDropTableState, CellReadTarget, CellReadSession, CellReadChunk } from './core/types';
 import { prepareCellUpdateForStorage } from './core/json-utils';
 import {
   assertMutableRecordId,
@@ -24,17 +24,28 @@ import {
   isPrimaryKeyRecordId,
   primaryKeyColumnsFromTableInfo
 } from './core/row-identity';
-import { escapeIdentifier, validateRowId } from './core/sql-utils';
+import {
+  assertUsableSqlIdentifier,
+  escapeIdentifier,
+  escapeMainIdentifier,
+  validateRowId
+} from './core/sql-utils';
 import {
   assertColumnDropHistoryFitsUndoBudget,
+  assertTableSchemaStateCurrent,
   buildColumnDropHistorySizePreflight,
   COLUMN_DROP_TABLE_STATE_SQL,
   mapColumnDropTableState
 } from './core/column-drop';
 import { runReadSnapshot } from './core/operation-serializer';
-import { isViewDefinitionConflictError } from './core/view-utils';
+import {
+  isViewDefinitionConflictError,
+  MAX_VIEW_DEFINITION_CONFIRMATION_ATTEMPTS,
+  VIEW_DEFINITION_RETRY_EXHAUSTED_MESSAGE
+} from './core/view-utils';
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
-import { assertDocumentModification } from './core/modification-validation';
+import { normalizeTablePageOptions } from './core/table-pagination';
+import { normalizeCellTextEncoding } from './core/cell-read';
 import { estimateUndoMemoryBytes } from './core/undo-history';
 import type { CellMaterializationService } from './cellMaterialization';
 import {
@@ -44,12 +55,21 @@ import {
   DEFAULT_MAX_CELL_EDIT_BYTES,
   formatOversizedCellReplacementWarning,
   isOversizedCellReplacementConflictError,
-  isOversizedCellReplacementRequiredError
+  isOversizedCellReplacementRequiredError,
+  MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS,
+  OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE
 } from './core/cell-edit-policy';
 
 interface ActiveCellMediaPreview {
+  requestId: string;
   previewId: string;
   uri: vsc.Uri;
+  panel: vsc.WebviewPanel;
+}
+
+interface ActiveCellMediaRequest {
+  requestId: string;
+  controller: AbortController;
   panel: vsc.WebviewPanel;
 }
 
@@ -95,6 +115,10 @@ function cloneColumnDropTableState(state: ColumnDropTableState): ColumnDropTable
   return {
     tableSql: state.tableSql,
     columns: [...state.columns],
+    ...(state.generatedColumns
+      ? { generatedColumns: [...state.generatedColumns] }
+      : {}),
+    ...(state.dataVersion !== undefined ? { dataVersion: state.dataVersion } : {}),
     identity: state.identity.kind === 'rowid'
       ? { kind: 'rowid' }
       : {
@@ -108,7 +132,8 @@ function cloneColumnDropTableState(state: ColumnDropTableState): ColumnDropTable
 interface CellMediaPreviewOptions {
   type: CellContentType;
   webviewId: string;
-  /** Informational only; the host re-reads authoritative cell metadata. */
+  requestId: string;
+  /** UI snapshot length; the host rejects drift against authoritative reads. */
   sourceByteLength?: number;
 }
 
@@ -131,6 +156,47 @@ const OVERSIZED_MEDIA_TYPES: Readonly<Record<string, {
   'video/avi': { type: 'video', extension: 'avi' },
   'application/pdf': { type: 'pdf', extension: 'pdf' }
 };
+
+function bytesMatch(bytes: Uint8Array, offset: number, expected: readonly number[]): boolean {
+  return offset >= 0
+    && offset + expected.length <= bytes.byteLength
+    && expected.every((value, index) => bytes[offset + index] === value);
+}
+
+/** Validate UI media classification against bytes from the materialization snapshot. */
+function mediaSignatureMatches(mime: string, bytes: Uint8Array): boolean {
+  const ascii = (offset: number, value: string) => bytesMatch(
+    bytes,
+    offset,
+    Array.from(value, character => character.charCodeAt(0))
+  );
+  switch (mime) {
+    case 'image/png': return bytesMatch(bytes, 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    case 'image/jpeg': return bytesMatch(bytes, 0, [0xff, 0xd8, 0xff]);
+    case 'image/gif': return ascii(0, 'GIF8');
+    case 'image/bmp': return ascii(0, 'BM');
+    case 'image/webp': return ascii(0, 'RIFF') && ascii(8, 'WEBP');
+    case 'application/pdf': return ascii(0, '%PDF-');
+    case 'audio/mpeg':
+      return ascii(0, 'ID3')
+        || bytesMatch(bytes, 0, [0xff, 0xfb])
+        || bytesMatch(bytes, 0, [0xff, 0xf3])
+        || bytesMatch(bytes, 0, [0xff, 0xf2]);
+    case 'audio/ogg': return ascii(0, 'OggS');
+    case 'audio/wav': return ascii(0, 'RIFF') && ascii(8, 'WAVE');
+    case 'audio/flac': return ascii(0, 'fLaC');
+    case 'video/webm': return bytesMatch(bytes, 0, [0x1a, 0x45, 0xdf, 0xa3]);
+    case 'video/avi': return ascii(0, 'RIFF') && ascii(8, 'AVI ');
+    case 'video/mp4':
+    case 'video/quicktime': {
+      if (bytes.byteLength < 12 || !ascii(4, 'ftyp')) return false;
+      const brand = new TextDecoder('ascii').decode(bytes.subarray(8, 12));
+      const quickTime = brand === 'qt  ' || brand.startsWith('M4A');
+      return mime === 'video/quicktime' ? quickTime : !quickTime;
+    }
+    default: return false;
+  }
+}
 
 /** A webview result has one canonical row matrix; sql.js aliases stay internal. */
 export function toWebviewQueryResultSet(result: QueryResultSet): WebviewQueryResultSet {
@@ -174,6 +240,51 @@ function pathLeaf(value: string): string {
     withoutTrailingSeparators.lastIndexOf('\\')
   );
   return withoutTrailingSeparators.slice(separator + 1);
+}
+
+function isMissingWorkspaceResource(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return code === 'FileNotFound' || code === 'ENOENT';
+}
+
+/** Stage provider output beside the destination so a failed write cannot truncate it. */
+async function writeWorkspaceFileAtomically(
+  target: vsc.Uri,
+  bytes: Uint8Array
+): Promise<void> {
+  const leaf = pathLeaf(target.path);
+  if (leaf.length === 0) throw new Error('Cannot save a file without a destination name');
+  const temporary = vsc.Uri.joinPath(
+    uriDirectory(target),
+    `.${leaf}.${crypto.randomUUID()}.tmp`
+  );
+  if (temporary.toString() === target.toString()) {
+    throw new Error('The workspace provider did not produce a distinct temporary save URI');
+  }
+
+  let temporaryMayExist = false;
+  try {
+    // Mark this before awaiting: a provider is allowed to create or truncate a
+    // resource and then reject its write promise.
+    temporaryMayExist = true;
+    await vsc.workspace.fs.writeFile(temporary, bytes);
+    await vsc.workspace.fs.rename(temporary, target, { overwrite: true });
+    temporaryMayExist = false;
+  } catch (error) {
+    if (temporaryMayExist) {
+      try {
+        await vsc.workspace.fs.delete(temporary, { recursive: false, useTrash: false });
+      } catch (cleanupError) {
+        if (!isMissingWorkspaceResource(cleanupError)) {
+          throw new AggregateError(
+            [error, cleanupError],
+            'Saving failed and the private temporary file could not be removed'
+          );
+        }
+      }
+    }
+    throw error;
+  }
 }
 
 // Type for Uint8Array-like objects (transferable over postMessage)
@@ -240,8 +351,7 @@ const HISTORY_RECORDING_METHODS = [
   'dropView',
   'updateCellBatch',
   'addColumn',
-  'setPragma',
-  'fireEditEvent'
+  'setPragma'
 ] as const;
 
 /** Methods whose complete host-side lifecycle must precede a paged snapshot. */
@@ -254,7 +364,7 @@ const TRACKED_MUTATION_METHODS = [
 const HISTORY_RECORDING_METHOD_NAMES = new Set<string>(HISTORY_RECORDING_METHODS);
 
 /** Keep this paired with the settings modal's stored-vs-session-only wording. */
-const PAGED_PERSISTENT_PRAGMAS = new Set(['journal_mode', 'auto_vacuum']);
+const WASM_PERSISTENT_PRAGMAS = new Set(['journal_mode', 'auto_vacuum']);
 
 function sameEffectivePragmaValue(left: CellValue, right: CellValue): boolean {
   return typeof left === 'string' && typeof right === 'string'
@@ -272,7 +382,7 @@ export class HostBridge implements ToastService {
   private activePreviewController: AbortController | undefined;
   private activeCellMaterializationController: AbortController | undefined;
   private readonly activeCellMediaPreviews = new Map<string, ActiveCellMediaPreview>();
-  private readonly activeCellMediaControllers = new Map<string, AbortController>();
+  private readonly activeCellMediaRequests = new Map<string, ActiveCellMediaRequest>();
   private readonly mediaPanelSubscriptions = new Map<vsc.WebviewPanel, vsc.Disposable>();
 
   constructor(
@@ -370,11 +480,15 @@ export class HostBridge implements ToastService {
       COLUMN_DROP_TABLE_STATE_SQL,
       [table, table]
     );
+    const dataVersionResult = await dbOps.executeQuery('PRAGMA data_version');
+    const dataVersion = Number(dataVersionResult[0]?.rows[0]?.[0]);
     return mapColumnDropTableState(
       table,
       columns.map(column => column.identifier),
       identity,
-      result[0]?.rows ?? []
+      result[0]?.rows ?? [],
+      columns.filter(column => column.isGenerated).map(column => column.identifier),
+      dataVersion
     );
   }
 
@@ -394,6 +508,9 @@ export class HostBridge implements ToastService {
         connected: true,
         filename: document.fileParts.filename,
         readOnly: this.isReadOnly,
+        ...(Number.isSafeInteger(document.connectionGeneration)
+          ? { connectionGeneration: document.connectionGeneration }
+          : {}),
       };
     }
     throw new Error("Document not found in webviews");
@@ -411,6 +528,23 @@ export class HostBridge implements ToastService {
       return await document.databaseOperations.ping();
     }
     return false;
+  }
+
+  /** Expose the engine's bounded snapshot reader without materializing a cell in the host. */
+  async openCellReadSession(target: CellReadTarget): Promise<CellReadSession> {
+    return this.ensureDatabaseInitialized().openCellReadSession(target);
+  }
+
+  async readCellChunk(
+    sessionId: string,
+    byteOffset: number,
+    maxBytes: number
+  ): Promise<CellReadChunk> {
+    return this.ensureDatabaseInitialized().readCellChunk(sessionId, byteOffset, maxBytes);
+  }
+
+  async closeCellReadSession(sessionId: string): Promise<void> {
+    await this.ensureDatabaseInitialized().closeCellReadSession(sessionId);
   }
 
   /**
@@ -454,17 +588,20 @@ export class HostBridge implements ToastService {
     const byteLengthExpression =
       `CASE WHEN ${escapedColumn} IS NULL THEN 0 ` +
       `ELSE length(CAST(${escapedColumn} AS BLOB)) END`;
+    let databaseTextEncoding: ReturnType<typeof normalizeCellTextEncoding> | undefined;
 
-    while (true) {
+    for (let attempt = 1; attempt <= MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS; attempt++) {
       // The CASE expression is the containment boundary for edit history: a
       // bounded prior follows the existing path, while an oversized prior is
       // represented only by typeof()/exact byte length and is never returned.
       const current = await dbOps.executeQuery(
         `SELECT typeof(${escapedColumn}), ${byteLengthExpression}, ` +
         `CASE WHEN typeof(${escapedColumn}) IN ('text', 'blob') ` +
-        `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END ` +
-        `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql} LIMIT 1`,
-        [editLimitBytes, ...predicate.params]
+        `AND ${byteLengthExpression} > ? THEN NULL ELSE ${escapedColumn} END, ` +
+        `CASE WHEN typeof(${escapedColumn}) = 'text' ` +
+        `AND ${byteLengthExpression} <= ? THEN CAST(${escapedColumn} AS BLOB) END ` +
+        `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 1`,
+        [editLimitBytes, editLimitBytes, ...predicate.params]
       );
       this.assertConnectionGeneration(connectionGeneration);
       const currentRow = current[0]?.rows[0];
@@ -523,7 +660,9 @@ export class HostBridge implements ToastService {
             modificationType: 'cell_update',
             targetTable: table,
             targetRowId: rowId,
-            ...(isPrimaryKeyRecordId(rowId) ? { newTargetRowId } : {}),
+            ...(isPrimaryKeyRecordId(rowId) || newTargetRowId !== rowId
+              ? { newTargetRowId }
+              : {}),
             targetColumn: column,
             newValue: value,
             operation: 'set',
@@ -534,8 +673,41 @@ export class HostBridge implements ToastService {
         } catch (error) {
           // Metadata is exactly what the user confirmed. Re-read and re-confirm
           // if another writer changed it while the modal was open.
-          if (isOversizedCellReplacementConflictError(error)) continue;
+          if (isOversizedCellReplacementConflictError(error)) {
+            if (attempt < MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS) continue;
+            throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE, {
+              cause: error
+            });
+          }
           throw error;
+        }
+      }
+
+      let observedPriorValue = currentRow[2] as CellValue;
+      if (storageClass === 'text') {
+        const rawText = currentRow[3];
+        if (!(rawText instanceof Uint8Array)) {
+          throw new Error(`SQLite returned invalid raw TEXT metadata for ${table}.${column}`);
+        }
+        if (!databaseTextEncoding) {
+          const encoding = await dbOps.executeQuery('PRAGMA encoding');
+          this.assertConnectionGeneration(connectionGeneration);
+          databaseTextEncoding = normalizeCellTextEncoding(encoding[0]?.rows[0]?.[0]);
+        }
+        let decoded: string;
+        try {
+          decoded = new TextDecoder(databaseTextEncoding, {
+            fatal: true,
+            ignoreBOM: true
+          }).decode(rawText);
+        } catch {
+          decoded = '';
+        }
+        if (decoded !== currentRow[2]) {
+          // The backend now records malformed TEXT as raw bytes. Prevent the
+          // host's JSON-patch heuristic from interpreting a lossy JS string;
+          // the guarded backend snapshot remains authoritative for undo.
+          observedPriorValue = rawText;
         }
       }
 
@@ -544,33 +716,42 @@ export class HostBridge implements ToastService {
         : -1;
       const priorValue = primaryKeyIndex >= 0
         ? predicate.primaryKey!.values[primaryKeyIndex]
-        : currentRow[2];
+        : observedPriorValue;
       const prepared = prepareCellUpdateForStorage(value, priorValue);
-      const patch = prepared.operation === 'json_patch' ? String(prepared.value) : undefined;
 
       this.assertConnectionGeneration(connectionGeneration);
 
       // Use specific method instead of generic exec
       // This allows the backend to handle safe SQL construction
-      if ('updateCell' in dbOps) {
-        let updatedRowId: RecordId | void;
+      if ('updateCellBatch' in dbOps) {
+        let historyCell: CellUpdateResult | undefined;
         try {
-          updatedRowId = await dbOps.updateCell(
+          [historyCell] = await dbOps.updateCellBatch(
             table,
-            rowId,
-            column,
-            value,
-            patch,
+            [{
+              rowId,
+              column,
+              value: prepared.value,
+              operation: prepared.operation
+            }],
             editLimitBytes
           );
         } catch (error) {
           // A concurrent writer can make the prior oversized after our
           // metadata read. Re-enter the metadata/confirmation loop rather than
           // bypassing the extension-host confirmation with a normal update.
-          if (isOversizedCellReplacementRequiredError(error)) continue;
+          if (isOversizedCellReplacementRequiredError(error)) {
+            if (attempt < MAX_OVERSIZED_CELL_REPLACEMENT_ATTEMPTS) continue;
+            throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE, {
+              cause: error
+            });
+          }
           throw error;
         }
-        const newTargetRowId = updatedRowId ?? rowId;
+        if (!historyCell) {
+          throw new Error(`Backend did not return cell history for ${table}.${column}`);
+        }
+        const newTargetRowId = historyCell.newRowId ?? rowId;
 
         // Fire edit event
         this.document.recordExternalModification({
@@ -579,11 +760,15 @@ export class HostBridge implements ToastService {
           modificationType: 'cell_update',
           targetTable: table,
           targetRowId: rowId,
-          ...(isPrimaryKeyRecordId(rowId) ? { newTargetRowId } : {}),
+          ...(isPrimaryKeyRecordId(rowId) || newTargetRowId !== rowId
+            ? { newTargetRowId }
+            : {}),
           targetColumn: column,
-          newValue: prepared.value,
-          operation: prepared.operation,
-          priorValue
+          newValue: historyCell.newValue,
+          operation: historyCell.operation,
+          priorValue: historyCell.priorValue,
+          priorState: historyCell.priorState,
+          postState: historyCell.postState
         });
         return newTargetRowId;
       } else {
@@ -591,6 +776,7 @@ export class HostBridge implements ToastService {
         throw new Error("Backend does not support updateCell");
       }
     }
+    throw new Error(OVERSIZED_CELL_REPLACEMENT_RETRY_EXHAUSTED_MESSAGE);
   }
 
   /**
@@ -598,6 +784,7 @@ export class HostBridge implements ToastService {
    */
   async insertRow(table: string, data: Record<string, CellValue>) {
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
@@ -607,30 +794,42 @@ export class HostBridge implements ToastService {
       Object.values(data),
       DEFAULT_MAX_CELL_EDIT_BYTES
     );
-    let rowId: RecordId | undefined;
-
-    if ('insertRow' in dbOps) {
-      rowId = await dbOps.insertRow(table, data, editLimitBytes);
-    } else {
-      throw new Error("Backend does not support insertRow");
-    }
-
-    let historyRowData: Record<string, CellValue> = {};
-    if (rowId !== undefined && isPrimaryKeyRecordId(rowId)) {
-      const primaryKey = decodePrimaryKeyRecordId(rowId);
-      historyRowData = Object.fromEntries(
-        primaryKey.columns.map((column, index) => [column, primaryKey.values[index]])
+    const modification = {
+      label: 'Insert Row',
+      description: `Insert row into ${table}`,
+      modificationType: 'row_insert' as const,
+      targetTable: table,
+      rowData: data,
+      insertedRow: { rowId: 0, row: {}, storageClasses: [] }
+    };
+    const undoMemoryLimitBytes = this.document.undoMemoryLimitBytes
+      ?? getMaxUndoMemoryBytes();
+    const baseMemoryBytes = estimateUndoMemoryBytes(modification);
+    if (baseMemoryBytes > undoMemoryLimitBytes) {
+      throw new Error(
+        `Insert undo metadata exceeds the ${undoMemoryLimitBytes}-byte memory limit; ` +
+        'insert fewer values or increase sqliteExplorer.maxUndoMemory.'
       );
     }
 
+    if (typeof dbOps.insertRowWithHistory !== 'function') {
+      throw new Error('Backend does not support guarded row insertion history');
+    }
+    const insertedRow = await dbOps.insertRowWithHistory(
+      table,
+      data,
+      editLimitBytes,
+      undoMemoryLimitBytes - baseMemoryBytes
+    );
+    this.assertConnectionGeneration(connectionGeneration);
+    const rowId = insertedRow.rowId;
+
     // Fire edit event
     this.document.recordExternalModification({
-      label: 'Insert Row',
-      description: `Insert row into ${table}`,
-      modificationType: 'row_insert',
-      targetTable: table,
+      ...modification,
       targetRowId: rowId,
-      rowData: { ...data, ...historyRowData }
+      rowData: insertedRow.row,
+      insertedRow
     });
 
     return rowId;
@@ -706,7 +905,22 @@ export class HostBridge implements ToastService {
     }
 
     // If there are dependent indexes, ask the user for confirmation
+    let confirmedSchemaState: ColumnDropTableState | undefined;
     if (dependentIndexes.length > 0) {
+      // Bind the confirmation text to exact schema definitions, not only index
+      // names. Another connection can replace a same-named index while the
+      // modal is open; silently dropping that replacement would exceed what
+      // the user actually confirmed.
+      confirmedSchemaState = await runReadSnapshot(dbOps, async snapshotOps => {
+        const tableInfo = await snapshotOps.getTableInfo(table);
+        const identity = await this.resolveTableIdentity(snapshotOps, table, tableInfo);
+        return this.captureColumnDropTableState(
+          snapshotOps,
+          table,
+          tableInfo,
+          identity
+        );
+      });
       const indexList = dependentIndexes.join(', ');
       const message = vsc.l10n.t(
         'The following indexes depend on the selected column(s) and will be dropped: {0}',
@@ -742,6 +956,15 @@ export class HostBridge implements ToastService {
         tableInfoBefore,
         identityBefore
       );
+      if (confirmedSchemaState) {
+        assertTableSchemaStateCurrent(
+          table,
+          confirmedSchemaState,
+          stateBefore,
+          'delete columns',
+          'while the confirmation was open'
+        );
+      }
       const colMap = new Map(tableInfoBefore.map(column => [
         column.identifier,
         // An empty declared type is meaningful in SQLite: staging it as TEXT
@@ -811,7 +1034,7 @@ export class HostBridge implements ToastService {
         const valueProjection = columns.map(escapeIdentifier);
         const result = await snapshotOps.executeQuery(
           `SELECT ${[...identityProjection, ...valueProjection].join(', ')} ` +
-          `FROM ${escapeIdentifier(table)}`
+          `FROM ${escapeMainIdentifier(table)}`
         );
         const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length;
         for (const row of result[0]?.rows ?? []) {
@@ -856,7 +1079,8 @@ export class HostBridge implements ToastService {
       stateAfter = await dbOps.deleteColumns(
         table,
         columns,
-        dependentIndexes.length > 0 ? dependentIndexes : undefined
+        dependentIndexes.length > 0 ? dependentIndexes : undefined,
+        stateBefore
       );
     } else {
       throw new Error("Backend does not support deleteColumns");
@@ -878,14 +1102,19 @@ export class HostBridge implements ToastService {
    * Create a new table.
    */
   async createTable(table: string, columns: import('./core/types').ColumnDefinition[]) {
+    assertUsableSqlIdentifier(table, 'Table name');
+    for (const column of columns) {
+      assertUsableSqlIdentifier(column.name, 'Column name');
+    }
     const dbOps = this.ensureDatabaseInitialized();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
 
+    let tableCreateSnapshot: ColumnDropTableState;
     if ('createTable' in dbOps) {
-      await dbOps.createTable(table, columns);
+      tableCreateSnapshot = await dbOps.createTable(table, columns);
     } else {
       throw new Error("Backend does not support createTable");
     }
@@ -896,7 +1125,8 @@ export class HostBridge implements ToastService {
       description: `Create table ${table}`,
       modificationType: 'table_create',
       targetTable: table,
-      tableDef: { columns }
+      tableDef: { columns },
+      tableCreateSnapshot
     });
   }
 
@@ -911,6 +1141,7 @@ export class HostBridge implements ToastService {
     selectSql: string,
     intent: ViewDefinitionIntent = 'edit'
   ) {
+    assertUsableSqlIdentifier(view, 'View name');
     return this.ensureDatabaseInitialized().validateViewDefinition(view, selectSql, intent);
   }
 
@@ -921,6 +1152,7 @@ export class HostBridge implements ToastService {
     limit: number = 50,
     intent: ViewDefinitionIntent = 'edit'
   ) {
+    assertUsableSqlIdentifier(view, 'View name');
     this.activePreviewController?.abort();
     const controller = new AbortController();
     this.activePreviewController = controller;
@@ -941,6 +1173,7 @@ export class HostBridge implements ToastService {
 
   /** Create a view and record enough state for save, undo, and redo. */
   async createView(view: string, selectSql: string) {
+    assertUsableSqlIdentifier(view, 'View name');
     const dbOps = this.ensureDatabaseInitialized();
     const connectionGeneration = this.captureConnectionGeneration();
     if (this.isReadOnly) {
@@ -983,7 +1216,7 @@ export class HostBridge implements ToastService {
       // Direct callers may not already hold a modal/editor snapshot. Capture
       // the exact trigger state shown in this confirmation so the engine can
       // reject a trigger added or changed while the dialog is open.
-      triggerSnapshot ??= current.triggers;
+      triggerSnapshot = current.triggers;
       if (current.triggers.length > 0) {
         const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
         const answer = await vsc.window.showWarningMessage(
@@ -1030,7 +1263,7 @@ export class HostBridge implements ToastService {
       throw new Error('Document is read-only');
     }
 
-    while (true) {
+    for (let attempt = 1; attempt <= MAX_VIEW_DEFINITION_CONFIRMATION_ATTEMPTS; attempt++) {
       const current = await dbOps.getViewDefinition(view);
       const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
       const confirmationMessage = triggerNames
@@ -1069,10 +1302,14 @@ export class HostBridge implements ToastService {
       } catch (err) {
         // Re-read and re-confirm so the dialog always names the exact trigger
         // set guarded by the engine-side compare-and-swap.
-        if (isViewDefinitionConflictError(err)) continue;
+        if (isViewDefinitionConflictError(err)) {
+          if (attempt < MAX_VIEW_DEFINITION_CONFIRMATION_ATTEMPTS) continue;
+          throw new Error(VIEW_DEFINITION_RETRY_EXHAUSTED_MESSAGE, { cause: err });
+        }
         throw err;
       }
     }
+    throw new Error(VIEW_DEFINITION_RETRY_EXHAUSTED_MESSAGE);
   }
 
   /**
@@ -1093,9 +1330,10 @@ export class HostBridge implements ToastService {
       DEFAULT_MAX_CELL_EDIT_BYTES
     );
 
+    const cellCountLabel = `${updates.length} cell${updates.length === 1 ? '' : 's'}`;
     const modification = {
-      label: label || `Update ${updates.length} cells`,
-      description: `Update ${updates.length} cells in ${table}`,
+      label: label || `Update ${cellCountLabel}`,
+      description: `Update ${cellCountLabel} in ${table}`,
       modificationType: 'cell_update' as const,
       targetTable: table
     };
@@ -1111,6 +1349,8 @@ export class HostBridge implements ToastService {
         columnName: update.column,
         priorValue: null,
         newValue: update.value,
+        priorState: { storageClass: 'null' as const, value: null },
+        postState: { storageClass: 'null' as const, value: null },
         operation: update.operation ?? 'set'
       }))
     };
@@ -1146,17 +1386,35 @@ export class HostBridge implements ToastService {
    * Add a new column to a table.
    */
   async addColumn(table: string, column: string, type: string, defaultValue?: string) {
+    assertUsableSqlIdentifier(table, 'Table name');
+    assertUsableSqlIdentifier(column, 'Column name');
     const dbOps = this.ensureDatabaseInitialized();
+    const connectionGeneration = this.captureConnectionGeneration();
 
     if (this.isReadOnly) {
       throw new Error("Document is read-only");
     }
 
+    const columnAddBeforeSnapshot = await runReadSnapshot(dbOps, async snapshotOps => {
+      const tableInfo = await snapshotOps.getTableInfo(table);
+      const identity = await this.resolveTableIdentity(snapshotOps, table, tableInfo);
+      return this.captureColumnDropTableState(snapshotOps, table, tableInfo, identity);
+    });
+    this.assertConnectionGeneration(connectionGeneration);
+
+    let columnAddSnapshot: ColumnDropTableState;
     if ('addColumn' in dbOps) {
-      await dbOps.addColumn(table, column, type, defaultValue);
+      columnAddSnapshot = await dbOps.addColumn(
+        table,
+        column,
+        type,
+        defaultValue,
+        columnAddBeforeSnapshot
+      );
     } else {
       throw new Error("Backend does not support addColumn");
     }
+    this.assertConnectionGeneration(connectionGeneration);
 
     // Fire edit event
     this.document.recordExternalModification({
@@ -1165,7 +1423,9 @@ export class HostBridge implements ToastService {
       modificationType: 'column_add',
       targetTable: table,
       targetColumn: column,
-      columnDef: { type, defaultValue }
+      columnDef: { type, defaultValue },
+      columnAddBeforeSnapshot,
+      columnAddSnapshot
     });
   }
 
@@ -1176,17 +1436,18 @@ export class HostBridge implements ToastService {
     const dbOps = this.ensureDatabaseInitialized();
 
     if ('fetchTableData' in dbOps) {
+      const boundedOptions = normalizeTablePageOptions(options);
       const configuredCellLimit = getMaxInlineCellBytes();
-      const requestedCellLimit = Number.isSafeInteger(options.maxInlineCellBytes)
-        && (options.maxInlineCellBytes ?? 0) > 0
-        ? options.maxInlineCellBytes!
+      const requestedCellLimit = Number.isSafeInteger(boundedOptions.maxInlineCellBytes)
+        && (boundedOptions.maxInlineCellBytes ?? 0) > 0
+        ? boundedOptions.maxInlineCellBytes!
         : configuredCellLimit;
-      const requestedPageLimit = Number.isSafeInteger(options.maxPageResponseBytes)
-        && (options.maxPageResponseBytes ?? 0) > 0
-        ? options.maxPageResponseBytes!
+      const requestedPageLimit = Number.isSafeInteger(boundedOptions.maxPageResponseBytes)
+        && (boundedOptions.maxPageResponseBytes ?? 0) > 0
+        ? boundedOptions.maxPageResponseBytes!
         : DEFAULT_MAX_PAGE_RESPONSE_BYTES;
       return toWebviewQueryResultSet(await dbOps.fetchTableData(table, {
-        ...options,
+        ...boundedOptions,
         maxInlineCellBytes: Math.min(configuredCellLimit, requestedCellLimit),
         maxPageResponseBytes: Math.min(DEFAULT_MAX_PAGE_RESPONSE_BYTES, requestedPageLimit)
       }));
@@ -1260,9 +1521,12 @@ export class HostBridge implements ToastService {
     if (!('setPragma' in dbOps)) {
       throw new Error("Backend does not support setPragma");
     }
-    const trackPersistentPagedChange = this.document.isPagedWritableMode === true
-      && PAGED_PERSISTENT_PRAGMAS.has(pragma);
-    if (!trackPersistentPagedChange) {
+    // Native SQLite persists these PRAGMAs directly to the opened file. Both
+    // memory-backed and paged WASM engines instead need an explicit dirty entry
+    // so VS Code knows that Save must serialize the changed database image.
+    const trackPersistentWasmChange = WASM_PERSISTENT_PRAGMAS.has(pragma)
+      && await dbOps.engineKind === 'wasm';
+    if (!trackPersistentWasmChange) {
       await dbOps.setPragma(pragma, value);
       return;
     }
@@ -1316,8 +1580,8 @@ export class HostBridge implements ToastService {
   }
 
   // History replay (undo/redo/commit/rollback) is driven by DatabaseDocument on the
-  // extension side, never by the webview — do not re-add bridge methods for it here:
-  // every function-valued property on this class is dispatchable by name over RPC.
+  // extension side, never by the webview. These methods remain host lifecycle helpers
+  // and are deliberately absent from the webview RPC capability allowlist.
 
   /**
    * Trigger VS Code Undo command.
@@ -1359,24 +1623,13 @@ export class HostBridge implements ToastService {
       return {
         connected: true,
         filename: document.fileParts.filename,
-        readOnly: this.isReadOnly
+        readOnly: this.isReadOnly,
+        ...(Number.isSafeInteger(document.connectionGeneration)
+          ? { connectionGeneration: document.connectionGeneration }
+          : {})
       };
     }
     throw new Error(vsc.l10n.t('Reload is unavailable for untitled databases'));
-  }
-
-
-  /**
-   * Fire an edit event to mark the document as dirty.
-   *
-   * @param edit - The edit operation that was performed
-   */
-  async fireEditEvent(edit: unknown) {
-    if (this.isReadOnly) {
-      throw new Error('Document is read-only');
-    }
-    assertDocumentModification(edit);
-    this.document.recordExternalModification(edit);
   }
 
 
@@ -1442,14 +1695,19 @@ export class HostBridge implements ToastService {
     const { document } = this;
     if (document.uri.scheme !== 'untitled') {
       let cellParts: string[];
+      let explicitColumn: string | undefined;
 
       if (rowId === '__create__.sql') {
         cellParts = [params.table, params.name || '-', '__create__.sql'];
       } else {
+        if (colName === undefined) {
+          throw new Error('A column name is required to open a cell editor');
+        }
+        explicitColumn = colName;
         // Determine file extension based on content type
         const extname = await determineCellExtension(value, type);
         const materializer = this.cellMaterializer;
-        if (materializer && colName) {
+        if (materializer) {
           const target = { table: params.table, rowId, column: colName };
           const metadata = await this.ensureDatabaseInitialized().getCellMetadata(target);
           if (metadata.byteLength > getMaxInlineCellBytes()) {
@@ -1497,7 +1755,7 @@ export class HostBridge implements ToastService {
               materializer.release(materialized.uri);
               throw error;
             }
-            return;
+            return { success: true, mode: 'temporary-read-only' as const };
           }
         }
         const cellFilename = (colName || 'cell') + extname;
@@ -1510,18 +1768,27 @@ export class HostBridge implements ToastService {
       const docKey = await document.documentKey;
 
       // Construct URI path explicitly: /docKey/table/rowId/filename
-      // Empty segments (like schema name if not present) are filtered out by split().filter()
-      // in the file system provider, ensuring the path parts match the expected structure.
       const uriPath = [docKey, ...cellParts].map(p => encodeURIComponent(p)).join('/');
+      const query = [
+        ...(webviewId === undefined ? [] : [`webview-id=${encodeURIComponent(webviewId)}`]),
+        ...(explicitColumn === undefined
+          ? []
+          : [`column=${encodeURIComponent(explicitColumn)}`])
+      ].join('&');
 
       const cellUri = vsc.Uri.from({
           scheme: UriScheme,
           path: '/' + uriPath,
-          query: `webview-id=${webviewId}`
+          query
       });
 
       await vsc.commands.executeCommand('vscode.open', cellUri, vsc.ViewColumn.Two);
+      return { success: true, mode: 'virtual-document' as const };
     }
+    return {
+      success: false,
+      message: vsc.l10n.t('The external cell editor is unavailable for untitled databases')
+    };
   }
 
   /**
@@ -1553,6 +1820,19 @@ export class HostBridge implements ToastService {
     if (!options || typeof options.webviewId !== 'string' || options.webviewId.length === 0) {
       throw new TypeError('Oversized media preview requires a webview ID');
     }
+    if (
+      typeof options.requestId !== 'string'
+      || options.requestId.length === 0
+      || options.requestId.length > 128
+    ) {
+      throw new TypeError('Oversized media preview requires a bounded request ID');
+    }
+    if (
+      options.sourceByteLength !== undefined
+      && (!Number.isSafeInteger(options.sourceByteLength) || options.sourceByteLength < 0)
+    ) {
+      throw new TypeError('Oversized media preview source byte length is invalid');
+    }
 
     const media = resolveOversizedMediaType(options.type);
     const materializer = this.cellMaterializer;
@@ -1570,76 +1850,138 @@ export class HostBridge implements ToastService {
 
     const target = { table: params.table, rowId, column: colName };
     const operations = this.ensureDatabaseInitialized();
-    const metadata = await operations.getCellMetadata(target);
-    if (metadata.storageClass !== 'blob') {
-      throw new Error('Oversized media preview requires a BLOB cell');
-    }
-    if (metadata.byteLength <= getMaxInlineCellBytes()) {
-      return {
-        success: false,
-        message: 'This media cell is within the inline transport budget and does not need a temp URI'
-      };
-    }
-
-    this.activeCellMediaControllers.get(options.webviewId)?.abort();
+    this.activeCellMediaRequests.get(options.webviewId)?.controller.abort();
     const controller = new AbortController();
-    this.activeCellMediaControllers.set(options.webviewId, controller);
+    const request: ActiveCellMediaRequest = {
+      requestId: options.requestId,
+      controller,
+      panel
+    };
+    this.activeCellMediaRequests.set(options.webviewId, request);
     const panelDisposeSubscription = panel.onDidDispose(() => controller.abort());
+    const assertRequestCurrent = () => {
+      if (
+        controller.signal.aborted
+        || this.activeCellMediaRequests.get(options.webviewId) !== request
+        || this.webviews.getByWebviewId(options.webviewId) !== panel
+      ) {
+        const error = new Error('Oversized media preview was cancelled by a newer request or closed webview');
+        error.name = 'AbortError';
+        throw error;
+      }
+    };
 
-    let materialized;
+    let materialized: Awaited<ReturnType<CellMaterializationService['materialize']>> | undefined;
+    let installed = false;
     try {
+      const metadata = await operations.getCellMetadata(target);
+      assertRequestCurrent();
+      if (metadata.storageClass !== 'blob') {
+        throw new Error('Oversized media preview requires a BLOB cell');
+      }
+      if (
+        options.sourceByteLength !== undefined
+        && options.sourceByteLength !== metadata.byteLength
+      ) {
+        throw new Error(
+          `Oversized media cell changed size from ${options.sourceByteLength} to ` +
+          `${metadata.byteLength} bytes; reopen the inspector`
+        );
+      }
+      if (metadata.byteLength <= getMaxInlineCellBytes()) {
+        return {
+          success: false,
+          message: 'This media cell is within the inline transport budget and does not need a temp URI'
+        };
+      }
+
       materialized = await materializer.materialize(operations, target, {
         signal: controller.signal,
         fileExtension: media.extension,
         owner: panel
       });
-    } finally {
-      panelDisposeSubscription.dispose();
-      if (this.activeCellMediaControllers.get(options.webviewId) === controller) {
-        this.activeCellMediaControllers.delete(options.webviewId);
+      assertRequestCurrent();
+      if (materialized.metadata.storageClass !== 'blob') {
+        throw new Error(
+          `Oversized media cell changed from BLOB to ` +
+          `${materialized.metadata.storageClass.toUpperCase()} during materialization`
+        );
       }
-    }
+      if (
+        materialized.metadata.byteLength !== metadata.byteLength
+        || materialized.byteLength !== metadata.byteLength
+      ) {
+        throw new Error(
+          `Oversized media cell changed size during materialization; reopen the inspector`
+        );
+      }
+      if (!(materialized.sourcePrefix instanceof Uint8Array)) {
+        throw new Error('Oversized media materialization did not return an authoritative prefix');
+      }
+      if (!mediaSignatureMatches(options.type.mime!, materialized.sourcePrefix)) {
+        throw new Error(
+          `Materialized cell signature does not match ${options.type.mime}; reopen the inspector`
+        );
+      }
 
-    if (this.webviews.getByWebviewId(options.webviewId) !== panel) {
-      materializer.release(materialized.uri);
-      throw new Error('Oversized media preview was cancelled because its webview closed');
-    }
-
-    const previewId = crypto.randomUUID();
-    const runDirectory = uriDirectory(materialized.uri);
-    let resourceUri: string;
-    try {
-      resourceUri = panel.webview.asWebviewUri(materialized.uri).toString();
+      const previewId = crypto.randomUUID();
+      const runDirectory = uriDirectory(materialized.uri);
+      const resourceUri = panel.webview.asWebviewUri(materialized.uri).toString();
       panel.webview.options = {
         ...panel.webview.options,
         localResourceRoots: [this.codiconsResourceRoot(), runDirectory]
       };
-    } catch (error) {
-      materializer.release(materialized.uri);
-      throw error;
-    }
+      assertRequestCurrent();
 
-    const previous = this.activeCellMediaPreviews.get(options.webviewId);
-    try {
+      const previous = this.activeCellMediaPreviews.get(options.webviewId);
       if (previous) materializer.release(previous.uri);
-    } catch (error) {
-      materializer.release(materialized.uri);
-      throw error;
-    }
-    this.activeCellMediaPreviews.set(options.webviewId, {
-      previewId,
-      uri: materialized.uri,
-      panel
-    });
-    this.trackMediaPanel(panel);
+      this.activeCellMediaPreviews.set(options.webviewId, {
+        requestId: options.requestId,
+        previewId,
+        uri: materialized.uri,
+        panel
+      });
+      installed = true;
+      this.trackMediaPanel(panel);
 
-    return {
-      success: true,
-      previewId,
-      uri: resourceUri,
-      mime: options.type.mime!,
-      byteLength: materialized.byteLength
-    };
+      return {
+        success: true,
+        previewId,
+        uri: resourceUri,
+        mime: options.type.mime!,
+        byteLength: materialized.byteLength
+      };
+    } catch (error) {
+      if (materialized && !installed) {
+        try {
+          materializer.release(materialized.uri);
+        } catch (releaseError) {
+          throw new AggregateError(
+            [error, releaseError],
+            'Oversized media preview failed and temporary-file cleanup also failed'
+          );
+        }
+      }
+      throw error;
+    } finally {
+      panelDisposeSubscription.dispose();
+      if (this.activeCellMediaRequests.get(options.webviewId) === request) {
+        this.activeCellMediaRequests.delete(options.webviewId);
+      }
+    }
+  }
+
+  /** Cancel only the media request/lease carrying this opaque UI operation ID. */
+  async cancelCellMediaPreview(webviewId: string, requestId: string): Promise<void> {
+    const request = this.activeCellMediaRequests.get(webviewId);
+    if (request?.requestId === requestId) {
+      this.activeCellMediaRequests.delete(webviewId);
+      request.controller.abort();
+    }
+    const active = this.activeCellMediaPreviews.get(webviewId);
+    if (active?.requestId === requestId) {
+      await this.releaseCellMediaPreview(webviewId, active.previewId);
+    }
   }
 
   /** Release a URI lease. Stale cleanup calls are intentionally idempotent. */
@@ -1732,18 +2074,36 @@ export class HostBridge implements ToastService {
   /**
    * Show confirmation dialog for large selection.
    *
-   * @param openExportDialog - Callback to open export dialog
-   * @returns True if the user wants to continue with selection
+   * The webview RPC protocol can carry data, not callbacks. Returning one
+   * boolean keeps the decision serializable and leaves all UI mutation in the
+   * webview that requested it.
+   *
+   * @returns True if the user wants to continue with selection.
    */
-  async confirmLargeSelection(openExportDialog: () => void): Promise<boolean> {
-    const answer = await vsc.window.showWarningMessage(vsc.l10n.t('Large Selection Warning'), {
-      detail: vsc.l10n.t('You are attempting to select more than 10,000 rows. Large selections may impact performance. Do you want to open the export menu instead?'),
-      modal: true,
-    }, ...[{ title: vsc.l10n.t('Export data'), value: 'export' }, { title: vsc.l10n.t('Continue'), value: 'continue' }]);
-    if (answer?.value === 'export') {
-      openExportDialog();
+  async confirmLargeSelection(
+    itemCount: number,
+    unit: 'rows' | 'cells'
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(itemCount) || itemCount <= 0) {
+      throw new Error('Large selection count must be a positive safe integer');
     }
-    return answer?.value === 'continue';
+    if (unit !== 'rows' && unit !== 'cells') {
+      throw new Error('Large selection unit must be rows or cells');
+    }
+
+    const answer = await vsc.window.showWarningMessage(vsc.l10n.t('Large Selection Warning'), {
+      detail: vsc.l10n.t(
+        'Selecting {0} {1} may slow or freeze the editor. Cancel and use Export for large data operations. Continue?',
+        itemCount.toLocaleString(),
+        unit
+      ),
+      modal: true,
+    }, { title: vsc.l10n.t('Continue'), value: true }, {
+      title: vsc.l10n.t('Cancel'),
+      value: false,
+      isCloseAffordance: true
+    });
+    return answer?.value === true;
   }
 
   /**
@@ -1766,9 +2126,18 @@ export class HostBridge implements ToastService {
    */
   async updateExtensionSetting(key: string, value: boolean | string) {
     if (key === 'autoCommit') {
-      this.document.autoCommitEnabled = !!value;
-      // Update persistent configuration
-      await vsc.workspace.getConfiguration(ConfigurationSection).update('instantCommit', value ? 'always' : 'never', vsc.ConfigurationTarget.Global);
+      if (typeof value !== 'boolean') {
+        throw new TypeError('autoCommit must be a boolean');
+      }
+      // The live document must not diverge from the persisted setting when a
+      // configuration provider rejects the write (read-only profile, policy,
+      // remote failure). Commit in-memory behavior only after persistence.
+      await vsc.workspace.getConfiguration(ConfigurationSection).update(
+        'instantCommit',
+        value ? 'always' : 'never',
+        vsc.ConfigurationTarget.Global
+      );
+      this.document.autoCommitEnabled = value;
     } else if (key === 'doubleClickBehavior') {
         // Update persistent configuration
         await vsc.workspace.getConfiguration(ConfigurationSection).update('doubleClickBehavior', value, vsc.ConfigurationTarget.Global);
@@ -1791,7 +2160,15 @@ export class HostBridge implements ToastService {
       ...dbParams,
       uri: this.document.uri.toString()
     };
-    await vsc.commands.executeCommand(`${ExtensionId}.exportTable`, enrichedParams, columns, dbOptions, tableStore, exportOptions, extras);
+    return await vsc.commands.executeCommand(
+      `${ExtensionId}.exportTable`,
+      enrichedParams,
+      columns,
+      dbOptions,
+      tableStore,
+      exportOptions,
+      extras
+    );
   }
 
   /**
@@ -1828,23 +2205,47 @@ export class HostBridge implements ToastService {
     // '<folder>/../../etc/passwd' still returns the folder. Containment must be
     // re-verified on normalized paths before the read.
     const workspaceFolder = vsc.workspace.getWorkspaceFolder(uri);
-    if (workspaceFolder && isUriContainedInDirectory(uri, workspaceFolder.uri, 'directory')) {
-      return await vsc.workspace.fs.readFile(uri);
-    }
+    const isInWorkspace = Boolean(
+      workspaceFolder
+      && isUriContainedInDirectory(uri, workspaceFolder.uri, 'directory')
+    );
 
     // 2. Check if file is in the same directory tree as the open document.
     // This allows drag-and-drop from the same directory tree in single-file mode.
-    if (!isUriContainedInDirectory(uri, this.document.uri, 'parent-of-file')) {
+    if (!isInWorkspace && !isUriContainedInDirectory(uri, this.document.uri, 'parent-of-file')) {
       throw new Error(`Access denied: File "${uri.toString()}" is not in the current workspace or document directory.`);
     }
 
-    return await vsc.workspace.fs.readFile(uri);
+    const stat = await vsc.workspace.fs.stat(uri);
+    if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
+      throw new Error(`Cannot verify file size for "${uri.toString()}"`);
+    }
+    if (stat.size > DEFAULT_MAX_CELL_EDIT_BYTES) {
+      throw new Error(
+        `File too large (${stat.size} bytes). Maximum is 16 MB ` +
+        `(${DEFAULT_MAX_CELL_EDIT_BYTES} bytes).`
+      );
+    }
+
+    const bytes = await vsc.workspace.fs.readFile(uri);
+    // The provider may change the resource between stat and read. Retain an
+    // authoritative post-read check so that race cannot cross the RPC bound.
+    if (bytes.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
+      throw new Error(
+        `File too large (${bytes.byteLength} bytes). Maximum is 16 MB ` +
+        `(${DEFAULT_MAX_CELL_EDIT_BYTES} bytes).`
+      );
+    }
+    return bytes;
   }
 
   /**
    * Save a file to the workspace via dialog.
    */
-  async saveFile(filename: string, data: Uint8ArrayLike): Promise<void> {
+  async saveFile(
+    filename: string,
+    data: Uint8ArrayLike
+  ): Promise<{ success: true } | { success: false; cancelled: true }> {
     // Use the database file's directory as the default location
     const safeFilename = pathLeaf(filename);
     const defaultUri = vsc.Uri.joinPath(uriDirectory(this.document.uri), safeFilename);
@@ -1854,16 +2255,17 @@ export class HostBridge implements ToastService {
         saveLabel: 'Save Blob'
     });
 
-    if (uri) {
-        // Convert data to Uint8Array if needed
-        let buffer: Uint8Array;
-        if (data instanceof Uint8Array) {
-            buffer = data;
-        } else {
-            buffer = new Uint8Array(data.buffer || (data as unknown as ArrayBufferLike), data.byteOffset, data.byteLength);
-        }
-        await vsc.workspace.fs.writeFile(uri, buffer);
+    if (!uri) return { success: false, cancelled: true };
+
+    // Convert data to Uint8Array if needed
+    let buffer: Uint8Array;
+    if (data instanceof Uint8Array) {
+        buffer = data;
+    } else {
+        buffer = new Uint8Array(data.buffer || (data as unknown as ArrayBufferLike), data.byteOffset, data.byteLength);
     }
+    await writeWorkspaceFileAtomically(uri, buffer);
+    return { success: true };
   }
 
   /**
@@ -1942,12 +2344,19 @@ async function showToast<T extends string | DialogButton>(
  * @returns File extension including the dot
  */
 async function determineCellExtension(value?: CellValue, type?: CellContentType): Promise<string> {
+  const suppliedExtension = type?.ext?.replace(/^\./, '');
+  if (suppliedExtension && /^[a-z0-9]{1,12}$/i.test(suppliedExtension)) {
+    return '.' + suppliedExtension.toLowerCase();
+  }
+
   // Default to .txt for text, .bin for binary
-  if (value instanceof Uint8Array || (value && typeof value === 'object' && 'buffer' in value)) {
-    // Check if it's a known binary format
-    if (type?.mime?.startsWith('image/')) {
-      return '.' + (type.ext || 'bin');
-    }
+  const contentCategory = type?.type?.toLowerCase();
+  if (
+    value instanceof Uint8Array
+    || (value && typeof value === 'object' && 'buffer' in value)
+    || contentCategory === 'blob'
+    || contentCategory === 'binary'
+  ) {
     return '.bin';
   }
   return '.txt';

@@ -5,8 +5,11 @@ import { state, persistState } from './state.js';
 import { clearSelection, loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
-import { applyConnectionResult } from './connection-state.js';
+import { applyConnectionResult, updateMutationControlCapabilities } from './connection-state.js';
 import { invalidateAllCounts } from './count-cache.js';
+import { showErrorState, showLoading, updateStatus, updateToolbarButtons } from './ui.js';
+import { closeDatabaseTargetModals } from './modals.js';
+import { getErrorMessage } from './utils.js';
 
 export { backendApi } from './api.js';
 
@@ -19,20 +22,50 @@ export async function refreshContent(filename, connectionResult) {
     // write, revert — the host also echoes one after this webview's own
     // edits). None of the cached counts can be trusted across it.
     invalidateAllCounts();
+    const contentGeneration = ++state.contentGeneration;
+    state.isRefreshingContent = true;
+    updateMutationControlCapabilities();
+    const priorConnectionGeneration = state.connectionGeneration;
     if (connectionResult) {
         applyConnectionResult(connectionResult);
     }
-    if (state.isDbConnected) {
+    const connectionReplaced = connectionResult
+        && state.connectionGeneration !== priorConnectionGeneration;
+    closeDatabaseTargetModals({ connectionReplaced });
+    // A row ID can be deleted and reused by another panel without replacing
+    // the connection. Clear every positional/targeted intent synchronously,
+    // before the first schema await exposes the stale grid again.
+    clearSelection();
+    state.pinnedRowIds.clear();
+    state.editingCellInfo = null;
+    state.activeCellInput = null;
+    updateToolbarButtons();
+    try {
+      if (state.isDbConnected) {
+        if (connectionReplaced) {
+            clearSelection();
+            state.pinnedRowIds.clear();
+            state.pinnedColumns.clear();
+            state.tableColumns = [];
+            state.gridData = [];
+            state.gridExactIntegerTexts = {};
+            state.gridOversizedCells = {};
+            state.gridReadOnlyRowReasons = {};
+            state.keysetAnchors = null;
+            state.renderedTable = null;
+            state.editingCellInfo = null;
+            state.activeCellInput = null;
+            showLoading();
+            updateToolbarButtons();
+            persistState();
+        }
         // A broadcast view refresh may replace its projection and row order.
         // Clear positional state before any async reload so another webview's
         // edit cannot leave this panel's controls targeting unrelated cells.
-        if (state.selectedTable && state.selectedTableType === 'view') {
-            clearSelection();
-            persistState();
-        }
+        if (state.selectedTable && state.selectedTableType === 'view') persistState();
 
         // Refresh schema to reflect added/removed tables or views
-        await refreshSchema();
+        if (!await refreshSchema()) return { success: false, superseded: true };
 
         // Validate if selected table still exists
         const tableExists = state.schemaCache.tables.some(t => t.name === state.selectedTable) ||
@@ -54,14 +87,30 @@ export async function refreshContent(filename, connectionResult) {
                 </div>
             `;
             persistState();
+            updateToolbarButtons();
         } else if (state.selectedTable) {
             // Refresh columns to reflect added/removed columns
-            await loadTableColumns();
-            // Refresh data to reflect row changes
-            await loadTableData(false);
+            if (await loadTableColumns()) {
+                // Refresh data to reflect row changes
+                await loadTableData(false);
+            } else if (connectionReplaced) {
+                showErrorState('Could not load table columns after reloading the database.');
+            }
         }
+      }
+      return { success: true };
+    } catch (error) {
+      const message = getErrorMessage(error);
+      showErrorState(`Refresh failed: ${message}`);
+      updateStatus(`Refresh failed: ${message}`);
+      throw error;
+    } finally {
+      if (state.contentGeneration === contentGeneration) {
+        state.isRefreshingContent = false;
+        updateMutationControlCapabilities();
+        updateToolbarButtons();
+      }
     }
-    return { success: true };
 }
 
 const webviewMethods = {

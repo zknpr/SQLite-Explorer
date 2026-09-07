@@ -3,32 +3,12 @@
  */
 import { state } from './state.js';
 import { backendApi } from './api.js';
-import { escapeHtml } from './utils.js';
+import { escapeHtml, getErrorMessage } from './utils.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
 
 export function updateStatus(message) {
     const el = document.getElementById('statusText');
     if (el) el.textContent = message;
-}
-
-/**
- * Did the backend report that the user dismissed a save dialog?
- *
- * Every desktop path that writes a file for the user (table export, blob
- * download, whole-database export, Save As) answers one contract:
- * `{ success, savedAs }`, where a genuine failure REJECTS and `success:false`
- * means exactly "the save dialog was cancelled". This is the single definition
- * of that reading, for the call sites that see only the flag — each of them
- * previously invented its own, and both reported a cancelled dialog as a
- * completed save. (`host.saveToDisk` adds a `reason` on top of the same
- * contract, so desktop-viewer.js discriminates on that instead.)
- *
- * Strictly `=== false`: the VS Code host resolves these to `undefined` and the
- * web demo resolves them to the worker's `{contentChunks, filename}`, so
- * "no flag" must never be read as a cancellation on those lanes.
- */
-export function wasSaveCancelled(result) {
-    return result?.success === false;
 }
 
 export function showLoading() {
@@ -71,6 +51,11 @@ export function showErrorState(message) {
 
 export function updateToolbarButtons() {
     const hasTable = state.selectedTable && state.selectedTableType === 'table';
+    const hasActionableTable = hasTable
+        && !state.isLoadingColumns
+        && !state.isGridReloading
+        && !state.isRefreshingContent
+        && state.renderedTable === state.selectedTable;
     const rowEligibility = getSelectedRowActionEligibility();
     const hasRowSelection = rowEligibility.rowIds.length > 0;
     const hasColumnSelection = state.selectedColumns.size > 0;
@@ -80,13 +65,14 @@ export function updateToolbarButtons() {
     const btnDeleteRows = document.getElementById('btnDeleteRows');
     const btnExport = document.getElementById('btnExport');
 
-    if (btnAddRow) btnAddRow.disabled = state.isReadOnly || !hasTable;
-    if (btnAddColumn) btnAddColumn.disabled = state.isReadOnly || !hasTable;
+    if (btnAddRow) btnAddRow.disabled = state.isReadOnly || !hasActionableTable;
+    if (btnAddColumn) btnAddColumn.disabled = state.isReadOnly || !hasActionableTable;
     // Enable delete button if rows OR columns are selected
     if (btnDeleteRows) {
         btnDeleteRows.disabled = state.isReadOnly
             || state.isGridReloading
-            || !hasTable
+            || state.isRefreshingContent
+            || !hasActionableTable
             || (!hasRowSelection && !hasColumnSelection);
         if (!hasColumnSelection && rowEligibility.readOnlyCount > 0) {
             btnDeleteRows.title = hasRowSelection
@@ -96,7 +82,11 @@ export function updateToolbarButtons() {
             btnDeleteRows.title = 'Delete selected rows or columns';
         }
     }
-    if (btnExport) btnExport.disabled = !state.selectedTable;
+    if (btnExport) btnExport.disabled = !state.selectedTable
+        || state.isLoadingColumns
+        || state.isGridReloading
+        || state.isRefreshingContent
+        || state.renderedTable !== state.selectedTable;
 }
 
 /**
@@ -147,12 +137,28 @@ export function initSidebarResize(options = {}) {
     const persistedWidth = normalizeWidth(
         options.initialWidth ?? document.getElementById('vscode-env')?.dataset.sidebarLeft
     );
-    if (persistedWidth !== undefined) {
-        sidebar.style.width = persistedWidth + 'px';
-    }
+    const applyWidth = width => {
+        sidebar.style.width = width + 'px';
+        handle.setAttribute?.('aria-valuenow', String(width));
+    };
+    let persistQueue = Promise.resolve();
+    const persistWidth = width => {
+        // Key repeat can issue a second save before the first RPC resolves.
+        // Serialize them so an older completion cannot overwrite the latest width.
+        persistQueue = persistQueue.then(async () => {
+            try {
+                await backendApi.saveSidebarState('left', width);
+            } catch (err) {
+                console.error('Failed to persist sidebar width:', err);
+                updateStatus(`Failed to persist sidebar width: ${getErrorMessage(err)}`);
+            }
+        });
+        return persistQueue;
+    };
+    if (persistedWidth !== undefined) applyWidth(persistedWidth);
 
     let isResizing = false;
-    let resizedWidth = persistedWidth;
+    let resizedWidth = persistedWidth ?? 220;
 
     handle.addEventListener('mousedown', e => {
         isResizing = true;
@@ -163,9 +169,7 @@ export function initSidebarResize(options = {}) {
     document.addEventListener('mousemove', e => {
         if (!isResizing) return;
         resizedWidth = normalizeWidth(e.clientX);
-        if (resizedWidth !== undefined) {
-            sidebar.style.width = resizedWidth + 'px';
-        }
+        if (resizedWidth !== undefined) applyWidth(resizedWidth);
     });
 
     document.addEventListener('mouseup', async () => {
@@ -173,12 +177,23 @@ export function initSidebarResize(options = {}) {
             isResizing = false;
             document.body.style.cursor = '';
             if (resizedWidth === undefined) return;
-            try {
-                await backendApi.saveSidebarState('left', resizedWidth);
-            } catch (err) {
-                console.error('Failed to persist sidebar width:', err);
-                updateStatus(`Failed to persist sidebar width: ${err.message}`);
-            }
+            await persistWidth(resizedWidth);
         }
+    });
+
+    handle.addEventListener('keydown', async event => {
+        const step = event.shiftKey ? 1 : 10;
+        let nextWidth;
+        if (event.key === 'ArrowLeft') nextWidth = resizedWidth - step;
+        else if (event.key === 'ArrowRight') nextWidth = resizedWidth + step;
+        else if (event.key === 'Home') nextWidth = 150;
+        else if (event.key === 'End') nextWidth = 400;
+        else return;
+
+        event.preventDefault();
+        resizedWidth = normalizeWidth(nextWidth);
+        if (resizedWidth === undefined) return;
+        applyWidth(resizedWidth);
+        await persistWidth(resizedWidth);
     });
 }

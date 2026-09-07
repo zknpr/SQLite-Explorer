@@ -3,7 +3,7 @@
  */
 import { state } from './state.js';
 import { backendApi } from './api.js';
-import { validateRowId, formatCellValueAsText, parseGridInputValue } from './utils.js';
+import { getErrorMessage, validateRowId, formatCellValueAsText, parseGridInputValue } from './utils.js';
 import { updateStatus } from './ui.js';
 import { updateSelectionStates, clearSelection } from './grid-selection.js';
 import { loadTableData } from './grid-data.js';
@@ -28,6 +28,7 @@ import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js
 import { revealGridCell } from './grid-reveal.js';
 import { resetMatchNav } from './match-nav.js';
 import { ensureGridRowMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
+import { closeModal, openModal } from './modals.js';
 
 let blobInspector;
 let isSavingCellPreview = false;
@@ -41,6 +42,8 @@ export function initEdit() {
     document.getElementById('compactJsonBtn')?.addEventListener('click', compactCellPreviewJson);
     document.getElementById('wrapTextBtn')?.addEventListener('click', toggleCellPreviewWrap);
     document.getElementById('openInVsCodeBtn')?.addEventListener('click', openCellInVsCode);
+    document.getElementById('cellPreviewEmptyBtn')?.addEventListener('click', setCellPreviewEmpty);
+    document.getElementById('cellPreviewNullBtn')?.addEventListener('click', setCellPreviewNull);
     document.getElementById('btnCancelCellPreview')?.addEventListener('click', closeCellPreview);
     document.getElementById('cellPreviewSaveBtn')?.addEventListener('click', saveCellPreview);
     const previewTextarea = document.getElementById('cellPreviewTextarea');
@@ -139,6 +142,7 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     // Create input element
     const input = document.createElement('textarea');
     input.className = 'cell-input';
+    input.ariaLabel = `Edit ${column.name}`;
     input.value = currentText;
     input.spellcheck = false;
 
@@ -207,15 +211,12 @@ export async function saveCellEdit() {
         return true;
     }
 
-    const isNotNull = column && column.notnull === 1;
-
     let valueToSave;
     if (newValue === '') {
-        if (isNotNull) {
-            valueToSave = '';
-        } else {
-            valueToSave = null;
-        }
+        // Empty TEXT and SQL NULL have different query, constraint, trigger,
+        // and application semantics. NULL is available only through an
+        // explicit action; clearing an editor must preserve the empty string.
+        valueToSave = '';
     } else if (!isNaN(Number(newValue)) && newValue.trim() !== '') {
         valueToSave = parseGridInputValue(
             newValue,
@@ -281,7 +282,7 @@ export async function saveCellEdit() {
 
     } catch (err) {
         console.error('Save failed:', err);
-        let errorMessage = err.message || String(err);
+        let errorMessage = getErrorMessage(err);
         // ... error message formatting ...
         // Retaining the failed session only helps while its editor textarea is
         // still there to correct the value. A table switch re-renders the grid
@@ -396,38 +397,51 @@ function cleanupCellEdit() {
 export async function openCellInVsCode() {
     if (!state.cellPreviewInfo) return;
 
-    const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = state.cellPreviewInfo;
-    const mutationBlockReason = getCellMutationBlockReason(rowIdx, colIdx);
-    if (mutationBlockReason) {
-        updateStatus(mutationBlockReason);
+    const previewSession = state.cellPreviewInfo;
+    const {
+        rowId, columnName, originalValue, originalText,
+        table, column: sessionColumn, colIdx
+    } = previewSession;
+    const targetTable = table ?? state.selectedTable;
+    const column = sessionColumn ?? state.tableColumns[colIdx];
+    if (!targetTable) return;
+    if (previewSession.readOnlyReason) {
+        updateStatus(previewSession.readOnlyReason);
         return;
     }
-    const column = state.tableColumns[colIdx];
 
     // We get the webview id from dataset if available or assume 'default'
     const webviewId = document.getElementById('vscode-env')?.dataset.webviewId || 'default';
 
     try {
         updateStatus('Opening in VS Code...');
-        // Close the preview modal as we are moving to VS Code editor
-        closeCellPreview();
-
-        await backendApi.openCellEditor(
-            { table: state.selectedTable, name: '' }, // dbParams
+        const result = await backendApi.openCellEditor(
+            { table: targetTable, name: '' }, // dbParams
             validateRowId(rowId),
             columnName,
             {}, // colTypes
             {
                 value: originalText ?? originalValue,
-                type: { type: column.type }, // Pass column type
+                type: { type: column?.type }, // Pass column type
                 webviewId,
                 rowCount: state.gridData.length
             }
         );
-        updateStatus('Opened in VS Code');
+        // The user may have closed A and opened B while the host picker/editor
+        // was pending. A's completion owns neither B's draft nor its status.
+        if (state.cellPreviewInfo !== previewSession) return;
+        if (result?.success === false) {
+            updateStatus(result.message || 'External cell editing is unavailable');
+            return;
+        }
+        // Discard the modal draft only after the host confirms that an editor opened.
+        closeCellPreview();
+        updateStatus(result?.mode === 'temporary-read-only'
+            ? 'Opened in VS Code as a verified read-only temporary file'
+            : 'Opened in VS Code');
     } catch (err) {
         console.error('Failed to open in VS Code:', err);
-        updateStatus(`Error: ${err.message}`);
+        if (state.cellPreviewInfo === previewSession) updateStatus(`Error: ${getErrorMessage(err)}`);
     }
 }
 
@@ -443,7 +457,7 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
             );
             return;
         }
-        blobInspector.inspectOversized(
+        return blobInspector.inspectOversized(
             getCellValue(row, colIdx),
             oversizedMetadata,
             rowId,
@@ -451,7 +465,6 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
             rowIdx,
             colIdx
         );
-        return;
     }
 
     if (state.editingCellInfo) {
@@ -465,7 +478,9 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     if (!row) return;
 
     const value = getCellValue(row, colIdx);
-    const readOnlyRowReason = getReadOnlyRowReason(rowIdx);
+    const readOnlyRowReason = getCellMutationBlockReason(rowIdx, colIdx, {
+        allowOversizedReplacement: true
+    });
 
     // Delegate BLOB inspection
     if (value instanceof Uint8Array) {
@@ -481,10 +496,18 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         colIdx,
         rowId,
         columnName: column.name,
+        table: state.selectedTable,
+        tableType: state.selectedTableType,
+        column: { ...column },
+        identityKind: state.selectedTableIdentity?.kind ?? null,
+        documentReadOnly: state.isReadOnly,
         originalValue: value,
         originalText,
-        readOnlyReason: readOnlyRowReason
+        readOnlyReason: readOnlyRowReason,
+        valueMode: 'value',
+        dirty: false
     };
+    const previewSession = state.cellPreviewInfo;
 
     const modal = document.getElementById('cellPreviewModal');
     const columnNameEl = document.getElementById('cellPreviewColumnName');
@@ -494,6 +517,8 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     const readonlyBadgeEl = document.getElementById('cellPreviewReadonlyBadge');
     const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
     const openInVsCodeBtnEl = document.getElementById('openInVsCodeBtn');
+    const emptyBtnEl = document.getElementById('cellPreviewEmptyBtn');
+    const nullBtnEl = document.getElementById('cellPreviewNullBtn');
     const wrapBtnEl = document.getElementById('wrapTextBtn');
 
     columnNameEl.textContent = column.name;
@@ -510,14 +535,20 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
 
     textarea.value = displayValue;
 
-    const isReadonly = state.isReadOnly || state.selectedTableType !== 'table' || !!readOnlyRowReason;
+    const isReadonly = previewSession.documentReadOnly
+        || previewSession.tableType !== 'table'
+        || !!readOnlyRowReason;
     textarea.readOnly = isReadonly;
     if (isReadonly) {
         textarea.classList.add('readonly');
         readonlyBadgeEl.style.display = 'inline';
         readonlyBadgeEl.textContent = readOnlyRowReason
-            ? 'Read-only (primary key too large)'
-            : 'Read-only (View)';
+            ? column.isGenerated
+                ? 'Read-only (Generated column)'
+                : 'Read-only (Row)'
+            : previewSession.documentReadOnly
+                ? 'Read-only (Database)'
+                : 'Read-only (View)';
         readonlyBadgeEl.title = readOnlyRowReason || '';
         saveBtnEl.style.display = 'none';
     } else {
@@ -526,7 +557,21 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         readonlyBadgeEl.title = '';
         saveBtnEl.style.display = 'inline-block';
     }
-    if (openInVsCodeBtnEl) openInVsCodeBtnEl.style.display = readOnlyRowReason ? 'none' : '';
+    if (openInVsCodeBtnEl) {
+        const externalEditorAvailable = !!document.getElementById('vscode-env');
+        openInVsCodeBtnEl.style.display = readOnlyRowReason || !externalEditorAvailable ? 'none' : '';
+    }
+    if (emptyBtnEl) {
+        emptyBtnEl.classList.remove('active');
+        emptyBtnEl.disabled = isReadonly;
+    }
+    if (nullBtnEl) {
+        nullBtnEl.classList.remove('active');
+        nullBtnEl.disabled = isReadonly || column.notnull === 1;
+        nullBtnEl.title = column.notnull === 1
+            ? 'This column does not allow SQL NULL'
+            : 'Store SQL NULL explicitly';
+    }
 
     updateCellPreviewCharCount();
 
@@ -534,11 +579,58 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     textarea.style.overflowX = state.cellPreviewWrapEnabled ? 'hidden' : 'auto';
     wrapBtnEl.classList.toggle('active', state.cellPreviewWrapEnabled);
 
-    modal.classList.remove('hidden');
+    openModal('cellPreviewModal');
     textarea.focus();
 
     // Attach listener for char count
-    textarea.oninput = updateCellPreviewCharCount;
+    textarea.oninput = () => {
+        if (state.cellPreviewInfo === previewSession) {
+            previewSession.valueMode = 'value';
+            previewSession.dirty = true;
+        }
+        emptyBtnEl?.classList.remove('active');
+        nullBtnEl?.classList.remove('active');
+        updateCellPreviewCharCount();
+    };
+}
+
+export function setCellPreviewEmpty() {
+    const previewSession = state.cellPreviewInfo;
+    if (
+        !previewSession
+        || previewSession.documentReadOnly
+        || previewSession.tableType !== 'table'
+        || previewSession.readOnlyReason
+    ) return;
+    const textarea = document.getElementById('cellPreviewTextarea');
+    if (!textarea) return;
+    previewSession.valueMode = 'value';
+    previewSession.dirty = true;
+    textarea.value = '';
+    document.getElementById('cellPreviewEmptyBtn')?.classList.add('active');
+    document.getElementById('cellPreviewNullBtn')?.classList.remove('active');
+    updateCellPreviewCharCount();
+    textarea.focus();
+}
+
+export function setCellPreviewNull() {
+    const previewSession = state.cellPreviewInfo;
+    if (
+        !previewSession
+        || previewSession.documentReadOnly
+        || previewSession.tableType !== 'table'
+        || previewSession.readOnlyReason
+        || previewSession.column?.notnull === 1
+    ) return;
+    const textarea = document.getElementById('cellPreviewTextarea');
+    if (!textarea) return;
+    previewSession.valueMode = 'null';
+    previewSession.dirty = true;
+    textarea.value = '';
+    document.getElementById('cellPreviewNullBtn')?.classList.add('active');
+    document.getElementById('cellPreviewEmptyBtn')?.classList.remove('active');
+    updateCellPreviewCharCount();
+    textarea.focus();
 }
 
 export function onCellPreviewKeydown(event) {
@@ -560,9 +652,7 @@ function updateCellPreviewCharCount() {
 }
 
 export function closeCellPreview() {
-    const modal = document.getElementById('cellPreviewModal');
-    modal.classList.add('hidden');
-    state.cellPreviewInfo = null;
+    closeModal('cellPreviewModal');
 }
 
 export async function saveCellPreview() {
@@ -576,28 +666,34 @@ export async function saveCellPreview() {
 }
 
 async function saveCellPreviewOnce() {
-    if (state.isReadOnly) {
+    const previewSession = state.cellPreviewInfo;
+    if (!previewSession) return;
+    if (previewSession.documentReadOnly ?? state.isReadOnly) {
         updateStatus('Document is read-only');
         return;
     }
-    if (!state.cellPreviewInfo) return;
-    if (state.cellPreviewInfo.readOnlyReason) {
-        updateStatus(state.cellPreviewInfo.readOnlyReason);
+    if (previewSession.readOnlyReason) {
+        updateStatus(previewSession.readOnlyReason);
         return;
     }
-    if (state.selectedTableType !== 'table') {
+    if ((previewSession.tableType ?? state.selectedTableType) !== 'table') {
         updateStatus('Views are read-only');
         return;
     }
 
-    const previewSession = state.cellPreviewInfo;
-    const targetTable = state.selectedTable;
+    const targetTable = previewSession.table ?? state.selectedTable;
     const { rowIdx, colIdx, rowId, columnName, originalValue, originalText } = previewSession;
     const textarea = document.getElementById('cellPreviewTextarea');
     const newValue = textarea.value;
 
     const origStr = originalText ?? (originalValue === null ? '' : String(originalValue));
-    if (newValue === origStr) {
+    const valueMode = previewSession.valueMode ?? 'value';
+    const explicitlyUnchanged = previewSession.dirty === false;
+    const legacyUnchanged = previewSession.dirty === undefined
+        && valueMode === 'value'
+        && newValue === origStr;
+    const nullUnchanged = valueMode === 'null' && originalValue === null;
+    if (explicitlyUnchanged || legacyUnchanged || nullUnchanged) {
         closeCellPreview();
         state.selectedCells = [];
         state.lastSelectedCell = null;
@@ -605,17 +701,22 @@ async function saveCellPreviewOnce() {
         return;
     }
 
-    const column = state.tableColumns[colIdx];
-    const isNotNull = column && column.notnull === 1;
+    const column = previewSession.column ?? state.tableColumns[colIdx];
 
     let valueToSave;
-    if (newValue === '') {
-        valueToSave = isNotNull ? '' : null;
+    if (valueMode === 'null') {
+        if (column?.notnull === 1) {
+            updateStatus(`Column ${columnName} does not allow SQL NULL`);
+            return;
+        }
+        valueToSave = null;
+    } else if (newValue === '') {
+        valueToSave = '';
     } else if (!isNaN(Number(newValue)) && newValue.trim() !== '') {
         valueToSave = parseGridInputValue(
             newValue,
             column,
-            state.selectedTableIdentity?.kind === 'primaryKey'
+            previewSession.identityKind === 'primaryKey'
         );
     } else {
         valueToSave = newValue;
@@ -660,7 +761,7 @@ async function saveCellPreviewOnce() {
         updateStatus('Saved');
     } catch (err) {
         console.error('Save failed:', err);
-        updateStatus(`Save failed: ${err.message}`);
+        updateStatus(`Save failed: ${getErrorMessage(err)}`);
     }
 }
 
@@ -668,7 +769,12 @@ export function formatCellPreviewJson() {
     const textarea = document.getElementById('cellPreviewTextarea');
     try {
         const parsed = JSON.parse(textarea.value);
-        textarea.value = JSON.stringify(parsed, null, 2);
+        const formatted = JSON.stringify(parsed, null, 2);
+        if (formatted !== textarea.value && state.cellPreviewInfo) {
+            state.cellPreviewInfo.valueMode = 'value';
+            state.cellPreviewInfo.dirty = true;
+        }
+        textarea.value = formatted;
         updateCellPreviewCharCount();
     } catch (e) {
         updateStatus('Content is not valid JSON');
@@ -679,7 +785,12 @@ export function compactCellPreviewJson() {
     const textarea = document.getElementById('cellPreviewTextarea');
     try {
         const parsed = JSON.parse(textarea.value);
-        textarea.value = JSON.stringify(parsed);
+        const compacted = JSON.stringify(parsed);
+        if (compacted !== textarea.value && state.cellPreviewInfo) {
+            state.cellPreviewInfo.valueMode = 'value';
+            state.cellPreviewInfo.dirty = true;
+        }
+        textarea.value = compacted;
         updateCellPreviewCharCount();
     } catch (e) {
         updateStatus('Content is not valid JSON');

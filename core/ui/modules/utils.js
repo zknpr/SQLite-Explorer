@@ -8,6 +8,8 @@ import {
     isReadOnlyPrimaryKeyRecordId
 } from '../../../src/core/row-identity.ts';
 
+const MAX_UI_ERROR_MESSAGE_LENGTH = 8192;
+
 /**
  * Escape HTML special characters to prevent XSS attacks.
  */
@@ -19,6 +21,58 @@ export function escapeHtml(str) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+}
+
+/**
+ * Turn arbitrary rejected values into a usable status message. JavaScript
+ * promises may reject with null, strings, proxies, or objects whose coercion
+ * throws; error reporting must not become a second failure.
+ */
+export function getErrorMessage(error, fallback = 'Unknown error') {
+    let message = fallback;
+    try {
+        if (error instanceof Error && typeof error.message === 'string' && error.message) {
+            message = error.message;
+        } else {
+            message = String(error) || fallback;
+        }
+    } catch {
+        message = fallback;
+    }
+    if (message.length <= MAX_UI_ERROR_MESSAGE_LENGTH) return message;
+    return message.slice(0, MAX_UI_ERROR_MESSAGE_LENGTH)
+        + `... [truncated from ${message.length} characters]`;
+}
+
+/** Normalize transport/file binary values without lossy Uint8Array coercion. */
+export function normalizeBinaryData(value) {
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (ArrayBuffer.isView(value)) {
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+    }
+
+    let bytes;
+    if (Array.isArray(value)) {
+        bytes = value;
+    } else if (value && typeof value === 'object') {
+        const keys = Object.keys(value);
+        if (value.type === 'Buffer'
+            && Array.isArray(value.data)
+            && keys.length === 2
+            && keys.includes('type')
+            && keys.includes('data')) {
+            bytes = value.data;
+        } else if (keys.length > 0 && keys.every((key, index) => key === String(index))) {
+            // Legacy typed-array serialization: { 0: byte, 1: byte, ... }.
+            bytes = keys.map(key => value[key]);
+        }
+    }
+
+    if (!bytes || bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+        throw new TypeError('Invalid binary data: expected canonical bytes in the range 0..255');
+    }
+    return new Uint8Array(bytes);
 }
 
 /**
@@ -147,24 +201,20 @@ export function hasIntegerOrNumericAffinity(declaredType) {
     return true;
 }
 
-/** Preserve decimal text when a declared PK integer cannot survive a JS number round-trip. */
+/** Apply declared affinity without destroying lexical TEXT or unsafe integer input. */
 export function parseGridInputValue(value, column, usesDeclaredPrimaryKey = false) {
     const declaredType = (column?.type ?? '').toUpperCase();
-    if (
-        usesDeclaredPrimaryKey
-        && column?.isPrimaryKey
-        && /(CHAR|CLOB|TEXT)/.test(declaredType)
-    ) {
+    if (/(CHAR|CLOB|TEXT)/.test(declaredType)) {
         return value;
     }
     const numericValue = Number(value);
     if (
-        usesDeclaredPrimaryKey
-        && column?.isPrimaryKey
-        && hasIntegerOrNumericAffinity(declaredType)
+        hasIntegerOrNumericAffinity(declaredType)
         && /^[+-]?\d+$/.test(value.trim())
         && !Number.isSafeInteger(numericValue)
     ) {
+        // Binding exact decimal text lets SQLite apply INTEGER/NUMERIC affinity
+        // without first rounding through JavaScript's binary64 Number.
         return value.trim();
     }
     return numericValue;
@@ -256,7 +306,7 @@ function isDateType(type, name) {
  * Format a date value.
  */
 function formatDate(value, format) {
-    if (!value) return null;
+    if (value === null || value === undefined || value === '') return null;
 
     // Parse date (assuming string or number)
     let date;
@@ -304,7 +354,8 @@ function formatDate(value, format) {
  * Format date as relative time (e.g. "2 hours ago").
  */
 function timeAgo(date) {
-    const seconds = Math.floor((new Date() - date) / 1000);
+    const signedSeconds = Math.trunc((Date.now() - date.getTime()) / 1000);
+    const seconds = Math.abs(signedSeconds);
     const intervals = {
         year: 31536000,
         month: 2592000,
@@ -315,15 +366,11 @@ function timeAgo(date) {
         second: 1
     };
 
-    let counter;
     for (const [unit, secondsInUnit] of Object.entries(intervals)) {
-        counter = Math.floor(seconds / secondsInUnit);
+        const counter = Math.floor(seconds / secondsInUnit);
         if (counter > 0) {
-            if (counter === 1) {
-                return `1 ${unit} ago`;
-            } else {
-                return `${counter} ${unit}s ago`;
-            }
+            const quantity = `${counter} ${unit}${counter === 1 ? '' : 's'}`;
+            return signedSeconds < 0 ? `in ${quantity}` : `${quantity} ago`;
         }
     }
     return 'Just now';

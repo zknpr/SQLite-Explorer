@@ -68,11 +68,18 @@ export function cancelTokenToAbortSignal(
   if (token.isCancellationRequested) {
     controller.abort();
   } else {
-    // Store the disposable and clean it up after abort to prevent memory leak
-    const disposable = token.onCancellationRequested(() => {
+    // Cancellation can win between the property read above and listener
+    // registration. Some token implementations invoke the callback inline;
+    // defer disposal until onCancellationRequested has returned its handle.
+    let disposable: { dispose(): unknown } | undefined;
+    let cancellationObserved = false;
+    const onCancellation = () => {
+      cancellationObserved = true;
       controller.abort();
-      disposable.dispose();
-    });
+      disposable?.dispose();
+    };
+    disposable = token.onCancellationRequested(onCancellation);
+    if (cancellationObserved) disposable.dispose();
   }
   return controller.signal;
 }

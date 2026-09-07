@@ -425,7 +425,7 @@ describe('keyset SQL assembly', () => {
     );
     assert.strictEqual(
       buildSelectQuery('t', options).sql,
-      'SELECT "rowid" AS "rowid", "value" FROM "t" WHERE "value" LIKE ? ESCAPE \'\\\' ' +
+      'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "value" LIKE ? ESCAPE \'\\\' ' +
       'ORDER BY "value" DESC LIMIT 50 OFFSET 100'
     );
   });
@@ -437,29 +437,29 @@ describe('keyset SQL assembly', () => {
       plan('t', { ...rowidOptions, keyset: { mode: 'first' } })
     );
     assert.deepStrictEqual(first, {
-      sql: 'SELECT "rowid" AS "rowid", "value" FROM "t" ORDER BY "rowid" ASC LIMIT 50',
+      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" ORDER BY "rowid" ASC LIMIT 50',
       params: []
     });
 
     // rowid slots are INTEGER-class: they bind through CAST(? AS INTEGER) so
     // int64 values beyond 2^53 (decoded to decimal strings) seek exactly.
     assert.deepStrictEqual(build(rowidOptions, ROWID_IDENTITY, 'after', [100n]), {
-      sql: 'SELECT "rowid" AS "rowid", "value" FROM "t" WHERE "rowid" > CAST(? AS INTEGER) ' +
+      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" > CAST(? AS INTEGER) ' +
         'ORDER BY "rowid" ASC LIMIT 50',
       params: [100]
     });
     assert.deepStrictEqual(build(rowidOptions, ROWID_IDENTITY, 'atOrAfter', [100n]), {
-      sql: 'SELECT "rowid" AS "rowid", "value" FROM "t" WHERE "rowid" >= CAST(? AS INTEGER) ' +
+      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" >= CAST(? AS INTEGER) ' +
         'ORDER BY "rowid" ASC LIMIT 50',
       params: [100]
     });
     assert.deepStrictEqual(build(rowidOptions, ROWID_IDENTITY, 'before', [100n]), {
-      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "value" FROM "t" WHERE "rowid" < CAST(? AS INTEGER) ' +
+      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" < CAST(? AS INTEGER) ' +
         'ORDER BY "rowid" DESC LIMIT 50) ORDER BY "rowid" ASC',
       params: [100]
     });
     assert.deepStrictEqual(build(rowidOptions, ROWID_IDENTITY, 'last', undefined, 7), {
-      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "value" FROM "t" ' +
+      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "value" FROM main."t" ' +
         'ORDER BY "rowid" DESC LIMIT 7) ORDER BY "rowid" ASC',
       params: []
     });
@@ -469,7 +469,7 @@ describe('keyset SQL assembly', () => {
     const options: TableQueryOptions = { columns: ['tenant', 'seq', 'value'], limit: 10 };
     // Per-slot binding: TEXT stays a plain placeholder, INTEGER gets CAST.
     assert.deepStrictEqual(build(options, COMPOSITE_IDENTITY, 'after', ['north', 7n]), {
-      sql: 'SELECT "tenant", "seq", "value" FROM "t" ' +
+      sql: 'SELECT "tenant", "seq", "value" FROM main."t" ' +
         'WHERE ("tenant", "seq") > (?, CAST(? AS INTEGER)) ' +
         'ORDER BY "tenant" ASC, "seq" ASC LIMIT 10',
       params: ['north', 7]
@@ -483,7 +483,7 @@ describe('keyset SQL assembly', () => {
       filters: [{ column: 'value', value: 'needle' }]
     };
     assert.deepStrictEqual(build(options, ROWID_IDENTITY, 'after', [42n]), {
-      sql: 'SELECT "rowid" AS "rowid", "value" FROM "t" WHERE "value" LIKE ? ESCAPE \'\\\' ' +
+      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "value" LIKE ? ESCAPE \'\\\' ' +
         'AND "rowid" > CAST(? AS INTEGER) ORDER BY "rowid" ASC LIMIT 10',
       params: ['%needle%', 42]
     });
@@ -494,12 +494,12 @@ describe('keyset SQL assembly', () => {
     // REAL compares numerically with INTEGER storage in every affinity; only
     // the INTEGER class needs the CAST rescue.
     assert.deepStrictEqual(build(options, ROWID_IDENTITY, 'after', [1.5, 9n]), {
-      sql: 'SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ("s", "rowid") > (?, CAST(? AS INTEGER)) ' +
+      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ("s", "rowid") > (?, CAST(? AS INTEGER)) ' +
         'ORDER BY "s" ASC, "rowid" ASC LIMIT 4',
       params: [1.5, 9]
     });
     assert.deepStrictEqual(build(options, ROWID_IDENTITY, 'after', [9007199254740993n, 9n]), {
-      sql: 'SELECT "rowid" AS "rowid", "s" FROM "t" ' +
+      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" ' +
         'WHERE ("s", "rowid") > (CAST(? AS INTEGER), CAST(? AS INTEGER)) ' +
         'ORDER BY "s" ASC, "rowid" ASC LIMIT 4',
       params: ['9007199254740993', 9]
@@ -512,27 +512,27 @@ describe('keyset SQL assembly', () => {
 
     // ASC, non-NULL anchor: NULLs sort first and are already behind us.
     assert.deepStrictEqual(build(asc, ROWID_IDENTITY, 'after', ['m', 9n]), {
-      sql: 'SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ("s", "rowid") > (?, CAST(? AS INTEGER)) ' +
+      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ("s", "rowid") > (?, CAST(? AS INTEGER)) ' +
         'ORDER BY "s" ASC, "rowid" ASC LIMIT 4',
       params: ['m', 9]
     });
     // ASC, NULL anchor: the rest of the NULL run, then every non-NULL row.
     // The CAST rides into the NULL-decomposed identity compare too.
     assert.deepStrictEqual(build(asc, ROWID_IDENTITY, 'after', [null, 9n]), {
-      sql: 'SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ' +
+      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
         '(("s" IS NULL AND "rowid" > CAST(? AS INTEGER)) OR "s" IS NOT NULL) ' +
         'ORDER BY "s" ASC, "rowid" ASC LIMIT 4',
       params: [9]
     });
     // ASC 'before' runs reversed (DESC), where the NULL run lies ahead.
     assert.deepStrictEqual(build(asc, ROWID_IDENTITY, 'before', ['m', 9n]), {
-      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ' +
+      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
         '(("s", "rowid") < (?, CAST(? AS INTEGER)) OR "s" IS NULL) ' +
         'ORDER BY "s" DESC, "rowid" DESC LIMIT 4) ORDER BY "s" ASC, "rowid" ASC',
       params: ['m', 9]
     });
     assert.deepStrictEqual(build(asc, ROWID_IDENTITY, 'before', [null, 9n]), {
-      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ' +
+      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
         '("s" IS NULL AND "rowid" < CAST(? AS INTEGER)) ' +
         'ORDER BY "s" DESC, "rowid" DESC LIMIT 4) ORDER BY "s" ASC, "rowid" ASC',
       params: [9]
@@ -540,27 +540,27 @@ describe('keyset SQL assembly', () => {
 
     // DESC, non-NULL anchor: the NULL run sorts last and lies ahead.
     assert.deepStrictEqual(build(desc, ROWID_IDENTITY, 'after', ['m', 9n]), {
-      sql: 'SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ' +
+      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
         '(("s", "rowid") < (?, CAST(? AS INTEGER)) OR "s" IS NULL) ' +
         'ORDER BY "s" DESC, "rowid" DESC LIMIT 4',
       params: ['m', 9]
     });
     // DESC, NULL anchor: only the rest of the NULL run remains.
     assert.deepStrictEqual(build(desc, ROWID_IDENTITY, 'after', [null, 9n]), {
-      sql: 'SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ' +
+      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
         '("s" IS NULL AND "rowid" < CAST(? AS INTEGER)) ' +
         'ORDER BY "s" DESC, "rowid" DESC LIMIT 4',
       params: [9]
     });
     // DESC 'before' runs reversed (ASC): larger values, NULLs excluded.
     assert.deepStrictEqual(build(desc, ROWID_IDENTITY, 'before', ['m', 9n]), {
-      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ' +
+      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
         '("s", "rowid") > (?, CAST(? AS INTEGER)) ' +
         'ORDER BY "s" ASC, "rowid" ASC LIMIT 4) ORDER BY "s" DESC, "rowid" DESC',
       params: ['m', 9]
     });
     assert.deepStrictEqual(build(desc, ROWID_IDENTITY, 'before', [null, 9n]), {
-      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM "t" WHERE ' +
+      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
         '(("s" IS NULL AND "rowid" > CAST(? AS INTEGER)) OR "s" IS NOT NULL) ' +
         'ORDER BY "s" ASC, "rowid" ASC LIMIT 4) ORDER BY "s" DESC, "rowid" DESC',
       params: [9]
@@ -594,7 +594,7 @@ describe('keyset fallback ordering', () => {
     // Unsorted anchorable: scan order becomes the explicit identity order.
     assert.strictEqual(
       applyFallback({ columns: ['rowid', 'value'], limit: 50, offset: 100 }, ROWID_IDENTITY).sql,
-      'SELECT "rowid" AS "rowid", "value" FROM "t" ORDER BY "rowid" ASC LIMIT 50 OFFSET 100'
+      'SELECT "rowid" AS "rowid", "value" FROM main."t" ORDER BY "rowid" ASC LIMIT 50 OFFSET 100'
     );
     // Sorted: the bare sort column gains the uniform identity tiebreak, so
     // OFFSET tie order can no longer depend on SQLite's chosen plan.
@@ -603,7 +603,7 @@ describe('keyset fallback ordering', () => {
         { columns: ['rowid', 'value'], orderBy: 'value', orderDir: 'DESC', limit: 50, offset: 100 },
         ROWID_IDENTITY
       ).sql,
-      'SELECT "rowid" AS "rowid", "value" FROM "t" ' +
+      'SELECT "rowid" AS "rowid", "value" FROM main."t" ' +
       'ORDER BY "value" DESC, "rowid" DESC LIMIT 50 OFFSET 100'
     );
     // Composite identity sorted by a key member: deduped uniform order.
@@ -612,12 +612,12 @@ describe('keyset fallback ordering', () => {
         { columns: ['tenant', 'seq', 'value'], orderBy: 'seq', orderDir: 'ASC', limit: 10, offset: 20 },
         COMPOSITE_IDENTITY
       ).sql,
-      'SELECT "tenant", "seq", "value" FROM "t" ORDER BY "seq" ASC, "tenant" ASC LIMIT 10 OFFSET 20'
+      'SELECT "tenant", "seq", "value" FROM main."t" ORDER BY "seq" ASC, "tenant" ASC LIMIT 10 OFFSET 20'
     );
     // orderDir without a sort column is meaningless: identity stays ASC.
     assert.strictEqual(
       applyFallback({ columns: ['rowid', 'value'], orderDir: 'DESC', limit: 5 }, ROWID_IDENTITY).sql,
-      'SELECT "rowid" AS "rowid", "value" FROM "t" ORDER BY "rowid" ASC LIMIT 5'
+      'SELECT "rowid" AS "rowid", "value" FROM main."t" ORDER BY "rowid" ASC LIMIT 5'
     );
     // The export streamer's rowid-ordered identity walk (the one non-grid
     // rowid-first caller, tableExportStreaming) already orders by the keyset
@@ -627,7 +627,7 @@ describe('keyset fallback ordering', () => {
         { columns: ['rowid'], orderBy: 'rowid', orderDir: 'ASC', limit: 512, offset: 0 },
         ROWID_IDENTITY
       ).sql,
-      'SELECT "rowid" AS "rowid" FROM "t" ORDER BY "rowid" ASC LIMIT 512 OFFSET 0'
+      'SELECT "rowid" AS "rowid" FROM main."t" ORDER BY "rowid" ASC LIMIT 512 OFFSET 0'
     );
   });
 
@@ -635,7 +635,7 @@ describe('keyset fallback ordering', () => {
     // No identity (view, keyless object, shadowed rowid): unchanged scan...
     assert.strictEqual(
       applyFallback({ columns: ['rowid', 'value'], limit: 50, offset: 100 }, undefined).sql,
-      'SELECT "rowid" AS "rowid", "value" FROM "t" LIMIT 50 OFFSET 100'
+      'SELECT "rowid" AS "rowid", "value" FROM main."t" LIMIT 50 OFFSET 100'
     );
     // ...and unchanged bare-column sort.
     assert.strictEqual(
@@ -643,7 +643,7 @@ describe('keyset fallback ordering', () => {
         { columns: ['rowid', 'value'], orderBy: 'value', orderDir: 'DESC', limit: 50, offset: 100 },
         undefined
       ).sql,
-      'SELECT "rowid" AS "rowid", "value" FROM "t" ORDER BY "value" DESC LIMIT 50 OFFSET 100'
+      'SELECT "rowid" AS "rowid", "value" FROM main."t" ORDER BY "value" DESC LIMIT 50 OFFSET 100'
     );
     // External multi-column ordering contracts are not grid queries.
     assert.strictEqual(
@@ -651,7 +651,7 @@ describe('keyset fallback ordering', () => {
         { columns: ['a', 'b'], orderByColumns: ['a', 'b'], orderDir: 'DESC', limit: 5 },
         ROWID_IDENTITY
       ).sql,
-      'SELECT "a", "b" FROM "t" ORDER BY "a" DESC, "b" DESC LIMIT 5'
+      'SELECT "a", "b" FROM main."t" ORDER BY "a" DESC, "b" DESC LIMIT 5'
     );
   });
 

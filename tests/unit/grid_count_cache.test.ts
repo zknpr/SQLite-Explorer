@@ -91,7 +91,7 @@ describe('grid count cache', () => {
         delete (globalThis as any).document;
     });
 
-    it('serves page turns from the cached count with no count fetch, keyset and OFFSET alike', async () => {
+    it('reuses cached counts until a full final page makes the end ambiguous', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
         const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
@@ -109,7 +109,7 @@ describe('grid count cache', () => {
         primeTableState(state, 'items');
 
         try {
-            // First load is the only count fetch of the whole sequence.
+            // Interior page turns reuse the first load's count.
             assert.strictEqual(await loadTableData(false, false), true);
             assert.strictEqual(countCalls.length, 1);
             assert.strictEqual(state.totalRecordCount, 60);
@@ -126,39 +126,39 @@ describe('grid count cache', () => {
             assert.deepStrictEqual(dataRequests.at(-1).keyset, { mode: 'atOrAfter', anchor: 'F2' });
             assert.strictEqual(countCalls.length, 1);
 
-            // last: remainder computed from the cached count
+            // A full purported last page must refresh the count because an
+            // external writer may have appended another page.
             state.currentPageIndex = 2;
             await loadTableData(false, false, 'last');
             assert.deepStrictEqual(dataRequests.at(-1).keyset, { mode: 'last', lastPageRowCount: 20 });
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 2);
 
             // prev with a valid anchor (anchors describe page 2 after 'last')
             state.currentPageIndex = 1;
             await loadTableData(false, false, 'prev');
             assert.deepStrictEqual(dataRequests.at(-1).keyset, { mode: 'before', anchor: 'F4' });
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 2);
 
             // first
             state.currentPageIndex = 0;
             await loadTableData(false, false, 'first');
             assert.deepStrictEqual(dataRequests.at(-1).keyset, { mode: 'first' });
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 2);
 
-            // OFFSET fallback: anchors describing a different page than the
-            // intent expects still turn the page without a count fetch.
+            // An OFFSET fallback on that full final page has the same ambiguity.
             state.currentPageIndex = 2;
             state.keysetAnchors = { table: 'items', pageIndex: 0, first: 'F0', last: 'L0' };
             await loadTableData(false, false, 'next');
             assert.strictEqual(dataRequests.at(-1).keyset, undefined);
             assert.strictEqual(dataRequests.at(-1).offset, 40);
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 3);
 
             // Arbitrary jump without intent (goToPage default): OFFSET, no count.
             state.currentPageIndex = 1;
             state.keysetAnchors = null;
             await loadTableData(false, false);
             assert.strictEqual(dataRequests.at(-1).keyset, undefined);
-            assert.strictEqual(countCalls.length, 1);
+            assert.strictEqual(countCalls.length, 3);
         } finally {
             resetHarness(state, backendApi, originals);
         }
@@ -192,6 +192,135 @@ describe('grid count cache', () => {
             assert.strictEqual(await load, true);
             assert.strictEqual(state.totalRecordCount, 40);
             assert.strictEqual(state.totalPageCount, 2);
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('does not let a cached exact count hide rows added by an external writer', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const dataLimits: number[] = [];
+        let countCalls = 0;
+        let databaseRows = 1;
+        backendApi.fetchTableCount = async () => {
+            countCalls += 1;
+            return { count: databaseRows, isExact: true };
+        };
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            dataLimits.push(options.limit);
+            return {
+                rows: Array.from(
+                    { length: Math.min(databaseRows, options.limit) },
+                    (_, row) => [row + 1, `row-${row + 1}`]
+                )
+            };
+        };
+        primeTableState(state, 'externally_changed');
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.strictEqual(state.gridData.length, 1);
+            assert.strictEqual(countCalls, 1);
+
+            databaseRows = 100;
+            assert.strictEqual(await loadTableData(false, false), true);
+
+            assert.strictEqual(state.gridData.length, 100);
+            assert.strictEqual(state.totalRecordCount, 100);
+            assert.strictEqual(countCalls, 2);
+            assert.deepStrictEqual(dataLimits, [5000, 5000]);
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('refreshes a cached final-page count when fresh data fills the page', async () => {
+        const elements = installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        let countCalls = 0;
+        let databaseRows = 5000;
+        backendApi.fetchTableCount = async () => {
+            countCalls += 1;
+            return { count: databaseRows, isExact: true };
+        };
+        backendApi.fetchTableData = async (_table: string, options: any) => ({
+            rows: Array.from(
+                { length: Math.min(databaseRows, options.limit) },
+                (_, row) => [row + 1, `row-${row + 1}`]
+            )
+        });
+        primeTableState(state, 'externally_grown');
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.strictEqual(countCalls, 1);
+            assert.strictEqual(state.totalPageCount, 1);
+
+            databaseRows = 6000;
+            assert.strictEqual(await loadTableData(false, false), true);
+
+            assert.strictEqual(countCalls, 2);
+            assert.strictEqual(state.totalRecordCount, 6000);
+            assert.strictEqual(state.totalPageCount, 2);
+            assert.strictEqual(state.gridData.length, 5000);
+            assert.strictEqual(elements.btnNext.disabled, false);
+        } finally {
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('refetches a clipped short exact page at its real row bound', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const fullPayload = JSON.stringify({ payload: 'x'.repeat(710) });
+        assert.strictEqual(Buffer.byteLength(fullPayload, 'utf8'), 724);
+        const clippedPayload = fullPayload.slice(0, 671);
+        const dataLimits: number[] = [];
+        let countCalls = 0;
+
+        backendApi.fetchTableCount = async () => {
+            countCalls += 1;
+            return { count: 46, isExact: true };
+        };
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            dataLimits.push(options.limit);
+            if (options.limit === 5000) {
+                return {
+                    rows: [[1, clippedPayload]],
+                    oversizedCells: {
+                        0: { 1: { storageClass: 'text', byteLength: 724 } }
+                    }
+                };
+            }
+            assert.strictEqual(options.limit, 46);
+            return { rows: [[1, fullPayload]] };
+        };
+        primeTableState(state, 'events');
+        state.rowsPerPage = 5000;
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            // Consumer-visible proof: the normal 724-byte value is complete
+            // and editable, rather than retaining the containment preview.
+            assert.strictEqual(state.gridData[0][1], fullPayload);
+            assert.deepStrictEqual(state.gridOversizedCells, {});
+            assert.deepStrictEqual(dataLimits, [5000, 46]);
+
+            // A cached count cannot safely shorten the first query because an
+            // external writer may have changed the table. If the unbounded
+            // query clips a cell, refresh the count and retry against the new
+            // load's exact bound.
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.strictEqual(state.gridData[0][1], fullPayload);
+            assert.deepStrictEqual(state.gridOversizedCells, {});
+            assert.strictEqual(countCalls, 2);
+            assert.deepStrictEqual(dataLimits, [5000, 46, 5000, 46]);
         } finally {
             resetHarness(state, backendApi, originals);
         }
@@ -430,12 +559,18 @@ describe('grid count cache', () => {
         // selectedColumns is non-empty and no rows are selected.
         const { submitAddColumn, submitDelete } = await import(crudModulePath);
         const originals = {
+            fetchSchema: backendApi.fetchSchema,
             fetchTableCount: backendApi.fetchTableCount,
             fetchTableData: backendApi.fetchTableData,
             deleteColumns: backendApi.deleteColumns,
             addColumn: backendApi.addColumn,
             getTableInfo: backendApi.getTableInfo
         };
+        backendApi.fetchSchema = async () => ({
+            tables: [{ identifier: 'items', identity: { kind: 'rowid' } }],
+            views: [],
+            indexes: []
+        });
         const countCalls = installCountSpy(backendApi, call => (call === 1 ? 10 : 0));
         backendApi.fetchTableData = async () => ({ rows: [] });
         let droppedColumns: string[] = [];
@@ -449,6 +584,7 @@ describe('grid count cache', () => {
             { ordinal: 0, identifier: 'value', declaredType: 'TEXT', isRequired: 0, defaultExpression: null, primaryKeyPosition: 0 }
         ]);
         primeTableState(state, 'items');
+        state.isDbConnected = true;
         state.columnFilters = { value: 'abc' };
 
         try {
@@ -475,6 +611,78 @@ describe('grid count cache', () => {
                 'column add must invalidate the filtered identity'
             );
         } finally {
+            state.isDbConnected = false;
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
+    it('reloads dropped columns when the host refresh closes the confirmation first', async () => {
+        const elements = installDocumentMock();
+        const modalClasses = new Set(['hidden']);
+        elements.deleteModal = {
+            classList: {
+                add: (name: string) => modalClasses.add(name),
+                remove: (name: string) => modalClasses.delete(name),
+                contains: (name: string) => modalClasses.has(name)
+            },
+            querySelector() { return null; }
+        };
+        elements.deleteConfirmText = { textContent: '' };
+
+        const { state, backendApi } = await loadHarness();
+        const crudModulePath = '../../core/ui/modules/crud.js';
+        const modalsModulePath = '../../core/ui/modules/modals.js';
+        const { openDeleteModal, submitDelete } = await import(crudModulePath);
+        const { closeDatabaseTargetModals } = await import(modalsModulePath);
+        const originals = {
+            fetchSchema: backendApi.fetchSchema,
+            fetchTableCount: backendApi.fetchTableCount,
+            fetchTableData: backendApi.fetchTableData,
+            deleteColumns: backendApi.deleteColumns,
+            getTableInfo: backendApi.getTableInfo
+        };
+        let tableInfoCalls = 0;
+        backendApi.fetchSchema = async () => ({
+            tables: [{ identifier: 'items', identity: { kind: 'rowid' } }],
+            views: [],
+            indexes: []
+        });
+        backendApi.getTableInfo = async () => {
+            tableInfoCalls += 1;
+            return [{
+                ordinal: 0,
+                identifier: 'id',
+                declaredType: 'INTEGER',
+                isRequired: false,
+                defaultExpression: null,
+                primaryKeyPosition: 0
+            }];
+        };
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async () => ({ rows: [[1, 1]] });
+        backendApi.deleteColumns = async () => {
+            // DatabaseDocument broadcasts its edit synchronously. The host-side
+            // refresh closes database-bound modals before this RPC response is
+            // delivered back to the initiating webview.
+            closeDatabaseTargetModals();
+            return {};
+        };
+        primeTableState(state, 'items');
+        state.isDbConnected = true;
+        state.selectedColumns = new Set(['value']);
+
+        try {
+            openDeleteModal();
+            assert.strictEqual(
+                elements.deleteConfirmText.textContent,
+                'Are you sure you want to delete 1 column (value)? This will permanently remove the column and its data.'
+            );
+            await submitDelete();
+
+            assert.strictEqual(tableInfoCalls, 1);
+            assert.deepStrictEqual(state.tableColumns.map((column: any) => column.name), ['id']);
+        } finally {
+            state.isDbConnected = false;
             resetHarness(state, backendApi, originals);
         }
     });

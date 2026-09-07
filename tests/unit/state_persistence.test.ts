@@ -36,3 +36,46 @@ it('does not persist extension-owned cellEditBehavior in webview state', async (
         globalThis.clearTimeout = originalClearTimeout;
     }
 });
+
+it('persists the sidebar filter when the user types it', async () => {
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const sidebarModulePath = '../../core/ui/modules/sidebar.js';
+    const { state } = await import(stateModulePath);
+    const { initSidebar } = await import(sidebarModulePath);
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let onInput: (() => void) | undefined;
+    const filterInput = {
+        value: 'audit_log',
+        addEventListener(type: string, listener: () => void) {
+            if (type === 'input') onInput = listener;
+        }
+    };
+    const sidebarPanel = { addEventListener() {} };
+    persistedState = undefined;
+    (globalThis as any).setTimeout = (callback: () => void) => {
+        callback();
+        return 1;
+    };
+    (globalThis as any).clearTimeout = () => {};
+    (globalThis as any).document = {
+        getElementById(id: string) {
+            if (id === 'sidebarPanel') return sidebarPanel;
+            if (id === 'sidebarFilterInput') return filterInput;
+            return null;
+        }
+    };
+
+    try {
+        state.sidebarFilter = '';
+        initSidebar();
+        assert.ok(onInput);
+        onInput();
+        assert.strictEqual((persistedState as any)?.sidebarFilter, 'audit_log');
+    } finally {
+        state.sidebarFilter = '';
+        delete (globalThis as any).document;
+        globalThis.setTimeout = originalSetTimeout;
+        globalThis.clearTimeout = originalClearTimeout;
+    }
+});

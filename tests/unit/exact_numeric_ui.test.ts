@@ -25,6 +25,8 @@ afterEach(async () => {
     state.gridOversizedCells = {};
     state.selectedCells = [];
     state.selectedRowIds.clear();
+    state.pinnedColumns.clear();
+    state.pinnedRowIds.clear();
 });
 
 it('copies exact numeric sidecar text for single cells, ranges, and selected rows', async () => {
@@ -120,4 +122,51 @@ it('refuses cell, range, and row copies containing a truncated grid value', asyn
     await copySelectedRowsToClipboard();
 
     assert.deepStrictEqual(writes, []);
+});
+
+it('copies selected cells and rows in pinned-first visual order', async () => {
+    const writes: string[] = [];
+    navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: { clipboard: { writeText: async (text: string) => writes.push(text) } }
+    });
+    (globalThis as any).document = { getElementById() { return null; } };
+
+    const { state } = await import(stateModulePath);
+    const {
+        copyCellsToClipboard,
+        copySelectedRowsToClipboard
+    } = await import(clipboardModulePath);
+    state.selectedTableType = 'table';
+    state.tableColumns = [
+        { name: 'a', type: 'TEXT' },
+        { name: 'b', type: 'TEXT' },
+        { name: 'c', type: 'TEXT' }
+    ];
+    state.gridData = [
+        [1, '1a', '1b', '1c'],
+        [2, '2a', '2b', '2c'],
+        [3, '3a', '3b', '3c']
+    ];
+    state.pinnedColumns.add('c');
+    state.pinnedRowIds.add(3);
+    state.selectedCells = state.gridData.flatMap((row: any[], rowIdx: number) => (
+        state.tableColumns.map((_column: any, colIdx: number) => ({
+            rowIdx,
+            colIdx,
+            rowId: row[0],
+            value: row[colIdx + 1]
+        }))
+    ));
+
+    await copyCellsToClipboard();
+    state.selectedCells = [];
+    state.selectedRowIds = new Set([1, 2, 3]);
+    await copySelectedRowsToClipboard();
+
+    assert.deepStrictEqual(writes, [
+        '3c\t3a\t3b\n1c\t1a\t1b\n2c\t2a\t2b',
+        'c\ta\tb\n3c\t3a\t3b\n1c\t1a\t1b\n2c\t2a\t2b'
+    ]);
 });

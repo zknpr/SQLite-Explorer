@@ -1,9 +1,10 @@
 import type { CellValue, RecordId } from './types';
 import type { RecordIdentityPredicate } from './row-identity';
 import { estimateUndoMemoryBytes } from './undo-history';
-import { escapeIdentifier } from './sql-utils';
+import { escapeIdentifier, escapeMainIdentifier } from './sql-utils';
 
 const DELETED_ROW_STRUCTURAL_BYTES = 32;
+const STORAGE_CLASS_ENTRY_STRUCTURAL_BYTES = 48;
 
 function safeNonNegativeInteger(value: unknown, label: string): number {
   const normalized = typeof value === 'bigint' ? Number(value) : value;
@@ -16,11 +17,9 @@ function safeNonNegativeInteger(value: unknown, label: string): number {
 /** Columns whose database values survive in the returned row object. */
 export function deleteSnapshotValueColumns(
   insertableColumns: readonly string[],
-  includeSyntheticRowId: boolean
+  _includeSyntheticRowId: boolean
 ): string[] {
-  return includeSyntheticRowId
-    ? insertableColumns.filter(column => column !== 'rowid')
-    : [...insertableColumns];
+  return [...insertableColumns];
 }
 
 /** Metadata-only aggregate; no TEXT/BLOB value crosses the engine boundary. */
@@ -41,7 +40,7 @@ export function buildDeleteSnapshotSizeQuery(
   return {
     sql:
       `SELECT COUNT(*), COALESCE(SUM(${valueBytes}), 0) ` +
-      `FROM ${escapeIdentifier(table)} WHERE ${predicate.sql}`,
+      `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
     params: predicate.params
   };
 }
@@ -72,6 +71,7 @@ export function assertDeleteSnapshotFitsUndoBudget(input: {
   rowCount: number;
   valueBytes: number;
   maxSnapshotBytes: number;
+  operation?: 'Delete' | 'Insert';
 }): void {
   if (!Number.isSafeInteger(input.maxSnapshotBytes) || input.maxSnapshotBytes < 0) {
     throw new Error('Delete undo snapshot budget must be a non-negative safe integer');
@@ -81,22 +81,28 @@ export function assertDeleteSnapshotFitsUndoBudget(input: {
   }
 
   const rowKeys = new Set(input.insertableColumns);
-  if (input.includeSyntheticRowId) rowKeys.add('rowid');
   const rowKeyBytes = [...rowKeys].reduce((total, key) => total + key.length * 2, 0);
   const identityBytes = input.rowIds.reduce<number>(
     (total, rowId) => total + estimateUndoMemoryBytes(rowId),
     0
   );
+  const storageClassBytes = input.rowCount * input.insertableColumns.reduce(
+    (total, column) => total + column.length * 2 + STORAGE_CLASS_ENTRY_STRUCTURAL_BYTES,
+    0
+  );
   const projectedBytes = input.valueBytes
-    // Every DeletedRow retains rowId; rowid tables also restore the same value
-    // from row.rowid, so the snapshot owns a second primitive/string copy.
-    + identityBytes * (input.includeSyntheticRowId ? 2 : 1)
-    + input.rowCount * (DELETED_ROW_STRUCTURAL_BYTES + rowKeyBytes);
+    // Synthetic row identity is retained only in DeletedRow.rowId. Keeping it
+    // out of row avoids colliding with a legal declared column named rowid.
+    + identityBytes
+    + input.rowCount * (DELETED_ROW_STRUCTURAL_BYTES + rowKeyBytes)
+    + storageClassBytes;
 
   if (!Number.isSafeInteger(projectedBytes) || projectedBytes > input.maxSnapshotBytes) {
+    const operation = input.operation ?? 'Delete';
     throw new Error(
-      `Delete undo snapshot exceeds the ${input.maxSnapshotBytes}-byte memory budget; ` +
-      'delete fewer rows or increase sqliteExplorer.maxUndoMemory.'
+      `${operation} undo snapshot exceeds the ${input.maxSnapshotBytes}-byte memory budget; ` +
+      `${operation.toLowerCase()} fewer rows or increase ` +
+      'sqliteExplorer.maxUndoMemory.'
     );
   }
 }

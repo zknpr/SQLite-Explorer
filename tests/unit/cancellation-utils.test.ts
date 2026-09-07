@@ -52,5 +52,21 @@ describe('Cancellation Utils', () => {
 
             assert.strictEqual(signal!.aborted, true);
         });
+
+        it('handles cancellation racing the listener subscription', () => {
+            let disposed = false;
+            const token: any = {
+                isCancellationRequested: false,
+                onCancellationRequested: (callback: () => void) => {
+                    callback();
+                    return { dispose: () => { disposed = true; } };
+                }
+            };
+
+            const signal = cancelTokenToAbortSignal(token);
+
+            assert.strictEqual(signal!.aborted, true);
+            assert.strictEqual(disposed, true);
+        });
     });
 });

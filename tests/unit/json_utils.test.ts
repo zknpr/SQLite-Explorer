@@ -5,6 +5,7 @@ import {
     generateMergePatch,
     applyMergePatch,
     computeJsonPatchUndo,
+    planJsonPatchHistoryReplay,
     prepareCellUpdateForStorage
 } from '../../src/core/json-utils';
 
@@ -144,6 +145,161 @@ describe('JSON Merge Patch (RFC 7396)', () => {
             patch.own = 2;
             assert.deepStrictEqual(asPlain(applyMergePatch({ a: 1 }, patch)), { a: 1, own: 2 });
         });
+    });
+});
+
+describe('guarded JSON patch history replay', () => {
+    const writeValue = (plan: ReturnType<typeof planJsonPatchHistoryReplay>) => {
+        assert.strictEqual(plan.kind, 'write');
+        return (plan as { kind: 'write'; value: string }).value;
+    };
+
+    it('undo rejects drift on a touched path but allows untouched siblings', () => {
+        const prior = '{"status":"draft","owner":"ada"}';
+        const patch = '{"status":"published"}';
+        const post = '{"status":"published","owner":"ada"}';
+
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"status":"archived","owner":"ada","reviewer":"grace"}',
+                patch,
+                prior,
+                post,
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+        assert.deepStrictEqual(
+            JSON.parse(writeValue(planJsonPatchHistoryReplay(
+                '{"status":"published","owner":"ada","reviewer":"grace"}',
+                patch,
+                prior,
+                post,
+                'undo'
+            ))),
+            { status: 'draft', owner: 'ada', reviewer: 'grace' }
+        );
+    });
+
+    it('redo validates touched paths against prior and preserves untouched siblings', () => {
+        const prior = '{"status":"draft","owner":"ada"}';
+        const patch = '{"status":"published"}';
+        const post = '{"status":"published","owner":"ada"}';
+
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"status":"archived","owner":"ada"}',
+                patch,
+                prior,
+                post,
+                'redo'
+            ),
+            { kind: 'conflict' }
+        );
+        assert.deepStrictEqual(
+            JSON.parse(writeValue(planJsonPatchHistoryReplay(
+                '{"status":"draft","owner":"ada","reviewer":"grace"}',
+                patch,
+                prior,
+                post,
+                'redo'
+            ))),
+            { status: 'published', owner: 'ada', reviewer: 'grace' }
+        );
+    });
+
+    it('distinguishes a missing touched key from explicit JSON null', () => {
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"removed":null,"keep":2}',
+                '{"removed":null}',
+                '{"removed":1,"keep":2}',
+                '{"keep":2}',
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+    });
+
+    it('treats arrays and scalars at patch leaves as atomic values', () => {
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"items":[1,2,3],"mode":"ready"}',
+                '{"items":[1,2],"mode":"ready"}',
+                '{"items":[0],"mode":"draft"}',
+                '{"items":[1,2],"mode":"ready"}',
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+    });
+
+    it('treats an object patch onto a missing branch as an atomic branch', () => {
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"keep":1,"meta":{"reviewed":true,"external":"sibling"}}',
+                '{"meta":{"reviewed":true}}',
+                '{"keep":1}',
+                '{"keep":1,"meta":{"reviewed":true}}',
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+    });
+
+    it('handles __proto__ as an own JSON key without changing object prototypes', () => {
+        const plan = planJsonPatchHistoryReplay(
+            '{"__proto__":{"value":2},"keep":3}',
+            '{"__proto__":{"value":2}}',
+            '{"__proto__":{"value":1}}',
+            '{"__proto__":{"value":2}}',
+            'undo'
+        );
+        assert.deepStrictEqual(
+            JSON.parse(writeValue(plan)),
+            JSON.parse('{"__proto__":{"value":1},"keep":3}')
+        );
+        assert.strictEqual(({} as Record<string, unknown>).value, undefined);
+    });
+
+    it('falls back to exact whole-cell comparison for precision-risky JSON', () => {
+        const prior = '{"exact":9007199254740993,"status":"draft"}';
+        const post = '{"exact":9007199254740993,"status":"published"}';
+        const patch = '{"status":"published"}';
+
+        assert.strictEqual(
+            writeValue(planJsonPatchHistoryReplay(post, patch, prior, post, 'undo')),
+            prior
+        );
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"exact":9007199254740993,"status":"published","sibling":1}',
+                patch,
+                prior,
+                post,
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+    });
+
+    it('rejects patch structures deeper than the replay limit', () => {
+        let prior: unknown = 0;
+        let post: unknown = 1;
+        let patch: unknown = 1;
+        for (let depth = 0; depth < 1002; depth++) {
+            prior = { child: prior };
+            post = { child: post };
+            patch = { child: patch };
+        }
+        const priorRaw = JSON.stringify(prior);
+        const postRaw = JSON.stringify(post);
+        const patchRaw = JSON.stringify(patch);
+
+        assert.throws(
+            () => planJsonPatchHistoryReplay(postRaw, patchRaw, priorRaw, postRaw, 'undo'),
+            /depth limit/i
+        );
     });
 });
 

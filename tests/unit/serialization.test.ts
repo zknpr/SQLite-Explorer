@@ -8,6 +8,25 @@ import {
     toWebviewPayloadLimitErrorData
 } from '../../src/core/webview-transport';
 
+const OWN_PROTO_JSON =
+    '{"safe":1,"__proto__":{"inherited":"top"},"nested":[{"safe":2,"__proto__":{"inherited":"nested"}}]}';
+
+function ownProtoFixture(): any {
+    return JSON.parse(OWN_PROTO_JSON);
+}
+
+function assertOwnProtoPreserved(value: unknown): void {
+    const root = value as Record<string, any>;
+    const nested = root.nested[0] as Record<string, any>;
+    for (const [record, expected] of [[root, 'top'], [nested, 'nested']] as const) {
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(record, '__proto__'), true);
+        assert.deepStrictEqual(record['__proto__'], { inherited: expected });
+        assert.strictEqual(record.inherited, undefined);
+    }
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(value)), ownProtoFixture());
+    assert.strictEqual(({} as Record<string, unknown>).inherited, undefined);
+}
+
 describe('RPC Serialization', () => {
 
     describe('deserializeArgs', () => {
@@ -49,6 +68,20 @@ describe('RPC Serialization', () => {
     });
 
     describe('serializeValue', () => {
+        it('rejects excessive nesting before recursive serialization can exhaust the stack', () => {
+            let nested: Record<string, unknown> = {};
+            for (let depth = 0; depth < 300; depth++) nested = { child: nested };
+
+            assert.throws(
+                () => serializeValue(nested),
+                /nesting depth.*exceeds/i
+            );
+        });
+
+        it('preserves own __proto__ data properties recursively', () => {
+            assertOwnProtoPreserved(serializeValue(ownProtoFixture()));
+        });
+
         it('preserves non-finite numbers through a JSON-only webview boundary', () => {
             const wireValue = serializeValue({ values: [Infinity, -Infinity, Number.NaN] });
             const jsonValue = JSON.parse(JSON.stringify(wireValue));
@@ -239,6 +272,10 @@ describe('RPC Serialization', () => {
 
 
     describe('deserializeValue edge cases', () => {
+        it('preserves own __proto__ data properties recursively', () => {
+            assertOwnProtoPreserved(deserializeValue(structuredClone(ownProtoFixture())));
+        });
+
         it('does not decode non-finite-number marker lookalikes with extra keys', () => {
             const marker = { __type: 'NonFiniteNumber', value: 'Infinity', extra: true };
             assert.deepStrictEqual(deserializeValue(marker), marker);

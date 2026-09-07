@@ -1,6 +1,7 @@
 import './vscode_mock_setup';
 
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import {
@@ -17,6 +18,99 @@ async function loadContainmentModule(): Promise<any> {
 }
 
 describe('grid cell containment limits', () => {
+    it('routes byte-unrepresentable TEXT to a raw sidecar instead of exposing U+FFFD as editable data', async () => {
+        const { containUnrepresentableTextCells } = await loadContainmentModule();
+        const decoded = containUnrepresentableTextCells({
+            sourceRows: [['�', '�']],
+            rawTextRows: [[Uint8Array.of(0x80), Uint8Array.of(0xef, 0xbf, 0xbd)]],
+            rawTextColumnIndices: [0, 1],
+            textEncoding: 'utf-8',
+            contained: { rows: [['�', '�']] }
+        });
+
+        assert.deepStrictEqual(decoded.rows, [[Uint8Array.of(0x80), '�']]);
+        assert.deepStrictEqual(decoded.oversizedCells, {
+            0: { 0: { storageClass: 'text', byteLength: 1 } }
+        });
+    });
+
+    it('caps an unrepresentable TEXT raw prefix without changing its bytes', async () => {
+        const {
+            containUnrepresentableTextCells,
+            MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES
+        } = await loadContainmentModule();
+        const raw = new Uint8Array(MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES + 17);
+        raw.fill(0x80);
+        raw[0] = 0xff;
+        raw[MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES - 1] = 0xfe;
+        const decoded = containUnrepresentableTextCells({
+            sourceRows: [['�']],
+            rawTextRows: [[raw]],
+            rawTextColumnIndices: [0],
+            textEncoding: 'utf-8',
+            contained: { rows: [['�']] }
+        });
+        const retained = decoded.rows[0][0];
+
+        assert.ok(retained instanceof Uint8Array);
+        assert.strictEqual(retained.byteLength, MAX_UNREPRESENTABLE_TEXT_PREVIEW_BYTES);
+        assert.strictEqual(retained[0], 0xff);
+        assert.strictEqual(retained.at(-1), 0xfe);
+        assert.deepStrictEqual(decoded.oversizedCells, {
+            0: { 0: { storageClass: 'text', byteLength: raw.byteLength } }
+        });
+    });
+
+    it('contains malformed ordinary SQLite TEXT in an actual WASM table page', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const engine = result.operations!;
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE malformed_text_value (value TEXT); ' +
+                "INSERT INTO malformed_text_value VALUES " +
+                "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT))"
+            );
+            const page = await engine.fetchTableData('malformed_text_value', {
+                columns: ['rowid', 'value'],
+                orderBy: 'rowid',
+                orderDir: 'ASC',
+                limit: 10,
+                offset: 0
+            });
+
+            assert.deepStrictEqual(page.rows, [[1, Uint8Array.of(0x80)], [2, '�']]);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: { 1: { storageClass: 'text', byteLength: 1 } }
+            });
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('retains a byte-exact raw prefix for unrepresentable TEXT returned by a view', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const engine = result.operations!;
+        try {
+            await engine.executeQuery(
+                'CREATE TABLE malformed_view_source (value TEXT); ' +
+                "INSERT INTO malformed_view_source VALUES (CAST(X'80' AS TEXT)); " +
+                'CREATE VIEW malformed_text_view AS SELECT value FROM malformed_view_source'
+            );
+            const page = await engine.fetchTableData('malformed_text_view', {
+                columns: ['value'],
+                limit: 1,
+                offset: 0
+            });
+
+            assert.deepStrictEqual(page.rows, [[Uint8Array.of(0x80)]]);
+            assert.deepStrictEqual(page.oversizedCells, {
+                0: { 0: { storageClass: 'text', byteLength: 1 } }
+            });
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('keeps the 1 MiB per-cell ceiling when the page budget is looser', async () => {
         const { deriveEffectiveInlineCellBytes } = await loadContainmentModule();
 
@@ -91,6 +185,73 @@ describe('grid cell containment limits', () => {
             );
         } finally {
             (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('derives maximum-width containment metadata from the same volatile row evaluation', async () => {
+        const {
+            buildCellContainmentQuery,
+            decodeCellContainment,
+            mergeCellContainmentMetadataRows
+        } = await loadContainmentModule();
+        const sourceColumns = Array.from({ length: 2000 }, (_, index) => (
+            index === 0 ? 'volatile_blob() AS c0' : `NULL AS c${index}`
+        ));
+        const query = buildCellContainmentQuery(
+            `SELECT ${sourceColumns.join(', ')}`,
+            2000,
+            {
+                limit: 1,
+                maxInlineCellBytes: 1024 * 1024,
+                maxPageResponseBytes: 16 * 1024 * 1024
+            }
+        );
+        let evaluations = 0;
+        const database = new DatabaseSync(':memory:');
+        try {
+            database.function('volatile_blob', () => {
+                evaluations += 1;
+                const byteLength = evaluations === 1
+                    ? query.effectiveInlineCellBytes + 1
+                    : 1;
+                return Buffer.alloc(byteLength, 0x41);
+            });
+            const executeRows = (sql: string): unknown[][] => {
+                const statement = database.prepare(sql);
+                statement.setReturnArrays(true);
+                return statement.all() as unknown as unknown[][];
+            };
+            const primaryRows = executeRows(query.sql);
+            const metadataRows = query.metadataSql
+                ? executeRows(query.metadataSql)
+                : undefined;
+            const transportedRows = mergeCellContainmentMetadataRows(
+                primaryRows,
+                metadataRows,
+                query
+            );
+            const decoded = decodeCellContainment(
+                transportedRows,
+                2000,
+                undefined,
+                16 * 1024 * 1024
+            );
+
+            assert.strictEqual(evaluations, 1);
+            assert.strictEqual(
+                (decoded.rows[0][0] as Uint8Array).byteLength,
+                query.effectiveInlineCellBytes
+            );
+            assert.deepStrictEqual(decoded.oversizedCells, {
+                0: {
+                    0: {
+                        storageClass: 'blob',
+                        byteLength: query.effectiveInlineCellBytes + 1
+                    }
+                }
+            });
+        } finally {
+            database.close();
         }
     });
 

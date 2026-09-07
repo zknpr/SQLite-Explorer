@@ -28,6 +28,19 @@ describe('getMaximumFileSizeBytes', () => {
     configStore.set('maxFileSize', 0);
     assert.strictEqual(getMaximumFileSizeBytes(), 0);
   });
+
+  it('uses the safe default for non-numeric and non-finite runtime values', () => {
+    configStore.set('maxFileSize', 'not-a-number');
+    assert.strictEqual(getMaximumFileSizeBytes(), 200 * (2 ** 20));
+
+    configStore.set('maxFileSize', Number.POSITIVE_INFINITY);
+    assert.strictEqual(getMaximumFileSizeBytes(), 200 * (2 ** 20));
+  });
+
+  it('uses the safe default for hand-edited negative values instead of treating them as unlimited', () => {
+    configStore.set('maxFileSize', -1);
+    assert.strictEqual(getMaximumFileSizeBytes(), 200 * (2 ** 20));
+  });
 });
 
 describe('getQueryTimeout', () => {

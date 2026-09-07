@@ -76,6 +76,12 @@ export async function revertDatabaseToSaved(
     return;
   }
 
+  if (databaseOps.revertModifications) {
+    await databaseOps.revertModifications(forward, redo, signal);
+    tracker.rollbackToCheckpoint();
+    return;
+  }
+
   // Discard live edits first, then re-apply the saved entries the user had
   // undone so the final database matches the checkpoint.
   //

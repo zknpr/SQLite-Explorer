@@ -144,46 +144,52 @@ test('runConsole passes the script and an options object through to the host', a
 // barrier, which nothing told the user before they took it.
 // ---------------------------------------------------------------------------
 
-function confirmingHost(dependencies: unknown) {
+function confirmingHost(dependentIndexes: unknown) {
   const calls: Array<{ method: string; args: unknown[] }> = [];
   return {
     calls,
     invoke: async (method: string, args: unknown[]) => {
       calls.push({ method, args });
-      if (method === 'findColumnDependencies') return dependencies;
+      if (method === 'findDependentIndexes') return dependentIndexes;
       return { ok: true };
     }
   };
 }
 
-test('deleteColumns names the indexes it would drop and passes them to the engine', async () => {
-  const host = confirmingHost({
-    indexes: ['idx_users_email'],
-    dependentObjects: [{ type: 'view', identifier: 'active_users' }]
-  });
+const EMAIL_INDEX = { identifier: 'idx_users_email', sql: 'CREATE INDEX idx_users_email ON users(email)' };
+
+test('deleteColumns names the indexes it would drop and passes their exact definitions to the engine', async () => {
+  const host = confirmingHost([EMAIL_INDEX]);
   initDesktopApi(host as never);
 
   const pending = backendApi.deleteColumns('users', ['email']);
   const prompt = await presentedConfirmation();
 
   assert.match(prompt, /idx_users_email/);
-  assert.match(prompt, /view active_users/);
   // The undo cost, stated BEFORE the drop rather than discovered after ⌘Z.
   assert.match(prompt, /cannot be undone/);
 
   answerConfirmation(true);
   await pending;
 
-  // …and the confirmed list is what actually reaches the engine. Without it
-  // SQLite refuses the drop outright ("error in index ... no such column").
+  // …and the confirmed DEFINITIONS are what reach the engine: the worker
+  // re-derives the list inside the drop's savepoint and refuses if an index
+  // changed while the prompt was open, so names alone would not do.
   assert.deepEqual(host.calls.at(-1), {
     method: 'deleteColumns',
-    args: ['users', ['email'], ['idx_users_email']]
+    args: ['users', ['email'], [EMAIL_INDEX]]
   });
 });
 
+test('a malformed dependent-index answer is refused before any prompt', async () => {
+  const host = confirmingHost([{ identifier: 'idx', sql: 42 }]);
+  initDesktopApi(host as never);
+  await assert.rejects(backendApi.deleteColumns('users', ['email']), /Invalid dependent-index definition/);
+  assert.deepEqual(host.calls.map(call => call.method), ['findDependentIndexes']);
+});
+
 test('declining the prompt cancels honestly and touches nothing', async () => {
-  const host = confirmingHost({ indexes: [], dependentObjects: [] });
+  const host = confirmingHost([]);
   initDesktopApi(host as never);
 
   const pending = backendApi.deleteColumns('users', ['email']);
@@ -194,11 +200,11 @@ test('declining the prompt cancels honestly and touches nothing', async () => {
   // host has always answered it that way), so the grid reports "Delete
   // cancelled" and does not reload.
   assert.deepEqual(await pending, { cancelled: true });
-  assert.deepEqual(host.calls.map(call => call.method), ['findColumnDependencies']);
+  assert.deepEqual(host.calls.map(call => call.method), ['findDependentIndexes']);
 });
 
 test('a column with no dependencies OMITS the third argument entirely', async () => {
-  const host = confirmingHost({ indexes: [], dependentObjects: [] });
+  const host = confirmingHost([]);
   initDesktopApi(host as never);
 
   const pending = backendApi.deleteColumns('users', ['email', 'phone']);
@@ -212,9 +218,9 @@ test('a column with no dependencies OMITS the third argument entirely', async ()
   // `[table, columns, undefined]`, reasoning that the worker's third parameter
   // is optional — true in JavaScript, false on the wire. See the round-trip
   // test below: JSON has no `undefined`, so the hole arrived as an explicit
-  // `null` and tripped the worker's `dropDependentIndexes !== undefined`
-  // guard. Every desktop user dropping a column with no dependent index — the
-  // common case — got "dropDependentIndexes must be an array of index names".
+  // `null`, which the worker's confirmation validator rightly refuses as
+  // "not an array". Every desktop user dropping a column with no dependent
+  // index — the common case — got that refusal.
   assert.deepEqual(host.calls.at(-1), {
     method: 'deleteColumns',
     args: ['users', ['email', 'phone']]
@@ -237,7 +243,7 @@ function acrossTheNativeWire(method: string, args: unknown[]): unknown[] {
 test('the deleteColumns argument list survives the native JSON transport intact', async () => {
   // The bug was a TRANSPORT bug, so assert against the transport rather than
   // against the argument array the caller happened to build.
-  const host = confirmingHost({ indexes: [], dependentObjects: [] });
+  const host = confirmingHost([]);
   initDesktopApi(host as never);
   const pending = backendApi.deleteColumns('people', ['note']);
   await presentedConfirmation();
@@ -248,7 +254,7 @@ test('the deleteColumns argument list survives the native JSON transport intact'
   const received = acrossTheNativeWire(sent.method, sent.args);
 
   // Absent on arrival — which is what makes the worker's
-  // `if (dropDependentIndexes !== undefined)` early-out fire.
+  // `normalizeDependentIndexConfirmation(undefined)` early-out fire.
   assert.deepEqual(received, ['people', ['note']]);
   assert.equal(received.length, 2);
 
@@ -261,9 +267,10 @@ test('the deleteColumns argument list survives the native JSON transport intact'
   );
 
   // And with a real dependency list nothing is lost either.
+  const definitions = [{ identifier: 'idx_people_note', sql: 'CREATE INDEX idx_people_note ON people(note)' }];
   assert.deepEqual(
-    acrossTheNativeWire('deleteColumns', ['people', ['note'], ['idx_people_note']]),
-    ['people', ['note'], ['idx_people_note']]
+    acrossTheNativeWire('deleteColumns', ['people', ['note'], definitions]),
+    ['people', ['note'], definitions]
   );
 });
 

@@ -432,6 +432,29 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   }
 
   /**
+   * Make the current database image a new clean baseline with no undo history.
+   *
+   * Reload replaces the database independently of the retained entries. Keeping
+   * any timeline or redo entry would let an old custom-editor callback apply to
+   * the replacement database. Advancing the invalidation revision also prevents
+   * an in-flight persistence checkpoint from naming a position in this reset
+   * timeline.
+   */
+  resetToCleanState(): void {
+    this.timeline = [];
+    this.timelineSizes = [];
+    this.timelineOffset = 0;
+    this.futureStack = [];
+    this.futureStackSizes = [];
+    this.revertOnRestore = [];
+    this.revertOnRestoreSizes = [];
+    this.checkpointIndex = 0;
+    this.currentSize = 0;
+    this.historyRecordingBlockedByBarrierLimit = false;
+    this.invalidateCapturedCheckpointPositions();
+  }
+
+  /**
    * Return the absolute timeline position after the latest retained entry.
    *
    * This position is stable across later front-eviction because it includes the

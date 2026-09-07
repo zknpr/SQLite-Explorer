@@ -46,6 +46,8 @@ export const CopilotChatId = 'github.copilot-chat';
 
 /** Default query timeout in milliseconds (30 seconds). */
 export const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+const DEFAULT_MAX_FILE_SIZE_MB = 200;
+const MAX_FILE_SIZE_MB = 4000;
 const MIN_QUERY_TIMEOUT_MS = 1000;
 const MIN_INLINE_CELL_BYTES = 1024;
 const MAX_INLINE_CELL_BYTES = 16 * 1024 * 1024;
@@ -64,8 +66,16 @@ const MAX_UNDO_MEMORY_BYTES = 512 * 1024 * 1024;
  */
 export function getMaximumFileSizeBytes(): number {
   const config = vsc.workspace.getConfiguration(ConfigurationSection);
-  const sizeMB = config.get<number>('maxFileSize', 200);
-  return sizeMB * (2 ** 20);
+  const configuredValue = config.get<unknown>('maxFileSize', DEFAULT_MAX_FILE_SIZE_MB);
+  // Runtime configuration can bypass package.json validation. NaN and
+  // Infinity disable every `size > limit` guard; a negative value is also not
+  // the documented opt-in for unlimited reads (only literal zero is).
+  if (typeof configuredValue !== 'number'
+    || !Number.isFinite(configuredValue)
+    || configuredValue < 0) {
+    return DEFAULT_MAX_FILE_SIZE_MB * (2 ** 20);
+  }
+  return Math.min(configuredValue, MAX_FILE_SIZE_MB) * (2 ** 20);
 }
 
 /**

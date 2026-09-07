@@ -594,6 +594,21 @@ describe('sqljs-shim: error surfaces', () => {
                 assert.doesNotMatch((error as Error).message, /no such table/);
                 return true;
             });
+            // A view whose base table was dropped is in the catalog, so the
+            // view is never accused — the proof walks into its stored body and
+            // names the table it lost instead. This is also how the view
+            // editor's own failures stay actionable: it validates through the
+            // installed view, whose name is all the failing statement carries.
+            shim.run('CREATE TABLE gone (v); CREATE VIEW over_gone AS SELECT v FROM gone; DROP TABLE gone');
+            assert.throws(() => shim.exec('SELECT * FROM over_gone'), (error: unknown) => {
+                assert.equal((error as Error).message, 'no such table: gone');
+                assert.equal((error as { errno?: number }).errno, 1);
+                return true;
+            });
+            assert.throws(() => shim.exec('EXPLAIN SELECT * FROM main."over_gone"'), (error: unknown) => {
+                assert.equal((error as Error).message, 'no such table: gone');
+                return true;
+            });
         } finally {
             shim.close();
         }

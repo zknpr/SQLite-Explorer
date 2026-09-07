@@ -30,7 +30,7 @@ it('keeps unsafe INTEGER primary-key input as exact decimal text', async () => {
         '9007199254740993'
     );
     assert.strictEqual(parseGridInputValue('42', column, true), 42);
-    assert.strictEqual(parseGridInputValue('9007199254740993', column, false), 9007199254740992);
+    assert.strictEqual(parseGridInputValue('9007199254740993', column, false), '9007199254740993');
 });
 
 it('keeps unsafe NUMERIC-affinity primary-key input as exact decimal text', async () => {
@@ -55,6 +55,18 @@ it('keeps numeric-looking TEXT primary-key input as text', async () => {
         '9007199254740993'
     );
     assert.strictEqual(parseGridInputValue('42', column, true), '42');
+    assert.strictEqual(parseGridInputValue('42', column, false), '42');
+    assert.strictEqual(parseGridInputValue('00123', column, false), '00123');
+});
+
+it('keeps unsafe integer input exact outside primary-key columns', async () => {
+    const { parseGridInputValue } = await import(utilsModulePath);
+    const column = { name: 'amount', type: 'INTEGER', isPrimaryKey: false };
+
+    assert.strictEqual(
+        parseGridInputValue('9007199254740993', column, false),
+        '9007199254740993'
+    );
     assert.strictEqual(parseGridInputValue('42', column, false), 42);
 });
 
@@ -83,4 +95,41 @@ it('remaps grid, selected, and pinned state after a primary-key edit', async () 
     assert.deepStrictEqual([...state.selectedRowIds], [newIdentity]);
     assert.deepStrictEqual([...state.pinnedRowIds], [newIdentity]);
     assert.strictEqual(state.selectedCells[0].rowId, newIdentity);
+});
+
+it('blocks generated columns from single-cell and batch mutation paths', async () => {
+    const { state } = await import(stateModulePath);
+    const {
+        getBatchSelectionEligibility,
+        getCellMutationBlockReason
+    } = await import(dataUtilsModulePath);
+    state.selectedTable = 'generated_values';
+    state.selectedTableType = 'table';
+    state.tableColumns = [
+        { name: 'base', type: 'INTEGER', isPrimaryKey: false, isGenerated: false },
+        { name: 'computed', type: 'INTEGER', isPrimaryKey: false, isGenerated: true }
+    ];
+    state.gridData = [[1, 7, 14]];
+    state.gridReadOnlyRowReasons = {};
+    state.gridOversizedCells = {};
+    state.selectedCells = [
+        { rowIdx: 0, colIdx: 0, rowId: 1, value: 7 },
+        { rowIdx: 0, colIdx: 1, rowId: 1, value: 14 }
+    ];
+
+    try {
+        assert.strictEqual(getCellMutationBlockReason(0, 0), undefined);
+        assert.match(getCellMutationBlockReason(0, 1), /generated column/i);
+        const eligibility = getBatchSelectionEligibility();
+        assert.deepStrictEqual(eligibility.cells, [state.selectedCells[0]]);
+        assert.strictEqual(eligibility.readOnlyCount, 1);
+        assert.match(eligibility.readOnlyReason, /generated column/i);
+    } finally {
+        state.selectedTable = null;
+        state.tableColumns = [];
+        state.gridData = [];
+        state.gridReadOnlyRowReasons = {};
+        state.gridOversizedCells = {};
+        state.selectedCells = [];
+    }
 });

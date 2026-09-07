@@ -96,7 +96,10 @@ function createBridge(documentUriString: string): HostBridge {
 
 type MutableWorkspace = {
     getWorkspaceFolder: (uri: unknown) => unknown;
-    fs: { readFile: (uri: unknown) => Promise<Uint8Array> };
+    fs: {
+        stat: (uri: unknown) => Promise<{ size: number }>;
+        readFile: (uri: unknown) => Promise<Uint8Array>;
+    };
 };
 
 const uriApi = vscode.Uri as unknown as { parse: (value: string) => unknown };
@@ -132,6 +135,7 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
     const original = {
         parse: uriApi.parse,
         getWorkspaceFolder: workspaceApi.getWorkspaceFolder,
+        stat: workspaceApi.fs.stat,
         readFile: workspaceApi.fs.readFile
     };
     let readUris: string[];
@@ -140,6 +144,7 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
         readUris = [];
         uriApi.parse = parseUriForTest;
         workspaceApi.getWorkspaceFolder = () => undefined;
+        workspaceApi.fs.stat = async () => ({ size: FILE_PAYLOAD.byteLength });
         workspaceApi.fs.readFile = async (uri: unknown) => {
             readUris.push(String((uri as { toString(): string }).toString()));
             return FILE_PAYLOAD;
@@ -149,6 +154,7 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
     afterEach(() => {
         uriApi.parse = original.parse;
         workspaceApi.getWorkspaceFolder = original.getWorkspaceFolder;
+        workspaceApi.fs.stat = original.stat;
         workspaceApi.fs.readFile = original.readFile;
     });
 
@@ -161,6 +167,34 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
         const result = await bridge.readWorkspaceFileUri('file:///home/user/elsewhere/blob.bin');
         assert.strictEqual(result, FILE_PAYLOAD);
         assert.deepStrictEqual(readUris, ['file:///home/user/elsewhere/blob.bin']);
+    });
+
+    it('rejects an oversized authorized URI from stat without reading the file', async () => {
+        installWorkspaceFolders(['file:///home/user/elsewhere']);
+        workspaceApi.fs.stat = async () => ({ size: 16 * 1024 * 1024 + 1 });
+        const bridge = createBridge('file:///home/user/data/main.db');
+
+        await assert.rejects(
+            bridge.readWorkspaceFileUri('file:///home/user/elsewhere/oversized.bin'),
+            /file too large.*16.*mb/i
+        );
+        assert.deepStrictEqual(readUris, []);
+    });
+
+    it('rejects a file that grows after stat using the post-read size check', async () => {
+        installWorkspaceFolders(['file:///home/user/elsewhere']);
+        workspaceApi.fs.stat = async () => ({ size: 1 });
+        workspaceApi.fs.readFile = async (uri: unknown) => {
+            readUris.push(String((uri as { toString(): string }).toString()));
+            return new Uint8Array(16 * 1024 * 1024 + 1);
+        };
+        const bridge = createBridge('file:///home/user/data/main.db');
+
+        await assert.rejects(
+            bridge.readWorkspaceFileUri('file:///home/user/elsewhere/growing.bin'),
+            /file too large.*16.*mb/i
+        );
+        assert.deepStrictEqual(readUris, ['file:///home/user/elsewhere/growing.bin']);
     });
 
     it('allows a non-file URI inside a workspace folder (remote/virtual workspaces)', async () => {

@@ -3,14 +3,18 @@
  */
 import { backendApi } from './api.js';
 import { updateStatus } from './ui.js';
-import { closeModal } from './modals.js';
+import { closeModal, openModal, registerModalCloseHandler } from './modals.js';
 import { state } from './state.js';
 import { applyTheme, THEME_IDS } from './desktop-theme.js';
 import { modLabel } from './platform.js';
+import { getErrorMessage } from './utils.js';
 
-export function doubleClickOptions(isDesktop) {
-    return isDesktop ? ['inline', 'modal'] : ['inline', 'modal', 'vscode'];
-}
+let activeSettingsLoadToken = 0;
+
+registerModalCloseHandler('settingsModal', () => {
+    // A response from a closed session must not paint over a later reopen.
+    activeSettingsLoadToken += 1;
+});
 
 export function initSettings() {
     const container = document.getElementById('pragmaSettingsContainer');
@@ -41,12 +45,13 @@ export function initSettings() {
 export async function openSettingsModal() {
     const modal = document.getElementById('settingsModal');
     if (modal) {
-        modal.classList.remove('hidden');
+        openModal('settingsModal');
         await loadPragmas();
     }
 }
 
 async function loadPragmas() {
+    const loadToken = ++activeSettingsLoadToken;
     const container = document.getElementById('pragmaSettingsContainer');
     container.textContent = 'Loading settings...';
 
@@ -55,11 +60,15 @@ async function loadPragmas() {
             backendApi.getPragmas(),
             backendApi.getExtensionSettings()
         ]);
+        if (loadToken !== activeSettingsLoadToken) return false;
         renderPragmaForm(pragmas, settings);
+        return true;
     } catch (err) {
         console.error('Failed to load settings:', err);
-        container.textContent = `Error loading settings: ${err.message}`;
+        if (loadToken !== activeSettingsLoadToken) return false;
+        container.textContent = `Error loading settings: ${getErrorMessage(err)}`;
         container.style.color = 'var(--error-color)';
+        return false;
     }
 }
 
@@ -67,6 +76,7 @@ function renderPragmaForm(pragmas, settings) {
     const container = document.getElementById('pragmaSettingsContainer');
     if (!container) return;
 
+    container.style.color = '';
     // Helper to create select options
     const createOptions = (options, selected) => {
         return options.map(opt => {
@@ -82,6 +92,7 @@ function renderPragmaForm(pragmas, settings) {
     };
 
     container.replaceChildren();
+    let unnamedSettingControl = 0;
 
     // Helper to append HTML structure
     const appendSection = (title) => {
@@ -105,6 +116,11 @@ function renderPragmaForm(pragmas, settings) {
         div.className = 'form-field';
 
         const label = document.createElement('label');
+        const controlKey = control.dataset.key
+            ?? control.dataset.name
+            ?? `field_${++unnamedSettingControl}`;
+        control.id = `setting_${controlKey}`;
+        label.htmlFor = control.id;
         if (control.type === 'checkbox') {
             Object.assign(label.style, { display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' });
             control.style.margin = '0';
@@ -141,13 +157,23 @@ function renderPragmaForm(pragmas, settings) {
     autoCommitInput.className = 'setting-extension';
     autoCommitInput.dataset.key = 'autoCommit';
     autoCommitInput.checked = !!settings.autoCommit;
-    appendField('Auto-Commit Changes', autoCommitInput, `Automatically save changes to disk immediately. If disabled, you must save manually (${modLabel('S')}).`);
+    autoCommitInput.disabled = settings.autoCommitSupported === false;
+    appendField(
+        'Auto-Commit Changes',
+        autoCommitInput,
+        settings.autoCommitSupported === false
+            ? 'Auto-commit is unavailable in the web demo. Download the database to save changes.'
+            : `Automatically save changes to disk immediately. If disabled, you must save manually (${modLabel('S')}).`
+    );
 
     // Double Click Behavior
     const doubleClickSelect = document.createElement('select');
     doubleClickSelect.className = 'setting-extension';
     doubleClickSelect.dataset.key = 'doubleClickBehavior';
-    createOptions(doubleClickOptions(state.isDesktop), settings.cellEditBehavior).forEach(opt => doubleClickSelect.appendChild(opt));
+    const cellEditBehaviorOptions = Array.isArray(settings.cellEditBehaviorOptions)
+        ? settings.cellEditBehaviorOptions
+        : ['inline', 'modal', 'vscode'];
+    createOptions(cellEditBehaviorOptions, settings.cellEditBehavior).forEach(opt => doubleClickSelect.appendChild(opt));
     appendField('Double Click Behavior', doubleClickSelect, 'Action when double-clicking a cell');
 
     // Theme (desktop shell only — VS Code drives its own theme via the editor)
@@ -288,7 +314,7 @@ export async function updateExtensionSetting(key, value) {
         updateStatus(`Updated ${key}`);
     } catch (err) {
         console.error(`Failed to set ${key}:`, err);
-        updateStatus(`Error: ${err.message}`);
+        updateStatus(`Error: ${getErrorMessage(err)}`);
         await loadPragmas();
     }
 }
@@ -302,7 +328,7 @@ export async function updatePragma(name, value) {
         updateStatus(`Updated ${name}`);
     } catch (err) {
         console.error(`Failed to set ${name}:`, err);
-        updateStatus(`Error: ${err.message}`);
+        updateStatus(`Error: ${getErrorMessage(err)}`);
         // Reload to revert UI
         await loadPragmas();
     }

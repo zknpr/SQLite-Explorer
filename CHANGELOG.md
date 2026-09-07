@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.7.2
+
+### Security
+
+- **Table-browser operations are now pinned to the persistent `main` schema.** A malicious database can no longer use a same-named TEMP table to redirect reads, counts, edits, inserts, deletes, oversized-cell replacement, or history replay away from the table shown in the UI. Raw SQL keeps SQLite's normal schema-resolution rules.
+- **Undo and redo fail closed when the database has changed behind SQLite Explorer.** Cell, row, table, column, and view history now records and verifies the relevant storage state before replay. Trigger side effects, unsafe foreign-key actions, substituted row identities, stale schema objects, and concurrent external writes are rejected or rolled back instead of producing partial or misleading history.
+- **Native worker and webview boundaries reject malformed or oversized protocol data.** Requests, identities, page bounds, byte containers, error messages, and native response frames are validated and bounded before allocation or display. Worker I/O failures retire the affected connection explicitly instead of leaving requests pending.
+- **Hostile identifiers and UI state remain data, not object structure.** Legal SQLite identifiers are preserved exactly, unusable NUL/empty schema names are rejected, and prototype-spelled column names can no longer alter inherited filter or layout state.
+
+### Fixes
+
+- **Ordinary text cells no longer appear falsely truncated.** When the row-count cache is cold and the final page contains fewer rows than the configured page size, SQLite Explorer now refetches against the exact row bound instead of spending the page transport budget on rows that do not exist. Short values render inline rather than as incorrect “too large” placeholders.
+- **The full-value flow now returns the full byte-exact value.** Bounded previews, “load more,” and full-content access are separate paths; the full-content action uses a stable cell snapshot or desktop temporary-file flow rather than inheriting the modal preview cap. Split UTF-8 characters, malformed SQLite TEXT, BLOBs, empty quoted identifiers, rowid zero, cancellation, and stale dialogs are handled without truncation or retargeting another cell.
+- **Saving is atomic across local files and workspace providers.** WASM and native saves stage a complete SQLite image and replace the destination only after validation. Cancellation, export/write failures, symlinks, WAL activity, destination-generation races, partial provider writes, Save As, instant commit, reload, revert, and hot-exit backup paths preserve the existing database or fail explicitly.
+- **Edits stay attached to the row and table the user acted on.** Single, batch, oversized, drag-and-drop, modal, Add Row, delete, reload, and schema operations snapshot their target and reject stale completion. Exact 64-bit identities, INTEGER PRIMARY KEY aliases, composite primary keys, WITHOUT ROWID tables, generated columns, and shadowed `rowid` names are handled consistently by native and WASM engines.
+- **Schema changes preserve dependencies and constraints or refuse safely.** Table/column/view history validates current schema state, index references, generated columns, triggers, reverse view dependencies, foreign-key settings, column order, defaults, nullability, and composite primary keys before commit or replay.
+- **Exports and downloads report their real outcome.** Cancelled save dialogs no longer claim that an export started, selected rows are emitted in the visual order shown by the grid, oversized cells stay byte-exact, and failed browser downloads revoke temporary object URLs.
+- **Grid state survives real-world interaction races.** Overlapping table loads, schema refreshes, reloads, filters, pins, selections, column deletion, batch actions, and drag-and-drop can no longer let an older completion mutate a newer grid. Large selections require bounded confirmation before allocation, and cancelled selections leave the current state intact.
+- **Editing semantics are explicit.** Add Row and batch forms distinguish database defaults, empty strings, SQL NULL, JSON patches, and unchanged values; clearing nullable TEXT produces an empty string unless NULL is selected explicitly. Generated columns remain read-only.
+- **Column sizing and sidebar state persist correctly.** Final column widths are saved, overflow measurements are invalidated after resizing, and sidebar filtering restores even when no table is selected.
+- **Reload and demo lifecycle cleanup is complete.** Reload replaces the active database connection rather than only recreating the webview, waits for admitted saves/mutations, and clears stale history. The web demo rejects pending RPC calls when a worker is retired, propagates initialization failures, and keeps its supported settings aligned with the extension.
+- **Date and error rendering cover edge cases.** Unix epoch zero is formatted instead of treated as missing, future timestamps use future-relative wording, and non-`Error` or unstringifiable rejection values produce bounded fallback messages.
+
+### Accessibility
+
+- **Grid, sidebar, modal, CRUD, and batch controls are keyboard and screen-reader operable.** Generated inputs have programmatic labels, table/view rows use native controls, the grid has one roving keyboard entry point, resize handles work from the keyboard, dialogs trap and restore focus, and repeated submissions are ignored while an action is pending.
+
+### Maintenance
+
+- **Adversarial regression coverage now spans the complete native/WASM/UI paths.** The suite exercises atomic persistence, history conflicts, trigger and foreign-key side effects, schema shadowing, exact cell materialization, protocol limits, stale UI operations, accessibility, and web-demo lifecycle behavior against both mocked boundaries and the bundled native runtime.
+
 ## 1.7.1
 
 ### Security

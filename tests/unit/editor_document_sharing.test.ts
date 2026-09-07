@@ -120,6 +120,35 @@ function createPanel() {
     } as any;
 }
 
+it('releases per-document theme and configuration listeners when the document closes', async () => {
+    const originalThemeListener = (mockVscode.window as any).onDidChangeActiveColorTheme;
+    const originalConfigurationListener = (mockVscode.workspace as any).onDidChangeConfiguration;
+    let disposedListeners = 0;
+    const countedDisposable = () => ({
+        dispose() { disposedListeners++; }
+    });
+    (mockVscode.window as any).onDidChangeActiveColorTheme = countedDisposable;
+    (mockVscode.workspace as any).onDidChangeConfiguration = countedDisposable;
+
+    const provider = createProvider('sqlite-explorer.view');
+    const document = await provider.openCustomDocument(
+        fileUri('/workspace/listener-lifetime.sqlite'),
+        openContext
+    );
+    try {
+        await document.dispose();
+        assert.strictEqual(
+            disposedListeners,
+            2,
+            'global listeners must follow the document lifetime, not the extension-provider lifetime'
+        );
+    } finally {
+        provider.dispose();
+        (mockVscode.window as any).onDidChangeActiveColorTheme = originalThemeListener;
+        (mockVscode.workspace as any).onDidChangeConfiguration = originalConfigurationListener;
+    }
+});
+
 it('keeps duplicate view-type undo entries synchronized with one shared history', async () => {
     const defaultProvider = createProvider('sqlite-explorer.view');
     const optionalProvider = createProvider('sqlite-explorer.option');
@@ -538,7 +567,8 @@ it('binds optional-view RPC to the provider that owns its webview panel', async 
             data: {
                 connected: true,
                 filename: 'provider-bridge.sqlite',
-                readOnly: false
+                readOnly: false,
+                connectionGeneration: 0
             }
         });
     } finally {

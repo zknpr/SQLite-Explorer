@@ -50,7 +50,17 @@ class MockDatabaseOperations implements DatabaseOperations {
         };
     }
     async findDependentIndexes(table: string, columns: string[]): Promise<string[]> { return []; }
-    async createTable(table: string, columns: ColumnDefinition[]): Promise<void> {}
+    async createTable(
+        table: string,
+        columns: ColumnDefinition[]
+    ): Promise<ColumnDropTableState> {
+        return {
+            tableSql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`,
+            columns: ['id'],
+            identity: { kind: 'rowid' },
+            schemaObjects: []
+        };
+    }
     async getViewDefinition(view: string) { return { identifier: view, sql: `CREATE VIEW ${view} AS SELECT 1`, selectSql: 'SELECT 1', triggers: [] }; }
     async validateViewDefinition(view: string, selectSql: string): Promise<void> {}
     async previewViewDefinition(view: string, selectSql: string, limit?: number): Promise<QueryResultSet> { return { headers: [], rows: [] }; }
@@ -61,7 +71,19 @@ class MockDatabaseOperations implements DatabaseOperations {
     }
     async dropView(view: string) { return this.getViewDefinition(view); }
     async updateCellBatch(table: string, updates: CellUpdate[]) { return []; }
-    async addColumn(table: string, column: string, type: string, defaultValue?: string): Promise<void> {}
+    async addColumn(
+        table: string,
+        column: string,
+        type: string,
+        defaultValue?: string
+    ): Promise<ColumnDropTableState> {
+        return {
+            tableSql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, ${column} ${type})`,
+            columns: ['id', column],
+            identity: { kind: 'rowid' },
+            schemaObjects: []
+        };
+    }
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> { return { headers: [], rows: [] }; }
     async fetchTableCount(table: string, options: TableCountOptions) { return { count: 0, isExact: true }; }
     async fetchSchema(): Promise<SchemaSnapshot> { return { tables: [], views: [], indexes: [] }; }

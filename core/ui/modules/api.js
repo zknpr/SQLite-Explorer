@@ -13,6 +13,7 @@ import {
     escapeJsonSafeNumberString,
     rpcErrorFields
 } from './transport.js';
+import { getErrorMessage } from './utils.js';
 
 export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 
@@ -153,7 +154,12 @@ async function serializeValueAsync(value) {
     if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
         const result = {};
         for (const key of Object.keys(value)) {
-            result[key] = await serializeValueAsync(value[key]);
+            Object.defineProperty(result, key, {
+                value: await serializeValueAsync(value[key]),
+                enumerable: true,
+                configurable: true,
+                writable: true
+            });
         }
         return result;
     }
@@ -211,7 +217,12 @@ function deserializeValue(value) {
         // Recursively deserialize object properties
         const result = {};
         for (const key of Object.keys(value)) {
-            result[key] = deserializeValue(value[key]);
+            Object.defineProperty(result, key, {
+                value: deserializeValue(value[key]),
+                enumerable: true,
+                configurable: true,
+                writable: true
+            });
         }
         return result;
     }
@@ -264,10 +275,14 @@ export async function sendRpcRequest(method, args) {
 
         pendingRpcCalls.set(messageId, { resolve, reject, timeoutId });
 
-        if (vscodeApi) {
+        try {
+            if (!vscodeApi) throw new Error('VS Code API not available');
             vscodeApi.postMessage(outboundMessage);
-        } else {
-            console.warn('VS Code API not available');
+        } catch (error) {
+            if (pendingRpcCalls.delete(messageId)) {
+                if (timeoutId !== undefined) clearTimeout(timeoutId);
+                reject(error);
+            }
         }
     });
 }
@@ -325,7 +340,7 @@ export function sendRpcError(correlationId, error) {
     const message = {
         kind: 'result',
         correlationId,
-        errorText: error instanceof Error ? error.message : String(error),
+        errorText: getErrorMessage(error),
         ...rpcErrorFields(error)
     };
     assertWebviewTransportPayload(message, {
@@ -339,10 +354,8 @@ export function sendRpcError(correlationId, error) {
 // Backend API proxy
 export const backendApi = {
     initialize: () => sendRpcRequest('initialize', []),
-    exportDb: (filename) => sendRpcRequest('exportDb', [filename]),
     refreshFile: () => sendRpcRequest('refreshFile', []),
     saveSidebarState: (side, position) => sendRpcRequest('saveSidebarState', [side, position]),
-    fireEditEvent: (edit) => sendRpcRequest('fireEditEvent', [edit]),
     exportTable: (dbParams, columns, dbOptions, tableStore, exportOptions, extras) => sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
 
     // New safe methods
@@ -366,6 +379,8 @@ export const backendApi = {
             expectedTriggers
         ]),
     dropView: (view) => sendRpcRequest('dropView', [view]),
+    confirmLargeSelection: (itemCount, unit) =>
+        sendRpcRequest('confirmLargeSelection', [itemCount, unit]),
     updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
@@ -379,13 +394,18 @@ export const backendApi = {
     ping: () => sendRpcRequest('ping', []),
     prepareCellMediaPreview: (params, rowId, colName, options) =>
         sendRpcRequest('prepareCellMediaPreview', [params, rowId, colName, options]),
+    cancelCellMediaPreview: (webviewId, requestId) =>
+        sendRpcRequest('cancelCellMediaPreview', [webviewId, requestId]),
     releaseCellMediaPreview: (webviewId, previewId) =>
         sendRpcRequest('releaseCellMediaPreview', [webviewId, previewId]),
+    openCellReadSession: (target) => sendRpcRequest('openCellReadSession', [target]),
+    readCellChunk: (sessionId, byteOffset, maxBytes) =>
+        sendRpcRequest('readCellChunk', [sessionId, byteOffset, maxBytes]),
+    closeCellReadSession: (sessionId) =>
+        sendRpcRequest('closeCellReadSession', [sessionId]),
     openCellEditor: (params, rowId, colName, colTypes, options) => sendRpcRequest('openCellEditor', [params, rowId, colName, colTypes, options]),
     openViewEditor: (view, webviewId) => sendRpcRequest('openViewEditor', [view, webviewId]),
     readWorkspaceFileUri: (uri) => sendRpcRequest('readWorkspaceFileUri', [uri]),
     saveFile: (filename, data) => sendRpcRequest('saveFile', [filename, data]),
-    selectFile: () => sendRpcRequest('selectFile', []),
-    triggerUndo: () => sendRpcRequest('triggerUndo', []),
-    triggerRedo: () => sendRpcRequest('triggerRedo', [])
+    selectFile: () => sendRpcRequest('selectFile', [])
 };

@@ -118,41 +118,25 @@ const SWEEP = [
     }],
 
     ['refreshFile', async ({ s, check }) => {
-        // DELIBERATE NO-OP at the worker layer. The desktop answers ⌘R in
+        // DELIBERATE REFUSAL at the worker layer. The desktop answers ⌘R in
         // desktop-host.js (which re-opens the bound path and returns
-        // {connected, filename, readOnly}); this method is what the RPC name
-        // resolves to if anything reaches the worker with it. Pinned so a
-        // future change has to be deliberate: it must not start reporting a
-        // refresh it did not do.
+        // {connected, filename, readOnly}) and never forwards it; the worker's
+        // own version exists so the VS Code contract has a callee, and it
+        // refuses because only a host holding the original source can reload.
+        // Pinned so a future change has to be deliberate: it must not start
+        // reporting a refresh it did not do, and it must not touch the data.
         const before = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people']);
         const refresh = await s.invoke('refreshFile', []);
         const after = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people']);
-        check(body(refresh).success === true
-            && body(refresh).data === undefined
+        check(failed(refresh, /Reload must be handled by the demo host/)
             && JSON.stringify(body(before).data) === JSON.stringify(body(after).data),
-            'sweep/refreshFile/happy-is-a-no-op-that-claims-nothing', detail(refresh));
+            'sweep/refreshFile/happy-refuses-and-claims-nothing', detail(refresh));
 
-        // No argument shape can make it fail, and that IS the contract: a
-        // no-op must not become a crash surface for a hostile caller.
+        // No argument shape changes that answer: a refusal must not become a
+        // crash surface for a hostile caller either.
         const hostile = await s.invoke('refreshFile', [{ __proto__: { polluted: true } }, 'extra']);
-        check(body(hostile).success === true && body(hostile).data === undefined,
-            'sweep/refreshFile/error-surplus-and-hostile-arguments-are-ignored', detail(hostile));
-    }],
-
-    ['fireEditEvent', async ({ s, check }) => {
-        // Same shape as refreshFile: the desktop host answers it locally
-        // ({success:true}); the worker's own version is a no-op that exists so
-        // the VS Code contract has a callee. It must not touch the database.
-        const edit = await s.invoke('fireEditEvent', [{ label: 'x' }]);
-        const rows = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people']);
-        check(body(edit).success === true
-            && body(edit).data === undefined
-            && body(rows).data?.[0]?.rows?.[0]?.[0] === 3,
-            'sweep/fireEditEvent/happy-is-an-inert-no-op', detail(edit));
-
-        const hostile = await s.invoke('fireEditEvent', [null]);
-        check(body(hostile).success === true && body(hostile).data === undefined,
-            'sweep/fireEditEvent/error-a-null-edit-is-ignored-not-thrown', detail(hostile));
+        check(failed(hostile, /Reload must be handled by the demo host/),
+            'sweep/refreshFile/error-surplus-and-hostile-arguments-still-refuse', detail(hostile));
     }],
 
     // ---- schema reads ----------------------------------------------------
@@ -296,8 +280,8 @@ const SWEEP = [
     // ---- DDL: tables and columns ----------------------------------------
     ['createTable', async ({ s, check }) => {
         const made = await s.invoke('createTable', ['sweep_made', [
-            { name: 'id', type: 'INTEGER', pk: true },
-            { name: 'label', type: 'TEXT', notnull: true, defaultValue: 'unset' }
+            { name: 'id', type: 'INTEGER', primaryKey: true },
+            { name: 'label', type: 'TEXT', notNull: true, defaultValue: 'unset' }
         ]]);
         const info = await s.invoke('getTableInfo', ['sweep_made']);
         const columns = (body(info).data ?? []).map((c) => c.identifier);
@@ -340,29 +324,32 @@ const SWEEP = [
             detail(injected));
     }],
 
-    ['findColumnDependencies', async ({ s, check }) => {
-        const deps = await s.invoke('findColumnDependencies', ['people', ['note']]);
+    ['findDependentIndexes', async ({ s, check }) => {
+        // SQLite itself is the parser here: the worker recreates each index
+        // against a TEMP probe table and asks DROP COLUMN. The answer is the
+        // exact {identifier, sql} definitions, which go back with the drop.
+        const deps = await s.invoke('findDependentIndexes', ['people', ['note']]);
         const data = body(deps).data;
         check(body(deps).success === true
-            && Array.from(data?.indexes ?? []).includes('idx_people_note')
-            && Array.isArray(data?.dependentObjects),
-            'sweep/findColumnDependencies/happy-names-the-blocking-index', detail(deps));
+            && Array.isArray(data)
+            && data.some((index) => index.identifier === 'idx_people_note' && /idx_people_note/.test(index.sql)),
+            'sweep/findDependentIndexes/happy-names-the-blocking-index', detail(deps));
 
         // Shape validation matters here specifically: this result is fed
         // straight back in as deleteColumns' third argument.
-        const bad = await s.invoke('findColumnDependencies', ['people', 'note']);
-        check(failed(bad, /requires an array of column names/),
-            'sweep/findColumnDependencies/error-a-bare-string-is-refused', detail(bad));
+        const bad = await s.invoke('findDependentIndexes', ['people', 'note']);
+        check(failed(bad, /Column names must be an array/),
+            'sweep/findDependentIndexes/error-a-bare-string-is-refused', detail(bad));
     }],
 
     ['deleteColumns', async ({ s, check }) => {
         // REGRESSION PIN for F-E, at the layer where it actually broke. The
         // webview used to send `[table, columns, undefined]`, which JSON
-        // renders as `null`, and the worker's `!== undefined` guard rejected
+        // renders as `null`, and the worker's confirmation validator rejects
         // it. Two-and-a-half assertions: the ordinary no-dependency drop must
         // SUCCEED with an absent third argument, an explicit `null` must still
-        // be REFUSED (the guard is load-bearing, not collateral), and the
-        // dependency-carrying drop must work when handed the index list.
+        // be REFUSED (the validator is load-bearing, not collateral), and the
+        // dependency-carrying drop must work when handed the definitions.
         await s.invoke('runConsole', [
             'CREATE TABLE drop_plain(id INTEGER PRIMARY KEY, keep TEXT, victim TEXT);'
             + "INSERT INTO drop_plain VALUES (1,'k','v')"
@@ -376,23 +363,23 @@ const SWEEP = [
 
         const nulled = await s.invoke('deleteColumns', ['drop_plain', ['keep'], null]);
         const stillThere = await s.invoke('getTableInfo', ['drop_plain']);
-        check(failed(nulled, /dropDependentIndexes must be an array of index names/)
+        check(failed(nulled, /Dependent-index confirmation must be an array/)
             && (body(stillThere).data ?? []).some((c) => c.identifier === 'keep'),
             'sweep/deleteColumns/error-explicit-null-is-still-refused-and-nothing-dropped',
             detail(nulled));
 
-        // The dependency lane end to end: refused without the index list,
-        // accepted with exactly the list findColumnDependencies returned.
+        // The dependency lane end to end: refused without the confirmation,
+        // accepted with exactly the definitions findDependentIndexes returned.
         const blocked = await s.invoke('deleteColumns', ['people', ['note']]);
-        const deps = await s.invoke('findColumnDependencies', ['people', ['note']]);
+        const deps = await s.invoke('findDependentIndexes', ['people', ['note']]);
         const withList = await s.invoke('deleteColumns', [
-            'people', ['note'], Array.from(body(deps).data?.indexes ?? [])
+            'people', ['note'], Array.from(body(deps).data ?? [])
         ]);
         const peopleInfo = await s.invoke('getTableInfo', ['people']);
-        check(body(blocked).success === false
+        check(failed(blocked, /requires confirmation for dependent indexes: idx_people_note/)
             && body(withList).success === true
             && !(body(peopleInfo).data ?? []).some((c) => c.identifier === 'note'),
-            'sweep/deleteColumns/happy-dependent-index-drops-when-the-list-is-supplied',
+            'sweep/deleteColumns/happy-dependent-index-drops-when-the-definitions-are-supplied',
             `blocked=${detail(blocked)} withList=${detail(withList)}`);
     }],
 
@@ -444,17 +431,14 @@ const SWEEP = [
         check(body(bad).success === false && body(stillOk).success === true,
             'sweep/validateViewDefinition/error-refuses-and-rolls-the-view-back', detail(bad));
 
-        // KNOWN GAP G-1b (reported, deliberately not fixed here). Unlike
-        // createView/editView, this method installs the candidate view and
-        // then compiles a SELECT over it — so the failing statement names only
-        // the view, which IS in the catalog, and the missing-table probe
-        // correctly declines to accuse it. The message therefore stays the
-        // generic class. Closing it means adding createView's body pre-compile
-        // here, which is a product-behaviour change (it also alters the
-        // read-only CTE preview path), so it is written up rather than guessed.
-        // Pinned so a fix shows up as a deliberate change to this line.
-        check(/native engine cannot report/.test(String(body(bad).errorMessage ?? '')),
-            'sweep/validateViewDefinition/error-G1b-message-is-STILL-generic-known-gap',
+        // G-1b, CLOSED. Every view-editor method now validates through the
+        // INSTALLED main view (1.7.2), so the failing statement names only the
+        // view — in the catalog, hence never accused. The missing-table proof
+        // therefore walks into the view's stored body (sqlite-errors.js
+        // findUnresolvedTableNames) and names the table it lost, on all four
+        // methods alike.
+        check(failed(bad, /no such table: definitely_absent/),
+            'sweep/validateViewDefinition/error-G1-names-the-missing-table-through-the-installed-view',
             detail(bad));
     }],
 
@@ -474,9 +458,9 @@ const SWEEP = [
         check(body(bad).success === false && body(stillOk).success === true,
             'sweep/previewViewDefinition/error-refuses-and-leaves-the-installed-view-intact',
             detail(bad));
-        // Same known gap as validateViewDefinition — see G-1b there.
-        check(/native engine cannot report/.test(String(body(bad).errorMessage ?? '')),
-            'sweep/previewViewDefinition/error-G1b-message-is-STILL-generic-known-gap',
+        // Same route as validateViewDefinition — see G-1b there.
+        check(failed(bad, /no such table: definitely_absent/),
+            'sweep/previewViewDefinition/error-G1-names-the-missing-table-through-the-installed-view',
             detail(bad));
     }],
 
@@ -544,6 +528,36 @@ const SWEEP = [
             'sweep/insertRow/error-primary-key-clash-is-classified-and-inert', detail(clash));
     }],
 
+    ['insertRowWithHistory', async ({ s, check }) => {
+        // The route the desktop host actually takes for Add Row: the insert
+        // AND its exact post-image ({rowId, row, storageClasses}) in one
+        // savepoint, which is what undo deletes by and redo re-inserts by.
+        const inserted = await s.invoke('insertRowWithHistory', [
+            'people', { id: 11, name: 'epsilon', r: 0.5 }, undefined, 1024 * 1024
+        ]);
+        const image = body(inserted).data;
+        const readBack = await s.invoke('runQuery', ['SELECT name FROM people WHERE id = 11']);
+        check(body(inserted).success === true
+            && Number(image?.rowId) === 11
+            && image?.row?.name === 'epsilon'
+            && Array.isArray(image?.storageClasses)
+            && image.storageClasses.some((c) => c.column === 'name' && c.storageClass === 'text')
+            && body(readBack).data?.[0]?.rows?.[0]?.[0] === 'epsilon',
+            'sweep/insertRowWithHistory/happy-returns-the-exact-post-image', detail(inserted));
+
+        // The snapshot budget is enforced BEFORE the insert is released: a
+        // row whose image would not fit the undo memory is refused, and the
+        // savepoint takes the insert back with it.
+        const tooBig = await s.invoke('insertRowWithHistory', [
+            'people', { id: 12, name: 'x'.repeat(2048) }, undefined, 64
+        ]);
+        const count = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people WHERE id = 12']);
+        check(body(tooBig).success === false
+            && body(count).data?.[0]?.rows?.[0]?.[0] === 0,
+            'sweep/insertRowWithHistory/error-over-budget-snapshot-refuses-and-rolls-the-insert-back',
+            detail(tooBig));
+    }],
+
     ['updateCell', async ({ s, check }) => {
         const edit = await s.invoke('updateCell', ['people', 10, 'name', 'delta-edited']);
         const readBack = await s.invoke('runQuery', ['SELECT name FROM people WHERE id = 10']);
@@ -556,19 +570,24 @@ const SWEEP = [
             'sweep/updateCell/error-absent-row-is-named-not-silently-ignored', detail(ghost));
     }],
 
-    ['updateCellBatch', async ({ s, check }) => {
+    ['updateCellBatch', async ({ s, check, state }) => {
         const batch = await s.invoke('updateCellBatch', ['people', [
             { rowId: 1, column: 'name', value: 'alpha-2' },
             { rowId: 2, column: 'name', value: 'beta-2' }
         ]]);
         const readBack = await s.invoke('runQuery', ['SELECT name FROM people WHERE id IN (1,2) ORDER BY id']);
         const outcomes = body(batch).data ?? [];
+        // Kept for the history-replay entries below: the states are what make
+        // an entry replayable.
+        state.history = outcomes;
         check(body(batch).success === true
             && outcomes.length === 2
             && outcomes[0]?.priorValue === 'alpha'
+            && outcomes[0]?.priorState?.storageClass === 'text'
+            && outcomes[0]?.postState?.value === 'alpha-2'
             && JSON.stringify(body(readBack).data?.[0]?.rows?.map((r) => r[0]))
                 === JSON.stringify(['alpha-2', 'beta-2']),
-            'sweep/updateCellBatch/happy-reports-prior-values', detail(batch));
+            'sweep/updateCellBatch/happy-reports-prior-and-post-states', detail(batch));
 
         // The batch is one savepoint: a single bad member must take the whole
         // batch down, or a partial write silently diverges from the history
@@ -626,8 +645,38 @@ const SWEEP = [
     }],
 
     // ---- history replay --------------------------------------------------
-    ['undoModification', async ({ s, check }) => {
-        const undo = await s.invoke('undoModification', [{
+    // The replay is an exact-state compare-and-swap: the entry has to carry
+    // the prior/post states the worker captured, which is what the desktop
+    // host records from updateCellBatch's own answer. `state.history` is the
+    // record of the batch above (alpha → alpha-2 on row 1), and both replays
+    // are refused without those states — LegacyCellHistoryError, pinned below.
+    ['undoModification', async ({ s, check, state }) => {
+        const outcome = state.history?.[0];
+        const entry = outcome && {
+            modificationType: 'cell_update',
+            targetTable: 'people',
+            affectedCells: [{
+                rowId: outcome.rowId,
+                newRowId: outcome.newRowId ?? outcome.rowId,
+                columnName: outcome.columnName,
+                priorValue: outcome.priorValue,
+                newValue: outcome.newValue,
+                priorState: outcome.priorState,
+                postState: outcome.postState,
+                operation: outcome.operation
+            }]
+        };
+        state.cellEntry = entry;
+        const undo = await s.invoke('undoModification', [entry ?? {}]);
+        const readBack = await s.invoke('runQuery', ['SELECT name FROM people WHERE id = 1']);
+        check(!!entry
+            && body(undo).success === true
+            && body(readBack).data?.[0]?.rows?.[0]?.[0] === 'alpha',
+            'sweep/undoModification/happy-restores-the-prior-value', detail(undo));
+
+        // An entry without the captured states cannot be replayed safely, and
+        // must say so rather than guess at what the cell held.
+        const legacy = await s.invoke('undoModification', [{
             modificationType: 'cell_update',
             targetTable: 'people',
             targetRowId: 1,
@@ -636,10 +685,8 @@ const SWEEP = [
             newValue: 'alpha-2',
             operation: 'set'
         }]);
-        const readBack = await s.invoke('runQuery', ['SELECT name FROM people WHERE id = 1']);
-        check(body(undo).success === true
-            && body(readBack).data?.[0]?.rows?.[0]?.[0] === 'alpha',
-            'sweep/undoModification/happy-restores-the-prior-value', detail(undo));
+        check(failed(legacy, /predates guarded cell history/),
+            'sweep/undoModification/error-stateless-entry-is-refused-not-guessed', detail(legacy));
 
         // A barrier type reaching the replay engine is a contract breach, and
         // has to say so rather than no-op into a silently divergent history.
@@ -650,17 +697,11 @@ const SWEEP = [
             'sweep/undoModification/error-barrier-type-is-refused-loudly', detail(barrier));
     }],
 
-    ['redoModification', async ({ s, check }) => {
-        const redo = await s.invoke('redoModification', [{
-            modificationType: 'cell_update',
-            targetTable: 'people',
-            targetRowId: 1,
-            targetColumn: 'name',
-            newValue: 'alpha-2',
-            operation: 'set'
-        }]);
+    ['redoModification', async ({ s, check, state }) => {
+        const redo = await s.invoke('redoModification', [state.cellEntry ?? {}]);
         const readBack = await s.invoke('runQuery', ['SELECT name FROM people WHERE id = 1']);
-        check(body(redo).success === true
+        check(!!state.cellEntry
+            && body(redo).success === true
             && body(readBack).data?.[0]?.rows?.[0]?.[0] === 'alpha-2',
             'sweep/redoModification/happy-re-applies-the-new-value', detail(redo));
 
@@ -787,11 +828,15 @@ const SWEEP = [
             reopened = image.prepare('SELECT count(*) AS c FROM people').get().c;
             image.close();
         }
+        const live = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people']);
+        const expectedRows = body(live).data?.[0]?.rows?.[0]?.[0];
         check(body(exported).success === true
             && bytes instanceof Uint8Array
             && String.fromCharCode(...bytes.subarray(0, 15)) === 'SQLite format 3'
-            && reopened === 3,
-            'sweep/exportDatabase/happy-image-reopens', `bytes=${bytes?.length} rows=${reopened}`);
+            && Number.isInteger(expectedRows)
+            && reopened === expectedRows,
+            'sweep/exportDatabase/happy-image-reopens',
+            `bytes=${bytes?.length} rows=${reopened} expected=${expectedRows}`);
         check(true, 'sweep/exportDatabase/error-deferred-to-dead-session-phase');
     }],
 

@@ -1,6 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { escapeIdentifier, cellValueToSql, validateSqlType, escapeLikePattern, validateRowId, validateRowIds } from '../../src/core/sql-utils';
+import {
+  assertUsableSqlIdentifier,
+  escapeIdentifier,
+  cellValueToSql,
+  validateSqlType,
+  escapeLikePattern,
+  validateRowId,
+  validateRowIds
+} from '../../src/core/sql-utils';
 
 describe('SQL Utils', () => {
   describe('validateSqlType', () => {
@@ -61,6 +69,30 @@ describe('SQL Utils', () => {
 
     it('should handle empty strings', () => {
       assert.strictEqual(escapeIdentifier(''), '""');
+    });
+  });
+
+  describe('assertUsableSqlIdentifier', () => {
+    it('accepts legal SQLite identifiers without trimming or Unicode folding', () => {
+      assert.doesNotThrow(() => assertUsableSqlIdentifier(' ui "table" 🚀 ', 'Table name'));
+      assert.doesNotThrow(() => assertUsableSqlIdentifier('   ', 'Table name'));
+      assert.doesNotThrow(() => assertUsableSqlIdentifier('Ä', 'Table name'));
+      assert.doesNotThrow(() => assertUsableSqlIdentifier('ä', 'Table name'));
+    });
+
+    it('rejects missing, empty, and NUL-containing identifiers explicitly', () => {
+      assert.throws(
+        () => assertUsableSqlIdentifier(undefined, 'Table name'),
+        /Table name is required/
+      );
+      assert.throws(
+        () => assertUsableSqlIdentifier('', 'Column name'),
+        /Column name is required/
+      );
+      assert.throws(
+        () => assertUsableSqlIdentifier('bad\0name', 'View name'),
+        /View name cannot contain NUL/
+      );
     });
   });
 

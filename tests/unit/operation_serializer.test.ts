@@ -38,7 +38,12 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
             schemaObjects: []
         }),
         findDependentIndexes: async () => [],
-        createTable: async () => {},
+        createTable: async table => ({
+            tableSql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY)`,
+            columns: ['id'],
+            identity: { kind: 'rowid' },
+            schemaObjects: []
+        }),
         getViewDefinition: async () => ({ identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] }),
         validateViewDefinition: async () => {},
         previewViewDefinition: async () => ({ headers: [], rows: [] }),
@@ -49,7 +54,12 @@ function createOperations(overrides: Partial<DatabaseOperations> = {}): Database
         }),
         dropView: async () => ({ identifier: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] }),
         updateCellBatch: async () => [],
-        addColumn: async () => {},
+        addColumn: async table => ({
+            tableSql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, added TEXT)`,
+            columns: ['id', 'added'],
+            identity: { kind: 'rowid' },
+            schemaObjects: []
+        }),
         fetchTableData: async () => ({
             headers: [],
             rows: []

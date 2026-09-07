@@ -1,18 +1,23 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { buildSelectQuery, buildCountQuery } from '../../src/core/query-builder';
+import {
+  buildSelectQuery,
+  buildCountQuery,
+  MAX_TABLE_PAGE_ROWS
+} from '../../src/core/query-builder';
+import type { ResolvedKeysetPlan } from '../../src/core/keyset-pagination';
 
 describe('Query Builder', () => {
   describe('buildSelectQuery', () => {
     it('should build simple select *', () => {
       const { sql, params } = buildSelectQuery('my_table', {});
-      assert.strictEqual(sql, 'SELECT * FROM "my_table"');
+      assert.strictEqual(sql, 'SELECT * FROM main."my_table"');
       assert.deepStrictEqual(params, []);
     });
 
     it('should select specific columns', () => {
       const { sql } = buildSelectQuery('my_table', { columns: ['name', 'age'] });
-      assert.strictEqual(sql, 'SELECT "name", "age" FROM "my_table"');
+      assert.strictEqual(sql, 'SELECT "name", "age" FROM main."my_table"');
     });
 
     it('should handle filters', () => {
@@ -20,7 +25,7 @@ describe('Query Builder', () => {
         filters: [{ column: 'name', value: 'John' }]
       };
       const { sql, params } = buildSelectQuery('users', options);
-      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ? ESCAPE \'\\\'');
+      assert.strictEqual(sql, 'SELECT * FROM main."users" WHERE "name" LIKE ? ESCAPE \'\\\'');
       assert.deepStrictEqual(params, ['%John%']);
     });
 
@@ -29,7 +34,7 @@ describe('Query Builder', () => {
         filters: [{ column: 'name', value: '100%' }]
       };
       const { sql, params } = buildSelectQuery('users', options);
-      assert.strictEqual(sql, 'SELECT * FROM "users" WHERE "name" LIKE ? ESCAPE \'\\\'');
+      assert.strictEqual(sql, 'SELECT * FROM main."users" WHERE "name" LIKE ? ESCAPE \'\\\'');
       assert.deepStrictEqual(params, ['%100\\%%']);
     });
 
@@ -41,7 +46,54 @@ describe('Query Builder', () => {
         orderDir: 'DESC' as const
       };
       const { sql } = buildSelectQuery('logs', options);
-      assert.strictEqual(sql, 'SELECT * FROM "logs" ORDER BY "created_at" DESC LIMIT 10 OFFSET 20');
+      assert.strictEqual(sql, 'SELECT * FROM main."logs" ORDER BY "created_at" DESC LIMIT 10 OFFSET 20');
+    });
+
+    it('rejects malformed page bounds instead of emitting an unbounded LIMIT', () => {
+      for (const limit of [-1, 0, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+        assert.throws(
+          () => buildSelectQuery('logs', { limit, offset: 0 }),
+          /page limit must be a positive safe integer/i
+        );
+      }
+      for (const offset of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+        assert.throws(
+          () => buildSelectQuery('logs', { limit: 10, offset }),
+          /page offset must be a non-negative safe integer/i
+        );
+      }
+    });
+
+    it('clamps a requested page above the declared maximum', () => {
+      const { sql } = buildSelectQuery('logs', {
+        limit: MAX_TABLE_PAGE_ROWS + 1,
+        offset: 0
+      });
+      assert.strictEqual(
+        sql,
+        `SELECT * FROM main."logs" LIMIT ${MAX_TABLE_PAGE_ROWS} OFFSET 0`
+      );
+    });
+
+    it('validates the engine-owned keyset limit at final SQL assembly too', () => {
+      const plan: ResolvedKeysetPlan = {
+        keyColumns: ['rowid'],
+        nullableSortKey: false,
+        direction: 'ASC',
+        mode: 'first',
+        limit: -1
+      };
+      assert.throws(
+        () => buildSelectQuery('logs', { limit: 10, offset: 0 }, plan),
+        /page limit must be a positive safe integer/i
+      );
+
+      const clamped = buildSelectQuery(
+        'logs',
+        { limit: 10, offset: 0 },
+        { ...plan, limit: MAX_TABLE_PAGE_ROWS + 1 }
+      );
+      assert.match(clamped.sql, new RegExp(`LIMIT ${MAX_TABLE_PAGE_ROWS}$`));
     });
 
     it('orders a synthetic composite identity by every declared key member', () => {
@@ -52,7 +104,7 @@ describe('Query Builder', () => {
 
       assert.strictEqual(
         sql,
-        'SELECT * FROM "entries" ORDER BY "tenant" DESC, "sequence""number" DESC'
+        'SELECT * FROM main."entries" ORDER BY "tenant" DESC, "sequence""number" DESC'
       );
     });
 
@@ -62,7 +114,7 @@ describe('Query Builder', () => {
         globalFilter: 'test'
       };
       const { sql, params } = buildSelectQuery('products', options);
-      assert.strictEqual(sql, 'SELECT "name", "description" FROM "products" WHERE ("name" LIKE ? ESCAPE \'\\\' OR "description" LIKE ? ESCAPE \'\\\')');
+      assert.strictEqual(sql, 'SELECT "name", "description" FROM main."products" WHERE ("name" LIKE ? ESCAPE \'\\\' OR "description" LIKE ? ESCAPE \'\\\')');
       assert.deepStrictEqual(params, ['%test%', '%test%']);
     });
 
@@ -76,7 +128,7 @@ describe('Query Builder', () => {
 
       assert.strictEqual(
         sql,
-        'SELECT "rowid" AS "rowid", "value" FROM "items" WHERE ("value" LIKE ? ESCAPE \'\\\')'
+        'SELECT "rowid" AS "rowid", "value" FROM main."items" WHERE ("value" LIKE ? ESCAPE \'\\\')'
       );
       assert.deepStrictEqual(params, ['%12%']);
     });
@@ -87,7 +139,7 @@ describe('Query Builder', () => {
         globalFilter: 'test'
       };
       const { sql, params } = buildSelectQuery('products', options);
-      assert.strictEqual(sql, 'SELECT * FROM "products" WHERE ("*" LIKE ? ESCAPE \'\\\')');
+      assert.strictEqual(sql, 'SELECT * FROM main."products" WHERE ("*" LIKE ? ESCAPE \'\\\')');
       assert.deepStrictEqual(params, ['%test%']);
     });
 
@@ -98,7 +150,7 @@ describe('Query Builder', () => {
       };
       const { sql, params } = buildSelectQuery('products', options);
       // Implementation should avoid generating WHERE ()
-      assert.strictEqual(sql, 'SELECT  FROM "products"');
+      assert.strictEqual(sql, 'SELECT  FROM main."products"');
       assert.deepStrictEqual(params, []);
     });
 
@@ -108,7 +160,7 @@ describe('Query Builder', () => {
         filters: [{ column: 'name', value: '   ' }],
         globalFilter: '\t '
       });
-      assert.strictEqual(inactive.sql, 'SELECT "name" FROM "products"');
+      assert.strictEqual(inactive.sql, 'SELECT "name" FROM main."products"');
       assert.deepStrictEqual(inactive.params, []);
 
       const padded = buildSelectQuery('products', {
@@ -123,7 +175,7 @@ describe('Query Builder', () => {
   describe('buildCountQuery', () => {
     it('should build simple count', () => {
       const { sql, params } = buildCountQuery('my_table', {});
-      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "my_table"');
+      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM main."my_table"');
       assert.deepStrictEqual(params, []);
     });
 
@@ -133,7 +185,7 @@ describe('Query Builder', () => {
         globalFilter: 'test'
       };
       const { sql, params } = buildCountQuery('products', options);
-      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "products" WHERE ("name" LIKE ? ESCAPE \'\\\' OR "description" LIKE ? ESCAPE \'\\\')');
+      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM main."products" WHERE ("name" LIKE ? ESCAPE \'\\\' OR "description" LIKE ? ESCAPE \'\\\')');
       assert.deepStrictEqual(params, ['%test%', '%test%']);
     });
 
@@ -146,7 +198,7 @@ describe('Query Builder', () => {
 
       assert.strictEqual(
         sql,
-        'SELECT COUNT(*) as count FROM "products" WHERE ("visible" LIKE ? ESCAPE \'\\\')'
+        'SELECT COUNT(*) as count FROM main."products" WHERE ("visible" LIKE ? ESCAPE \'\\\')'
       );
       assert.deepStrictEqual(params, ['%needle%']);
     });
@@ -157,7 +209,7 @@ describe('Query Builder', () => {
         globalFilter: 'test'
       };
       const { sql, params } = buildCountQuery('products', options);
-      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM "products"');
+      assert.strictEqual(sql, 'SELECT COUNT(*) as count FROM main."products"');
       assert.deepStrictEqual(params, []);
     });
 
@@ -167,7 +219,7 @@ describe('Query Builder', () => {
         filters: [{ column: 'name', value: '   ' }],
         globalFilter: '\n'
       });
-      assert.strictEqual(inactive.sql, 'SELECT COUNT(*) as count FROM "products"');
+      assert.strictEqual(inactive.sql, 'SELECT COUNT(*) as count FROM main."products"');
       assert.deepStrictEqual(inactive.params, []);
 
       const padded = buildCountQuery('products', {

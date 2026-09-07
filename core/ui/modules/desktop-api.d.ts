@@ -37,7 +37,6 @@ export interface DesktopBackendApi {
     saveSidebarState(state: unknown): Promise<unknown>;
     exportDb(filename: string): Promise<unknown>;
     refreshFile(): Promise<unknown>;
-    fireEditEvent(edit: unknown): Promise<unknown>;
     exportTable(
         dbParams: unknown,
         columns: unknown,

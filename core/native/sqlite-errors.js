@@ -143,6 +143,14 @@ const SQL_WORD_CHARACTER = /[A-Za-z0-9_$\u0080-\uffff]/;
 const MAX_PROBED_TABLE_CANDIDATES = 4;
 
 /**
+ * How many views deep the missing-table proof follows a broken definition
+ * (`findUnresolvedTableNames`). Views over views over views are unusual;
+ * anything deeper than this stays the generic class rather than costing a
+ * probe per level.
+ */
+const MAX_VIEW_WALK_DEPTH = 4;
+
+/**
  * Split SQL into bare words, quoted identifiers and single-character symbols,
  * skipping string literals and comments.
  *
@@ -245,6 +253,48 @@ export function extractTableReferences(sql) {
 }
 
 /**
+ * The SELECT body of a stored `CREATE VIEW … AS <select>`, or `undefined` when
+ * the text is not shaped like one. Positional, not parsed: the body starts
+ * after the first bare `AS`, which in a CREATE VIEW can only be the one that
+ * introduces the body (the view's own name is a single identifier, and a
+ * column list, if present, sits in parentheses before it).
+ *
+ * @param {string} viewSql
+ * @returns {string|undefined}
+ */
+function extractViewBody(viewSql) {
+    const tokens = scanSqlWords(viewSql);
+    const first = tokens.find(token => token.kind === 'word');
+    if (!first || first.value.toUpperCase() !== 'CREATE') return undefined;
+    // scanSqlWords carries no offsets, so the body is located by re-scanning
+    // the source for the AS keyword outside quotes and comments: the token
+    // index tells us WHICH bare `AS` it is, and the walk below finds it.
+    let asOrdinal = -1;
+    for (let index = 0; index < tokens.length; index += 1) {
+        if (tokens[index].kind === 'word' && tokens[index].value.toUpperCase() === 'AS') {
+            asOrdinal = index;
+            break;
+        }
+    }
+    if (asOrdinal < 0) return undefined;
+    // Count bare-word `AS` occurrences in the raw text until the ordinal one.
+    // Quoted identifiers/strings/comments cannot contain a bare-word match at
+    // depth zero of this scanner, so the word regex over the raw text lands on
+    // the same token the scanner did.
+    let seen = 0;
+    const wordPattern = /[A-Za-z0-9_$\u0080-\uffff]+|'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?\*\//g;
+    let match;
+    while ((match = wordPattern.exec(viewSql)) !== null) {
+        const text = match[0];
+        if (!SQL_WORD_CHARACTER.test(text[0])) continue;   // quoted or comment: not a bare word
+        if (text.toUpperCase() !== 'AS') continue;
+        seen += 1;
+        if (seen === 1) return viewSql.slice(match.index + text.length);
+    }
+    return undefined;
+}
+
+/**
  * Ask SQLite which of `names` does not resolve as a table.
  *
  * `probe` supplies two independent answers and BOTH are required before a name
@@ -257,13 +307,39 @@ export function extractTableReferences(sql) {
  *     is what keeps a view whose BODY is broken (its base table was dropped —
  *     which this very app can do) from being reported as a missing table: the
  *     compile probe fails for it, but the name is right there in the catalog.
+ *
+ * A name that is in the catalog yet does not compile is exactly that broken
+ * view, and when the probe can also hand back its stored definition
+ * (`viewSql(name)`, optional) the proof walks INTO the body and reports the
+ * table the view lost instead. This is what keeps the view editor's own
+ * failures actionable on the native engine: since 1.7.2 it validates a
+ * definition through the INSTALLED main view (`EXPLAIN SELECT * FROM
+ * main."view"`), so the failing statement names only the view — which is in
+ * the catalog — and a missing table in the new body would otherwise come back
+ * as the generic class. Bounded by MAX_VIEW_WALK_DEPTH and a visited set.
+ *
+ * @param {readonly string[]} names
+ * @param {{resolves(name: string): boolean, inCatalog(name: string): boolean, viewSql?(name: string): string|undefined}} probe
  */
-export function findUnresolvedTableNames(names, probe) {
+export function findUnresolvedTableNames(names, probe, depth = 0, visited = new Set()) {
     const missing = [];
     for (const name of names) {
         if (probe.resolves(name)) continue;
-        if (probe.inCatalog(name)) continue;
-        missing.push(name);
+        if (!probe.inCatalog(name)) {
+            missing.push(name);
+            continue;
+        }
+        if (depth >= MAX_VIEW_WALK_DEPTH || typeof probe.viewSql !== 'function') continue;
+        const key = name.toLowerCase();
+        if (visited.has(key)) continue;
+        visited.add(key);
+        const body = extractViewBody(probe.viewSql(name) ?? '');
+        if (!body) continue;
+        const inner = extractTableReferences(body);
+        if (!inner || inner.length === 0) continue;
+        for (const found of findUnresolvedTableNames(inner, probe, depth + 1, visited)) {
+            if (!missing.includes(found)) missing.push(found);
+        }
     }
     return missing;
 }

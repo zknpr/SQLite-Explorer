@@ -55,6 +55,7 @@ it('restores a saved table identity before loading its columns or data', async (
         },
         loadTableColumns: async () => {
             identityAtColumnLoad = state.selectedTableIdentity;
+            return true;
         },
         loadTableData: async () => {
             restored.resolve();
@@ -102,6 +103,9 @@ it('restores a saved table identity before loading its columns or data', async (
                     const modules: Record<string, string> = {
                         './modules/state.js': `
                             export const state = ${harness}.state;
+                            export function createSafeColumnState(value = {}) {
+                                return Object.assign(Object.create(null), value);
+                            }
                             export function resolveStartupPageSize(_configured, persisted) {
                                 return persisted ?? 5000;
                             }
