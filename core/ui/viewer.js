@@ -96,6 +96,9 @@ async function restoreSavedState() {
     // inside the selected-table branch loses the user's filter on an empty or
     // newly opened database when the webview is reconstructed.
     state.sidebarFilter = savedState?.sidebarFilter || '';
+    state.collapsedSections = new Set(Array.isArray(savedState?.collapsedSections)
+        ? savedState.collapsedSections.filter(section => ['tables', 'views', 'indexes'].includes(section))
+        : ['views', 'indexes']);
     const sidebarFilterInput = document.getElementById('sidebarFilterInput');
     if (sidebarFilterInput) sidebarFilterInput.value = state.sidebarFilter;
 
@@ -183,13 +186,15 @@ function applyVsCodeSettings() {
 async function initializeApp() {
     try {
         initializeModules();
+        applyVsCodeSettings();
         await connectAndLoadSchema();
         await restoreSavedState();
-        applyVsCodeSettings();
-        setupGlobalShortcuts();
     } catch (err) {
         console.error('Init error:', err);
+        updateStatus(err.message);
         showErrorState(err.message);
+    } finally {
+        setupGlobalShortcuts();
     }
 }
 

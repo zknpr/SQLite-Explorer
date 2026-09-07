@@ -155,13 +155,21 @@ function setSpacerHeight(spacer, rowCount) {
 // ================================================================
 
 function formatOversizedPreview(value, metadata, ordinaryDisplayValue) {
+    const byteUnit = metadata.byteLength === 1 ? 'byte' : 'bytes';
+    if (metadata.storageClass === 'blob') {
+        // Preview limits must not change a BLOB into apparent hex text,
+        // including BLOB values stored in columns with TEXT affinity.
+        return {
+            preview: '[BLOB]',
+            details: ` · ${metadata.byteLength.toLocaleString()} ${byteUnit}`
+        };
+    }
     const rawTextBytes = metadata.storageClass === 'text' && value instanceof Uint8Array;
     const preview = value instanceof Uint8Array
         ? Array.from(value.subarray(0, OVERSIZED_BLOB_PREVIEW_BYTES), byte => (
             byte.toString(16).padStart(2, '0')
         )).join(' ')
         : ordinaryDisplayValue;
-    const byteUnit = metadata.byteLength === 1 ? 'byte' : 'bytes';
     if (rawTextBytes) {
         const complete = value.byteLength === metadata.byteLength;
         return {
@@ -415,19 +423,23 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
         zIndex: isRowPinned ? '8' : '2'
     });
 
-    const rowNumVal = state.currentPageIndex * state.rowsPerPage + rowIdx + 1;
+    // A bounded count cannot locate a last-keyset page in the global row order.
+    // Use explicit page-local ordinals instead of inventing an OFFSET from it.
+    const rowNumVal = (state.totalRecordCountIsExact ? state.currentPageIndex * state.rowsPerPage : 0) + rowIdx + 1;
+    const rowLabel = `row ${rowNumVal}${state.totalRecordCountIsExact ? '' : ' on this page'}`;
     // Use DOM methods instead of innerHTML for consistency with XSS prevention patterns
     const rowSelectButton = document.createElement('button');
     rowSelectButton.type = 'button';
     rowSelectButton.className = 'row-select-button';
     rowSelectButton.textContent = String(rowNumVal);
-    rowSelectButton.ariaLabel = `Select row ${rowNumVal}`;
+    rowSelectButton.ariaLabel = `Select ${rowLabel}`;
+    rowSelectButton.title = state.totalRecordCountIsExact ? `Row ${rowNumVal}` : `Row ${rowNumVal} on this page; total count is bounded`;
     rowNumTd.appendChild(rowSelectButton);
     const pinButton = document.createElement('button');
     pinButton.type = 'button';
     pinButton.className = `pin-icon codicon codicon-pin ${isRowPinned ? 'pinned' : ''}`;
     pinButton.title = isRowPinned ? 'Unpin row' : 'Pin row';
-    pinButton.ariaLabel = `${pinButton.title} ${rowNumVal}`;
+    pinButton.ariaLabel = `${isRowPinned ? 'Unpin' : 'Pin'} ${rowLabel}`;
     pinButton.setAttribute?.('aria-pressed', String(isRowPinned));
     rowNumTd.appendChild(pinButton);
     tr.appendChild(rowNumTd);
@@ -628,10 +640,15 @@ function renderWindowRows(vw, newStart, newEnd) {
     for (const [j, tr] of vw.windowRows) {
         if (!newRows.has(j)) vw.tbody.removeChild(tr);
     }
-    // Insert in ascending order before the bottom spacer; insertBefore also
-    // moves reused rows, so the final order is correct without index math.
-    for (const tr of newRows.values()) {
-        vw.tbody.insertBefore(tr, vw.bottomSpacer.tr);
+    // Overlapping rows already have the right order. Moving one with
+    // insertBefore detaches its focused cell and sends keyboard events to
+    // BODY. Insert only new rows, walking backwards to place prepended rows
+    // before the retained slice without disturbing any live controls.
+    let nextRow = vw.bottomSpacer.tr;
+    for (let j = newEnd - 1; j >= newStart; j--) {
+        const tr = newRows.get(j);
+        if (!vw.windowRows.has(j)) vw.tbody.insertBefore(tr, nextRow);
+        nextRow = tr;
     }
     setSpacerHeight(vw.topSpacer, newStart);
     setSpacerHeight(vw.bottomSpacer, vw.totalUnpinned - newEnd);
@@ -777,7 +794,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
 
     // Calculate row number column width based on the largest row number that will be displayed
     // Base width: 50px for up to 2 digits, add ~8px per additional digit
-    const maxRowNum = state.currentPageIndex * state.rowsPerPage + state.gridData.length;
+    const maxRowNum = (state.totalRecordCountIsExact ? state.currentPageIndex * state.rowsPerPage : 0) + state.gridData.length;
     const digitCount = Math.max(2, String(maxRowNum).length);
     const rowNumWidth = 36 + (digitCount * 8); // Base 36px + 8px per digit
 
@@ -796,7 +813,8 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     // falls back to rendering every row.
     const viewportHeight = readViewportHeight(container);
 
-    const hasActiveFilters = Object.values(state.columnFilters).some(v => v && v.trim() !== '');
+    const hasActiveFilters = state.filterQuery.trim() !== ''
+        || Object.values(state.columnFilters).some(v => v && v.trim() !== '');
 
     // Clear container
     container.innerHTML = '';
@@ -909,6 +927,13 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
 }
 
 export function updatePagination() {
+    if (state.countStatus === 'pending' || state.countStatus === 'unavailable') {
+        document.getElementById('pageIndicator').textContent = `${state.currentPageIndex + 1} / ?`;
+        for (const id of ['btnFirst', 'btnPrev', 'btnNext', 'btnLast']) {
+            document.getElementById(id).disabled = true;
+        }
+        return;
+    }
     const boundPrefix = state.totalRecordCountIsExact ? '' : '≤';
     document.getElementById('pageIndicator').textContent =
         `${boundPrefix}${state.currentPageIndex + 1} / ${boundPrefix}${state.totalPageCount}`;

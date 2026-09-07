@@ -57,7 +57,7 @@ export function initEdit() {
 
 export function startCellEdit(rowIdx, colIdx, rowId) {
     if (state.isReadOnly || state.selectedTableType !== 'table') {
-        updateStatus('Views are read-only');
+        updateStatus(state.isReadOnly ? 'Document is read-only' : 'Views are read-only');
         return;
     }
 
@@ -314,6 +314,7 @@ async function saveCellEditAndMove(direction) {
     // already drifted, the post-save advance below must compare against the
     // table the edit belongs to, not whatever is now selected.
     const targetTable = editSession.table;
+    const targetConnectionGeneration = state.connectionGeneration;
     const { rowIdx, colIdx, originalValue, originalText } = editSession;
     const submittedValue = state.activeCellInput?.value;
 
@@ -352,12 +353,27 @@ async function saveCellEditAndMove(direction) {
     const submittedOriginalText = originalText
         ?? (originalValue === null ? '' : String(originalValue));
     if (submittedValue !== submittedOriginalText) {
-        // recordExternalModification posts refreshContent before the update RPC
-        // response, but that broadcast is not awaited. Start an authoritative
-        // post-commit reload after the editor is cleaned up; its load token
-        // supersedes any still-running broadcast refresh and it renders the row
-        // indices that startCellEdit will use below.
-        if (await loadTableData(false) !== true) return;
+        // The host echo reloads schema before rows. Its slower schema request
+        // can supersede our row load during the first-paint yield, dropping Tab
+        // navigation. Finish that echo before rendering the next edit target.
+        for (;;) {
+            while (state.contentRefreshPromise) {
+                try {
+                    await state.contentRefreshPromise;
+                } catch {
+                    // refreshContent already displays the failure. Leave its
+                    // error visible instead of opening an editor on stale rows.
+                    return;
+                }
+            }
+            if (state.selectedTable !== targetTable
+                || state.connectionGeneration !== targetConnectionGeneration
+                || state.editingCellInfo) return;
+            const loaded = await loadTableData(false);
+            if (state.contentRefreshPromise) continue;
+            if (loaded !== true) return;
+            break;
+        }
     }
 
     const nextRowIdx = state.gridData.findIndex((row, index) => (

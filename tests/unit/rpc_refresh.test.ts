@@ -216,16 +216,10 @@ it('clears and persists selection when refresh removes the selected table', asyn
     const { state } = await import(stateModulePath);
     const originalFetchSchema = backendApi.fetchSchema;
     const persistCountBefore = persistedStates.length;
-    const originalSetTimeout = globalThis.setTimeout;
-    let persistCallback: (() => void) | undefined;
 
     backendApi.fetchSchema = async () => ({ tables: [], views: [], indexes: [] });
     paginationElements.set('tableNameLabel', { textContent: '', innerHTML: '', disabled: false });
     paginationElements.set('gridContainer', { textContent: '', innerHTML: '', disabled: false });
-    (globalThis as any).setTimeout = (callback: () => void) => {
-        persistCallback = callback;
-        return 1;
-    };
     state.isDbConnected = true;
     state.selectedTable = 'removed_table';
     state.selectedTableType = 'table';
@@ -243,15 +237,14 @@ it('clears and persists selection when refresh removes the selected table', asyn
         assert.deepStrictEqual(state.selectedCells, []);
         assert.deepStrictEqual([...state.selectedRowIds], []);
         assert.deepStrictEqual([...state.selectedColumns], []);
-        assert.ok(persistCallback, 'removal should schedule persisted state');
-        persistCallback();
+        // persistState writes synchronously: a hidden webview can be destroyed
+        // before any timer would have run.
         assert.strictEqual(persistedStates.length, persistCountBefore + 1);
         assert.strictEqual((persistedStates.at(-1) as any).selectedTable, null);
     } finally {
         backendApi.fetchSchema = originalFetchSchema;
         paginationElements.delete('tableNameLabel');
         paginationElements.delete('gridContainer');
-        globalThis.setTimeout = originalSetTimeout;
         state.isDbConnected = false;
         state.selectedTable = null;
         state.selectedTableType = 'table';

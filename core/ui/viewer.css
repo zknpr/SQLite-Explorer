@@ -82,6 +82,7 @@ body {
 
 .main-panel {
     flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -362,19 +363,23 @@ button.section-title:focus-visible,
    TOOLBAR STYLES
    ================================================================ */
 .toolbar-panel {
-    height: var(--toolbar-height);
+    min-height: var(--toolbar-height);
+    flex-shrink: 0;
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border-color);
     display: flex;
     align-items: center;
-    padding: 0 8px;
+    padding: 4px 8px;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .toolbar-left {
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .toolbar-right {
@@ -382,6 +387,8 @@ button.section-title:focus-visible,
     display: flex;
     align-items: center;
     gap: 8px;
+    max-width: 100%;
+    flex-wrap: wrap;
 }
 
 .current-table {
@@ -389,6 +396,13 @@ button.section-title:focus-visible,
     align-items: center;
     gap: 6px;
     font-weight: 500;
+    min-width: 0;
+}
+
+#tableNameLabel {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .toolbar-button {
@@ -397,6 +411,7 @@ button.section-title:focus-visible,
     color: var(--text-primary);
     padding: 4px 10px;
     border-radius: 3px;
+    white-space: nowrap;
     cursor: pointer;
     font-size: 12px;
     display: flex;
@@ -1025,19 +1040,30 @@ button.section-title:focus-visible,
    FOOTER STYLES
    ================================================================ */
 .footer-panel {
-    height: var(--footer-height);
+    min-height: var(--footer-height);
+    flex-shrink: 0;
     background: var(--bg-secondary);
     border-top: 1px solid var(--border-color);
     display: flex;
     align-items: center;
-    padding: 0 12px;
+    padding: 4px 12px;
     font-size: 12px;
+    flex-wrap: wrap;
+    gap: 4px 12px;
 }
 
 .footer-left {
     display: flex;
     align-items: center;
     gap: 12px;
+    min-width: 0;
+    max-width: 100%;
+}
+
+#statusText {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* Engine badge (desktop only; ships hidden in the shared template).
@@ -1066,12 +1092,15 @@ button.section-title:focus-visible,
     display: flex;
     align-items: center;
     gap: 12px;
+    max-width: 100%;
+    flex-wrap: wrap;
 }
 
 .page-selector {
     display: flex;
     align-items: center;
     gap: 4px;
+    white-space: nowrap;
 }
 
 .page-selector select {
@@ -1143,8 +1172,8 @@ button.section-title:focus-visible,
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 6px;
-    min-width: 400px;
-    max-width: 600px;
+    min-width: min(400px, calc(100vw - 24px));
+    max-width: min(600px, calc(100vw - 24px));
     max-height: 80vh;
     overflow: hidden;
     display: flex;
@@ -1162,9 +1191,12 @@ button.section-title:focus-visible,
 .modal-title {
     font-weight: 600;
     font-size: 14px;
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .modal-close {
+    flex-shrink: 0;
     background: none;
     border: none;
     color: var(--text-secondary);
@@ -1188,6 +1220,7 @@ button.section-title:focus-visible,
     display: flex;
     justify-content: flex-end;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .form-field {
@@ -1223,6 +1256,11 @@ button.section-title:focus-visible,
 .form-field select:focus {
     outline: none;
     border-color: var(--accent-color);
+}
+
+input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--vscode-focusBorder, var(--accent-color));
+    outline-offset: 2px;
 }
 
 .view-editor-dialog {
@@ -1655,7 +1693,7 @@ button.section-title:focus-visible,
 }
 
 .blob-inspector-dialog {
-    min-width: 600px;
+    min-width: min(600px, calc(100vw - 24px));
     height: 600px;
 }
 

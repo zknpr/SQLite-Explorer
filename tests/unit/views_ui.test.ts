@@ -92,6 +92,54 @@ describe('view modal concurrency', () => {
         persistedStates.length = 0;
     });
 
+    it('leaves focus in the VS Code editor opened from the view modal', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const originalGet = backendApi.getViewDefinition;
+        const originalOpen = backendApi.openViewEditor;
+        let webviewFocused = true;
+        let restoredFocus = 0;
+        (globalThis as any).document.activeElement = { focus() { restoredFocus++; webviewFocused = true; } };
+        // VS Code's focus notification may lag the completed open command.
+        (globalThis as any).document.hasFocus = () => true;
+        elements.viewModal.classList.add('hidden');
+        backendApi.getViewDefinition = async () => ({ name: 'v', sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] });
+        let hiddenAtHandoff = false;
+        backendApi.openViewEditor = async () => {
+            hiddenAtHandoff = elements.viewModal.classList.contains('hidden');
+            webviewFocused = false;
+        };
+        try {
+            initViews(); await openEditViewModal('v');
+            await listener('btnOpenViewInVsCode', 'click')();
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), true);
+            assert.strictEqual(hiddenAtHandoff, true, 'hide the old focused modal before the editor group handoff');
+            assert.strictEqual(restoredFocus, 0, 'successful editor handoff must not refocus the webview');
+        } finally { backendApi.getViewDefinition = originalGet; backendApi.openViewEditor = originalOpen; }
+    });
+
+    it('restores the same view draft when opening its external editor fails', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const originals = { get: backendApi.getViewDefinition, open: backendApi.openViewEditor };
+        backendApi.getViewDefinition = async () => ({ sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] });
+        backendApi.openViewEditor = async () => { throw new Error('controlled editor failure'); };
+        try {
+            initViews(); await openEditViewModal('v');
+            elements.viewSelectSql.value = 'SELECT draft';
+            await listener('btnOpenViewInVsCode', 'click')();
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
+            assert.strictEqual(elements.viewSelectSql.value, 'SELECT draft');
+            assert.match(elements.viewValidationStatus.textContent, /controlled editor failure/);
+        } finally { backendApi.getViewDefinition = originals.get; backendApi.openViewEditor = originals.open; }
+    });
+
     it('ignores an older edit response that resolves after a newer view', async () => {
         const { elements } = installViewDocument();
         const apiModulePath = '../../core/ui/modules/api.js';
@@ -1128,15 +1176,7 @@ describe('view modal concurrency', () => {
         const { state } = await import(stateModulePath);
         const { dropViewFromSidebar } = await import(viewsModulePath);
         const originalDrop = backendApi.dropView;
-        const originalSetTimeout = globalThis.setTimeout;
-        const originalClearTimeout = globalThis.clearTimeout;
-        let persistCallback: (() => void) | undefined;
         backendApi.dropView = async () => ({});
-        (globalThis as any).setTimeout = (callback: () => void) => {
-            persistCallback = callback;
-            return 1;
-        };
-        (globalThis as any).clearTimeout = () => undefined;
         state.isReadOnly = false;
         state.isDbConnected = false;
         state.selectedTable = 'dropped_view';
@@ -1145,9 +1185,6 @@ describe('view modal concurrency', () => {
 
         try {
             await dropViewFromSidebar('dropped_view');
-            assert.ok(persistCallback, 'dropping the selected view should schedule state persistence');
-            persistCallback();
-
             assert.strictEqual(elements.tableNameLabel.textContent, 'No table selected');
             assert.ok(persistedStates.at(-1));
             assert.strictEqual(persistedStates.at(-1).selectedTable, null);
@@ -1155,8 +1192,6 @@ describe('view modal concurrency', () => {
             assert.deepStrictEqual(persistedStates.at(-1).selectedColumns, []);
         } finally {
             backendApi.dropView = originalDrop;
-            globalThis.setTimeout = originalSetTimeout;
-            globalThis.clearTimeout = originalClearTimeout;
             state.selectedTable = null;
         }
     });

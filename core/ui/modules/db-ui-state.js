@@ -50,6 +50,11 @@ const perDbStateDefaults = () => ({
     currentPageIndex: 0,
     totalRecordCount: 0,
     totalRecordCountIsExact: true,
+    // 'pending' while a cold-cache first page is on screen ahead of its
+    // count, 'unavailable' when that count failed (grid-data.js). Per
+    // database: it describes the rows this database has on screen, and a
+    // switch mid-count leaves it for that database's next load to settle.
+    countStatus: 'ready',
     totalPageCount: 1,
     tableColumns: [],
     sortedColumn: null,
@@ -114,6 +119,11 @@ const transientStateDefaults = () => ({
     // switch abandons (the fetch itself is refused by the dbId gate).
     isLoadingColumns: false,
     isRefreshingContent: false,
+    // The in-flight host broadcast itself (rpc.js refreshContent publishes it
+    // so edit.js's Tab-advance can await it). Transient like the flag above:
+    // its `finally` clears the slot only if it still holds THIS promise, so an
+    // outgoing database's late completion cannot null out the incoming one's.
+    contentRefreshPromise: null,
     isGridReloading: false,
     lastDoubleClickTime: 0,
     isTransitioningEdit: false,
@@ -146,13 +156,21 @@ export const TRANSIENT_STATE_FIELDS = Object.freeze(Object.keys(transientStateDe
  *   first is likewise bound to one static `#dateFormatSelect`.
  * - `cellEditBehavior` mirrors the host's persisted setting, pushed app-wide.
  * - `isDesktop` is a build fact.
+ * - `collapsedSections` and `sidebarWidth` are sidebar LAYOUT preferences
+ *   (state.js; VS Code persists them in its webview snapshot). The sidebar is
+ *   one static panel the switch re-renders in place — renderSidebar() applies
+ *   `collapsedSections` to the section DOM on every render — so making them
+ *   per-database would snap the Tables/Views/Indexes groups open or closed,
+ *   or resize the panel, every time the user changes tabs.
  */
 export const GLOBAL_STATE_FIELDS = Object.freeze([
     'rowsPerPage',
     'dateFormat',
     'cellPreviewWrapEnabled',
     'cellEditBehavior',
-    'isDesktop'
+    'isDesktop',
+    'collapsedSections',
+    'sidebarWidth'
 ]);
 
 /** A brand-new database's UI state: every per-database field at its default. */

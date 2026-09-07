@@ -4,9 +4,11 @@ import { it } from 'node:test';
 import assert from 'node:assert';
 import { createDeferred } from './helpers/deferred';
 
+let vsCodeState: Record<string, unknown> | undefined;
+const savedVsCodeStates: Record<string, unknown>[] = [];
 (globalThis as any).acquireVsCodeApi = () => ({
-    getState: () => undefined,
-    setState() {},
+    getState: () => vsCodeState,
+    setState(value: Record<string, unknown>) { savedVsCodeStates.push(value); },
     postMessage() {}
 });
 
@@ -73,6 +75,38 @@ it('persists the final sidebar width and applies it on the next initialization',
         initSidebarResize();
         assert.strictEqual(restored.sidebar.style.width, '333px');
     } finally {
+        backendApi.saveSidebarState = originalSaveSidebarState;
+        delete (globalThis as any).document;
+    }
+});
+
+it('prefers the webview snapshot width over the stale HTML dataset and records resizes in it', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const uiModulePath = '../../core/ui/modules/ui.js';
+    const { backendApi } = await import(apiModulePath);
+    const { state } = await import(stateModulePath);
+    const { initSidebarResize } = await import(uiModulePath);
+    const originalSaveSidebarState = backendApi.saveSidebarState;
+    backendApi.saveSidebarState = async () => {};
+    // VS Code reuses the HTML (and so its dataset) across hide/show; the
+    // snapshot is the only record of a resize made in this editor.
+    vsCodeState = { sidebarWidth: 333 };
+
+    try {
+        const fixture = installSidebarDocument(220);
+        initSidebarResize();
+        assert.strictEqual(fixture.sidebar.style.width, '333px');
+        assert.strictEqual(state.sidebarWidth, 333);
+
+        const keydown = fixture.handleListeners.get('keydown');
+        assert.ok(keydown);
+        await keydown({ key: 'ArrowRight', shiftKey: false, preventDefault() {} });
+        assert.strictEqual(state.sidebarWidth, 343);
+        assert.strictEqual(savedVsCodeStates.at(-1)?.sidebarWidth, 343);
+    } finally {
+        vsCodeState = undefined;
+        state.sidebarWidth = null;
         backendApi.saveSidebarState = originalSaveSidebarState;
         delete (globalThis as any).document;
     }

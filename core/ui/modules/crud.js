@@ -659,7 +659,13 @@ export function addColumnDefinition(isFirst = false) {
 
 export function removeColumnDefinition(colId) {
     const elem = document.getElementById(`colDef_${colId}`);
-    if (elem) elem.remove();
+    if (!elem) return;
+    const adjacentRow = elem.nextElementSibling ?? elem.previousElementSibling;
+    const focusTarget = adjacentRow?.querySelector('.col-name')
+        ?? document.getElementById('btnAddColumnDef');
+    // Removing the focused button otherwise leaves keyboard focus on BODY.
+    elem.remove();
+    focusTarget?.focus();
 }
 
 export async function submitCreateTable() {

@@ -55,6 +55,7 @@ function primeTableState(state: any, table: string, pageIndex = 0) {
     state.editingCellInfo = null;
     state.keysetAnchors = null;
     state.gridData = [];
+    state.countStatus = 'ready';
     state.selectedRowIds = new Set();
     state.selectedColumns = new Set();
     state.selectedCells = [];
@@ -164,18 +165,23 @@ describe('grid count cache', () => {
         }
     });
 
-    it('fetches a missing count in parallel with the data query', async () => {
-        installDocumentMock();
+    it('commits first-page rows before requesting a missing count', async () => {
+        const elements = installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
         const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
         const count = createDeferred<number>();
+        const countStarted = createDeferred<void>();
+        const calls: string[] = [];
         let countRequested = 0;
         let dataRequested = 0;
         backendApi.fetchTableCount = async () => {
+            calls.push('count');
             countRequested += 1;
+            countStarted.resolve();
             return count.promise;
         };
         backendApi.fetchTableData = async () => {
+            calls.push('data');
             dataRequested += 1;
             return { rows: [[1, 'row']] };
         };
@@ -183,16 +189,25 @@ describe('grid count cache', () => {
 
         try {
             const load = loadTableData(false, false);
-            // Both RPCs are dispatched in the same synchronous section: the
-            // data query does not wait for the count to resolve.
-            assert.strictEqual(countRequested, 1);
+            // Counting must not take the database queue before the useful rows.
+            assert.deepStrictEqual(calls, ['data']);
             assert.strictEqual(dataRequested, 1);
-
+            await countStarted.promise;
+            assert.strictEqual(countRequested, 1);
+            assert.deepStrictEqual(state.gridData, [[1, 'row']]);
+            assert.strictEqual(state.countStatus, 'pending');
+            assert.strictEqual(state.isGridReloading, true);
+            assert.strictEqual(elements.pageIndicator.textContent, '1 / ?');
+            assert.strictEqual(elements.btnLast.disabled, true);
+            state.selectedCells = [{ row: 0, col: 1 }];
             count.resolve(40);
             assert.strictEqual(await load, true);
             assert.strictEqual(state.totalRecordCount, 40);
             assert.strictEqual(state.totalPageCount, 2);
+            assert.strictEqual(state.countStatus, 'ready');
+            assert.deepStrictEqual(state.selectedCells, [{ row: 0, col: 1 }], 'count completion must not reset a new selection');
         } finally {
+            count.resolve(40);
             resetHarness(state, backendApi, originals);
         }
     });
@@ -822,8 +837,8 @@ describe('grid count cache', () => {
         }
     });
 
-    it('fails the load on a count fetch error without caching or committing anything', async () => {
-        installDocumentMock();
+    it('keeps successful rows when counting fails and retries the count on reload', async () => {
+        const elements = installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
         const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
         const countCalls: any[] = [];
@@ -838,11 +853,12 @@ describe('grid count cache', () => {
         state.totalRecordCount = 7;
 
         try {
-            assert.strictEqual(await loadTableData(false, false), false);
-            assert.strictEqual(state.lastGridLoadError, 'count exploded');
-            // Nothing committed: the failed load's data result never surfaces.
-            assert.deepStrictEqual(state.gridData, [['old']]);
-            assert.strictEqual(state.totalRecordCount, 7);
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.strictEqual(state.lastGridLoadError, null);
+            assert.deepStrictEqual(state.gridData, [[1, 'fresh']]);
+            assert.strictEqual(state.countStatus, 'unavailable');
+            assert.match(elements.statusText.textContent, /count unavailable: count exploded/);
+            assert.strictEqual(elements.pageIndicator.textContent, '1 / ?');
 
             // Nothing cached either: the retry fetches the count again.
             assert.strictEqual(await loadTableData(false, false), true);

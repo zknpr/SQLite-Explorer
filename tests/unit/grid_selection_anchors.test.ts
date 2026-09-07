@@ -837,6 +837,35 @@ describe('grid selection anchors', () => {
         }
     });
 
+    it('shows the empty state instead of the spinner when Reload finds no table selected', async () => {
+        const elements = installDocumentStub({ withGrid: true });
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { reloadFromDisk } = await import(sidebarModulePath);
+        const originals = { refreshFile: backendApi.refreshFile, fetchSchema: backendApi.fetchSchema };
+        backendApi.refreshFile = async () => ({ connected: true, readOnly: false });
+        backendApi.fetchSchema = async () => ({
+            tables: [{ identifier: 'items', identity: { kind: 'rowid' } }],
+            views: [],
+            indexes: []
+        });
+        state.isDbConnected = true;
+        state.selectedTable = null;
+        state.selectedTableType = null;
+
+        try {
+            await reloadFromDisk();
+            // showLoading() runs before the schema refresh; with no table to load
+            // afterwards, only an explicit empty state replaces it.
+            assert.doesNotMatch(elements.gridContainer.innerHTML, /Loading/);
+            assert.match(elements.gridContainer.innerHTML, /Select a table/);
+            assert.strictEqual(elements.statusText.textContent, 'Reloaded');
+        } finally {
+            backendApi.refreshFile = originals.refreshFile;
+            backendApi.fetchSchema = originals.fetchSchema;
+        }
+    });
+
     it('clears the cell and column-header selection after applying a batch update', async () => {
         installDocumentStub({
             batchInputs: [{ value: 'updated', dataset: { colidx: '1' } }]

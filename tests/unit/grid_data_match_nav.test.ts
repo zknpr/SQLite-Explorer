@@ -659,18 +659,15 @@ describe('grid data match cache', () => {
         const { state } = await import(stateModulePath);
         const { backendApi } = await import(apiModulePath);
         const { loadTableData } = await import(gridDataModulePath);
-        const firstCount = createDeferred<number>();
-        const secondCount = createDeferred<number>();
-        const counts = [firstCount.promise, secondCount.promise];
-        let countCall = 0;
+        const firstData = createDeferred<{ rows: unknown[][] }>();
+        const secondData = createDeferred<{ rows: unknown[][] }>();
+        const data = [firstData.promise, secondData.promise];
+        let dataCall = 0;
         const originalFetchCount = backendApi.fetchTableCount;
         const originalFetchData = backendApi.fetchTableData;
         mock.method(console, 'error', () => {});
-        backendApi.fetchTableCount = async () => counts[countCall++];
-        // A cache miss legitimately issues the data query in parallel with the
-        // count; neither load's result is committed here (the first is
-        // superseded, the second fails on its count), so plain rows suffice.
-        backendApi.fetchTableData = async () => ({ rows: [] });
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async () => data[dataCall++];
         state.selectedTable = 'items';
         state.selectedTableType = 'table';
         state.renderedTable = null;
@@ -688,7 +685,7 @@ describe('grid data match cache', () => {
             assert.strictEqual(state.isLoadingData, true);
             assert.strictEqual(state.isGridReloading, true);
 
-            firstCount.resolve(1);
+            firstData.resolve({ rows: [] });
             await staleLoad;
 
             assert.strictEqual(
@@ -698,7 +695,7 @@ describe('grid data match cache', () => {
             );
             assert.strictEqual(state.isGridReloading, true);
 
-            secondCount.reject(new Error('current load stopped for test'));
+            secondData.reject(new Error('current load stopped for test'));
             assert.strictEqual(await currentLoad, false);
             assert.strictEqual(state.isLoadingData, false);
             assert.strictEqual(state.isGridReloading, false);
@@ -738,14 +735,14 @@ describe('grid data match cache', () => {
         const { state } = await import(stateModulePath);
         const { backendApi } = await import(apiModulePath);
         const { loadTableData } = await import(gridDataModulePath);
-        const foregroundCount = createDeferred<number>();
-        const backgroundCount = createDeferred<number>();
-        const counts = [foregroundCount.promise, backgroundCount.promise];
-        let countCall = 0;
+        const foregroundData = createDeferred<{ rows: unknown[][] }>();
+        const backgroundData = createDeferred<{ rows: unknown[][] }>();
+        const data = [foregroundData.promise, backgroundData.promise];
+        let dataCall = 0;
         const originalFetchCount = backendApi.fetchTableCount;
         const originalFetchData = backendApi.fetchTableData;
-        backendApi.fetchTableCount = async () => counts[countCall++];
-        backendApi.fetchTableData = async () => ({ rows: [[1, 'fresh']] });
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async () => data[dataCall++];
         state.selectedTable = 'items';
         state.selectedTableType = 'table';
         state.renderedTable = null;
@@ -763,12 +760,12 @@ describe('grid data match cache', () => {
             assert.strictEqual(state.isLoadingData, true);
 
             const backgroundLoad = loadTableData(false, false);
-            foregroundCount.resolve(1);
+            foregroundData.resolve({ rows: [[1, 'stale']] });
             await foregroundLoad;
             assert.strictEqual(state.isLoadingData, true);
             assert.strictEqual(state.isGridReloading, true);
 
-            backgroundCount.resolve(1);
+            backgroundData.resolve({ rows: [[1, 'fresh']] });
             await backgroundLoad;
             assert.strictEqual(
                 state.isLoadingData,

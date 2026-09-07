@@ -1,8 +1,8 @@
 /**
  * UI Helper Functions
  */
-import { state } from './state.js';
-import { backendApi } from './api.js';
+import { state, persistState } from './state.js';
+import { backendApi, getVsCodeState } from './api.js';
 import { escapeHtml, getErrorMessage } from './utils.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
 
@@ -129,20 +129,26 @@ export function initSidebarResize(options = {}) {
     if (!sidebar || !handle) return;
 
     const normalizeWidth = value => {
+        if (value === null || value === undefined || value === '') return undefined;
         const width = Number(value);
         return Number.isFinite(width)
             ? Math.max(150, Math.min(400, width))
             : undefined;
     };
-    const persistedWidth = normalizeWidth(
+    // VS Code reuses this HTML after hide/show; its dataset predates any
+    // resize in this editor. The webview snapshot contains the latest width.
+    const persistedWidth = normalizeWidth(getVsCodeState()?.sidebarWidth) ?? normalizeWidth(
         options.initialWidth ?? document.getElementById('vscode-env')?.dataset.sidebarLeft
     );
+    state.sidebarWidth = persistedWidth ?? null;
     const applyWidth = width => {
         sidebar.style.width = width + 'px';
         handle.setAttribute?.('aria-valuenow', String(width));
     };
     let persistQueue = Promise.resolve();
     const persistWidth = width => {
+        state.sidebarWidth = width;
+        persistState();
         // Key repeat can issue a second save before the first RPC resolves.
         // Serialize them so an older completion cannot overwrite the latest width.
         persistQueue = persistQueue.then(async () => {

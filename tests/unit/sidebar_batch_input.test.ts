@@ -20,10 +20,12 @@ interface StateModule {
 interface SidebarModule {
     initSidebar(): void;
     updateBatchSidebar(): void;
+    applyBatchUpdate(): Promise<void>;
 }
 
 const stateModulePath = '../../core/ui/modules/state.js';
 const sidebarModulePath = '../../core/ui/modules/sidebar.js';
+const apiModulePath = '../../core/ui/modules/api.js';
 
 let persistedState: PersistedSidebarState | undefined;
 (globalThis as any).acquireVsCodeApi = () => ({
@@ -256,6 +258,90 @@ it('associates each generated Batch Update input and names its value-mode button
         }
     } finally {
         state.selectedTable = null;
+        state.tableColumns = [];
+        state.gridData = [];
+        state.gridExactIntegerTexts = {};
+        state.gridOversizedCells = {};
+        state.gridReadOnlyRowReasons = {};
+        state.selectedCells = [];
+    }
+});
+
+it('disables batch editing with the document read-only reason and refuses to apply', async () => {
+    const elements: Record<string, any> = {
+        batchUpdateSectionTitle: makeBatchNode('button'),
+        batchUpdateList: makeBatchNode('div'),
+        batchUpdateCount: makeBatchNode('span'),
+        batchUpdateFields: makeBatchNode('div'),
+        btnApplyBatchUpdate: makeBatchNode('button'),
+        statusText: makeBatchNode('span')
+    };
+    (globalThis as any).document = {
+        getElementById(id: string) {
+            return elements[id] ?? null;
+        },
+        createElement(tagName: string) {
+            return makeBatchNode(tagName);
+        },
+        createTextNode(text: string) {
+            const node = makeBatchNode('#text');
+            node.textContent = text;
+            return node;
+        },
+        createDocumentFragment() {
+            return makeBatchNode('#fragment', true);
+        }
+    };
+    const { state } = await import(stateModulePath) as any;
+    const { updateBatchSidebar, applyBatchUpdate } = await import(sidebarModulePath) as SidebarModule;
+    const { backendApi } = await import(apiModulePath) as any;
+    const originalUpdateCellBatch = backendApi.updateCellBatch;
+    let batchCalls = 0;
+    backendApi.updateCellBatch = async () => { batchCalls++; return []; };
+
+    state.isReadOnly = true;
+    state.selectedTable = 'items';
+    state.selectedTableType = 'table';
+    state.tableColumns = [{ name: 'payload', type: 'TEXT', notnull: 0 }];
+    state.gridData = [[7, 'before']];
+    state.gridExactIntegerTexts = {};
+    state.gridOversizedCells = {};
+    state.gridReadOnlyRowReasons = {};
+    state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 7, value: 'before' }];
+    const noticeOf = () => findBatchNode(elements.batchUpdateFields, node => node.className === 'batch-selection-notice');
+
+    try {
+        updateBatchSidebar();
+        assert.strictEqual(elements.btnApplyBatchUpdate.disabled, true);
+        assert.strictEqual(noticeOf()?.textContent, 'Document is read-only');
+        for (const className of [
+            'batch-input',
+            'btn-secondary btn-batch-null',
+            'btn-secondary btn-batch-empty',
+            'btn-secondary btn-batch-patch'
+        ]) {
+            const control = findBatchNode(elements.batchUpdateFields, node => node.className === className);
+            assert.ok(control, `${className} must still be rendered`);
+            assert.strictEqual(control.disabled, true, `${className} must be disabled while read-only`);
+        }
+        // The keyboard path bypasses the disabled button: Apply must refuse too.
+        await applyBatchUpdate();
+        assert.strictEqual(batchCalls, 0);
+        assert.strictEqual(elements.statusText.textContent, 'Document is read-only');
+
+        state.isReadOnly = false;
+        state.selectedTableType = 'view';
+        updateBatchSidebar();
+        assert.strictEqual(elements.btnApplyBatchUpdate.disabled, true);
+        assert.strictEqual(noticeOf()?.textContent, 'Views are read-only');
+        await applyBatchUpdate();
+        assert.strictEqual(batchCalls, 0);
+        assert.strictEqual(elements.statusText.textContent, 'Views are read-only');
+    } finally {
+        backendApi.updateCellBatch = originalUpdateCellBatch;
+        state.isReadOnly = false;
+        state.selectedTable = null;
+        state.selectedTableType = 'table';
         state.tableColumns = [];
         state.gridData = [];
         state.gridExactIntegerTexts = {};

@@ -364,6 +364,14 @@ export function renderSidebar() {
     renderSidebarList('tablesList', filteredTables, 'table', 'codicon-table', filter ? 'No matching tables' : 'No tables');
     renderSidebarList('viewsList', filteredViews, 'view', 'codicon-eye', filter ? 'No matching views' : 'No views');
     renderIndexesList('indexesList', filteredIndexes, filter ? 'No matching indexes' : 'No indexes');
+    for (const section of ['tables', 'views', 'indexes']) {
+        setSectionCollapsed(section, state.collapsedSections.has(section));
+    }
+}
+
+function getBatchMutationBlockReason() {
+    if (state.isReadOnly) return 'Document is read-only';
+    if (state.selectedTableType !== 'table') return 'Views are read-only';
 }
 
 export function updateBatchSidebar() {
@@ -376,6 +384,7 @@ export function updateBatchSidebar() {
     const applyButton = document.getElementById('btnApplyBatchUpdate');
 
     const eligibility = getBatchSelectionEligibility();
+    const mutationBlockReason = getBatchMutationBlockReason();
     const cellCount = eligibility.cells.length;
 
     if (state.selectedCells.length === 0) {
@@ -395,7 +404,7 @@ export function updateBatchSidebar() {
 
     countBadge.textContent = cellCount;
     if (applyButton) {
-        applyButton.disabled = state.isReadOnly || isApplyingBatchUpdate || cellCount === 0;
+        applyButton.disabled = !!mutationBlockReason || isApplyingBatchUpdate || cellCount === 0;
     }
 
     // Analyze selected cells - group by column (see batch-update-logic.js)
@@ -410,7 +419,7 @@ export function updateBatchSidebar() {
     fieldsContainer.replaceChildren();
     const fragment = document.createDocumentFragment();
 
-    if (eligibility.readOnlyCount > 0) {
+    if (mutationBlockReason || eligibility.readOnlyCount > 0) {
         const notice = document.createElement('div');
         notice.className = 'batch-selection-notice';
         Object.assign(notice.style, {
@@ -418,7 +427,7 @@ export function updateBatchSidebar() {
             color: 'var(--text-secondary)',
             fontSize: '11px'
         });
-        notice.textContent =
+        notice.textContent = mutationBlockReason ||
             `${eligibility.readOnlyCount} read-only selected cell${eligibility.readOnlyCount === 1 ? '' : 's'} excluded: ${eligibility.readOnlyReason}`;
         fragment.appendChild(notice);
         title.title = notice.textContent;
@@ -456,6 +465,7 @@ export function updateBatchSidebar() {
 
         const input = document.createElement('input');
         input.type = 'text';
+        input.disabled = !!mutationBlockReason;
         input.id = inputId;
         input.className = 'batch-input';
         input.placeholder = valueDisplay;
@@ -475,11 +485,12 @@ export function updateBatchSidebar() {
         nullBtn.title = 'Set to NULL';
         nullBtn.ariaLabel = `Set ${colInfo.name} to NULL`;
         nullBtn.textContent = 'NULL';
-        nullBtn.disabled = colInfo.notnull === 1;
+        nullBtn.disabled = !!mutationBlockReason || colInfo.notnull === 1;
         controlsDiv.appendChild(nullBtn);
 
         const emptyBtn = document.createElement('button');
         emptyBtn.type = 'button';
+        emptyBtn.disabled = !!mutationBlockReason;
         emptyBtn.className = 'btn-secondary btn-batch-empty';
         emptyBtn.style.padding = '2px 6px';
         emptyBtn.title = 'Set to an empty string';
@@ -489,6 +500,7 @@ export function updateBatchSidebar() {
 
         const patchBtn = document.createElement('button');
         patchBtn.type = 'button';
+        patchBtn.disabled = !!mutationBlockReason;
         patchBtn.className = 'btn-secondary btn-batch-patch';
         patchBtn.style.padding = '2px 6px';
         patchBtn.title = 'JSON Patch';
@@ -504,6 +516,11 @@ export function updateBatchSidebar() {
 
 export async function applyBatchUpdate() {
     if (isApplyingBatchUpdate || state.selectedCells.length === 0) return;
+    const mutationBlockReason = getBatchMutationBlockReason();
+    if (mutationBlockReason) {
+        updateStatus(mutationBlockReason);
+        return;
+    }
     const eligibility = getBatchSelectionEligibility();
     if (eligibility.cells.length === 0) {
         updateStatus(`Batch update unavailable: ${eligibility.readOnlyReason}`);
@@ -715,17 +732,31 @@ export function toggleBatchPatch(colIdx, btn) {
     }
 }
 
-export function toggleSection(section) {
+function setSectionCollapsed(section, collapsed) {
     const list = document.getElementById(`${section}List`);
-    const toggle = document.querySelector(`[data-section="${section}"]`);
+    const toggle = document.querySelector?.(`[data-section="${section}"]`);
     const title = toggle?.classList?.contains('section-title')
         ? toggle
         : toggle?.closest?.('.section-title');
 
     if (list && title) {
-        list.classList.toggle('hidden');
-        title.classList.toggle('collapsed');
-        toggle.setAttribute?.('aria-expanded', String(!list.classList.contains('hidden')));
+        list.classList.toggle('hidden', collapsed);
+        title.classList.toggle('collapsed', collapsed);
+        toggle.setAttribute?.('aria-expanded', String(!collapsed));
+        return true;
+    }
+    return false;
+}
+
+export function toggleSection(section) {
+    const list = document.getElementById(`${section}List`);
+    if (!list) return;
+    const collapsed = !list.classList.contains('hidden');
+    if (!setSectionCollapsed(section, collapsed)) return;
+    if (['tables', 'views', 'indexes'].includes(section)) {
+        if (collapsed) state.collapsedSections.add(section);
+        else state.collapsedSections.delete(section);
+        persistState();
     }
 }
 
@@ -869,6 +900,8 @@ export async function reloadFromDisk() {
         if (state.selectedTable) {
             if (!await loadTableColumns()) return;
             if (!await loadTableData()) return;
+        } else {
+            showEmptyState();
         }
         updateStatus(connectionResult?.cancelled ? 'Reload cancelled' : 'Reloaded');
     } catch (err) {

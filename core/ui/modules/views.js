@@ -468,14 +468,22 @@ async function openDraftInVsCode() {
     if (!targetView) return;
     const isCurrentRequest = () => modalSession === activeViewModalSession
         && editingViewName === targetView;
+    const modal = document.getElementById('viewModal');
+    // Dismiss the focused control before opening another editor group. Hiding
+    // it after the handoff can reactivate the originating webview's group.
+    modal?.classList.add('hidden');
     try {
         const webviewId = document.getElementById('vscode-env')?.dataset.webviewId;
         await backendApi.openViewEditor(targetView, webviewId);
         if (!isCurrentRequest()) return;
-        closeModal('viewModal');
+        closeModal('viewModal', null, { restoreFocus: false });
         updateStatus(`Editing view "${targetView}" in VS Code`);
     } catch (err) {
-        if (isCurrentRequest()) setFeedback(getErrorMessage(err), true);
+        if (isCurrentRequest()) {
+            modal?.classList.remove('hidden');
+            setFeedback(getErrorMessage(err), true);
+            getElements().openInVsCode?.focus();
+        }
     }
 }
 

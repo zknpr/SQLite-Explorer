@@ -17,6 +17,16 @@ export { backendApi } from './api.js';
  * Methods called by the extension host.
  */
 export async function refreshContent(filename, connectionResult) {
+    const refresh = refreshContentOnce(filename, connectionResult);
+    state.contentRefreshPromise = refresh;
+    try {
+        return await refresh;
+    } finally {
+        if (state.contentRefreshPromise === refresh) state.contentRefreshPromise = null;
+    }
+}
+
+async function refreshContentOnce(filename, connectionResult) {
     // This broadcast means the document changed in a way this webview didn't
     // perform itself (undo/redo, another panel's edit, a VS Code cell-editor
     // write, revert — the host also echoes one after this webview's own

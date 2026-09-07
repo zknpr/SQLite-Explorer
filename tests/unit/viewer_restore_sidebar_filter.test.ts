@@ -18,7 +18,8 @@ it('restores and renders a saved sidebar filter without a selected table', async
     let renderCalls = 0;
     (globalThis as any).__viewerSidebarFilterHarness = {
         state,
-        savedState: { rowsPerPage: 5000, sidebarFilter: 'audit' },
+        // 'bogus' stands in for a section name from an older or hostile snapshot.
+        savedState: { rowsPerPage: 5000, sidebarFilter: 'audit', collapsedSections: ['tables', 'bogus'] },
         renderSidebar() { renderCalls++; },
         completed
     };
@@ -119,6 +120,8 @@ it('restores and renders a saved sidebar filter without a selected table', async
         await completed.promise;
         assert.strictEqual(state.sidebarFilter, 'audit');
         assert.strictEqual(elements.sidebarFilterInput.value, 'audit');
+        assert.deepStrictEqual([...state.collapsedSections], ['tables'],
+            'collapsed sidebar groups must survive webview reconstruction; unknown names are dropped');
         assert.strictEqual(renderCalls, 1);
     } finally {
         delete (globalThis as any).__viewerSidebarFilterHarness;
