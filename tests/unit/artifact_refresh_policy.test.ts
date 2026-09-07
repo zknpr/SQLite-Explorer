@@ -27,10 +27,6 @@ const sourceRepositoryRoot = path.resolve(
     '..'
 );
 
-const SQLJS_BRANCH = 'agent/paged-vfs-attach-isolation';
-const SQLJS_COMMIT = '653366ed214563ea95a57b34c92986b6ff584c23';
-const SQLJS_RUN = '31639875548';
-
 const TXIKI_BRANCH = 'agent/v8-bounded-host-views';
 const TXIKI_COMMIT = 'acef1d0de4f16321bc24b81261aebcea064f5923';
 const TXIKI_RUN = '31648639100';
@@ -47,29 +43,9 @@ interface ScriptSpec {
 }
 
 const scriptSpecs: readonly ScriptSpec[] = [
-    {
-        name: 'sql.js',
-        scriptName: 'refresh-sqljs.mjs',
-        branch: SQLJS_BRANCH,
-        commit: SQLJS_COMMIT,
-        runId: SQLJS_RUN,
-        artifactContents: {
-            'dist/sql-wasm.js': Buffer.from('fixture sql.js glue\n'),
-            'dist/sql-wasm.wasm': Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x02, 0x03])
-        },
-        destinations: {
-            'dist/sql-wasm.js': [
-                'vendor/sql.js/sql-wasm.js',
-                'website/public/sqlite-viewer/sql-wasm.js'
-            ],
-            'dist/sql-wasm.wasm': [
-                'vendor/sql.js/sql-wasm.wasm',
-                'assets/sqlite3.wasm',
-                'website/public/sqlite-viewer/sql-wasm.wasm'
-            ]
-        },
-        executable: false
-    },
+    // sql.js is now built from an immutable source commit plus our C helper.
+    // Its source/output provenance and rejection paths have separate tests in
+    // query_plan_artifacts.test.ts; it no longer installs Actions payloads.
     {
         name: 'txiki.js',
         scriptName: 'refresh-natives.mjs',
@@ -120,7 +96,7 @@ function writeFixtureFile(root: string, relativePath: string, contents: Buffer |
 function patchFixtureHashes(script: string, spec: ScriptSpec): string {
     let patched = script;
     for (const [artifactPath, contents] of Object.entries(spec.artifactContents)) {
-        const key = spec.name === 'sql.js' ? path.posix.basename(artifactPath) : artifactPath;
+        const key = artifactPath;
         const expression = new RegExp(`('${escapeRegExp(key)}'\\s*:\\s*)'[0-9a-f]{64}'`);
         assert.match(patched, expression, `fixture hash key ${key} must exist in ${spec.scriptName}`);
         patched = patched.replace(expression, `$1'${sha256(contents)}'`);
@@ -442,10 +418,10 @@ test('derives monitored payload names from the exact artifact manifest', async (
     );
 });
 
-test('refresh scripts share one pinned-artifact policy implementation', () => {
-    for (const spec of scriptSpecs) {
+test('runtime refresh and source builds share the rollback-protected artifact installer', () => {
+    for (const scriptName of [...scriptSpecs.map(spec => spec.scriptName), 'build-query-plan.mjs']) {
         const source = readFileSync(
-            path.join(sourceRepositoryRoot, 'scripts', spec.scriptName),
+            path.join(sourceRepositoryRoot, 'scripts', scriptName),
             'utf8'
         );
         assert.match(source, /from ['"]\.\/lib\/pinned-artifacts\.mjs['"]/);
