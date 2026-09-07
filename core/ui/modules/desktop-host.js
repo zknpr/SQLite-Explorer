@@ -1968,17 +1968,28 @@ export function createDesktopHost({ bridge, createWorker }) {
                 // EXCEPT foreign_keys, which SQLite silently ignores inside any
                 // open transaction (no error, no effect). A data-integrity
                 // control must not silently no-op, so the host refuses it while
-                // the native session transaction is open. journal_mode needs no
-                // guard: the engine itself errors loudly there.
-                if (method === 'setPragma') {
-                    if (entry.engine === 'native' && entry.nativeTxnOpen && args[0] === 'foreign_keys') {
+                // the native session transaction is open. journal_mode DOES error
+                // inside a txn, but the fork answers with a generic, misleading
+                // "SQL logic error (SQLITE_ERROR: a misspelled name...)" — nothing
+                // is misspelled — so the host pre-empts it with the same clear
+                // "save or discard first" message it gives foreign_keys.
+                if (method === 'setPragma'
+                    && entry.engine === 'native' && entry.nativeTxnOpen) {
+                    if (args[0] === 'foreign_keys') {
                         throw new Error(
                             'Save or discard the pending changes before changing foreign-key '
                             + 'enforcement: PRAGMA foreign_keys is silently ignored by SQLite '
                             + 'while a transaction is open.'
                         );
                     }
-                } else {
+                    if (args[0] === 'journal_mode') {
+                        throw new Error(
+                            'Save or discard the pending changes before changing the journal '
+                            + 'mode: PRAGMA journal_mode cannot change while a transaction is open.'
+                        );
+                    }
+                }
+                if (method !== 'setPragma') {
                     await ensureSessionTxn(entry);
                 }
                 // Guarded like every mutation: an abort-class failure here

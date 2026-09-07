@@ -2018,10 +2018,14 @@ test('setPragma foreign_keys is refused while a native transaction is open, and 
   // was recorded for an action that did not happen.
   assert.equal(nativeMethods(nativeLog).includes('setPragma'), false);
 
-  // journal_mode is NOT gated: inside a txn the engine itself errors loudly,
-  // and that answer must keep flowing through unchanged.
-  await host.invoke('setPragma', ['journal_mode', 'wal']);
-  assert.deepEqual(pragmas.at(-1), ['journal_mode', 'wal']);
+  // journal_mode IS gated with a clear message: inside a native txn the fork's
+  // own error is a misleading generic "SQL logic error", so the host pre-empts
+  // it with "save or discard first" and never forwards the pragma.
+  await assert.rejects(
+    host.invoke('setPragma', ['journal_mode', 'wal']),
+    /Save or discard the pending changes before changing the journal mode/
+  );
+  assert.notDeepEqual(pragmas.at(-1), ['journal_mode', 'wal']);
 
   await host.saveToDisk();                                       // txn closed
   await host.invoke('setPragma', ['foreign_keys', true]);        // now allowed
