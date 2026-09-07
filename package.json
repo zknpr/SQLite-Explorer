@@ -223,7 +223,7 @@
     "@scure/base": "^2.2.0",
     "@vscode/codicons": "^0.0.45",
     "@vscode/extension-telemetry": "^1.5.2",
-    "sql.js": "^1.14.1"
+    "sql.js": "^1.14.2"
   },
   "overrides": {
     "qs": ">=6.15.2",
