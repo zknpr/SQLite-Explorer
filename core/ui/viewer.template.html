@@ -446,6 +446,8 @@
                 <button type="button" class="cell-preview-toolbar-btn" id="cellPreviewNullBtn"
                     title="Store SQL NULL explicitly">SQL NULL</button>
                 <div class="flex-spacer"></div>
+                <button type="button" class="cell-preview-toolbar-btn" id="cellPreviewDownloadBtn"
+                    title="Download the stored cell, without changing the draft">Download stored cell</button>
                 <button type="button" class="cell-preview-toolbar-btn" id="openInVsCodeBtn" title="Edit in VS Code editor">
                     <span class="codicon codicon-code"></span> Edit in VS Code
                 </button>
@@ -487,6 +489,11 @@
                     <span class="blob-preview-placeholder">Select a BLOB to inspect</span>
                 </div>
                 <div class="tab-content blob-hex-pane" id="tab-hex">
+                    <div class="blob-hex-navigation" aria-label="Loaded Hex pages">
+                        <button type="button" class="btn-secondary" id="blob-hex-previous">Previous Hex page</button>
+                        <span id="blob-hex-position" role="status"></span>
+                        <button type="button" class="btn-secondary" id="blob-hex-next">Next Hex page</button>
+                    </div>
                     <textarea readonly class="hex-dump hex-dump-textarea"
                         aria-label="BLOB hexadecimal data"></textarea>
                 </div>
@@ -494,6 +501,7 @@
             <div class="modal-footer">
                 <button id="blob-replace-btn" class="btn-secondary">Replace...</button>
                 <button id="blob-load-more-btn" class="btn-secondary" hidden>Load more</button>
+                <button id="blob-save-full-btn" class="btn-secondary" hidden>Download complete cell</button>
                 <button id="blob-download-btn" class="btn-primary">Download</button>
             </div>
         </div>

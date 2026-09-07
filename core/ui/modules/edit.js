@@ -46,6 +46,7 @@ export function initEdit() {
     document.getElementById('cellPreviewNullBtn')?.addEventListener('click', setCellPreviewNull);
     document.getElementById('btnCancelCellPreview')?.addEventListener('click', closeCellPreview);
     document.getElementById('cellPreviewSaveBtn')?.addEventListener('click', saveCellPreview);
+    document.getElementById('cellPreviewDownloadBtn')?.addEventListener('click', downloadCellPreview);
     const previewTextarea = document.getElementById('cellPreviewTextarea');
     previewTextarea?.addEventListener('keydown', onCellPreviewKeydown);
     previewTextarea?.addEventListener('blur', () => resetTextareaTabFocusEscape(previewTextarea));
@@ -410,6 +411,50 @@ function cleanupCellEdit() {
 // ================================================================
 
 
+export async function downloadCellPreview() {
+    const session = state.cellPreviewInfo;
+    if (!session || session.downloading) return;
+    if ((session.connectionGeneration !== undefined && session.connectionGeneration !== state.connectionGeneration)
+        || (session.contentGeneration !== undefined && session.contentGeneration !== state.contentGeneration)) {
+        updateStatus('The database content changed. Reopen this cell before downloading.');
+        return;
+    }
+    session.downloading = true;
+    const button = document.getElementById('cellPreviewDownloadBtn');
+    if (button) button.disabled = true;
+    const storedCell = session.tableType === 'table' && !session.readOnlyReason;
+    try {
+        let result;
+        if (state.isDesktop) {
+            // The desktop shell has no VS Code cell-editor to hand the stored
+            // value to, so it saves through the same saveFileAs seam every other
+            // desktop download uses. The modal only ever holds an in-memory,
+            // non-oversized value (BLOBs and oversized cells route to the blob
+            // inspector), so its displayed text is the byte-exact stored value.
+            const text = storedCell
+                ? (session.originalText ?? (session.originalValue == null ? '' : String(session.originalValue)))
+                : (session.originalText ?? '');
+            result = await backendApi.saveFile('cell.txt', new TextEncoder().encode(text));
+        } else {
+            result = storedCell
+                ? await backendApi.openCellEditor(
+                    { table: session.table, name: '' }, validateRowId(session.rowId), session.columnName, {},
+                    { download: true, type: { type: 'text', ext: 'txt', mime: 'text/plain' } }
+                )
+                : await backendApi.saveFile('cell.txt', new TextEncoder().encode(session.originalText ?? ''));
+        }
+        if (state.cellPreviewInfo !== session) return;
+        updateStatus(result?.success === false
+            ? (result.cancelled ? 'Save cancelled. Your draft is unchanged.' : result.message || 'Download failed')
+            : `${storedCell ? 'Stored cell' : 'Displayed text'} downloaded. Your draft is unchanged.`);
+    } catch (error) {
+        if (state.cellPreviewInfo === session) updateStatus(`Download failed: ${getErrorMessage(error)}`);
+    } finally {
+        session.downloading = false;
+        if (state.cellPreviewInfo === session && button) button.disabled = false;
+    }
+}
+
 export async function openCellInVsCode() {
     if (!state.cellPreviewInfo) return;
 
@@ -519,6 +564,8 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         documentReadOnly: state.isReadOnly,
         originalValue: value,
         originalText,
+        connectionGeneration: state.connectionGeneration,
+        contentGeneration: state.contentGeneration,
         readOnlyReason: readOnlyRowReason,
         valueMode: 'value',
         dirty: false
@@ -532,6 +579,15 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     resetTextareaTabFocusEscape(textarea);
     const readonlyBadgeEl = document.getElementById('cellPreviewReadonlyBadge');
     const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
+    const downloadBtnEl = document.getElementById('cellPreviewDownloadBtn');
+    if (downloadBtnEl) {
+        const storedCell = previewSession.tableType === 'table' && !readOnlyRowReason;
+        downloadBtnEl.disabled = false;
+        downloadBtnEl.textContent = storedCell ? 'Download stored cell' : 'Download displayed text';
+        downloadBtnEl.title = storedCell
+            ? 'Download the byte-exact stored cell; unsaved modal text is excluded'
+            : 'Download the original displayed value as UTF-8; unsaved modal text is excluded';
+    }
     const openInVsCodeBtnEl = document.getElementById('openInVsCodeBtn');
     const emptyBtnEl = document.getElementById('cellPreviewEmptyBtn');
     const nullBtnEl = document.getElementById('cellPreviewNullBtn');

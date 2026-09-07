@@ -322,6 +322,33 @@ describe('editor keyboard and grid selection interactions', () => {
         }
     });
 
+    it('downloads the stored TEXT cell without submitting or discarding the modal draft', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { downloadCellPreview } = await import(editModulePath);
+        const status = { textContent: '' };
+        (globalThis as any).document = { getElementById(id: string) {
+            if (id === 'statusText') return status;
+            if (id === 'cellPreviewTextarea') throw new Error('download must not read the unsaved draft');
+            return null;
+        } };
+        const session = { table: 'items', tableType: 'table', rowId: 7, columnName: 'body', originalText: 'original', dirty: true };
+        state.cellPreviewInfo = session;
+        const open = backendApi.openCellEditor;
+        let requested: unknown[] = [];
+        backendApi.openCellEditor = async (...args: unknown[]) => { requested = args; return { success: true, mode: 'download' }; };
+        try {
+            assert.equal(typeof downloadCellPreview, 'function');
+            await downloadCellPreview();
+            assert.deepStrictEqual(requested.slice(0, 3), [{ table: 'items', name: '' }, 7, 'body']);
+            assert.strictEqual((requested[4] as { download: boolean }).download, true);
+            assert.strictEqual(state.cellPreviewInfo, session);
+            assert.strictEqual(session.dirty, true);
+            assert.match(status.textContent, /draft is unchanged/);
+        } finally { backendApi.openCellEditor = open; }
+    });
+
     it('keeps the preview open and reports the host reason when external editing is unavailable', async () => {
         const apiModulePath = '../../core/ui/modules/api.js';
         const { backendApi } = await import(apiModulePath);

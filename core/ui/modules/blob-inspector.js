@@ -45,7 +45,46 @@ export const OVERSIZED_INSPECTOR_LOAD_STEP_BYTES = MAX_CELL_READ_CHUNK_BYTES;
 export const MAX_OVERSIZED_INSPECTOR_LOAD_BYTES = 8 * 1024 * 1024;
 
 const CELL_TEXT_ENCODINGS = new Set(['utf-8', 'utf-16le', 'utf-16be']);
+const MAX_SINGLE_INSPECTOR_TEXT_CODE_UNITS = 64 * 1024;
+const INSPECTOR_TEXT_BLOCK_CODE_UNITS = 2048;
+const MAX_INSPECTOR_TEXT_BLOCKS = 4100;
 let mediaPreviewRequestCounter = 0;
+
+function renderBoundedInspectorTextBlocks(pre, text) {
+    pre.textContent = '';
+    // Formatting JSON may enlarge the displayed string beyond the source bytes.
+    // Leave one code unit for a surrogate boundary without exceeding the node cap.
+    const blockSize = Math.max(
+        INSPECTOR_TEXT_BLOCK_CODE_UNITS,
+        Math.ceil(text.length / MAX_INSPECTOR_TEXT_BLOCKS) + 1
+    );
+    for (let start = 0; start < text.length;) {
+        let end = Math.min(start + blockSize, text.length);
+        const last = text.charCodeAt(end - 1);
+        const next = text.charCodeAt(end);
+        if (end < text.length && last >= 0xD800 && last <= 0xDBFF
+            && next >= 0xDC00 && next <= 0xDFFF) end--;
+        const block = document.createElement('span');
+        block.className = 'inspector-text-block';
+        block.style.display = 'block';
+        // Keep off-screen text searchable and copyable without laying out every
+        // Unicode line when a large preview is expanded.
+        block.style.contentVisibility = 'auto';
+        block.style.containIntrinsicBlockSize = 'auto 1000px';
+        block.textContent = text.slice(start, end);
+        pre.appendChild(block);
+        start = end;
+    }
+    // CSS block boundaries must not become newlines in copied database text.
+    pre.addEventListener('copy', event => {
+        const selection = document.getSelection();
+        if (!event.clipboardData || selection?.rangeCount !== 1
+            || !pre.contains(selection.anchorNode) || !pre.contains(selection.focusNode)) return;
+        const selectedText = selection.getRangeAt(0).cloneContents().textContent ?? '';
+        event.clipboardData.setData('text/plain', selectedText);
+        event.preventDefault();
+    });
+}
 
 function createMediaPreviewRequestId() {
     const uuid = globalThis.crypto?.randomUUID?.();
@@ -105,8 +144,7 @@ function validateCellReadChunk(chunk, expectedOffset, requestedBytes, totalBytes
 function isOversizedMediaType(type) {
     return type?.type === 'image'
         || type?.type === 'audio'
-        || type?.type === 'video'
-        || type?.type === 'pdf';
+        || type?.type === 'video';
 }
 
 /** Keep inspector DOM work bounded and preserve a valid UTF-8 prefix for TEXT. */
@@ -183,6 +221,9 @@ export class BlobInspector {
         if (dlBtn) {
             dlBtn.addEventListener('click', () => this.download());
         }
+        document.getElementById('blob-save-full-btn')?.addEventListener('click', () => this.openFullContent(true));
+        document.getElementById('blob-hex-previous')?.addEventListener('click', () => this.renderHex(this.currentData, this.currentHexPage - 1));
+        document.getElementById('blob-hex-next')?.addEventListener('click', () => this.renderHex(this.currentData, this.currentHexPage + 1));
 
         // Replace button
         const replaceBtn = document.getElementById('blob-replace-btn');
@@ -226,6 +267,17 @@ export class BlobInspector {
         const replaceBtn = document.getElementById('blob-replace-btn');
         const downloadBtn = document.getElementById('blob-download-btn');
         const loadMoreBtn = document.getElementById('blob-load-more-btn');
+        const saveFullBtn = document.getElementById('blob-save-full-btn');
+        if (saveFullBtn) {
+            // The desktop has no host cell-editor to stream the full value into
+            // a file; its Download button already saves the loaded bytes through
+            // the same saveFileAs seam, so this VS Code/web-only affordance stays
+            // hidden on the desktop to avoid a second, redundant download button.
+            saveFullBtn.hidden = state.isDesktop
+                || !this.currentOversizedMetadata
+                || (this.currentInlineRawTextBytes && !this.currentRawTextCanStream);
+            saveFullBtn.disabled = uploading || !!this.activeFullContent;
+        }
         const mutationBlockReason = this.currentCellInfo
             ? getCellMutationBlockReason(
                 this.currentCellInfo.rowIdx,
@@ -281,7 +333,7 @@ export class BlobInspector {
                     downloadBtn.title = 'Load the whole value first (Load more), then download it';
                 }
             } else if (this.currentOversizedMetadata) {
-                downloadBtn.textContent = 'Open Full Content';
+                downloadBtn.textContent = this.currentTab === 'hex' ? 'Open Full Hex' : 'Open Full Content';
                 downloadBtn.title =
                     'Desktop opens the complete value in VS Code; the web demo is preview-only';
             } else {
@@ -640,6 +692,7 @@ export class BlobInspector {
     }
 
     switchTab(tabId) {
+        this.currentTab = tabId;
         // Update tab buttons
         this.modal.querySelectorAll('.tab-btn').forEach(btn => {
             if (btn.dataset.tab === tabId) {
@@ -662,7 +715,11 @@ export class BlobInspector {
             hexTab.style.display = 'none';
         } else {
             previewTab.style.display = 'none';
-            hexTab.style.display = 'block';
+            hexTab.style.display = 'flex';
+        }
+        this.setUploadState(this.isUploading);
+        if (tabId === 'hex' && this.currentHexNeedsSnapshot && this.currentTableType === 'table') {
+            return this.loadMoreOversizedContent(MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES);
         }
     }
 
@@ -676,7 +733,7 @@ export class BlobInspector {
             // button is inert until the chunked read holds the whole value
             // (setUploadState), and then saves exactly those bytes.
             if (!state.isDesktop) {
-                await this.openFullContent();
+                await this.openFullContent(this.currentTab !== 'hex' && this.currentType?.type === 'pdf');
                 return;
             }
             if (!this.isOversizedFullyLoaded()) return;
@@ -743,7 +800,7 @@ export class BlobInspector {
         }
     }
 
-    async openFullContent() {
+    async openFullContent(download = false) {
         if (this.activeFullContent?.promise) return this.activeFullContent.promise;
         const targetTable = this.currentTable ?? state.selectedTable;
         if (
@@ -763,6 +820,8 @@ export class BlobInspector {
             column: this.currentColName,
             type: this.currentType,
             sourceByteLength: this.currentOversizedMetadata.byteLength,
+            view: this.currentTab === 'hex' ? 'hex' : 'content',
+            download,
             webviewId,
             promise: null
         };
@@ -789,15 +848,18 @@ export class BlobInspector {
                 {
                     type: operation.type,
                     webviewId: operation.webviewId,
-                    sourceByteLength: operation.sourceByteLength
+                    sourceByteLength: operation.sourceByteLength,
+                    ...(operation.view === 'hex' && !operation.download ? { view: 'hex' } : {}),
+                    ...(operation.download ? { download: true } : {})
                 }
             );
             if (!this.isFullContentOperationCurrent(operation)) return false;
             if (result?.success === false) {
-                updateStatus(result.message || 'Full content is unavailable in the web demo');
+                updateStatus(result.cancelled ? 'Save cancelled' : (result.message || 'Full content is unavailable in the web demo'));
                 return false;
             }
-            updateStatus(result?.mode === 'temporary-read-only'
+            updateStatus(result?.mode === 'download' ? 'Saved full cell content' : result?.mode === 'paged-read-only'
+                ? 'Opened full content in a paged read-only viewer' : result?.mode === 'temporary-read-only'
                 ? 'Opened full content in a verified read-only temporary file'
                 : 'Opened full content in VS Code');
             return true;
@@ -844,7 +906,9 @@ export class BlobInspector {
     }
 
     inspect(blobData, rowId, colName, rowIdx, colIdx) {
+        this.currentHexPage = 0;
         this.cleanup();
+        this.currentHexNeedsSnapshot = false;
         const isText = typeof blobData === 'string';
         this.setInspectorTitle(isText ? 'TEXT Inspector' : 'BLOB Inspector');
 
@@ -891,6 +955,7 @@ export class BlobInspector {
     }
 
     inspectOversized(previewValue, metadata, rowId, colName, rowIdx, colIdx) {
+        this.currentHexPage = 0;
         this.cleanup();
         this.setInspectorTitle(metadata.storageClass === 'text' ? 'TEXT Inspector' : 'BLOB Inspector');
 
@@ -900,6 +965,8 @@ export class BlobInspector {
         this.currentCellInfo = { rowIdx, colIdx };
         this.currentOversizedMetadata = metadata;
         this.currentStorageClass = metadata.storageClass;
+        this.currentTableType = state.selectedTableType;
+        this.currentHexNeedsSnapshot = metadata.storageClass === 'text' && typeof previewValue === 'string';
         this.currentInlineRawTextBytes =
             metadata.storageClass === 'text' && previewValue instanceof Uint8Array;
         this.currentRawTextCanStream = this.currentInlineRawTextBytes
@@ -936,7 +1003,15 @@ export class BlobInspector {
             `Preview ${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +
             'Full content opens from a desktop temporary file; web is preview-only';
 
-        this.renderHex(data);
+        if (this.currentHexNeedsSnapshot) {
+            // The page's decoded string has no database encoding metadata.
+            // Re-encoding it as UTF-8 would mislabel UTF-16 bytes as raw Hex.
+            if (this.hexContainer) this.hexContainer.value = this.currentTableType === 'table'
+                ? 'Select Hex to read a bounded snapshot of the stored TEXT bytes.'
+                : 'Raw Hex is unavailable for this decoded view preview.';
+        } else {
+            this.renderHex(data);
+        }
         if (metadata.byteLength <= OVERSIZED_INSPECTOR_LOAD_STEP_BYTES) {
             // Aggregate page pressure can truncate a modest value to a few
             // hundred characters. One bounded snapshot read restores it.
@@ -947,9 +1022,12 @@ export class BlobInspector {
             this.renderOversizedMediaStatus('Preparing a private desktop media URI...');
             void this.loadOversizedMediaPreview(type, metadata, generation);
         } else {
-            // Bounded text/binary previews keep the existing byte path.
+            // The page's string preview can exceed the inspector's byte cap.
+            // Render the admitted bytes, preserving any stored leading BOM.
             this.renderPreview(data, type, {
-                text: metadata.storageClass === 'text' ? String(previewValue) : undefined
+                text: metadata.storageClass === 'text' && !this.currentInlineRawTextBytes
+                    ? decodeCellTextPrefix(data, 'utf-8', true)
+                    : undefined
             });
         }
         return Promise.resolve(false);
@@ -1053,6 +1131,7 @@ export class BlobInspector {
         if (!loaded || generation !== this.previewGeneration) return false;
 
         this.currentData = loaded.bytes;
+        this.currentHexNeedsSnapshot = false;
         this.currentOversizedMetadata = loaded.metadata;
         this.oversizedLoadedBytes = loaded.bytes.byteLength;
         let renderedText;
@@ -1236,16 +1315,6 @@ export class BlobInspector {
             mediaElement.style.maxWidth = '100%';
             mediaElement.style.maxHeight = '100%';
             mediaElement.style.objectFit = 'contain';
-        } else if (type.type === 'pdf') {
-            mediaElement = document.createElement('iframe');
-            // A PDF resource is untrusted database content. An empty iframe
-            // sandbox prevents scripts, navigation, downloads, and same-origin
-            // access even if the renderer misclassifies the bytes.
-            mediaElement.setAttribute('sandbox', '');
-            mediaElement.title = 'Oversized PDF preview';
-            mediaElement.style.width = '100%';
-            mediaElement.style.height = '100%';
-            mediaElement.style.border = '0';
         } else {
             throw new Error(`Unsupported oversized media category: ${type.type}`);
         }
@@ -1356,12 +1425,23 @@ export class BlobInspector {
         return (controlChars / sample.length) < 0.1;
     }
 
+    handleObjectUrlDecodeError(element, uri) {
+        const generation = this.previewGeneration;
+        element.addEventListener('error', () => {
+            if (generation !== this.previewGeneration || this.currentObjectUrl !== uri) return;
+            URL.revokeObjectURL(uri);
+            this.currentObjectUrl = null;
+            this.renderOversizedMediaStatus('This media preview could not be decoded. Download remains available.');
+        });
+    }
+
     renderPreview(data, type, { text: decodedText } = {}) {
         if (type.type === 'image') {
             // Image preview using object URL
             const blob = new Blob([data], { type: type.mime });
             this.currentObjectUrl = URL.createObjectURL(blob);
             const img = document.createElement('img');
+            this.handleObjectUrlDecodeError(img, this.currentObjectUrl);
             img.src = this.currentObjectUrl;
             img.style.maxWidth = '100%';
             img.style.maxHeight = '100%';
@@ -1376,6 +1456,7 @@ export class BlobInspector {
             const wrapper = document.createElement('div');
             wrapper.className = 'empty-view';
             wrapper.style.gap = '16px';
+            wrapper.style.width = '100%';
 
             const icon = document.createElement('span');
             icon.className = 'codicon codicon-play-circle';
@@ -1388,6 +1469,7 @@ export class BlobInspector {
 
             const audio = document.createElement('audio');
             audio.controls = true;
+            this.handleObjectUrlDecodeError(audio, this.currentObjectUrl);
             audio.src = this.currentObjectUrl;
             audio.style.width = '100%';
             audio.style.maxWidth = '400px';
@@ -1403,6 +1485,7 @@ export class BlobInspector {
 
             const video = document.createElement('video');
             video.controls = true;
+            this.handleObjectUrlDecodeError(video, this.currentObjectUrl);
             video.src = this.currentObjectUrl;
             video.style.maxWidth = '100%';
             video.style.maxHeight = '100%';
@@ -1421,6 +1504,12 @@ export class BlobInspector {
                 }
             } else {
                 pre.textContent = text;
+            }
+            // Both long paragraphs and many short Unicode lines can stall a
+            // single rendering block. Bound each block and defer off-screen
+            // layout while keeping the DOM below 4100 blocks.
+            if (pre.textContent.length > MAX_SINGLE_INSPECTOR_TEXT_CODE_UNITS) {
+                renderBoundedInspectorTextBlocks(pre, pre.textContent);
             }
             pre.style.whiteSpace = 'pre-wrap';
             pre.style.wordBreak = 'break-all';
@@ -1444,7 +1533,7 @@ export class BlobInspector {
 
              const text = document.createElement('span');
              text.style.marginTop = '12px';
-             text.textContent = `PDF Document (${this.formatSize(data.byteLength)})`;
+             text.textContent = `PDF Document (${this.formatSize(this.currentOversizedMetadata?.byteLength ?? data.byteLength)}). Download to view in a PDF reader.`;
 
              const dlBtn = document.createElement('button');
              dlBtn.className = 'btn-primary';
@@ -1483,16 +1572,18 @@ export class BlobInspector {
         }
     }
 
-    renderHex(data) {
+    renderHex(data, page = this.currentHexPage ?? 0) {
         if (!this.hexContainer) return;
 
-        // Generate hex dump (limit to reasonable size for performance)
-        const limit = 16 * 1000; // Show first ~16KB
+        const limit = 16 * 1024;
+        const pages = Math.max(1, Math.ceil(data.length / limit));
+        this.currentHexPage = Math.max(0, Math.min(Number.isSafeInteger(page) ? page : 0, pages - 1));
+        const start = this.currentHexPage * limit;
         let output = '';
-        const view = data.subarray(0, limit);
+        const view = data.subarray(start, start + limit);
 
         for (let i = 0; i < view.length; i += 16) {
-            const offset = i.toString(16).padStart(8, '0');
+            const offset = (start + i).toString(16).padStart(8, '0');
             const bytes = [];
             const chars = [];
 
@@ -1515,11 +1606,13 @@ export class BlobInspector {
             output += `${offset}  ${hexPart1}  ${hexPart2}  |${asciiPart}|\n`;
         }
 
-        if (data.length > limit) {
-            output += `\n... (${(data.length - limit).toLocaleString()} more bytes not shown)`;
-        }
-
         this.hexContainer.value = output;
+        const previous = document.getElementById('blob-hex-previous');
+        const next = document.getElementById('blob-hex-next');
+        const position = document.getElementById('blob-hex-position');
+        if (previous) previous.disabled = this.currentHexPage === 0;
+        if (next) next.disabled = this.currentHexPage >= pages - 1;
+        if (position) position.textContent = `Bytes ${start.toLocaleString()}–${(start + view.length).toLocaleString()} of ${data.length.toLocaleString()} loaded`;
     }
 
     formatSize(bytes) {

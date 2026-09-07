@@ -15,6 +15,7 @@ import {
     escapeJsonSafeNumberString
 } from '../../../src/core/json-safe-numbers.ts';
 import { getErrorMessage } from './utils.js';
+import { encodeBinaryBase64 } from './binary-encoding.js';
 
 export {
     MAX_WEBVIEW_BINARY_VALUE_BYTES,
@@ -29,32 +30,6 @@ export {
     escapeJsonSafeNumberString
 };
 
-async function uint8ArrayToBase64Async(bytes) {
-    const SYNC_THRESHOLD = 65536;
-    if (bytes.length <= SYNC_THRESHOLD) return uint8ArrayToBase64Sync(bytes);
-
-    const CHUNK_SIZE = 32768;
-    const chunks = [];
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-        const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-        chunks.push(String.fromCharCode.apply(null, chunk));
-        if (i > 0 && (i / CHUNK_SIZE) % 4 === 0) {
-            await new Promise(resolve => setTimeout(resolve, 0));
-        }
-    }
-    return btoa(chunks.join(''));
-}
-
-function uint8ArrayToBase64Sync(bytes) {
-    const CHUNK_SIZE = 32768;
-    const chunks = [];
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-        const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-        chunks.push(String.fromCharCode.apply(null, chunk));
-    }
-    return btoa(chunks.join(''));
-}
-
 function base64ToUint8Array(base64) {
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
@@ -68,11 +43,11 @@ async function serializeValueUnchecked(value) {
     }
     if (typeof value === 'string') return escapeJsonSafeNumberString(value);
     if (value instanceof Uint8Array) {
-        return { __type: 'Uint8Array', base64: await uint8ArrayToBase64Async(value) };
+        return { __type: 'Uint8Array', base64: await encodeBinaryBase64(value) };
     }
     if (ArrayBuffer.isView(value)) {
         const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-        return { __type: 'Uint8Array', base64: await uint8ArrayToBase64Async(bytes) };
+        return { __type: 'Uint8Array', base64: await encodeBinaryBase64(bytes) };
     }
     if (Array.isArray(value)) return Promise.all(value.map(serializeValueUnchecked));
     if (value && typeof value === 'object' && Object.prototype.toString.call(value) === '[object Object]') {
