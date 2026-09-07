@@ -374,3 +374,32 @@ test('the import methods route through host.invoke: pick/read are bare, importRo
     assert.equal(getRpcTimeoutMs(method), undefined, `${method} must not have a client deadline`);
   }
 });
+
+test('confirmLargeChanges presents the affected count in-page and honours BOTH answers', async () => {
+  initDesktopApi(fakeHost() as never);
+
+  const approved = backendApi.confirmLargeChanges(1001, 'cells');
+  assert.match(await presentedConfirmation(), /1,001 cells/);
+  answerConfirmation(true);
+  assert.equal(await approved, true);
+
+  // Declining must come back as a real `false` — the guard in
+  // large-change-guard.js keeps the mutation from ever being sent on it.
+  const declined = backendApi.confirmLargeChanges(2500, 'rows');
+  assert.match(await presentedConfirmation(), /2,500 rows/);
+  answerConfirmation(false);
+  assert.equal(await declined, false);
+});
+
+test('createTable omits absent options and forwards WITHOUT ROWID intact (native JSON lane has no undefined)', async () => {
+  const host = fakeHost();
+  initDesktopApi(host as never);
+  const columns = [{ name: 'id', type: 'INTEGER', primaryKey: true, notNull: false }];
+  await backendApi.createTable('ordinary', columns);
+  assert.deepEqual(host.calls.at(-1), { method: 'createTable', args: ['ordinary', columns] });
+  await backendApi.createTable('keyed', columns, { withoutRowid: true });
+  assert.deepEqual(host.calls.at(-1), {
+    method: 'createTable',
+    args: ['keyed', columns, { withoutRowid: true }]
+  });
+});

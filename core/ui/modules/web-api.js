@@ -539,7 +539,8 @@ export const backendApi = {
         }
         return sendRpcRequest('deleteColumns', [table, columns, dependentIndexes]);
     },
-    createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
+    createTable: (table, columns, options) => sendRpcRequest('createTable',
+        options === undefined ? [table, columns] : [table, columns, options]),
     getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
     validateViewDefinition: (view, selectSql, intent) =>
         sendRpcRequest('validateViewDefinition', [view, selectSql, intent]),
@@ -597,6 +598,9 @@ export const backendApi = {
     confirmLargeSelection: async (itemCount, unit) => window.confirm(
         `Selecting ${Number(itemCount).toLocaleString()} ${unit} may slow or freeze this page. ` +
         'Use Export for large data operations. Continue?'
+    ),
+    confirmLargeChanges: async (itemCount, unit) => window.confirm(
+        `Large Change Warning: this changes ${Number(itemCount).toLocaleString()} ${unit}. Continue?`
     ),
     updateCellBatch: (table, updates, label) => sendRpcRequest(
         'updateCellBatch',

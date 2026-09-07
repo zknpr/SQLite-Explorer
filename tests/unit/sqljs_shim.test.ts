@@ -853,6 +853,66 @@ describe('sqljs-shim: native-only behaviour', () => {
         });
     });
 
+    it('changes journal_mode to WAL and back through the worker-shaped PRAGMA path, durably', () => {
+        // The desktop's Configuration modal drives setPragma, which prepares
+        // and runs exactly `PRAGMA journal_mode = '<value>'` as one statement
+        // (worker.js runSingleStatement); the sidecar-lane case in
+        // scripts/lib/native-sidecar-lane.mjs runs the same round trip against
+        // the shipped binary. Here the stand-in is real SQLite on a real file,
+        // so the -wal/-shm sidecars and the durability across a reopen are the
+        // engine's own behaviour, not a mock's.
+        const journalMode = (db: ShimDatabase) => db.exec('PRAGMA journal_mode')[0].values[0][0];
+        const setJournalMode = (db: ShimDatabase, mode: string) => {
+            const statement = db.prepare(`PRAGMA journal_mode = '${mode}'`);
+            try {
+                statement.run();
+            } finally {
+                statement.free();
+            }
+        };
+        withFileDatabase(file => {
+            const db = createShim({ path: file });
+            try {
+                assert.strictEqual(journalMode(db), 'delete');
+                setJournalMode(db, 'WAL');
+                assert.strictEqual(journalMode(db), 'wal');
+                db.run("INSERT INTO t VALUES (10, 'wal', NULL, 0.0)");
+                assert.ok(fs.existsSync(`${file}-wal`), 'a write in WAL mode must materialise the -wal sidecar');
+                assert.ok(fs.statSync(`${file}-wal`).size > 0);
+                // TRUNCATE resets the log before the counters are read, so a
+                // successful checkpoint reports zero frames and an empty -wal.
+                assert.deepStrictEqual(
+                    normalize(db.exec('PRAGMA wal_checkpoint(TRUNCATE)')),
+                    [{ columns: ['busy', 'log', 'checkpointed'], values: [[0, 0, 0]] }]
+                );
+                assert.strictEqual(fs.statSync(`${file}-wal`).size, 0);
+                // Inside a transaction (the desktop's session transaction on a
+                // dirty database) SQLite refuses the switch and the mode stays.
+                db.run('BEGIN');
+                db.exec('SELECT count(*) FROM t');
+                assert.throws(() => setJournalMode(db, 'DELETE'), /within a transaction|SQL logic error/i);
+                assert.strictEqual(journalMode(db), 'wal');
+                db.run('ROLLBACK');
+                setJournalMode(db, 'DELETE');
+                assert.strictEqual(journalMode(db), 'delete');
+                assert.ok(!fs.existsSync(`${file}-wal`) && !fs.existsSync(`${file}-shm`),
+                    'leaving WAL must remove both sidecar files');
+            } finally {
+                db.close();
+            }
+            const reopened = createShim({ path: file });
+            try {
+                assert.strictEqual(journalMode(reopened), 'delete');
+                assert.deepStrictEqual(
+                    normalize(reopened.exec('SELECT count(*) AS c FROM t')),
+                    [{ columns: ['c'], values: [[4]] }]
+                );
+            } finally {
+                reopened.close();
+            }
+        });
+    });
+
     it('a readOnly open refuses writes with SQLITE_READONLY', () => {
         withFileDatabase(file => {
             const db = createShim({ path: file, readOnly: true });

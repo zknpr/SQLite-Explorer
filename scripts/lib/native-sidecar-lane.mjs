@@ -668,9 +668,159 @@ export async function runSidecarLane({ binary, scratch, note }) {
     // ---- a file the process cannot write (capstone E-11) ------------------
     checks += await runUnwritableFileCase(binary, scratch, note);
 
+    // ---- journal_mode WAL round trip --------------------------------------
+    checks += await runJournalModeCase(binary, scratch, note);
+
     // ---- ppid watchdog ----------------------------------------------------
     checks += await runWatchdogCase(binary, dbPath, note);
 
+    return checks;
+}
+
+/**
+ * journal_mode WAL and back through the shipped sidecar.
+ *
+ * The desktop's Configuration modal drives exactly these RPCs (setPragma,
+ * getPragmas, and — for a checkpoint — runQuery), and this is what a WASM
+ * image can never do: the mode change lands on the real file. Asserted: the
+ * -wal/-shm sidecars appear on the first write and an external reader sees
+ * the row through the log; a TRUNCATE checkpoint drains the log (SQLite
+ * resets it before reading the counters, hence 0/0/0 and an empty -wal);
+ * the switch is refused while a transaction is open — the host's session
+ * transaction on a dirty database — and the mode stays put; leaving WAL
+ * removes both sidecars; the mode a session leaves is the mode a FRESH
+ * session finds, with the rows intact; and a read-only session cannot
+ * change it at all.
+ *
+ * @returns {Promise<number>} checks run
+ */
+async function runJournalModeCase(binary, scratch, note) {
+    let checks = 0;
+    const check = (ok, label, detail) => { note(ok, label, detail); checks += 1; };
+
+    const dbPath = path.join(scratch, 'journal-fixture.sqlite');
+    createFixture(dbPath);
+    const sidecarFiles = () => ['-wal', '-shm'].filter((suffix) => fs.existsSync(`${dbPath}${suffix}`));
+    const walBytes = () => (fs.existsSync(`${dbPath}-wal`) ? fs.statSync(`${dbPath}-wal`).size : -1);
+    const journalMode = async (session) => (await session.invoke('getPragmas', [])).content?.data?.journal_mode;
+
+    let session = startSidecar(binary, dbPath, 'rw');
+    try {
+        await session.invoke('initializeDatabase', ['journal-fixture.sqlite', {
+            path: dbPath, readOnlyMode: false
+        }]);
+        const before = await journalMode(session);
+        const toWal = await session.invoke('setPragma', ['journal_mode', 'WAL']);
+        const afterSwitch = await journalMode(session);
+        check(before === 'delete' && toWal.content?.success === true && afterSwitch === 'wal',
+            'sidecar/journal-mode-switches-to-wal',
+            `before=${before}, answer=${JSON.stringify(toWal.content)}, after=${afterSwitch}`);
+
+        const write = await session.invoke('runConsole', ["INSERT INTO t VALUES (4, 'delta', NULL, 4, 4.0)"]);
+        const external = new DatabaseSync(dbPath, { readOnly: true });
+        let externalMode;
+        let externalCount;
+        try {
+            externalMode = external.prepare('PRAGMA journal_mode').get()?.journal_mode;
+            externalCount = external.prepare('SELECT count(*) AS c FROM t').get()?.c;
+        } finally {
+            external.close();
+        }
+        check(write.content?.data?.mutated === true
+            && JSON.stringify(sidecarFiles()) === JSON.stringify(['-wal', '-shm'])
+            && walBytes() > 0
+            && externalMode === 'wal' && externalCount === 4,
+            'sidecar/wal-write-lands-in-the-log-and-an-external-reader-sees-it',
+            `files=${JSON.stringify(sidecarFiles())}, walBytes=${walBytes()}, externalMode=${externalMode}, externalCount=${externalCount}`);
+
+        const checkpoint = await session.invoke('runQuery', ['PRAGMA wal_checkpoint(TRUNCATE)']);
+        const counters = checkpoint.content?.data?.[0]?.rows?.[0];
+        check(checkpoint.content?.success === true
+            && JSON.stringify(counters) === JSON.stringify([0, 0, 0])
+            && walBytes() === 0,
+            'sidecar/wal-checkpoint-drains-the-log',
+            `counters=${JSON.stringify(counters)}, walBytes=${walBytes()}`);
+
+        // The fork answers the in-transaction refusal with its generic
+        // "SQL logic error" (message loss, not a different outcome): what
+        // matters is that it IS refused and the mode did not move.
+        await session.invoke('runQuery', ['BEGIN']);
+        await session.invoke('runQuery', ['SELECT count(*) FROM t']);
+        const inTransaction = await session.invoke('setPragma', ['journal_mode', 'DELETE']);
+        const stillWal = await journalMode(session);
+        await session.invoke('runQuery', ['ROLLBACK']);
+        check(inTransaction.content?.success === false && stillWal === 'wal',
+            'sidecar/journal-mode-change-inside-a-transaction-is-refused-and-keeps-wal',
+            `answer=${JSON.stringify(inTransaction.content)}, mode=${stillWal}`);
+
+        const toDelete = await session.invoke('setPragma', ['journal_mode', 'DELETE']);
+        const afterDelete = await journalMode(session);
+        check(toDelete.content?.success === true && afterDelete === 'delete' && sidecarFiles().length === 0,
+            'sidecar/leaving-wal-removes-both-sidecar-files',
+            `answer=${JSON.stringify(toDelete.content)}, mode=${afterDelete}, files=${JSON.stringify(sidecarFiles())}`);
+
+        // Lower-case value (the settings modal's select) — left in place so
+        // the fresh session below proves the mode outlives the process.
+        const lower = await session.invoke('setPragma', ['journal_mode', 'wal']);
+        check(lower.content?.success === true && await journalMode(session) === 'wal',
+            'sidecar/journal-mode-accepts-a-lower-case-value', JSON.stringify(lower.content));
+
+        session.endStdin();
+        const code = await session.untilExit();
+        check(code === 0, 'sidecar/journal-session-exits-clean', `exit ${code}`);
+    } finally {
+        if (session.exitCode === null) session.child.kill('SIGKILL');
+        const stderrText = session.stderr.trim();
+        if (stderrText) console.log(`[sidecar journal stderr]\n${stderrText}\n`);
+    }
+
+    session = startSidecar(binary, dbPath, 'rw');
+    try {
+        await session.invoke('initializeDatabase', ['journal-fixture.sqlite', {
+            path: dbPath, readOnlyMode: false
+        }]);
+        const reopenedMode = await journalMode(session);
+        const rows = await session.invoke('runQuery', ['SELECT count(*) AS c FROM t']);
+        const back = await session.invoke('setPragma', ['journal_mode', 'DELETE']);
+        check(reopenedMode === 'wal'
+            && rows.content?.data?.[0]?.rows?.[0]?.[0] === 4
+            && back.content?.success === true,
+            'sidecar/journal-mode-persists-into-a-fresh-session-with-its-rows',
+            `mode=${reopenedMode}, rows=${JSON.stringify(rows.content?.data)}, back=${JSON.stringify(back.content)}`);
+        session.endStdin();
+        await session.untilExit();
+    } finally {
+        if (session.exitCode === null) session.child.kill('SIGKILL');
+        const stderrText = session.stderr.trim();
+        if (stderrText) console.log(`[sidecar journal reopen stderr]\n${stderrText}\n`);
+    }
+
+    const independent = new DatabaseSync(dbPath, { readOnly: true });
+    let finalMode;
+    let quickCheck;
+    try {
+        finalMode = independent.prepare('PRAGMA journal_mode').get()?.journal_mode;
+        quickCheck = independent.prepare('PRAGMA quick_check').get()?.quick_check;
+    } finally {
+        independent.close();
+    }
+    check(finalMode === 'delete' && quickCheck === 'ok' && sidecarFiles().length === 0,
+        'sidecar/leaving-wal-is-durable-and-the-file-is-intact',
+        `mode=${finalMode}, quick_check=${quickCheck}, files=${JSON.stringify(sidecarFiles())}`);
+
+    const readOnly = startSidecar(binary, dbPath, 'ro');
+    try {
+        await readOnly.invoke('initializeDatabase', ['journal-fixture.sqlite', {
+            path: dbPath, readOnlyMode: true
+        }]);
+        const refused = await readOnly.invoke('setPragma', ['journal_mode', 'WAL']);
+        check(refused.content?.success === false && /read-only/i.test(refused.content?.errorMessage ?? ''),
+            'sidecar/read-only-session-cannot-change-journal-mode', JSON.stringify(refused.content));
+        readOnly.endStdin();
+        await readOnly.untilExit();
+    } finally {
+        if (readOnly.exitCode === null) readOnly.child.kill('SIGKILL');
+    }
     return checks;
 }
 

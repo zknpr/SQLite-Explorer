@@ -1886,7 +1886,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
         case 'table_create':
             if (tableDef && tableDef.columns) {
-                await this.createTable(targetTable, tableDef.columns);
+                await this.createTable(targetTable, tableDef.columns, tableDef.options);
             } else if (strict) {
                 throw new Error('Cannot apply table_create: missing table definition');
             }
@@ -3437,9 +3437,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   async createTable(
     table: string,
-    columns: ColumnDefinition[]
+    columns: ColumnDefinition[],
+    options?: import('../../types').CreateTableOptions
   ): Promise<ColumnDropTableState> {
-    const sql = buildCreateTableSql(table, columns);
+    const sql = buildCreateTableSql(table, columns, options);
     const savepointName = this.createSavepointName('sp_create_table');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {

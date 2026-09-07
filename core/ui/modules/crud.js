@@ -12,6 +12,7 @@ import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
 import { saveHint } from './platform.js';
 import { assertUsableSqlIdentifier } from '../../../src/core/sql-utils.ts';
+import { confirmLargeChange, LARGE_CHANGE_WARNING_THRESHOLD } from './large-change-guard.js';
 
 let isSubmittingAddRow = false;
 let isSubmittingDelete = false;
@@ -437,6 +438,7 @@ async function submitDeleteRows(session, isCurrentSession) {
     }
 
     try {
+        if (rowIds.length > LARGE_CHANGE_WARNING_THRESHOLD && !(await confirmLargeChange(rowIds.length, 'rows'))) return;
         updateStatus('Deleting rows...');
         await backendApi.deleteRows(targetTable, rowIds);
         // VS Code retains this requested delta until its refreshContent echo.
@@ -548,6 +550,8 @@ export function openCreateTableModal() {
         contentGeneration: state.contentGeneration
     };
     document.getElementById('newTableName').value = '';
+    const withoutRowid = document.getElementById('newTableWithoutRowid');
+    if (withoutRowid) withoutRowid.checked = false;
     const container = document.getElementById('columnDefinitions');
     container.replaceChildren();
     columnDefCounter = 0;
@@ -605,6 +609,21 @@ export function addColumnDefinition(isFirst = false) {
         typeSelect.appendChild(option);
     });
     rowDiv.appendChild(typeSelect);
+
+    const defaultInputId = `columnDefault_${colId}`;
+    const defaultLabel = document.createElement('label');
+    defaultLabel.className = 'visually-hidden';
+    defaultLabel.htmlFor = defaultInputId;
+    defaultLabel.textContent = `Column ${colId} default literal`;
+    rowDiv.appendChild(defaultLabel);
+    const defaultInput = document.createElement('input');
+    defaultInput.id = defaultInputId;
+    defaultInput.type = 'text';
+    defaultInput.className = 'col-default';
+    defaultInput.placeholder = 'Default literal';
+    defaultInput.title = 'Empty: no default. Numbers and NULL keep their SQL meaning; other values are literal text, not SQL expressions.';
+    defaultInput.style.flex = '1';
+    rowDiv.appendChild(defaultInput);
 
     // PK Checkbox
     const pkLabel = document.createElement('label');
@@ -705,6 +724,7 @@ async function submitCreateTableOnce() {
         const type = row.querySelector('.col-type').value;
         const isPK = row.querySelector('.col-pk').checked;
         const isNN = row.querySelector('.col-nn').checked;
+        const defaultValue = row.querySelector('.col-default')?.value ?? '';
 
         try {
             assertUsableSqlIdentifier(name, 'Column name');
@@ -717,7 +737,8 @@ async function submitCreateTableOnce() {
             name: name,
             type: type,
             primaryKey: isPK,
-            notNull: isNN
+            notNull: isNN,
+            ...(defaultValue === '' ? {} : { defaultValue })
         });
     }
 
@@ -725,10 +746,16 @@ async function submitCreateTableOnce() {
         updateStatus('Error: At least one column is required');
         return;
     }
+    const withoutRowid = document.getElementById('newTableWithoutRowid')?.checked === true;
+    if (withoutRowid && !colDefs.some(column => column.primaryKey)) {
+        updateStatus('Error: WITHOUT ROWID requires a primary key');
+        return;
+    }
 
     try {
         updateStatus('Creating table...');
-        await backendApi.createTable(tableName, colDefs);
+        if (withoutRowid) await backendApi.createTable(tableName, colDefs, { withoutRowid: true });
+        else await backendApi.createTable(tableName, colDefs);
 
         await refreshSchema();
         if (isCurrentSession()) {

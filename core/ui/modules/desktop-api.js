@@ -269,7 +269,10 @@ export const backendApi = {
             dependentIndexes.length > 0 ? [table, columns, dependentIndexes] : [table, columns]
         );
     },
-    createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
+    // Omit absent options rather than send `undefined`: the native lane's
+    // argument list is JSON (see withoutTrailingUndefined).
+    createTable: (table, columns, options) => sendRpcRequest('createTable',
+        options === undefined ? [table, columns] : [table, columns, options]),
     getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
     validateViewDefinition: (view, selectSql, intent) =>
         sendRpcRequest('validateViewDefinition', [view, selectSql, intent]),
@@ -382,6 +385,19 @@ export const backendApi = {
         message:
             `Selecting ${Number(itemCount).toLocaleString()} ${unit} may slow or freeze this window. `
             + 'Use Export for large data operations.',
+        confirmLabel: 'Continue'
+    }),
+    /**
+     * The batch-edit, clear-cells and delete-rows paths ask before changing
+     * more than LARGE_CHANGE_WARNING_THRESHOLD cells/rows (large-change-guard.js);
+     * the caller re-checks the table/connection/content generation after the
+     * answer. Same in-page dialog as every other desktop confirmation.
+     */
+    confirmLargeChanges: (itemCount, unit) => confirmDestructiveAction({
+        title: 'Large change',
+        message:
+            `This operation changes ${Number(itemCount).toLocaleString()} ${unit}. `
+            + 'Do you want to continue?',
         confirmLabel: 'Continue'
     }),
     openCellEditor: (_params, _rowId, _colName, _colTypes, options = {}) => Promise.resolve({

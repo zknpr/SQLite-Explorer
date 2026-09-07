@@ -363,7 +363,9 @@ export const backendApi = {
     insertRow: (table, data) => sendRpcRequest('insertRow', [table, data]),
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
-    createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
+    // An absent array argument becomes null in VS Code's JSON transport.
+    createTable: (table, columns, options) => sendRpcRequest('createTable',
+        options === undefined ? [table, columns] : [table, columns, options]),
     getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
     validateViewDefinition: (view, selectSql, intent) =>
         sendRpcRequest('validateViewDefinition', [view, selectSql, intent]),
@@ -381,6 +383,7 @@ export const backendApi = {
     dropView: (view) => sendRpcRequest('dropView', [view]),
     confirmLargeSelection: (itemCount, unit) =>
         sendRpcRequest('confirmLargeSelection', [itemCount, unit]),
+    confirmLargeChanges: (itemCount, unit) => sendRpcRequest('confirmLargeChanges', [itemCount, unit]),
     updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),

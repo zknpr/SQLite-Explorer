@@ -93,6 +93,7 @@ const WEBVIEW_RPC_METHODS = new Set<string>([
   'releaseCellMediaPreview',
   'openViewEditor',
   'confirmLargeSelection',
+  'confirmLargeChanges',
   'getExtensionSettings',
   'updateExtensionSetting',
   'exportTable',

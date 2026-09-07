@@ -1,4 +1,4 @@
-import type { ColumnDefinition } from './types';
+import type { ColumnDefinition, CreateTableOptions } from './types';
 import {
   assertUsableSqlIdentifier,
   escapeIdentifier,
@@ -259,12 +259,20 @@ export function qualifyMainCreateIndexSql(
 
 export function buildCreateTableSql(
   table: string,
-  columns: readonly ColumnDefinition[]
+  columns: readonly ColumnDefinition[],
+  options: CreateTableOptions = {}
 ): string {
   assertUsableSqlIdentifier(table, 'Table name');
   if (columns.length === 0) throw new Error('At least one column is required');
+  if (!options || typeof options !== 'object' || Array.isArray(options)
+    || (options.withoutRowid !== undefined && typeof options.withoutRowid !== 'boolean')) {
+    throw new Error('Invalid Create Table options');
+  }
 
   const primaryKeyColumns = columns.filter(column => column.primaryKey);
+  if (options.withoutRowid && primaryKeyColumns.length === 0) {
+    throw new Error('WITHOUT ROWID requires a primary key');
+  }
   const compositePrimaryKey = primaryKeyColumns.length > 1;
   const seenColumnNames = new Set<string>();
   const definitions = columns.map(column => {
@@ -291,7 +299,7 @@ export function buildCreateTableSql(
       `PRIMARY KEY (${primaryKeyColumns.map(column => escapeIdentifier(column.name)).join(', ')})`
     );
   }
-  return `CREATE TABLE ${escapeMainIdentifier(table)} (${definitions.join(', ')})`;
+  return `CREATE TABLE ${escapeMainIdentifier(table)} (${definitions.join(', ')})${options.withoutRowid ? ' WITHOUT ROWID' : ''}`;
 }
 
 /** Reject a duplicate before backend-specific SQLite bindings can erase the cause. */

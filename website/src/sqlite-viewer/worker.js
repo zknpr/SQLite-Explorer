@@ -4573,11 +4573,14 @@ function findDependentSchemaObjects(columns) {
  *
  * @param {string} table - Table name
  * @param {Array<Object>} columns - Column definitions
+ * @param {{ withoutRowid?: boolean }} [options] - Table-level options
+ *   (absent on the JSON lane when the caller passed none; validated by
+ *   buildCreateTableSql, which also refuses WITHOUT ROWID without a key)
  */
-async function createTable(table, columns) {
+async function createTable(table, columns, options) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Table creation');
-  const createSql = buildCreateTableSql(table, columns);
+  const createSql = buildCreateTableSql(table, columns, options);
   const savepointName = createViewSavepointName('sp_create_table');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {

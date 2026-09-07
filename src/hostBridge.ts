@@ -1101,7 +1101,7 @@ export class HostBridge implements ToastService {
   /**
    * Create a new table.
    */
-  async createTable(table: string, columns: import('./core/types').ColumnDefinition[]) {
+  async createTable(table: string, columns: import('./core/types').ColumnDefinition[], options?: import('./core/types').CreateTableOptions) {
     assertUsableSqlIdentifier(table, 'Table name');
     for (const column of columns) {
       assertUsableSqlIdentifier(column.name, 'Column name');
@@ -1114,7 +1114,7 @@ export class HostBridge implements ToastService {
 
     let tableCreateSnapshot: ColumnDropTableState;
     if ('createTable' in dbOps) {
-      tableCreateSnapshot = await dbOps.createTable(table, columns);
+      tableCreateSnapshot = options === undefined ? await dbOps.createTable(table, columns) : await dbOps.createTable(table, columns, options);
     } else {
       throw new Error("Backend does not support createTable");
     }
@@ -1125,7 +1125,7 @@ export class HostBridge implements ToastService {
       description: `Create table ${table}`,
       modificationType: 'table_create',
       targetTable: table,
-      tableDef: { columns },
+      tableDef: { columns, ...(options === undefined ? {} : { options }) },
       tableCreateSnapshot
     });
   }
@@ -2063,9 +2063,11 @@ export class HostBridge implements ToastService {
    *
    * @returns True if the user confirms
    */
-  async confirmLargeChanges(): Promise<boolean> {
+  async confirmLargeChanges(itemCount: number, unit: 'rows' | 'cells'): Promise<boolean> {
+    if (!Number.isSafeInteger(itemCount) || itemCount <= 0) throw new Error('Large change count must be a positive safe integer');
+    if (unit !== 'rows' && unit !== 'cells') throw new Error('Large change unit must be rows or cells');
     const answer = await vsc.window.showWarningMessage(vsc.l10n.t('Large Change Warning'), {
-      detail: vsc.l10n.t('You are about to make changes that affect many rows. Do you want to continue?'),
+      detail: `This operation changes ${itemCount.toLocaleString()} ${unit}. Do you want to continue?`,
       modal: true,
     }, { title: vsc.l10n.t('Continue'), value: true }, { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true });
     return answer?.value ?? false;

@@ -29,6 +29,7 @@ import { applyConnectionResult } from './connection-state.js';
 import { invalidateAllCounts, noteCellValuesChanged } from './count-cache.js';
 import { closeDatabaseTargetModals } from './modals.js';
 import { getErrorMessage } from './utils.js';
+import { confirmLargeChange, LARGE_CHANGE_WARNING_THRESHOLD } from './large-change-guard.js';
 
 let isApplyingBatchUpdate = false;
 let activeSchemaLoadToken = 0;
@@ -579,6 +580,7 @@ export async function applyBatchUpdate() {
 
     try {
         const cellCountLabel = `${updates.length} cell${updates.length === 1 ? '' : 's'}`;
+        if (updates.length > LARGE_CHANGE_WARNING_THRESHOLD && !(await confirmLargeChange(updates.length, 'cells'))) return;
         updateStatus(`Updating ${cellCountLabel}...`);
         const label = `Batch update ${cellCountLabel}`;
 

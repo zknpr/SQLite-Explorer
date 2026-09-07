@@ -2747,7 +2747,7 @@ export async function createNativeDatabaseConnection(
 
             case 'table_create':
               if (tableDef && tableDef.columns) {
-                await rawOperations.createTable(targetTable, tableDef.columns);
+                await rawOperations.createTable(targetTable, tableDef.columns, tableDef.options);
               } else {
                 throw new Error('Cannot redo table_create: missing table definition');
               }
@@ -3457,9 +3457,10 @@ export async function createNativeDatabaseConnection(
          */
         createTable: async (
           table: string,
-          columns: ColumnDefinition[]
+          columns: ColumnDefinition[],
+          options?: import('./core/types').CreateTableOptions
         ): Promise<ColumnDropTableState> => {
-          const sql = buildCreateTableSql(table, columns);
+          const sql = buildCreateTableSql(table, columns, options);
           const savepointName = createSavepointName('sp_create_table');
           await worker.call('run', [`SAVEPOINT ${savepointName}`]);
           try {

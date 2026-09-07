@@ -153,9 +153,12 @@ describe('generated CRUD form accessibility', () => {
         const row = elements.columnDefinitions.children[0];
         const nameInput = findNode(row, node => node.className === 'col-name');
         const typeSelect = findNode(row, node => node.className === 'col-type');
+        const defaultInput = findNode(row, node => node.className === 'col-default');
         const removeButton = findNode(row, node => node.className.includes('btn-remove-col'));
         assert.ok(nameInput);
         assert.ok(typeSelect);
+        assert.ok(defaultInput, 'Create Table must expose a default literal input');
+        assert.ok(findNode(row, node => node.tagName === 'LABEL' && node.htmlFor === defaultInput.id && node.textContent === 'Column 1 default literal'));
         assert.ok(removeButton);
         assert.strictEqual(nameInput.id, 'columnName_1');
         assert.strictEqual(typeSelect.id, 'columnType_1');

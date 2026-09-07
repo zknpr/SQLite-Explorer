@@ -61,7 +61,7 @@ export interface DesktopBackendApi {
     insertRow(table: string, data: Record<string, unknown>): Promise<unknown>;
     deleteRows(table: string, rowIds: RecordId[]): Promise<unknown>;
     deleteColumns(table: string, columns: string[]): Promise<unknown>;
-    createTable(table: string, columns: unknown): Promise<unknown>;
+    createTable(table: string, columns: unknown, options?: { withoutRowid?: boolean }): Promise<unknown>;
     getViewDefinition(view: string): Promise<unknown>;
     validateViewDefinition(view: string, selectSql: string, intent?: unknown): Promise<unknown>;
     previewViewDefinition(view: string, selectSql: string, limit: number, intent?: unknown): Promise<unknown>;
@@ -135,6 +135,8 @@ export interface DesktopBackendApi {
         options?: { sourceByteLength?: number }
     ): Promise<{ success: boolean; message?: string }>;
     openViewEditor(): Promise<{ success: boolean; message?: string }>;
+    confirmLargeSelection(itemCount: number, unit: 'rows' | 'cells'): Promise<boolean>;
+    confirmLargeChanges(itemCount: number, unit: 'rows' | 'cells'): Promise<boolean>;
     readWorkspaceFileUri(): Promise<string | null>;
     triggerUndo(): Promise<unknown>;
     triggerRedo(): Promise<unknown>;

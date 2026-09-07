@@ -25,6 +25,7 @@ import type {
   SchemaSnapshot,
   ColumnMetadata,
   ColumnDefinition,
+  CreateTableOptions,
   ModificationEntry,
   ViewDefinitionIntent,
   ViewTriggerDefinition,
@@ -917,9 +918,10 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
 
     async createTable(
       table: string,
-      columns: ColumnDefinition[]
+      columns: ColumnDefinition[],
+      options?: CreateTableOptions
     ): Promise<ColumnDropTableState> {
-      return requireEngine().createTable(table, columns);
+      return requireEngine().createTable(table, columns, options);
     },
 
     async getViewDefinition(view: string) {
