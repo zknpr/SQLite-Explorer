@@ -203,6 +203,8 @@ button.section-title:hover {
    documents. Pinned by tests/unit/db_tabs.test.ts. */
 .section-title[hidden] {
     display: none;
+}
+
 .section-toggle:focus-visible,
 button.section-title:focus-visible,
 .list-item-select:focus-visible,

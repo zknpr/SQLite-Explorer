@@ -32,7 +32,8 @@ import {
     showErrorState,
     showLoading,
     initSidebarResize,
-    syncPageSizeSelect
+    syncPageSizeSelect,
+    updateToolbarButtons
 } from './modules/ui.js';
 import {
     closeAllModals,
@@ -454,6 +455,17 @@ async function refreshContentOnce(filename, connectionResult) {
                 } else if (connectionReplaced) {
                     showErrorState('Could not load table columns after reloading the database.');
                 }
+            } else {
+                // No table is selected (a fresh open, or the selected one was
+                // dropped and cleared above): draw the empty state so a spinner
+                // shown earlier in this refresh (connectionReplaced, or the open
+                // path) is never left up. The pre-refactor refreshContent cleared
+                // it with a standalone `if (!state.selectedTable)` block; the
+                // extraction into refreshContentOnce dropped that fallback, which
+                // left a fresh open stuck on "Loading…" with the grid never drawn.
+                document.getElementById('tableNameLabel').textContent = 'No table selected';
+                showEmptyState();
+                updateToolbarButtons();
             }
         }
         // Closes the console-DDL loop: a mutating console run makes the host
