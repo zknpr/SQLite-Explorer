@@ -52,6 +52,11 @@ import {
   encodeSqlExportCell
 } from '../../../src/core/export-encoding.ts';
 import {
+  decodeQueryPlan,
+  queryPlanRequest,
+  SQL_RESULT_ROWS
+} from '../../../src/core/sql-workspace.ts';
+import {
   COLUMN_DROP_DEPENDENT_OBJECT_SQL,
   executeSchemaPreservingColumnDrop,
   schemaObjectSqlMentionsColumn
@@ -219,6 +224,16 @@ let db = null;
  * @type {Object|null}
  */
 let SQL = null;
+/**
+ * True once the bounded EXPLAIN QUERY PLAN reader compiled into the vendored
+ * sql.js (src/runtime/query-plan.c, exported as
+ * `_sqlite_explorer_register_query_plan`) has been armed on this module. Set
+ * only by the WASM branch of the engine seam in initializeDatabase; the native
+ * sidecar's engine never has the reader (its fork disables loadable
+ * extensions), so there the console's EXPLAIN runs SQLite's own statement
+ * instead -- see readQueryPlan.
+ */
+let queryPlanReaderActive = false;
 let queryTimeout = DEFAULT_QUERY_TIMEOUT_MS;
 let readOnlyMode = false;
 /** User-facing explanation when safety policy forces a read-only open. */
@@ -933,6 +948,10 @@ async function initializeDatabase(filename, config) {
       }
 
       SQL = await self.initSqlJs(sqlConfig);
+      // Before the first connection: the reader installs itself as an
+      // auto-extension, which only reaches connections opened AFTER this call
+      // (the buffer open below and the paged open ladder alike).
+      queryPlanReaderActive = registerQueryPlanReader(SQL);
     }
 
     // Create the database. A File handle runs the open ladder (WAL sniff,
@@ -1219,10 +1238,12 @@ function clampConsoleMaxRows(maxRows) {
 
 /**
  * Clamp a caller-supplied statement cap to a positive integer, defaulting to
- * Infinity (run the whole script). The console's EXPLAIN button passes 1:
- * `EXPLAIN QUERY PLAN <editor text>` only ever prefixes the FIRST statement,
- * so without a cap a diagnostics button would run the rest of the script for
- * real.
+ * Infinity (run the whole script). A capped run executes the first N
+ * statements and reports the rest as skipped without running them (see the
+ * drain in runConsole). The console's EXPLAIN used to ride this with a cap of
+ * 1 -- `EXPLAIN QUERY PLAN <editor text>` only ever prefixes the FIRST
+ * statement -- and now has its own single-statement path (`options.explain`),
+ * so nothing in the shipped UI passes it today; it stays a supported option.
  *
  * @param {unknown} maxStatements
  * @returns {number}
@@ -1232,6 +1253,258 @@ function clampConsoleMaxStatements(maxStatements) {
   const numeric = Number(maxStatements);
   if (!Number.isFinite(numeric)) return Infinity;
   return Math.max(1, Math.trunc(numeric));
+}
+
+// ----------------------------------------------------------------------------
+// SQL console: positional parameters and query plans
+// ----------------------------------------------------------------------------
+
+/**
+ * Parameter-count ceiling shared with the page's parseQueryParameters
+ * (src/core/sql-workspace.ts) and the bounded reader (query-plan.c admits at
+ * most 100 values after the SQL text).
+ */
+const MAX_CONSOLE_PARAMETERS = 100;
+
+/**
+ * Validate the console's positional parameters. Untrusted RPC input: the page
+ * validates what the user typed, but the worker is the boundary that binds.
+ * Only the value classes JSON can carry and both engines bind identically --
+ * NUL-bearing text is refused for the same reason the SQL text is (sql.js
+ * binds text NUL-terminated, so the value would silently truncate), and a
+ * non-finite number has no SQLite representation.
+ *
+ * @param {unknown} value
+ * @returns {Array<null | string | number>}
+ */
+function normalizeConsoleParams(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error('Console parameters must be a JSON array.');
+  if (value.length > MAX_CONSOLE_PARAMETERS) {
+    throw new Error(`Use at most ${MAX_CONSOLE_PARAMETERS} positional parameters.`);
+  }
+  // for...of visits array holes (as undefined) where every()/forEach would
+  // skip them, so a sparse list cannot slip a hole past this check.
+  for (const item of value) {
+    if (item === null) continue;
+    if (typeof item === 'string') {
+      if (item.includes('\0')) {
+        throw new Error('Console parameters must not contain NUL bytes; SQLite would bind the text truncated at the first one.');
+      }
+      continue;
+    }
+    if (typeof item === 'number' && Number.isFinite(item)) continue;
+    throw new Error('Console parameters must be null, string, or finite number values.');
+  }
+  return value;
+}
+
+/**
+ * Bind the run's parameters to one statement, naming the count in the failure:
+ * SQLite's own wording for a value with no placeholder is "column index out of
+ * range", which reads as a result-column problem to someone who typed `[1, 2]`
+ * over a one-placeholder statement.
+ */
+function bindConsoleParams(statement, params) {
+  try {
+    statement.bind(params);
+  } catch (error) {
+    throw new Error(
+      `cannot bind ${params.length} positional parameter${params.length === 1 ? '' : 's'}: `
+      + getErrorMessage(error)
+    );
+  }
+}
+
+/**
+ * Bounds mirrored from src/runtime/query-plan.c (PLAN_MAX_SQL_BYTES,
+ * SQLITE_EXPLORER_PLAN_MAX_DETAIL_BYTES) so the built-in EXPLAIN path refuses
+ * exactly what the bounded reader refuses, on whichever engine answers.
+ */
+const QUERY_PLAN_MAX_SQL_BYTES = 4 * 65536;
+const QUERY_PLAN_MAX_DETAIL_BYTES = 65536;
+/** EXPLAIN QUERY PLAN's fixed result shape; query-plan.c asserts the same four. */
+const QUERY_PLAN_HEADERS = Object.freeze(['id', 'parent', 'notused', 'detail']);
+const QUERY_PLAN_UNSUPPORTED = 'SQLite returned an unsupported query plan.';
+/** Leading `PRAGMA`, after leading trivia is stripped. */
+const PRAGMA_PREFIX = /^pragma\b/i;
+
+/**
+ * Arm the bounded EXPLAIN QUERY PLAN reader compiled into the vendored sql.js
+ * (src/runtime/query-plan.c). The export installs `sqlite_explorer_query_plan`
+ * as an auto-extension, so it must run before the first connection opens and
+ * needs to run once per module. Absent on an older build (the console then
+ * falls back to SQLite's own EXPLAIN on this engine too); a build that HAS
+ * it and fails to register is broken rather than old, and mirrors the
+ * extension host's own refusal to open (src/core/sqlite-db.ts).
+ *
+ * @param {{ _sqlite_explorer_register_query_plan?: () => number }} module
+ * @returns {boolean} whether the reader is available on this module
+ */
+function registerQueryPlanReader(module) {
+  const register = module?._sqlite_explorer_register_query_plan;
+  if (typeof register !== 'function') return false;
+  if (register() !== 0) throw new Error('Unable to initialize the bounded query-plan reader.');
+  return true;
+}
+
+/**
+ * Skip leading whitespace, line (`--`) and block comments, so a leading
+ * keyword check sees the statement's real first token. Mirrors the native
+ * shim's stripLeadingTrivia (core/native/sqljs-shim.js) minus its
+ * empty-statement skipping: here the text is one normalised statement.
+ */
+function stripLeadingSqlTrivia(text) {
+  let index = 0;
+  for (;;) {
+    const before = index;
+    while (index < text.length && /\s/.test(text[index])) index += 1;
+    if (text.startsWith('--', index)) {
+      const lineEnd = text.indexOf('\n', index);
+      index = lineEnd < 0 ? text.length : lineEnd + 1;
+    } else if (text.startsWith('/*', index)) {
+      const blockEnd = text.indexOf('*/', index + 2);
+      index = blockEnd < 0 ? text.length : blockEnd + 2;
+    }
+    if (index === before) return text.slice(index);
+  }
+}
+
+/**
+ * Does `sql` compile as a single read query? The probe is the bounded reader's
+ * own admission test (query-plan.c compiles `SELECT * FROM (sql)` before it
+ * touches the original text): a DML/DDL statement, a PRAGMA, a second
+ * statement after a `;` -- none of them parse inside a subquery. Compile only,
+ * never stepped; the statement is freed at once.
+ */
+function compilesAsReadQuery(sql) {
+  let statement;
+  try {
+    statement = db.prepare(`SELECT * FROM (\n${sql}\n)`);
+  } catch {
+    return false;
+  }
+  statement.free();
+  return true;
+}
+
+/** Shape a list of plan rows as one console result set, capped like a read query's rows. */
+function toPlanResultSet(rows) {
+  return {
+    headers: [...QUERY_PLAN_HEADERS],
+    rows: rows.slice(0, SQL_RESULT_ROWS),
+    truncated: rows.length > SQL_RESULT_ROWS
+  };
+}
+
+/**
+ * The plan through the bounded reader: ONE statement, the user's SQL crossing
+ * as a bound value (so no character of it can escape into a second
+ * statement), compiled under clamped connection limits, at most 1001 rows of
+ * at most 64 KiB detail each, returned as JSON the C side already escaped.
+ * The reader also binds the caller's parameters, so the planner sees the
+ * values a real run would (LIKE optimisation, stat4 estimates).
+ */
+function readQueryPlanBounded(sql, params) {
+  const request = queryPlanRequest(sql, params);
+  const statement = db.prepare(request.sql);
+  try {
+    statement.bind(request.params);
+    if (!statement.step()) throw new Error(QUERY_PLAN_UNSUPPORTED);
+    return toPlanResultSet(decodeQueryPlan(statement.get()[0]).rows);
+  } finally {
+    statement.free();
+  }
+}
+
+/**
+ * The plan through SQLite's own `EXPLAIN QUERY PLAN <sql>`: the native engine
+ * has no reader (its fork disables loadable extensions), and on WASM this is
+ * the route for a statement the reader will not admit -- a DML statement has a
+ * plan worth reading too.
+ *
+ * What the reader guaranteed structurally is re-established here piece by
+ * piece: prepareSingleStatement's boundary marker refuses a second statement
+ * (only the first would ever be compiled, so nothing after a `;` runs -- but
+ * the user asked about their whole text, and an answer about half of it is
+ * wrong); rows and detail bytes are capped to the reader's limits; and a
+ * leading PRAGMA is refused BEFORE compiling, because flag pragmas take effect
+ * at sqlite3_prepare time -- `EXPLAIN QUERY PLAN PRAGMA query_only = ON` would
+ * arm the pragma while displaying nothing, on both engines (verified against
+ * the vendored WASM build; the runConsole drain guard exists for the same
+ * reason). PRAGMA is always a statement's leading token, so the leading-token
+ * check is complete.
+ *
+ * EXPLAIN itself never executes the statement it describes: SQLite runs the
+ * compiled program in listing mode, so ATTACH, VACUUM INTO and transaction
+ * control inside the text are listed, not performed (the native shim's
+ * leading-token guards for those see `EXPLAIN` here and stand aside, which is
+ * why this path must not, and does not, execute).
+ */
+function readQueryPlanBuiltin(sql, params) {
+  if (PRAGMA_PREFIX.test(stripLeadingSqlTrivia(sql))) {
+    throw new Error(
+      'PRAGMA statements have no query plan (and some pragmas take effect while being '
+      + 'compiled, so they are not even prepared here). Use Run.'
+    );
+  }
+  const statement = prepareSingleStatement(`EXPLAIN QUERY PLAN ${sql}`);
+  try {
+    if (params.length > 0) bindConsoleParams(statement, params);
+    const rows = [];
+    // One lookahead row past the display cap marks truncation, as the reader's
+    // 1001-row ceiling does. Stopping early is safe here and nowhere else in
+    // this file: a listing has no side effects to run to completion.
+    while (rows.length <= SQL_RESULT_ROWS && statement.step()) {
+      const row = statement.get();
+      if (row.length !== QUERY_PLAN_HEADERS.length || typeof row[3] !== 'string') {
+        throw new Error(QUERY_PLAN_UNSUPPORTED);
+      }
+      if (new TextEncoder().encode(row[3]).byteLength > QUERY_PLAN_MAX_DETAIL_BYTES) {
+        throw new Error('Query plan detail exceeds the 65,536-byte limit.');
+      }
+      rows.push(row);
+    }
+    return toPlanResultSet(rows);
+  } finally {
+    statement.free();
+  }
+}
+
+/**
+ * EXPLAIN QUERY PLAN for exactly one statement, by whichever mechanism this
+ * engine offers:
+ *
+ *   - WASM, read query: the bounded reader (readQueryPlanBounded), admitted by
+ *     the same compile probe the reader applies internally so its admission
+ *     refusal -- a syntax error naming the first non-SELECT token -- is never
+ *     what the user sees for a perfectly good UPDATE.
+ *   - WASM, anything else, and the native engine always: SQLite's own EXPLAIN
+ *     QUERY PLAN statement (readQueryPlanBuiltin), bounded here in JavaScript
+ *     to the reader's limits.
+ *
+ * Both answer the same four columns, so the console cannot tell them apart --
+ * which is the point: query plans work on both desktop engines.
+ *
+ * A single trailing `;` is stripped first (normalizeViewSelectSql's exact
+ * job): it is conventional in a console and fatal to both mechanisms, which
+ * would otherwise refuse `SELECT 1;` as a syntax error inside the reader's
+ * subquery or as "two statements" at the boundary marker.
+ *
+ * @param {string} sql
+ * @param {Array<null | string | number>} params
+ * @returns {{ headers: string[], rows: unknown[][], truncated: boolean }}
+ */
+function readQueryPlan(sql, params) {
+  if (typeof sql !== 'string' || sql.trim() === '') {
+    throw new Error('Enter one SQL statement to explain.');
+  }
+  if (new TextEncoder().encode(sql).byteLength > QUERY_PLAN_MAX_SQL_BYTES) {
+    throw new Error('Query plan SQL exceeds 262,144 UTF-8 bytes.');
+  }
+  const body = normalizeViewSelectSql(sql);
+  if (queryPlanReaderActive && compilesAsReadQuery(body)) return readQueryPlanBounded(body, params);
+  return readQueryPlanBuiltin(body, params);
 }
 
 /**
@@ -1257,8 +1530,24 @@ function clampConsoleMaxStatements(maxStatements) {
  * the file dirty, and honour instantCommit. A rejected mutation is an untracked
  * mutation.
  *
+ * POSITIONAL PARAMETERS (`options.params`) bind to EVERY statement of the
+ * script, so a parameterised run is in practice a single statement: SQLite
+ * refuses a value with no placeholder to land in (SQLITE_RANGE), and that
+ * refusal is reported against the statement it hit rather than silently
+ * dropping the value. Neither engine exposes `sqlite3_bind_parameter_count`,
+ * so binding only where placeholders exist is not an option here. Fewer values
+ * than placeholders leaves the rest NULL, as SQLite always has.
+ *
+ * EXPLAIN (`options.explain`): the plan of ONE statement, never its
+ * execution -- see readQueryPlan for the two engine mechanisms. It answers the
+ * same shape as a run (one result set of `id, parent, notused, detail` rows,
+ * `mutated`/`changes` measured for real) plus `explain: true`, so the
+ * renderer and the host need no second contract; a refused or failed plan
+ * resolves with `error` like an execution-phase failure would, because the
+ * page renders both through the same pane.
+ *
  * @param {string} sql - One or more semicolon-separated SQL statements
- * @param {{ maxRows?: number, maxStatements?: number }} [options]
+ * @param {{ maxRows?: number, maxStatements?: number, params?: unknown[], explain?: boolean }} [options]
  * @param {Int32Array} [cancellationFlag] - Shared cancellation flag; mirrors runQuery
  * @returns {Promise<{
  *   results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>,
@@ -1266,6 +1555,7 @@ function clampConsoleMaxStatements(maxStatements) {
  *   changes: number,
  *   durationMs: number,
  *   statementsSkipped?: boolean,
+ *   explain?: boolean,
  *   error?: string,
  *   multiStatement?: boolean
  * }>} `statementsSkipped` means the statement cap left part of the script
@@ -1297,6 +1587,9 @@ async function runConsole(sql, options = {}, cancellationFlag) {
     );
   }
 
+  // PRE-EXECUTION guard too (throws): a malformed parameter list is a caller
+  // error, and nothing has run yet.
+  const params = normalizeConsoleParams(options.params);
   const maxRows = clampConsoleMaxRows(options.maxRows);
   const maxStatements = clampConsoleMaxStatements(options.maxStatements);
   const startedAt = Date.now();
@@ -1315,6 +1608,46 @@ async function runConsole(sql, options = {}, cancellationFlag) {
       durationMs: Date.now() - startedAt
     };
   };
+
+  // The failure-path read of the same metadata. Unreachable today:
+  // total_changes()/schema_version cannot fail on a handle that just executed
+  // SQL. But if the handle ever IS wedged badly enough to refuse them, guess
+  // DIRTY. That direction is the safe one -- a false "mutated" costs a
+  // redundant undo barrier and a Save prompt, while a false "clean" silently
+  // discards real writes, which is the exact bug this whole resolve-on-failure
+  // path exists to prevent.
+  const mutationMetadataAfterFailure = () => {
+    try {
+      return mutationMetadata();
+    } catch {
+      return { mutated: true, changes: 0, durationMs: Date.now() - startedAt };
+    }
+  };
+
+  if (options.explain === true) {
+    // Measured, not assumed: a plan lookup compiles and lists and never
+    // executes, and `mutated` here is what proves it to the host on every
+    // run (the host skips its session-transaction bracket for EXPLAIN on the
+    // strength of this contract, and still honours a `mutated: true`).
+    try {
+      const plan = executeWithProgressHandler(
+        () => readQueryPlan(sql, params),
+        cancellationFlag
+      );
+      return { results: [plan], explain: true, statementsSkipped: false, ...mutationMetadata() };
+    } catch (error) {
+      // No `statement N:` prefix: a plan is always exactly one statement, and
+      // the refusals below already say what is wrong with it.
+      return {
+        results: [],
+        error: getErrorMessage(error),
+        explain: true,
+        multiStatement: false,
+        statementsSkipped: false,
+        ...mutationMetadataAfterFailure()
+      };
+    }
+  }
 
   let statementIndex = 0;
   let statementsSkipped = false;
@@ -1340,6 +1673,7 @@ async function runConsole(sql, options = {}, cancellationFlag) {
         if (step.done) break;
         const statement = step.value;
         try {
+          if (params.length > 0) bindConsoleParams(statement, params);
           // Zero columns BEFORE the first step is authoritative on sql.js --
           // sqlite3_column_count is known at prepare time, so it really does
           // mean DML/DDL. It is NOT authoritative on the native shim, whose
@@ -1479,18 +1813,7 @@ async function runConsole(sql, options = {}, cancellationFlag) {
     // silently misses and double-wraps via String(error). Built BEFORE the
     // metadata read so a second failure there cannot lose the real one.
     const message = `statement ${statementIndex}: ${getErrorMessage(error)}`;
-    let metadata;
-    try {
-      metadata = mutationMetadata();
-    } catch {
-      // Unreachable today: total_changes()/schema_version cannot fail on a
-      // handle that just executed SQL. But if the handle ever IS wedged badly
-      // enough to refuse them, guess DIRTY. That direction is the safe one --
-      // a false "mutated" costs a redundant undo barrier and a Save prompt,
-      // while a false "clean" silently discards real writes, which is the
-      // exact bug this whole resolve-on-failure path exists to prevent.
-      metadata = { mutated: true, changes: 0, durationMs: Date.now() - startedAt };
-    }
+    const metadata = mutationMetadataAfterFailure();
     return {
       results: [],
       error: message,

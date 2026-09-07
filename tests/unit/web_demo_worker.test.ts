@@ -5972,9 +5972,10 @@ describe('web demo view worker', () => {
     });
 
     it('runs only the first statement under maxStatements and reports the rest as skipped', async () => {
-        // What EXPLAIN does: explainWrap only prefixes statement 1, so without
-        // this cap the tail of a script would execute for real behind a button
-        // the user reads as read-only diagnostics.
+        // The cap the console's EXPLAIN button used to ride (a prefixed
+        // `EXPLAIN QUERY PLAN` only ever covers statement 1, so without a cap
+        // the tail would execute for real). EXPLAIN now has its own
+        // single-statement path; the cap remains a supported option.
         const worker = await createWorkerHarness();
         await worker.invoke('runConsole', 'CREATE TABLE console_cap_stmt (id INTEGER)');
 
@@ -6048,10 +6049,10 @@ describe('web demo view worker', () => {
         assert.strictEqual(result.statementsSkipped, false);
     });
 
-    it('shows a capped EXPLAIN its plan even when a later statement would fail to compile', async () => {
+    it('shows a capped run its first result even when a later statement would fail to compile', async () => {
         // The drain that frees the iterator must swallow prepare errors from
-        // statements it deliberately did not run, or EXPLAIN would report a
-        // failure instead of the plan the user asked for.
+        // statements it deliberately did not run, or a capped run would report
+        // a failure instead of the result the user asked for.
         const worker = await createWorkerHarness();
 
         const result = await worker.invoke(
@@ -6725,5 +6726,366 @@ describe('web demo worker engine defects', () => {
             ),
             'kept'
         );
+    });
+});
+
+/**
+ * The SQL console's query plans and positional parameters, driven through the
+ * REAL worker bundle against the REAL vendored sql.js. Two engine mechanisms
+ * answer EXPLAIN on the desktop -- the bounded reader compiled into sql.js
+ * (armed here at init) and SQLite's own `EXPLAIN QUERY PLAN` statement (the
+ * native sidecar's only route, and WASM's route for anything the reader will
+ * not admit) -- so both are exercised, and both are held to the same limits.
+ */
+describe('web demo worker SQL console query plans and parameters', () => {
+    const PLAN_HEADERS = ['id', 'parent', 'notused', 'detail'];
+
+    /** A table with an index the planner can be seen choosing. */
+    async function withIndexedTable(worker: WorkerHarness) {
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE plan_target (a INTEGER PRIMARY KEY, b TEXT); ' +
+            'CREATE INDEX plan_target_b ON plan_target(b); ' +
+            "INSERT INTO plan_target VALUES (1, 'x'), (2, 'y')"
+        );
+    }
+
+    /** The connection's mutation counters, read directly rather than through runConsole's own report. */
+    async function counters(worker: WorkerHarness) {
+        return [
+            await workerScalar(worker, 'SELECT total_changes()'),
+            await workerScalar(worker, 'PRAGMA schema_version')
+        ];
+    }
+
+    it('arms the bounded query-plan reader on the sql.js module at init', async () => {
+        const worker = await createWorkerHarness();
+
+        // The SQL function only exists on a connection opened after the
+        // auto-extension was registered, so its presence IS the proof that
+        // initializeDatabase registered it before opening.
+        const result = await worker.invoke(
+            'runQuery',
+            "SELECT sqlite_explorer_query_plan('SELECT 1') AS plan"
+        );
+        const plan = JSON.parse(result[0].rows[0][0]);
+        assert.strictEqual(Array.isArray(plan), true);
+        assert.strictEqual(plan.length, 1);
+        assert.strictEqual(plan[0].length, 4);
+        assert.match(plan[0][3], /SCAN CONSTANT ROW/);
+    });
+
+    it('refuses to open when a build that ships the reader fails to register it', async () => {
+        // Mirrors the extension host (src/core/sqlite-db.ts): a build that HAS
+        // the export and cannot arm it is broken, not old.
+        await assert.rejects(
+            createWorkerHarness({
+                initSqlJs: async (config: any) => ({
+                    ...(await initSqlJs(config)),
+                    _sqlite_explorer_register_query_plan: () => 1
+                })
+            }),
+            /Unable to initialize the bounded query-plan reader/
+        );
+    });
+
+    it('explains a read query through the reader, with its parameters bound', async () => {
+        const prepared: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => { if (kind === 'prepare') prepared.push(sql); }
+        });
+        await withIndexedTable(worker);
+        const before = await counters(worker);
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT a FROM plan_target WHERE b = ?',
+            { explain: true, params: ['x'] }
+        );
+
+        // The reader route: the user's SQL crossed as a bound value of the
+        // reader function, and no EXPLAIN statement was ever prepared.
+        assert.ok(prepared.includes('SELECT sqlite_explorer_query_plan(?, ?) AS plan'), prepared.join('\n'));
+        assert.strictEqual(prepared.some(sql => /^EXPLAIN QUERY PLAN/.test(sql)), false);
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.explain, true);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(result.changes, 0);
+        assert.strictEqual(result.statementsSkipped, false);
+        assert.strictEqual(result.results.length, 1);
+        assert.deepStrictEqual(Array.from(result.results[0].headers), PLAN_HEADERS);
+        assert.strictEqual(result.results[0].truncated, false);
+        const details = result.results[0].rows.map((row: unknown[]) => row[3]);
+        assert.ok(details.length >= 1);
+        // The planner chose the index -- a plan, not a placeholder.
+        assert.match(details.join('\n'), /SEARCH plan_target USING (COVERING )?INDEX plan_target_b/);
+        for (const row of result.results[0].rows) {
+            assert.strictEqual(row.length, 4);
+            assert.strictEqual(typeof row[3], 'string');
+        }
+        assert.deepStrictEqual(await counters(worker), before);
+    });
+
+    it('the reader answers exactly what SQLite\'s own EXPLAIN QUERY PLAN says for the same text', async () => {
+        const worker = await createWorkerHarness();
+        await withIndexedTable(worker);
+        const sql = 'SELECT a FROM plan_target WHERE b = ? ORDER BY a';
+
+        const viaReader = await worker.invoke('runConsole', sql, { explain: true, params: ['x'] });
+        const viaSqlite = await worker.invoke('runConsole', `EXPLAIN QUERY PLAN ${sql}`);
+
+        assert.deepStrictEqual(
+            Array.from(viaReader.results[0].rows, (row: unknown[]) => Array.from(row)),
+            Array.from(viaSqlite.results[0].rows, (row: unknown[]) => Array.from(row))
+        );
+    });
+
+    it('accepts one trailing semicolon, as a console user types it', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke('runConsole', 'SELECT 1;', { explain: true });
+
+        assert.strictEqual(result.error, undefined);
+        assert.match(result.results[0].rows[0][3], /SCAN CONSTANT ROW/);
+    });
+
+    it('refuses a second statement and runs nothing from it', async () => {
+        const worker = await createWorkerHarness();
+        await withIndexedTable(worker);
+
+        const result = await worker.invoke(
+            'runConsole',
+            "SELECT 1; INSERT INTO plan_target VALUES (3, 'z')",
+            { explain: true }
+        );
+
+        assert.match(result.error, /Exactly one SQL statement is required/);
+        // Not "statements before the error were applied": nothing runs on this path.
+        assert.strictEqual(result.multiStatement, false);
+        assert.strictEqual(result.explain, true);
+        assert.strictEqual(result.mutated, false);
+        assert.deepStrictEqual(Array.from(result.results), []);
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM plan_target'), 2);
+    });
+
+    it('explains a DML statement through SQLite\'s own EXPLAIN without executing it', async () => {
+        // The reader admits read queries only; a DML plan is still worth
+        // reading (does my UPDATE hit the index?), and it is what the native
+        // engine answers for everything.
+        const worker = await createWorkerHarness();
+        await withIndexedTable(worker);
+        const before = await counters(worker);
+
+        const result = await worker.invoke(
+            'runConsole',
+            "UPDATE plan_target SET b = 'changed' WHERE a = ?",
+            { explain: true, params: [1] }
+        );
+
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.explain, true);
+        assert.deepStrictEqual(Array.from(result.results[0].headers), PLAN_HEADERS);
+        assert.match(
+            result.results[0].rows.map((row: unknown[]) => row[3]).join('\n'),
+            /SEARCH plan_target USING INTEGER PRIMARY KEY/
+        );
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(await workerScalar(worker, 'SELECT b FROM plan_target WHERE a = 1'), 'x');
+        assert.deepStrictEqual(await counters(worker), before);
+    });
+
+    it('refuses to explain a PRAGMA before compiling it, so a flag pragma cannot take effect', async () => {
+        // Flag pragmas apply at sqlite3_prepare time; `EXPLAIN QUERY PLAN
+        // PRAGMA query_only = ON` would arm the pragma and display nothing.
+        const worker = await createWorkerHarness();
+
+        for (const sql of ['PRAGMA query_only = ON', '  -- note\n  pragma query_only = ON;']) {
+            const result = await worker.invoke('runConsole', sql, { explain: true });
+            assert.match(result.error, /PRAGMA statements have no query plan/, sql);
+            assert.strictEqual(result.mutated, false);
+        }
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        // Still writable: the connection was not silently write-locked.
+        const write = await worker.invoke('runConsole', 'CREATE TABLE pragma_probe (id INTEGER)');
+        assert.strictEqual(write.error, undefined);
+        assert.strictEqual(write.mutated, true);
+    });
+
+    it('reports a parameter-count mismatch from the reader in its own words', async () => {
+        const worker = await createWorkerHarness();
+
+        const none = await worker.invoke('runConsole', 'SELECT ? AS v', { explain: true });
+        assert.match(none.error, /Query plan positional parameter count does not match/);
+
+        const extra = await worker.invoke('runConsole', 'SELECT ? AS v', { explain: true, params: [1, 2] });
+        assert.match(extra.error, /Query plan positional parameter count does not match/);
+
+        const exact = await worker.invoke('runConsole', 'SELECT ? AS v', { explain: true, params: [1] });
+        assert.strictEqual(exact.error, undefined);
+        assert.strictEqual(exact.results[0].rows.length, 1);
+    });
+
+    it('caps a plan at 1000 displayed entries with one lookahead marking truncation, on both mechanisms', async () => {
+        const worker = await createWorkerHarness();
+        // 1100 scalar subqueries: SQLite lists two plan entries per subquery,
+        // so both routes must stop reading well before the end.
+        const subqueries = Array.from({ length: 1100 }, () => '(SELECT 1)').join(', ');
+
+        // Reader route: a read query.
+        const read = await worker.invoke('runConsole', `SELECT ${subqueries}`, { explain: true });
+        assert.strictEqual(read.error, undefined);
+        assert.strictEqual(read.results[0].rows.length, 1000);
+        assert.strictEqual(read.results[0].truncated, true);
+        // The reader restores the connection limits it clamped.
+        assert.strictEqual(await workerScalar(worker, 'SELECT length(zeroblob(2097152))'), 2097152);
+
+        // Built-in route: the same SELECT feeding an INSERT (DML is not a read query).
+        const columns = Array.from({ length: 1100 }, (_, i) => `c${i}`).join(', ');
+        await worker.invoke('runQuery', `CREATE TABLE wide_plan (${columns})`);
+        const dml = await worker.invoke(
+            'runConsole',
+            `INSERT INTO wide_plan SELECT ${subqueries}`,
+            { explain: true }
+        );
+        assert.strictEqual(dml.error, undefined);
+        assert.strictEqual(dml.results[0].rows.length, 1000);
+        assert.strictEqual(dml.results[0].truncated, true);
+        assert.strictEqual(dml.mutated, false);
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM wide_plan'), 0);
+    });
+
+    it('refuses SQL text over the reader\'s 262,144-byte limit on either route', async () => {
+        const worker = await createWorkerHarness();
+        const huge = `SELECT '${'x'.repeat(262_144)}'`;
+
+        const result = await worker.invoke('runConsole', huge, { explain: true });
+
+        assert.match(result.error, /Query plan SQL exceeds 262,144 UTF-8 bytes/);
+    });
+
+    it('falls back to SQLite\'s own EXPLAIN when the sql.js build has no reader', async () => {
+        // An older vendored build: `_sqlite_explorer_register_query_plan`
+        // absent. The console must still answer plans -- this is also the
+        // shape the native sidecar's engine presents. (The sql.js glue caches
+        // ONE module per import, so an earlier harness's auto-extension is
+        // still registered on this connection; the route is therefore proven
+        // by the SQL the worker prepares, not by the function's absence.)
+        const prepared: string[] = [];
+        const worker = await createWorkerHarness({
+            initSqlJs: async (config: any) => ({
+                ...(await initSqlJs(config)),
+                _sqlite_explorer_register_query_plan: undefined
+            }),
+            onSql: (kind, sql) => { if (kind === 'prepare') prepared.push(sql); }
+        });
+        await withIndexedTable(worker);
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT a FROM plan_target WHERE b = ?',
+            { explain: true, params: ['x'] }
+        );
+        assert.strictEqual(prepared.some(sql => sql.includes('sqlite_explorer_query_plan')), false, prepared.join('\n'));
+        assert.ok(prepared.some(sql => /^EXPLAIN QUERY PLAN SELECT a FROM plan_target WHERE b = \?\n\/\*sqlite_explorer_boundary_/.test(sql)), prepared.join('\n'));
+        assert.strictEqual(result.error, undefined);
+        assert.deepStrictEqual(Array.from(result.results[0].headers), PLAN_HEADERS);
+        assert.match(
+            result.results[0].rows.map((row: unknown[]) => row[3]).join('\n'),
+            /SEARCH plan_target USING (COVERING )?INDEX plan_target_b/
+        );
+        // The reader's structural guarantees are re-established in JavaScript.
+        const two = await worker.invoke('runConsole', 'SELECT 1; SELECT 2', { explain: true });
+        assert.match(two.error, /Exactly one SQL statement is required/);
+        const pragma = await worker.invoke('runConsole', 'PRAGMA foreign_keys = OFF', { explain: true });
+        assert.match(pragma.error, /PRAGMA statements have no query plan/);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA foreign_keys'), 1);
+    });
+
+    it('rejects EXPLAIN on a read-only database exactly as it rejects a run', async () => {
+        const worker = await createWorkerHarness({ readOnlyMode: true });
+
+        await assert.rejects(
+            worker.invoke('runConsole', 'SELECT 1', { explain: true }),
+            /read-only/
+        );
+    });
+
+    it('binds positional parameters to a run, to every statement of it', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE param_rows (id INTEGER, label TEXT)');
+
+        const inserted = await worker.invoke(
+            'runConsole',
+            'INSERT INTO param_rows VALUES (?, ?)',
+            { params: [7, 'seven'] }
+        );
+        assert.strictEqual(inserted.error, undefined);
+        assert.strictEqual(inserted.mutated, true);
+        assert.strictEqual(inserted.changes, 1);
+
+        const selected = await worker.invoke(
+            'runConsole',
+            'SELECT label FROM param_rows WHERE id = ?; SELECT ? * 2 AS twice',
+            { params: [7] }
+        );
+        assert.strictEqual(selected.error, undefined);
+        assert.deepStrictEqual(Array.from(selected.results[0].rows[0]), ['seven']);
+        assert.deepStrictEqual(Array.from(selected.results[1].rows[0]), [14]);
+
+        // NULL, text and floating point cross as themselves.
+        const typed = await worker.invoke(
+            'runConsole',
+            'SELECT ? IS NULL AS n, typeof(?) AS t, ? + 0.5 AS f',
+            { params: [null, 'text', 1] }
+        );
+        assert.deepStrictEqual(Array.from(typed.results[0].rows[0]), [1, 'text', 1.5]);
+    });
+
+    it('reports a value with no placeholder against the statement it hit, naming the count', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE param_over (id INTEGER)');
+
+        const result = await worker.invoke(
+            'runConsole',
+            'INSERT INTO param_over VALUES (?); SELECT 1;',
+            { params: [1, 2] }
+        );
+
+        // Statement 1 has one placeholder for two values: refused BEFORE it
+        // runs, so the table stays empty and the failure is statement 1's.
+        assert.match(result.error, /^statement 1: cannot bind 2 positional parameters: /);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM param_over'), 0);
+    });
+
+    it('rejects a malformed parameter list before anything runs', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE param_guard (id INTEGER)');
+        const attempts: Array<[unknown, RegExp]> = [
+            ['[1]', /must be a JSON array/],
+            [{ length: 1, 0: 1 }, /must be a JSON array/],
+            [[true], /null, string, or finite number/],
+            [[Number.NaN], /null, string, or finite number/],
+            [[{ toString: () => '1' }], /null, string, or finite number/],
+            [['a\0b'], /NUL/],
+            [Array.from({ length: 101 }, () => 1), /at most 100/],
+            // A hole is a value class of its own (undefined), and must not be skipped.
+            // eslint-disable-next-line no-sparse-arrays
+            [[1, , 3], /null, string, or finite number/]
+        ];
+        for (const [params, expected] of attempts) {
+            await assert.rejects(
+                worker.invoke('runConsole', 'INSERT INTO param_guard VALUES (1)', { params }),
+                expected,
+                JSON.stringify(params)
+            );
+        }
+        // Pre-execution: none of them ran.
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM param_guard'), 0);
+        // Absent and null both mean "no parameters".
+        for (const params of [undefined, null]) {
+            const result = await worker.invoke('runConsole', 'SELECT 1 AS ok', { params });
+            assert.strictEqual(result.error, undefined);
+        }
     });
 });

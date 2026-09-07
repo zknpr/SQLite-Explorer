@@ -1,11 +1,11 @@
 /**
- * SQL console module — a CodeMirror 6 SQL editor plus its history/EXPLAIN
- * helpers, for the desktop-only SQL console. Pure frontend: this file does
- * NOT import desktop-host.js or api.js. The run action calls the injected
- * `runSql` callback and history persistence goes through the injected
- * `loadHistory`/`saveHistory` callbacks — the caller (desktop-viewer.js)
- * wires the real backendApi-backed implementations; here they're just
- * function-shaped dependencies.
+ * SQL console module — a CodeMirror 6 SQL editor plus its history, EXPLAIN
+ * and positional-parameter helpers, for the desktop-only SQL console. Pure
+ * frontend: this file does NOT import desktop-host.js or api.js. The run
+ * action calls the injected `runSql` callback and history persistence goes
+ * through the injected `loadHistory`/`saveHistory` callbacks — the caller
+ * (desktop-viewer.js) wires the real backendApi-backed implementations; here
+ * they're just function-shaped dependencies.
  */
 import { EditorState, Compartment } from '@codemirror/state';
 import { EditorView, keymap, lineNumbers } from '@codemirror/view';
@@ -13,6 +13,7 @@ import { defaultKeymap, history as cmHistory, historyKeymap } from '@codemirror/
 import { sql, SQLite } from '@codemirror/lang-sql';
 import { autocompletion } from '@codemirror/autocomplete';
 import { modLabel } from './platform.js';
+import { parseQueryParameters } from '../../../src/core/sql-workspace.ts';
 
 export const HISTORY_CAP = 50;
 export const HISTORY_ENTRY_MAX = 4096;
@@ -41,18 +42,29 @@ export function pushHistory(list, sqlText) {
 }
 
 /**
- * Prefixes `sqlText` with `EXPLAIN QUERY PLAN ` unless it already starts
- * (after leading whitespace) with `explain`, case-insensitively — so
- * re-running EXPLAIN on text loaded back from history doesn't stack a
- * second prefix.
- *
- * Note that this only ever prefixes the FIRST statement of a script. The
- * EXPLAIN action therefore also caps execution at one statement
- * (`maxStatements: 1`); without that, a diagnostics button would run the rest
- * of the script for real.
+ * Removes a leading `EXPLAIN` / `EXPLAIN QUERY PLAN` (case-insensitive, after
+ * leading whitespace) so that EXPLAIN on text the user already wrote as an
+ * EXPLAIN — or loaded back from history that way — explains the statement
+ * inside it rather than asking the worker to plan a plan, which SQLite rejects
+ * as a syntax error. The worker owns the actual wrapping (`options.explain`);
+ * this module never builds SQL.
  */
-export function explainWrap(sqlText) {
-    return /^\s*explain\b/i.test(sqlText) ? sqlText : `EXPLAIN QUERY PLAN ${sqlText}`;
+export function stripExplainPrefix(sqlText) {
+    return String(sqlText).replace(/^\s*explain\b(?:\s+query\s+plan\b)?\s*/i, '');
+}
+
+/**
+ * The positional parameters typed into the console's parameter field, as the
+ * list the worker binds: blank is "no parameters", anything else must be the
+ * JSON array parseQueryParameters accepts (null, string, number values; at
+ * most 100; exact integers beyond 2^53 as quoted strings). Throws with that
+ * function's own message, which the run action shows in the notice line
+ * instead of sending anything.
+ */
+export function parseConsoleParameters(text) {
+    const trimmed = String(text ?? '').trim();
+    if (trimmed === '') return [];
+    return parseQueryParameters(trimmed);
 }
 
 /**
@@ -102,7 +114,7 @@ const consoleTheme = EditorView.theme({
 /**
  * Builds a CodeMirror 6 SQL console inside `container`. The module owns and
  * builds all of its own DOM under `container` (Run + EXPLAIN buttons, history
- * prev/next + dropdown, the editor, a notice line) — it makes no assumptions
+ * prev/next + dropdown, the parameter field, the editor, a notice line) — it makes no assumptions
  * about `container`'s existing children (it clears them first) and never
  * reaches outside `container` into the rest of the page. show()/hide()/toggle() therefore
  * only ever touch `container`'s own `hidden` attribute; any page-level
@@ -132,14 +144,14 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
     runButton.title = `Run (${modLabel('↩')})`;
     runButton.textContent = 'Run';
 
-    // EXPLAIN lives here rather than in the caller: it is the module's own
-    // explainWrap() applied to the module's own editor text, and it must NOT
-    // go through runCurrent() — a query plan is a diagnostic detour, not a
-    // query the user asked to remember, so it records no history.
+    // EXPLAIN lives here rather than in the caller: it reads the module's own
+    // editor and parameter fields, and it must NOT go through runCurrent() — a
+    // query plan is a diagnostic detour, not a query the user asked to
+    // remember, so it records no history.
     const explainButton = document.createElement('button');
     explainButton.type = 'button';
     explainButton.className = 'sql-console-explain';
-    explainButton.title = 'Run EXPLAIN QUERY PLAN for the current statement (not recorded in history)';
+    explainButton.title = 'Show the query plan (EXPLAIN QUERY PLAN) for the statement, with the parameters bound; nothing is executed and nothing is recorded in history';
     explainButton.textContent = 'EXPLAIN';
 
     const prevButton = document.createElement('button');
@@ -163,6 +175,27 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
 
     controls.append(runButton, explainButton, prevButton, historySelect, nextButton, hint);
 
+    // Positional parameters, bound to the statement instead of pasted into it.
+    // A plain field rather than a second editor: the value is a small JSON
+    // array. It is deliberately NOT part of history — history keeps the SQL
+    // the user is working on; parameter values are data (and may be secrets).
+    const paramsRow = document.createElement('div');
+    paramsRow.className = 'sql-console-params-row';
+
+    const paramsLabel = document.createElement('label');
+    paramsLabel.className = 'sql-console-params-label';
+    paramsLabel.textContent = 'Parameters';
+
+    const paramsInput = document.createElement('input');
+    paramsInput.type = 'text';
+    paramsInput.className = 'sql-console-params';
+    paramsInput.spellcheck = false;
+    paramsInput.autocomplete = 'off';
+    paramsInput.placeholder = 'JSON array bound to ? placeholders, e.g. [42, "alice", null] — leave empty for none';
+    paramsInput.title = 'Positional parameters for the statement: a JSON array of null, string and number values (at most 100). Exact integers beyond 2^53 go as quoted strings with CAST(? AS INTEGER). Never saved with history.';
+    paramsLabel.append(paramsInput);
+    paramsRow.append(paramsLabel);
+
     const editorRoot = document.createElement('div');
     editorRoot.className = 'sql-console-editor';
 
@@ -170,7 +203,7 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
     notice.className = 'sql-console-notice';
     notice.hidden = true;
 
-    container.append(controls, editorRoot, notice);
+    container.append(controls, paramsRow, editorRoot, notice);
 
     // -1 = editing a fresh draft (not browsing history); 0..N-1 indexes into
     // loadHistory()'s newest-first list.
@@ -256,10 +289,32 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
         }
     }
 
+    /**
+     * The run options the parameter field contributes, or null after showing
+     * why the field cannot be used — in which case nothing must be sent, since
+     * running the statement without the values the user typed would silently
+     * bind NULLs in their place.
+     */
+    function readRunOptions() {
+        let params;
+        try {
+            params = parseConsoleParameters(paramsInput.value);
+        } catch (err) {
+            setNotice(`Parameters: ${err instanceof Error ? err.message : String(err)}`);
+            return null;
+        }
+        // An absent key, not an empty array: the wire is JSON on the native
+        // engine and the worker treats both the same, but "no parameters"
+        // should read as no parameters in every trace.
+        return params.length > 0 ? { params } : {};
+    }
+
     async function runCurrent() {
         const text = view.state.doc.toString();
         if (!text.trim()) return;
-        await execute(text);
+        const options = readRunOptions();
+        if (options === null) return;
+        await execute(text, options);
         // History records the attempt regardless of outcome — a failed
         // query is exactly the kind of thing a user wants to recall and fix.
         saveHistory(pushHistory(loadHistory(), text));
@@ -273,17 +328,20 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
     }
 
     /**
-     * Runs the editor's text wrapped in EXPLAIN QUERY PLAN, capped at ONE
-     * statement: the wrap only prefixes the first, so without the cap the
-     * tail of a multi-statement script would execute for real — a diagnostics
-     * button that mutates. No history write either: the recorded entry should
-     * be the query the user is working on, not the plan lookup, and the next
-     * Run records it anyway.
+     * Asks the worker for the query plan of the editor's statement, with the
+     * parameter field's values bound so the planner sees what a real run
+     * would. The worker owns the EXPLAIN wrapping and refuses anything but
+     * one statement; the only text handling here is dropping a leading
+     * EXPLAIN the user already typed. No history write: the recorded entry
+     * should be the query the user is working on, not the plan lookup, and
+     * the next Run records it anyway.
      */
     async function runExplain() {
         const text = view.state.doc.toString();
         if (!text.trim()) return;
-        await execute(explainWrap(text), { maxStatements: 1 });
+        const options = readRunOptions();
+        if (options === null) return;
+        await execute(stripExplainPrefix(text), { ...options, explain: true });
     }
 
     const runKeymap = keymap.of([

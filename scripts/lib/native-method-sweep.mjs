@@ -246,6 +246,87 @@ const SWEEP = [
             && body(bad).data?.mutated === false,
             'sweep/runConsole/error-resolves-with-a-named-error-and-no-phantom-rows',
             detail(bad));
+
+        // ---- positional parameters ----------------------------------------
+        // Bound, never interpolated, through the real fork binding.
+        const bound = await s.invoke('runConsole', [
+            'SELECT name FROM people WHERE id = ?', { params: [3] }
+        ]);
+        check(body(bound).success === true
+            && body(bound).data?.error === undefined
+            && JSON.stringify(body(bound).data?.results?.[0]?.rows) === JSON.stringify([['gamma']]),
+            'sweep/runConsole/params-bind-positionally', detail(bound));
+
+        // A value with no placeholder is a refusal, never a silently dropped
+        // value. The fork words it its own way (the shim binds at step), so
+        // only the class of the outcome is pinned: an error, no rows, nothing
+        // mutated.
+        const overBound = await s.invoke('runConsole', ['SELECT 1 AS one', { params: [1, 2] }]);
+        check(body(overBound).success === true
+            && typeof body(overBound).data?.error === 'string'
+            && (body(overBound).data?.results?.length ?? 0) === 0
+            && body(overBound).data?.mutated === false,
+            'sweep/runConsole/error-params-without-placeholders-are-refused-not-dropped',
+            detail(overBound));
+
+        // ---- EXPLAIN (the plan of ONE statement, nothing executed) -------
+        // The native engine has no bounded reader (its fork disables loadable
+        // extensions), so this is SQLite's own EXPLAIN QUERY PLAN through the
+        // shim, with the parameters bound so the planner sees real values.
+        const plan = await s.invoke('runConsole', [
+            'SELECT name FROM people WHERE id = ?', { explain: true, params: [2] }
+        ]);
+        const planRows = body(plan).data?.results?.[0]?.rows ?? [];
+        check(body(plan).success === true
+            && body(plan).data?.error === undefined
+            && body(plan).data?.explain === true
+            && body(plan).data?.mutated === false
+            && JSON.stringify(body(plan).data?.results?.[0]?.headers)
+                === JSON.stringify(['id', 'parent', 'notused', 'detail'])
+            && planRows.length >= 1
+            && planRows.every((row) => row.length === 4 && typeof row[3] === 'string')
+            && /SEARCH people USING INTEGER PRIMARY KEY/.test(planRows.map((row) => row[3]).join('\n')),
+            'sweep/runConsole/explain-happy-native-builtin-plan', detail(plan));
+
+        // A DML plan is listed, not executed: the row is untouched afterwards.
+        const dmlPlan = await s.invoke('runConsole', [
+            "UPDATE people SET name = 'renamed' WHERE id = ?", { explain: true, params: [1] }
+        ]);
+        const afterDml = await s.invoke('runQuery', ['SELECT name FROM people WHERE id = 1']);
+        check(body(dmlPlan).success === true
+            && body(dmlPlan).data?.error === undefined
+            && body(dmlPlan).data?.mutated === false
+            && (body(dmlPlan).data?.results?.[0]?.rows?.length ?? 0) >= 1
+            && body(afterDml).data?.[0]?.rows?.[0]?.[0] === 'alpha',
+            'sweep/runConsole/explain-dml-lists-without-executing', detail(dmlPlan));
+
+        // A second statement is refused outright and nothing from it runs.
+        const twoStatements = await s.invoke('runConsole', [
+            "SELECT 1; INSERT INTO people VALUES (9, 'smuggled', 'n9', NULL, 0, 0)", { explain: true }
+        ]);
+        const countAfter = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people']);
+        check(body(twoStatements).success === true
+            && /Exactly one SQL statement is required/.test(body(twoStatements).data?.error ?? '')
+            && body(twoStatements).data?.multiStatement === false
+            && body(twoStatements).data?.mutated === false
+            && body(countAfter).data?.[0]?.rows?.[0]?.[0] === 3,
+            'sweep/runConsole/error-explain-refuses-a-second-statement-and-runs-nothing',
+            detail(twoStatements));
+
+        // A flag pragma takes effect at PREPARE time, so EXPLAIN must refuse it
+        // before compiling: query_only must still read 0 and writes must still
+        // work afterwards.
+        const pragmaPlan = await s.invoke('runConsole', ['PRAGMA query_only = ON', { explain: true }]);
+        const queryOnly = await s.invoke('runQuery', ['PRAGMA query_only']);
+        const stillWritable = await s.invoke('runConsole', [
+            "UPDATE people SET note = 'still writable' WHERE id = 3"
+        ]);
+        check(body(pragmaPlan).success === true
+            && /PRAGMA statements have no query plan/.test(body(pragmaPlan).data?.error ?? '')
+            && body(queryOnly).data?.[0]?.rows?.[0]?.[0] === 0
+            && body(stillWritable).data?.mutated === true,
+            'sweep/runConsole/error-explain-refuses-pragma-and-arms-nothing',
+            `${detail(pragmaPlan)} queryOnly=${detail(queryOnly)}`);
     }],
 
     ['fetchTableData', async ({ s, check }) => {

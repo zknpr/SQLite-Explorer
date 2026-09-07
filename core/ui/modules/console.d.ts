@@ -20,12 +20,18 @@ export const HISTORY_ENTRY_MAX: number;
 export function pushHistory(list: readonly string[], sqlText: string): string[];
 
 /**
- * Prefixes `sqlText` with `EXPLAIN QUERY PLAN ` unless it already starts
- * (after leading whitespace) with `explain`, case-insensitively. Only the
- * first statement of a script is prefixed, which is why the EXPLAIN action
- * also passes `maxStatements: 1`.
+ * Removes a leading `EXPLAIN` / `EXPLAIN QUERY PLAN` (case-insensitive, after
+ * leading whitespace) so EXPLAIN on already-EXPLAIN text explains the inner
+ * statement. The worker owns the wrapping (`options.explain`).
  */
-export function explainWrap(sqlText: string): string;
+export function stripExplainPrefix(sqlText: string): string;
+
+/**
+ * The parameter field's text as the list the worker binds: `[]` for blank,
+ * otherwise parseQueryParameters' JSON array of null/string/number values
+ * (at most 100). Throws with that function's message on anything else.
+ */
+export function parseConsoleParameters(text: string | null | undefined): Array<null | string | number>;
 
 /**
  * Filters a persisted history list to usable entries (strings within
@@ -45,20 +51,31 @@ export function historySkipNotice(sqlText: string): string;
 /** Schema shape consumed by @codemirror/lang-sql's `sql({ schema })` option: table/view name → column names. */
 export type ConsoleSchema = Record<string, string[]>;
 
+/** The run options console.js hands to `runSql`; forwarded verbatim to the worker's runConsole. */
+export interface ConsoleRunOptions {
+    maxRows?: number;
+    maxStatements?: number;
+    /** Positional parameters from the parameter field; absent when the field is blank. */
+    params?: Array<null | string | number>;
+    /** EXPLAIN: the plan of the (single) statement, nothing executed. */
+    explain?: boolean;
+}
+
 /** Dependencies injected into {@link createConsole}. */
 export interface CreateConsoleOptions {
     /** Empty mount element; the console clears it and builds all of its own DOM inside. */
     container: HTMLElement;
     /**
      * Executes `sqlText`. Invoked with the editor's full current text on
-     * Mod-Enter and on the Run button (no `options`), and with
-     * {@link explainWrap}'s result plus `{ maxStatements: 1 }` on the EXPLAIN
-     * button (which records no history). Implementations must forward
-     * `options` to the backend verbatim. May return a value or a Promise;
-     * createConsole awaits it but does not otherwise interpret the result —
-     * rendering results is the injected implementation's own responsibility.
+     * Mod-Enter and on the Run button, and with {@link stripExplainPrefix}'s
+     * result plus `explain: true` on the EXPLAIN button (which records no
+     * history). Both carry the parameter field's values as `params` when it
+     * is non-blank. Implementations must forward `options` to the backend
+     * verbatim. May return a value or a Promise; createConsole awaits it but
+     * does not otherwise interpret the result — rendering results is the
+     * injected implementation's own responsibility.
      */
-    runSql(sqlText: string, options?: { maxRows?: number; maxStatements?: number }): unknown;
+    runSql(sqlText: string, options?: ConsoleRunOptions): unknown;
     /** Returns the persisted history, newest first. */
     loadHistory(): string[];
     /** Persists a full replacement history list (as produced by {@link pushHistory}). */

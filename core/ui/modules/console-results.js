@@ -41,7 +41,8 @@ const SKIPPED_STATEMENTS_NOTE = 'remaining statements not executed';
  * Segments are emitted only when they carry information:
  * - rows: only when the script produced at least one result set. Multiple
  *   sets report the summed row count plus the set count; `(truncated)` marks
- *   that ANY set hit the row cap.
+ *   that ANY set hit the row cap. A query plan (`explain`) counts its rows
+ *   as plan entries, so `4 plan entries` cannot be misread as data.
  * - changes: only when the run mutated. `mutated` with zero row changes can
  *   only be a schema_version bump (see runConsole), so it is named as such
  *   rather than printed as a misleading "0 changed".
@@ -56,7 +57,7 @@ const SKIPPED_STATEMENTS_NOTE = 'remaining statements not executed';
  * it describes what the run declined to do rather than what it did — and the
  * user must not read a one-statement plan as covering their whole script.
  *
- * @param {{ results: Array<{ rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number, statementsSkipped?: boolean }} result
+ * @param {{ results: Array<{ rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number, statementsSkipped?: boolean, explain?: boolean }} result
  * @returns {string}
  */
 export function formatStatus(result) {
@@ -65,7 +66,10 @@ export function formatStatus(result) {
 
     if (sets.length > 0) {
         const rowCount = sets.reduce((total, set) => total + set.rows.length, 0);
-        let rows = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`;
+        const noun = result.explain === true
+            ? (rowCount === 1 ? 'plan entry' : 'plan entries')
+            : (rowCount === 1 ? 'row' : 'rows');
+        let rows = `${rowCount} ${noun}`;
         if (sets.length > 1) rows += ` in ${sets.length} sets`;
         if (sets.some(set => set.truncated)) rows += ' (truncated)';
         segments.push(rows);
@@ -139,12 +143,14 @@ function buildPane(set) {
 /**
  * Builds the tab strip for a multi-set run and wires it to show exactly one
  * pane. Selection state lives in this closure — it is per render, so a new
- * run can never inherit a stale index.
+ * run can never inherit a stale index. `onSelect` hears every change so the
+ * export control can follow the visible set.
  *
  * @param {HTMLElement[]} panes
+ * @param {(index: number) => void} onSelect
  * @returns {HTMLElement}
  */
-function buildTabStrip(panes) {
+function buildTabStrip(panes, onSelect) {
     const strip = document.createElement('div');
     strip.className = 'sql-console-results-tabs';
 
@@ -164,10 +170,44 @@ function buildTabStrip(panes) {
                 ? 'sql-console-results-tab active'
                 : 'sql-console-results-tab';
         });
+        onSelect(selectedIndex);
     }
 
     select(0);
     return strip;
+}
+
+/**
+ * Builds the status row: the summary text plus, when the caller can export and
+ * there is a set to export, an Export CSV button that hands over whichever set
+ * is visible at click time (the tab strip keeps `selected` current).
+ *
+ * @param {object} payload
+ * @param {{ onExportCsv?: (set: object, payload: object) => unknown } | undefined} options
+ * @param {{ index: number }} selected
+ * @returns {HTMLElement}
+ */
+function buildStatusRow(payload, options, selected) {
+    const status = document.createElement('div');
+    status.className = 'sql-console-results-status';
+
+    const text = document.createElement('span');
+    text.className = 'sql-console-results-status-text';
+    text.textContent = formatStatus(payload);
+    status.appendChild(text);
+
+    if (typeof options?.onExportCsv === 'function' && payload.results.length > 0) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'sql-console-results-export';
+        button.textContent = 'Export CSV';
+        button.title = 'Export the displayed rows of this result set as CSV';
+        button.addEventListener('click', () => {
+            options.onExportCsv(payload.results[selected.index], payload);
+        });
+        status.appendChild(button);
+    }
+    return status;
 }
 
 /**
@@ -255,11 +295,18 @@ function isRenderableRun(payload) {
  * by then, so a throw would lose the previous output AND show nothing in its
  * place.
  *
+ * `options.onExportCsv`, when given, adds an Export CSV control to the status
+ * row of a run with at least one result set; it receives the set that is
+ * visible when clicked and the whole payload. The renderer never builds the
+ * CSV or touches a file itself — that stays with the caller, which owns the
+ * host seam.
+ *
  * @param {HTMLElement} container
- * @param {{ results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number } | { error: string, multiStatement?: boolean }} payload
+ * @param {{ results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>, mutated: boolean, changes: number, durationMs: number, explain?: boolean } | { error: string, multiStatement?: boolean }} payload
+ * @param {{ onExportCsv?: (set: { headers: string[], rows: unknown[][], truncated: boolean }, payload: object) => unknown }} [options]
  * @returns {void}
  */
-export function renderConsoleResults(container, payload) {
+export function renderConsoleResults(container, payload, options) {
     container.replaceChildren();
 
     // Presence-checked and coerced on the way out (see isErrorPayload): the
@@ -280,12 +327,12 @@ export function renderConsoleResults(container, payload) {
         return;
     }
 
-    const status = document.createElement('div');
-    status.className = 'sql-console-results-status';
-    status.textContent = formatStatus(payload);
-    container.appendChild(status);
+    const selected = { index: 0 };
+    container.appendChild(buildStatusRow(payload, options, selected));
 
     const panes = payload.results.map(set => buildPane(set));
-    if (panes.length > 1) container.appendChild(buildTabStrip(panes));
+    if (panes.length > 1) {
+        container.appendChild(buildTabStrip(panes, index => { selected.index = index; }));
+    }
     for (const pane of panes) container.appendChild(pane);
 }

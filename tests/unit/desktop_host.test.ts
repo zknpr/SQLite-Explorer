@@ -807,6 +807,37 @@ test('runConsole without mutations stays clean', async () => {
   assert.equal(refreshed, 0);
 });
 
+test('a console EXPLAIN records nothing: no barrier, no dirty flag, no refresh', async () => {
+  const plan = {
+    results: [{ headers: ['id', 'parent', 'notused', 'detail'], rows: [[2, 0, 0, 'SCAN t']], truncated: false }],
+    explain: true, mutated: false, changes: 0, durationMs: 1, statementsSkipped: false
+  };
+  const { host } = makeHost({ runConsole: () => plan });
+  await host.start();
+  let refreshed = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshed++; return { success: true }; } });
+
+  const res = await host.invoke('runConsole', ['SELECT * FROM t', { explain: true }]);
+
+  assert.deepEqual(res, plan);
+  assert.equal(host.hasUnsavedChanges(), false);
+  assert.equal(refreshed, 0);
+});
+
+test('an EXPLAIN that somehow mutated is still barriered: the bypass rests on the worker\'s measured report, not on trust', async () => {
+  const { host } = makeHost({
+    runConsole: () => ({ results: [], explain: true, mutated: true, changes: 1, durationMs: 1 })
+  });
+  await host.start();
+  let refreshed = 0;
+  host.setWebviewMethods({ refreshContent: async () => { refreshed++; return { success: true }; } });
+
+  await host.invoke('runConsole', ['SELECT 1', { explain: true }]);
+
+  assert.equal(host.hasUnsavedChanges(), true);
+  assert.equal(refreshed, 1);
+});
+
 test('console history round-trips through the settings wire shape', async () => {
   const { host, saved } = makeHost({});
   await host.start();
@@ -1353,6 +1384,40 @@ test('a read-only console run closes the transaction it opened; a mutating run l
   assert.equal(host.hasUnsavedChanges(), true);
 
   await host.invoke('runConsole', ['SELECT 2', {}]);    // txn was already open: not this run's to close
+  assert.equal(txn.open, true);
+  assert.equal(host.hasUnsavedChanges(), true);
+});
+
+test('a native console EXPLAIN opens no session transaction and runs no probe', async () => {
+  // A plan lookup compiles and lists; it must not take a SHARED lock on the
+  // real file (BEGIN) or leave a phantom "unsaved" session, and it does not
+  // need the post-run reconcile probe either -- nothing could have changed
+  // the transaction state.
+  const { host, txn, nativeLog } = makeNativeHost({
+    runConsole: (args) => ((args[1] as Record<string, unknown>)?.explain === true
+      ? {
+        results: [{ headers: ['id', 'parent', 'notused', 'detail'], rows: [[2, 0, 0, 'SCAN t']], truncated: false }],
+        explain: true, mutated: false, changes: 0, durationMs: 1, statementsSkipped: false
+      }
+      : { results: [], mutated: true, changes: 1, durationMs: 1 })
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await host.openFromShellPath('/tmp/y.db');
+  const sqlBefore = nativeSql(nativeLog).length;
+
+  const res = await host.invoke('runConsole', ['SELECT * FROM t', { explain: true }]) as Record<string, unknown>;
+
+  assert.equal(res.explain, true);
+  assert.equal(txn.open, false);
+  assert.deepEqual(txn.applied, []);                      // no BEGIN, no COMMIT
+  assert.deepEqual(nativeSql(nativeLog).slice(sqlBefore), []); // and no probe round trip
+  assert.equal(host.hasUnsavedChanges(), false);
+
+  // With a dirty session already open, EXPLAIN leaves it exactly as it was.
+  await host.invoke('runConsole', ['INSERT INTO t DEFAULT VALUES', {}]);
+  assert.equal(txn.open, true);
+  await host.invoke('runConsole', ['SELECT * FROM t', { explain: true }]);
   assert.equal(txn.open, true);
   assert.equal(host.hasUnsavedChanges(), true);
 });

@@ -160,6 +160,28 @@ test('formatStatus reports mutations, with the schema-only case named', () => {
     );
 });
 
+test('formatStatus counts a query plan in plan entries, never rows', () => {
+    // `4 rows` under an EXPLAIN reads as data that was returned; the plan is
+    // a listing of what WOULD run.
+    assert.equal(
+        formatStatus({ results: [rowSet(4)], mutated: false, changes: 0, durationMs: 2, explain: true }),
+        '4 plan entries · 2 ms'
+    );
+    assert.equal(
+        formatStatus({ results: [rowSet(1)], mutated: false, changes: 0, durationMs: 2, explain: true }),
+        '1 plan entry · 2 ms'
+    );
+    assert.equal(
+        formatStatus({ results: [rowSet(1000, true)], mutated: false, changes: 0, durationMs: 9, explain: true }),
+        '1000 plan entries (truncated) · 9 ms'
+    );
+    // Only an explicit true switches the noun: an ordinary run never carries the flag.
+    assert.equal(
+        formatStatus({ results: [rowSet(4)], mutated: false, changes: 0, durationMs: 2, explain: undefined }),
+        '4 rows · 2 ms'
+    );
+});
+
 test('formatStatus never degenerates to a bare duration', () => {
     assert.equal(
         formatStatus({ results: [], mutated: false, changes: 0, durationMs: 0 }),
@@ -320,6 +342,66 @@ test('a single set leaves its pane visible', () => {
     assert.equal(panes[0].hidden, false);
 });
 
+// ---- Export CSV control ---------------------------------------------------
+
+test('an export callback adds an Export CSV control that hands over the visible set', () => {
+    installDocument();
+    const container = new FakeNode('div');
+    const exported: unknown[] = [];
+    const payload = {
+        results: [
+            { headers: ['a'], rows: [[1]], truncated: false },
+            { headers: ['b'], rows: [[2], [3]], truncated: true }
+        ],
+        mutated: false,
+        changes: 0,
+        durationMs: 9
+    };
+
+    renderConsoleResults(container as unknown as HTMLElement, payload, {
+        onExportCsv: (set, whole) => { exported.push({ set, whole }); }
+    });
+
+    // The status text is unchanged by the control beside it.
+    const statusText = findAllByClass(container, 'sql-console-results-status-text');
+    assert.equal(statusText.length, 1);
+    assert.equal(textOf(statusText[0]), '3 rows in 2 sets (truncated) · 9 ms');
+    const buttons = findAllByClass(container, 'sql-console-results-export');
+    assert.equal(buttons.length, 1);
+    assert.equal(buttons[0].type, 'button');
+    assert.equal(textOf(buttons[0]), 'Export CSV');
+
+    // Follows the tab strip: the set on screen is the one exported.
+    buttons[0].click();
+    assert.deepEqual(exported, [{ set: payload.results[0], whole: payload }]);
+    findAllByClass(container, 'sql-console-results-tab')[1].click();
+    buttons[0].click();
+    assert.equal(exported.length, 2);
+    assert.equal((exported[1] as { set: unknown }).set, payload.results[1]);
+});
+
+test('no Export CSV control without a callback, without a result set, or on an error', () => {
+    installDocument();
+    const container = new FakeNode('div');
+    const run = { results: [rowSet(2)], mutated: false, changes: 0, durationMs: 1 };
+
+    renderConsoleResults(container as unknown as HTMLElement, run);
+    assert.equal(findAllByClass(container, 'sql-console-results-export').length, 0);
+    // Existing callers see the same status text through the same class.
+    assert.equal(textOf(findAllByClass(container, 'sql-console-results-status')[0]), '2 rows · 1 ms');
+
+    const onExportCsv = () => { throw new Error('must not be rendered'); };
+    renderConsoleResults(
+        container as unknown as HTMLElement,
+        { results: [], mutated: true, changes: 1, durationMs: 1 },
+        { onExportCsv }
+    );
+    assert.equal(findAllByClass(container, 'sql-console-results-export').length, 0);
+
+    renderConsoleResults(container as unknown as HTMLElement, { error: 'nope' }, { onExportCsv });
+    assert.equal(findAllByClass(container, 'sql-console-results-export').length, 0);
+});
+
 /** Renders `payload` with console.error captured, asserting the contract-violation output. */
 function assertContractViolation(payload: unknown) {
     installDocument();
@@ -460,5 +542,5 @@ test('renderConsoleResults surfaces the skipped-statements flag in the rendered 
     });
     const [status] = findAllByClass(container, 'sql-console-results-status');
     assert.ok(status);
-    assert.match(status.textContent, /remaining statements not executed$/);
+    assert.match(textOf(status), /remaining statements not executed$/);
 });

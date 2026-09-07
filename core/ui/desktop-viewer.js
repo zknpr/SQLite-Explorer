@@ -68,6 +68,10 @@ import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 // tests/unit/console_desktop_wiring.test.ts.
 import { createConsole, sanitizeHistory } from './modules/console.js';
 import { renderConsoleResults } from './modules/console-results.js';
+// The CSV writer dev's SQL workspace uses for its result documents, reused
+// verbatim so a console export and an extension export of the same rows are
+// the same bytes (quoting, NULL/blob spelling, spreadsheet-formula guard).
+import { resultCsv } from '../../src/core/sql-workspace.ts';
 // Desktop-only for a different reason than the console's: the tab strip and the
 // Open Databases overview render a registry no other target has (VS Code and
 // the web demo hold exactly one database). Their markup ships hidden in the
@@ -179,6 +183,24 @@ function getConsoleSchema() {
 }
 
 /**
+ * Export CSV, from the results pane: the set the user is looking at, as CSV,
+ * through the same shell save dialog every other desktop export uses
+ * (`saveFile` → bridge `saveFileAs`; the shell writes only where the user
+ * picks). Page-side entirely — the rows are already here, so no engine round
+ * trip and no second query. What is exported is what is displayed: a set the
+ * worker capped exports its displayed rows, the same rule dev's SQL workspace
+ * states for its result documents.
+ */
+async function exportConsoleCsv(set, payload) {
+    const csv = resultCsv({ headers: set.headers, rows: set.rows }, set.rows.length);
+    const filename = payload?.explain === true ? 'query-plan.csv' : 'query-results.csv';
+    const result = await backendApi.saveFile(filename, new TextEncoder().encode(csv));
+    updateStatus(result?.success === true
+        ? `Exported ${set.rows.length} ${set.rows.length === 1 ? 'row' : 'rows'} to ${result.savedAs}`
+        : 'CSV export cancelled');
+}
+
+/**
  * Runs `sqlText` and renders the outcome into the results pane. Deliberately
  * never rejects: both failure modes (the read-only refusal and a worker
  * rejection) belong in the results area the user is already looking at, which
@@ -193,12 +215,18 @@ async function runConsoleSql(sqlText, options) {
         renderConsoleResults(results, { error: READ_ONLY_CONSOLE_NOTICE });
         return;
     }
+    const renderOptions = {
+        onExportCsv: (set, payload) => {
+            exportConsoleCsv(set, payload).catch(consoleSurface('CSV export failed'));
+        }
+    };
     try {
-        // Passed through untouched. A SQL failure is not a rejection: runConsole
-        // resolves with `{ error, multiStatement, mutated, changes }` once
-        // execution has begun, so the renderer picks the error branch while the
-        // host has already recorded the mutations a half-applied script made.
-        renderConsoleResults(results, await backendApi.runConsole(sqlText, options));
+        // Passed through untouched (`params`, `explain` included). A SQL
+        // failure is not a rejection: runConsole resolves with `{ error,
+        // multiStatement, mutated, changes }` once execution has begun, so the
+        // renderer picks the error branch while the host has already recorded
+        // the mutations a half-applied script made.
+        renderConsoleResults(results, await backendApi.runConsole(sqlText, options), renderOptions);
     } catch (err) {
         // Only failures that never reached (or never left) the worker land here:
         // transport, RPC timeout, an unbooted database.

@@ -1969,7 +1969,8 @@ input[type="checkbox"]:focus-visible {
    dependency on the shared toolbar markup. */
 .sql-console-controls button,
 .sql-console-controls select,
-.sql-console-results-tab {
+.sql-console-results-tab,
+.sql-console-results-export {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     color: var(--text-primary);
@@ -1982,7 +1983,8 @@ input[type="checkbox"]:focus-visible {
 
 .sql-console-controls button:hover,
 .sql-console-controls select:hover,
-.sql-console-results-tab:hover {
+.sql-console-results-tab:hover,
+.sql-console-results-export:hover {
     background: var(--hover-bg);
 }
 
@@ -1999,6 +2001,40 @@ input[type="checkbox"]:focus-visible {
     margin-left: auto;
     color: var(--text-secondary);
     font-size: 11px;
+}
+
+/* console.js's positional-parameter field: one line between the controls and
+   the editor. The label wraps the input so clicking the word focuses it. */
+.sql-console-params-row {
+    padding: 4px 8px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.sql-console-params-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-secondary);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.sql-console-params {
+    flex: 1;
+    min-width: 0;
+    font-family: monospace;
+    font-size: 12px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    padding: 2px 6px;
+}
+
+.sql-console-params:focus {
+    outline: none;
+    border-color: var(--accent-color);
 }
 
 /* CodeMirror needs a bounded height to scroll instead of growing the pane. */
@@ -2053,10 +2089,18 @@ input[type="checkbox"]:focus-visible {
 }
 
 .sql-console-results-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     padding: 5px 8px;
     color: var(--text-secondary);
     font-size: 12px;
     border-bottom: 1px solid var(--border-color);
+}
+
+/* console-results.js's Export CSV control, right-aligned in the status row. */
+.sql-console-results-export {
+    margin-left: auto;
 }
 
 .sql-console-results-tabs {

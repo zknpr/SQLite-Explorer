@@ -87,10 +87,20 @@ export interface DesktopBackendApi {
      * alongside the mutation metadata a half-applied script produced. It
      * rejects only for the pre-execution refusals (no database, read-only).
      *
-     * `maxStatements` caps how many statements run; EXPLAIN passes 1, because
-     * the EXPLAIN prefix only ever applies to the first one.
+     * `params` are positional values bound to every statement; `explain`
+     * asks for the query plan of the single statement instead of running it
+     * (the payload then carries `explain: true`); `maxStatements` caps how
+     * many statements run.
      */
-    runConsole(sql: string, options?: { maxRows?: number; maxStatements?: number }): Promise<unknown>;
+    runConsole(
+        sql: string,
+        options?: {
+            maxRows?: number;
+            maxStatements?: number;
+            params?: Array<null | string | number>;
+            explain?: boolean;
+        }
+    ): Promise<unknown>;
     getTableInfo(table: string): Promise<unknown>;
     getPragmas(): Promise<unknown>;
     setPragma(pragma: string, value: unknown): Promise<unknown>;

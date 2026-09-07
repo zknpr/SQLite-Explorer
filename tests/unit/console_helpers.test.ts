@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   pushHistory,
-  explainWrap,
+  stripExplainPrefix,
+  parseConsoleParameters,
   sanitizeHistory,
   historySkipNotice,
   HISTORY_CAP,
@@ -20,9 +21,29 @@ test('history caps at 50, dedupes consecutive, skips over-long entries', () => {
   assert.equal(pushHistory(h, long)[0], 'select 59');
 });
 
-test('explainWrap prefixes exactly once', () => {
-  assert.equal(explainWrap('SELECT 1'), 'EXPLAIN QUERY PLAN SELECT 1');
-  assert.equal(explainWrap('  explain query plan SELECT 1'), '  explain query plan SELECT 1');
+test('stripExplainPrefix removes a leading EXPLAIN [QUERY PLAN] and nothing else', () => {
+  // The worker owns the wrapping now; the console only keeps a user's own
+  // EXPLAIN from being wrapped a second time (a syntax error in SQLite).
+  assert.equal(stripExplainPrefix('EXPLAIN QUERY PLAN SELECT 1'), 'SELECT 1');
+  assert.equal(stripExplainPrefix('  explain query plan SELECT 1'), 'SELECT 1');
+  assert.equal(stripExplainPrefix('explain\n  SELECT 1'), 'SELECT 1');
+  assert.equal(stripExplainPrefix('EXPLAIN SELECT 1'), 'SELECT 1');
+  assert.equal(stripExplainPrefix('SELECT 1'), 'SELECT 1');
+  // A word that merely starts with "explain" is an identifier, not the keyword.
+  assert.equal(stripExplainPrefix('explainer'), 'explainer');
+  assert.equal(stripExplainPrefix("SELECT 'explain'"), "SELECT 'explain'");
+});
+
+test('parseConsoleParameters treats a blank field as no parameters and otherwise delegates', () => {
+  assert.deepEqual(parseConsoleParameters(''), []);
+  assert.deepEqual(parseConsoleParameters('   '), []);
+  assert.deepEqual(parseConsoleParameters(undefined), []);
+  assert.deepEqual(parseConsoleParameters(' [1, "a", null, 2.5] '), [1, 'a', null, 2.5]);
+  // parseQueryParameters' own refusals come through with its own messages.
+  assert.throws(() => parseConsoleParameters('{"a": 1}'), /JSON array/);
+  assert.throws(() => parseConsoleParameters('[true]'), /null, string, or number/);
+  assert.throws(() => parseConsoleParameters('[9007199254740993]'), /safe integer/);
+  assert.throws(() => parseConsoleParameters('not json'));
 });
 
 test('sanitizeHistory drops what would break the console and keeps the reference when clean', () => {

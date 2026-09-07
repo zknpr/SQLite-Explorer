@@ -129,12 +129,21 @@ test('runConsole passes the script and an options object through to the host', a
   await backendApi.runConsole('SELECT 1', { maxRows: 10 });
   assert.deepEqual(host.calls.at(-1), { method: 'runConsole', args: ['SELECT 1', { maxRows: 10 }] });
 
-  // EXPLAIN's contract: the console module injects this and the passthrough
-  // must not drop it, or a diagnostics click runs the whole script for real.
-  await backendApi.runConsole('EXPLAIN QUERY PLAN SELECT 1; DROP TABLE t;', { maxStatements: 1 });
+  // EXPLAIN's and the parameter field's contract: the console module injects
+  // these and the passthrough must not drop or reshape them -- without
+  // `explain` a diagnostics click would run the statement for real, and
+  // without `params` it would bind NULLs where the user typed values.
+  await backendApi.runConsole('SELECT a FROM t WHERE b = ?', { explain: true, params: ['x'] });
   assert.deepEqual(host.calls.at(-1), {
     method: 'runConsole',
-    args: ['EXPLAIN QUERY PLAN SELECT 1; DROP TABLE t;', { maxStatements: 1 }]
+    args: ['SELECT a FROM t WHERE b = ?', { explain: true, params: ['x'] }]
+  });
+
+  // The statement cap remains a supported option.
+  await backendApi.runConsole('SELECT 1; DROP TABLE t;', { maxStatements: 1 });
+  assert.deepEqual(host.calls.at(-1), {
+    method: 'runConsole',
+    args: ['SELECT 1; DROP TABLE t;', { maxStatements: 1 }]
   });
 });
 

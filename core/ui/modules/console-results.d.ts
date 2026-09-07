@@ -22,12 +22,18 @@ export interface ConsoleRunResult {
     changes: number;
     durationMs: number;
     /**
-     * True when a statement cap (EXPLAIN's `maxStatements: 1`) left part of the
-     * script unexecuted. Absent reads as false. Exact when the worker drained
-     * the tail; conservatively true when the tail held a pragma and was left
+     * True when a statement cap (`maxStatements`) left part of the script
+     * unexecuted. Absent reads as false. Exact when the worker drained the
+     * tail; conservatively true when the tail held a pragma and was left
      * untouched instead (see the worker's runConsole).
      */
     statementsSkipped?: boolean;
+    /**
+     * True for a query plan (`options.explain`): the single result set holds
+     * `id, parent, notused, detail` rows and nothing was executed. The status
+     * line counts them as plan entries.
+     */
+    explain?: boolean;
 }
 
 /**
@@ -45,6 +51,17 @@ export interface ConsoleRunError {
 
 export type ConsoleRenderPayload = ConsoleRunResult | ConsoleRunError;
 
+/** Optional renderer hooks. */
+export interface ConsoleRenderOptions {
+    /**
+     * When given, a run with at least one result set gets an Export CSV
+     * control in its status row; clicking it passes the set that is visible
+     * at that moment (the tab strip's selection) and the whole payload. The
+     * renderer builds no CSV and touches no file — the callback owns that.
+     */
+    onExportCsv?(set: ConsoleResultSet, payload: ConsoleRunResult): unknown;
+}
+
 /**
  * One-line summary of a completed run, e.g. `123 rows (truncated) · 2 changed · 45 ms`.
  * Segments appear only when they carry information: rows only when the script
@@ -52,7 +69,8 @@ export type ConsoleRenderPayload = ConsoleRunResult | ConsoleRunError;
  * the set count), changes only when the run mutated (`schema changed` when it
  * mutated with zero row changes), duration always, rounded to whole
  * milliseconds. A run with neither rows nor mutations reads `no results · N ms`.
- * A capped run appends ` · remaining statements not executed`.
+ * A capped run appends ` · remaining statements not executed`. A query plan
+ * counts `plan entries` instead of `rows`.
  */
 export function formatStatus(result: ConsoleRunResult): string;
 
@@ -71,4 +89,8 @@ export function formatStatus(result: ConsoleRunResult): string;
  * All DOM is built with createElement + textContent — query output is
  * untrusted database content and never reaches innerHTML.
  */
-export function renderConsoleResults(container: HTMLElement, payload: ConsoleRenderPayload): void;
+export function renderConsoleResults(
+    container: HTMLElement,
+    payload: ConsoleRenderPayload,
+    options?: ConsoleRenderOptions
+): void;

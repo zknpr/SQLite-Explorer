@@ -1594,19 +1594,27 @@ export function createDesktopHost({ bridge, createWorker }) {
                 return result;
             }
             if (method === 'runConsole') {
+                // EXPLAIN compiles and lists; it never executes (worker
+                // readQueryPlan). So no session transaction is opened for it —
+                // a plan lookup must not take a SHARED lock on the real file
+                // or leave a phantom "unsaved" session — and no txn probe
+                // follows it. The worker still MEASURES `mutated` for the
+                // lookup rather than assuming it, so the barrier below stays
+                // armed should a plan ever change anything.
+                const explain = args[1]?.explain === true;
                 // The script may mutate, and pending-ness must be in place
                 // BEFORE its first statement executes — so the session
                 // transaction opens up front. Whether it stays open depends on
                 // what the run reports below.
-                const beganForThisRun = entry.engine === 'native' && !entry.nativeTxnOpen;
-                await ensureSessionTxn(entry);
+                const beganForThisRun = !explain && entry.engine === 'native' && !entry.nativeTxnOpen;
+                if (!explain) await ensureSessionTxn(entry);
                 const result = await callWorker(entry, method, args);
                 // Runs only when runConsole RESOLVED: execution-phase script
                 // errors resolve (with {error, mutated}), so a rejection here
                 // means the script never ran (pre-execution refusal — txn
                 // state unchanged) or the transport died (everything after
                 // this rejects anyway; recovery is reopening the database).
-                await reconcileConsoleTxnState(entry);
+                if (!explain) await reconcileConsoleTxnState(entry);
                 // Arbitrary SQL cannot be replayed by the undo engine; a mutating run
                 // barriers the history exactly like DDL does. A pure SELECT must not
                 // dirty the file or wall off the user's undo stack.
