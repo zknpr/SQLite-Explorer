@@ -551,7 +551,11 @@ async function resolveLocalExportDestination(
     await fs.promises.lstat(finalPath);
   } catch (error) {
     if (nodeErrorCode(error) === 'ENOENT') {
-      return { replacementPath: finalPath, generation: { exists: false } };
+      const path = require('node:path') as typeof import('node:path');
+      const parent = await fs.promises.realpath(path.dirname(finalPath));
+      // Pin an absent leaf to its resolved parent just as an existing target
+      // is pinned above. Validation and rename must inspect the same path.
+      return { replacementPath: path.join(parent, path.basename(finalPath)), generation: { exists: false } };
     }
     throw error;
   }
@@ -609,11 +613,11 @@ async function writeLocalAtomic(
   uri: vsc.Uri,
   write: (sink: BinaryExportSink) => Promise<number>,
   cancellation?: ExportCancellation,
-  validateDestination?: () => void,
+  validateDestination?: (resolvedPath: string) => void,
   confirmReplacement = false
 ): Promise<number> {
   const destination = await resolveLocalExportDestination(fs, uri.fsPath);
-  validateDestination?.();
+  validateDestination?.(destination.replacementPath);
   if (confirmReplacement && !(await confirmFileReplacement(uri, destination.generation.exists))) {
     throw new vsc.CancellationError();
   }
@@ -639,7 +643,7 @@ async function writeLocalAtomic(
     await sink.close();
     assertExportNotCancelled(cancellation);
     assertLocalExportDestinationUnchanged(fs, destination);
-    validateDestination?.();
+    validateDestination?.(destinationPath);
     await fs.promises.rename(tempPath, destinationPath);
     if (ownershipPreservationFailure) {
       warnAfterSuccessfulLocalExportRename(ownershipPreservationFailure);
@@ -845,17 +849,26 @@ async function writeWorkspaceAtomic(
   }
 }
 
-function exportDestinationValidator(uri: vsc.Uri, fs: NodeFs | undefined): () => void {
-  return () => {
-    const identity = fs ? statIfPresent(uri.fsPath) : undefined;
+function exportDestinationValidator(uri: vsc.Uri, fs: NodeFs | undefined): (resolvedPath?: string) => void {
+  return (resolvedPath = uri.fsPath) => {
+    const identity = fs ? statIfPresent(resolvedPath) : undefined;
+    const canonicalDestination = fs ? canonicalPath(resolvedPath) : undefined;
     for (const document of DocumentRegistry.values()) {
+      const canonicalDatabase = fs && document.uri.scheme === 'file'
+        ? canonicalPath(document.uri.fsPath) : undefined;
       for (const suffix of ['', '-wal', '-shm', '-journal']) {
         if (uri.toString() === document.uri.with({ path: document.uri.path + suffix }).toString()) {
           throw new Error('Choose an export destination outside open database files and their journals.');
         }
-        if (fs && identity && document.uri.scheme === 'file') {
+        if (fs && canonicalDatabase !== undefined && canonicalDestination !== undefined) {
+          // Missing SQLite sidecars have no inode. Compare their names under
+          // the real database parent as well as any existing sidecar target.
+          if (sameReservedPath(canonicalDestination, canonicalDatabase + suffix)
+            || sameReservedPath(canonicalDestination, canonicalPath(document.uri.fsPath + suffix))) {
+            throw new Error('The export destination aliases an open database file or journal.');
+          }
           const databaseIdentity = statIfPresent(document.uri.fsPath + suffix);
-          if (databaseIdentity && identity.dev === databaseIdentity.dev && identity.ino === databaseIdentity.ino) {
+          if (identity && databaseIdentity && identity.dev === databaseIdentity.dev && identity.ino === databaseIdentity.ino) {
             throw new Error('The export destination aliases an open database file or journal.');
           }
         }
@@ -865,6 +878,20 @@ function exportDestinationValidator(uri: vsc.Uri, fs: NodeFs | undefined): () =>
   function statIfPresent(file: string) {
     try { return fs!.statSync(file, { bigint: true }); }
     catch (error) { if (nodeErrorCode(error) === 'ENOENT') return undefined; throw error; }
+  }
+  function sameReservedPath(left: string, right: string): boolean {
+    // Reserve case/normalization variants even on case-sensitive volumes.
+    // Missing sidecars have no inode; this key only rejects destinations and
+    // must never select or change the path that the atomic writer replaces.
+    return left === right || left.normalize('NFC').toLowerCase() === right.normalize('NFC').toLowerCase();
+  }
+  function canonicalPath(file: string): string {
+    try { return fs!.realpathSync(file); }
+    catch (error) {
+      if (nodeErrorCode(error) !== 'ENOENT') throw error;
+      const path = require('node:path') as typeof import('node:path');
+      return path.join(fs!.realpathSync(path.dirname(file)), path.basename(file));
+    }
   }
 }
 
