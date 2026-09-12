@@ -147,11 +147,16 @@ export function registerSqlWorkspace(_context: vscode.ExtensionContext): vscode.
             if (token.isCancellationRequested) controller.abort();
             const started = Date.now();
             try {
+                controller.signal.throwIfAborted();
                 assertAlive(database);
                 const result = await database.databaseOperations.executeReadQuery(sql, params, explain, controller.signal);
                 controller.signal.throwIfAborted(); assertAlive(database);
                 remember(sql);
                 await showOutput(result, database, Date.now() - started, explain);
+            } catch (error) {
+                // Backend interrupts and AbortSignal use different error types;
+                // only this operation's cancellation suppresses ordinary errors.
+                if (!controller.signal.aborted && !(error instanceof Error && error.name === 'AbortError')) throw error;
             } finally { cancel.dispose(); close.dispose(); }
         });
     };
