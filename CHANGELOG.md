@@ -13,6 +13,8 @@
 
 ### Fixes
 
+- Cancel an in-progress native Explain without closing its primary connection or losing TEMP objects and pending transactions. Expected Run/Explain cancellation no longer displays an error notification; SQL failures and deadlines remain visible.
+- Reject CSV/JSON sources changed during reading and destination schemas changed after preview. Schema validation and import commit share one snapshot, including changes made by another SQLite connection.
 - Refresh already-open Save As destinations, including file and directory symlinks. Close all destination handles before replacement, refuse dirty WASM aliases, and reopen each document with the replacement bytes and fresh history.
 - Restore applied unsaved Undo after hot exit and save the correct inactive WASM document during auto-save. Surface auto-save failures without losing dirty edits or newer retry requests; superseded saves count as cancellation.
 - Clear the dirty marker after Reload without writing the database or saving unrelated documents. Discarded Undo/Redo callbacks cannot replay old data or dirty the new checkpoint.
@@ -41,6 +43,7 @@
 
 ### Security and Maintenance
 
+- Sync the patched sql.js and txiki.js forks with upstream and rebuild pinned runtime artifacts. Restore the WASM stack after successful, failed, and cancelled queries; verify primary-connection native cancellation on all five packaged targets.
 - Update esbuild, stock sql.js, and website dependencies. Require Sharp 0.35.4 or newer with matching native decoders; update packaging dependencies qs and js-yaml without downgrading Mocha's separate YAML dependency. Add patched-version regressions and retain pinned extension SQL.js/native runtimes.
 - Remove the disabled telemetry runtime from extension entry bundles and redundant viewer sources from VSIX packages. Enforce production bundle size and package-content limits.
 - Retry inconclusive native cancellation probes within the existing finite budget. Enable interruptible snapshots only after an actual cancellation and a successful connection-health check.

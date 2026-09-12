@@ -243,7 +243,7 @@ If you find this extension useful, consider supporting development:
 
 ## Credits
 
-- **[sql.js](https://github.com/sql-js/sql.js)** — WebAssembly SQLite implementation (shipped as a [patched build](https://github.com/zknpr/sql.js/tree/sqlite-explorer/progress-interrupt) adding progress-handler and interrupt exports for query cancellation)
+- **[sql.js](https://github.com/sql-js/sql.js)** — WebAssembly SQLite implementation (shipped as a pinned [patched build](https://github.com/zknpr/sql.js/tree/master) with paged I/O and progress-handler/interrupt exports for query cancellation)
 - **[txiki.js](https://github.com/saghul/txiki.js)** — Native JavaScript runtime powering the native SQLite backend (bundled binaries built from [zknpr/txiki.js](https://github.com/zknpr/txiki.js), with async SQLite, V8-format IPC serialization, and query cancellation)
 - **[@vscode/codicons](https://github.com/microsoft/vscode-codicons)** — Icon font
 - **Icon** — [SQLite](https://iconscout.com/3d-icons/sqlite) by [Toms Design](https://iconscout.com/contributors/tomsdesign)
