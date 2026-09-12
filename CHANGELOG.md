@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+- Update esbuild, the stock sql.js dependency, and website dependency versions. Require Sharp 0.35.4 or newer and lock its matching native decoders. Update the packaging tools' qs and js-yaml dependencies without downgrading Mocha's separate YAML dependency; add regression checks for the patched versions. The extension's patched SQL.js and native runtimes remain pinned.
+- Exclude archived QA evidence from the extension TypeScript project while keeping source and test files typechecked.
+- Document the VS Code hot-exit failure after forcing an extension-host restart during Save Workspace As, including the save-and-close precaution.
+- Open oversized raw cell content in a read-only paginated viewer, with 64 KiB text pages, 16 KiB Hex pages, and complete stored-byte downloads. Add direct TEXT downloads and BLOB Load more with bounded Hex navigation; initial UTF-16 Hex previews use SQLite's actual bytes.
+- Keep signature-verified MP4 and WebM full-content snapshots in VS Code's video viewer above the inline limit. Explicit raw snapshots and Hex keep their bounded and read-only paths.
+- Preserve WASM connection PRAGMAs across saves and exact INTEGER values through Undo/Redo. Refuse further SQL if restoring connection policy fails, retain unsaved data, and retry restoration before continuing.
+- Keep exact batch-edit history in the host and return only row-identity changes over the JSON webview channel, preventing committed INTEGER batches from leaving the UI waiting for an unserializable reply. Propagate asynchronous reply-delivery failures to pending callers.
+- Avoid Windows WASM wide-grid timeouts caused by hundreds of thousands of tiny raw-TEXT backing buffers. Decode private byte companions into bounded slabs without changing query deadlines or native transport.
+- Release the native worker's idle auxiliary query connection when changing journal mode, so a completed read no longer blocks leaving WAL. Active export snapshots and external readers keep their lock protections.
+- Retry inconclusive native cancellation probes when a completed query's reply arrives after abort delivery. Keep the existing finite probe budget and require actual cancellation plus a healthy connection before enabling interruptible snapshots.
+- Bind native positional parameters as arrays, preserving single NULL, BLOB, and empty-BLOB values across statements, queries, batches, and prepared-statement reuse.
+- Confirm replacement consistently for Save As, table/query exports, and cell downloads. Export and download writers recheck the selected destination before atomic replacement.
+- Retry configured file-size refusals in the same database editor after changing the setting, without reloading VS Code. Make auto-save failures visible while retaining pending saves and dirty edits; detect stale WASM view drafts before changing their in-memory definitions.
+- Treat a superseded auto-save as cancellation, not a write failure. Manual Save clears the completed retry state and rearms failure warnings without clearing a newer failed save request.
+- Clear the custom-editor dirty marker after Reload through a URI-scoped, no-write checkpoint acknowledgement. Discarded host Undo/Redo entries cannot replay old data or mark the reloaded checkpoint dirty; unrelated unsaved databases are not saved.
+- Refresh each open editor independently after document changes, so a suspended hidden webview cannot delay Undo/Redo updates in a visible sibling for the full RPC timeout.
+- Reject new WASM worker calls immediately after disposal, so closing a database during import does not leave rollback and release waiting through separate RPC timeouts.
+- Clear completed table/view schema messages on the next content refresh, so Undo cannot leave a stale "view dropped" footer beside a restored view. Preserve in-flight operations, errors, and feedback written after the refresh starts.
+- Preserve virtual-grid keyboard focus and reveal focused cells below sticky headers; retain saved page/pins/scroll, collapsed groups, and sidebar width across webview recreation. Keep read-only batch controls visibly disabled, show checkbox focus, allow Escape then Shift+Tab to leave textareas, and treat Refresh cancellation as cancellation.
+- Add literal defaults and WITHOUT ROWID to Create Table, including Undo/Redo, and display destination defaults in import previews. After the host refreshes a committed table creation, replace the operation's own busy footer without closing a reopened draft or overwriting newer feedback. Confirm batch edits, clears, and deletes above 1000 affected cells or rows before mutation.
+- Open complete values as a read-only hex dump when Hex is selected, including inline BLOBs and PDFs. Account for the expanded dump in temporary-file quotas.
+- Report actual virtual-file byte lengths so VS Code can load and seek videos opened from cells. Use compact, neutral labels for large BLOBs.
+- Keep large TEXT and JSON previews on explicitly bounded, selectable pages so selecting offscreen text cannot force layout of an entire loaded value. Preserve exact Unicode and line endings across pages. Route complete large TEXT out of embedded textareas into bounded stored-byte inspection, with read-only full snapshots and retryable reads.
+- Make reselecting the active cell-inspector tab a no-op and keep modal focus stable during pointer tab switches. Render each Hex page as bounded static text nodes with keyboard focus, page-local Select All, and exact copy, removing the large textarea value from the native accessibility tree.
+- Refresh the cell-editing preference when hidden webviews are recreated, and keep keyboard-selected cells clear of native scrollbars as well as sticky headers.
+- Restore original JSON TEXT bytes during patch Undo/Redo when the cell has not changed externally. Concurrent unrelated JSON edits still survive guarded history replay.
+- Keep large dropped BLOBs labeled as BLOBs, use native browser Base64 encoding where available, and avoid background timer throttling in the fallback. Ctrl/Cmd+Z cancels pending file preparation and cannot undo the preceding edit while an upload is committing.
+- Show a Reload Database recovery button when a native file has been replaced or its connection retired. Ordinary external SQLite writes remain usable without invalidating the connection.
+- Remove the disabled telemetry runtime from extension entry bundles and exclude redundant viewer sources from VSIX packages. Production builds and package checks enforce size and content limits.
+- Show first-page rows before an uncached count finishes. Keep totals visibly unknown while counting and preserve successful rows if counting fails.
+- Add SQL editor commands for read queries, saved `.sql` files, schema completions, positional parameters, session history, and bounded result documents with atomic CSV export. Explain Query Plan uses the original SQL and parameters on native and WASM, with compilation and output limits enforced inside SQLite.
+- Add CSV/JSON import with preview, column mapping, cancellation, transaction rollback, and one guarded undo/redo edit on native and WASM backends. Desktop and remote imports support 64 MiB / 100,000 rows / 256 columns, with a 2,000,000-field limit and the existing cell-edit and undo-memory budgets. CSV parsing avoids a second row matrix, matching mappings reuse parsed rows, and source byte checks avoid a full encoded copy.
+- Pair saves started during an import with the completed import's history checkpoint, and undo imported foreign-key children before their parents.
+- Add a visible SQL Query button bound to its database and reuse the result editor group across repeated queries.
+- Detect externally replaced native databases before stale edits fail with misleading read-only errors. In-memory WASM saves also retain the original file generation, refuse conflicting overwrites, and keep unsaved edits available through Save As.
+- Accept metadata-only file changes during in-memory WASM saves and view editing after verifying the full stored bytes. Reopening an unchanged file through the Windows file dialog no longer blocks later saves; changed content and replaced files still require recovery or reload.
+- Accept local Windows file drops when URI serialization changes only the drive letter's case. Directory, provider, and non-Windows path checks remain unchanged.
+- Recover native transactions completely when an external reader blocks a commit, so later edits cannot report success inside an abandoned savepoint. Nested operations preserve their caller's transaction; unrecoverable cleanup invalidates the connection and history until Reload.
+- Fix Windows paged saves blocked by the extension's own file handles while preserving atomic replacement and retryable unsaved edits.
+- Refresh already-open Save As destinations, restore applied unsaved Undo after hot exit, and target inactive WASM documents during automatic saves. Honor OS read-only permissions and configured file-size limits on both desktop backends.
+- Fix Tab navigation during concurrent grid refreshes, empty global-filter results, narrow-window controls, and row labels when the total count is still bounded.
+- Keep oversized text previews responsive and byte-exact, preserve the viewer while opening media, and offer complete PDF downloads. Show explicit decoding fallbacks and usable audio seek controls.
+- Preserve SQL-editor focus when opening a view definition from its modal.
+- Keep keyboard focus inside Create Table when removing a column definition, including the final definition.
+- Ignore fileless workbench tabs during temporary-file cleanup, so closing Settings does not throw or interrupt cleanup of other closed editors.
+- Add installed-VSIX mouse/keyboard suites for workflows, lifecycle, grid/query actions, cell content, and file/settings edge cases, with isolated profiles and independent SQLite checks. Add a production-adapter large-database characterization and verify the actual VS Code version used by desktop tests.
+
 ## 1.7.2
 
 ### Security
