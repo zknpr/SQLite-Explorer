@@ -96,7 +96,7 @@ it('requires the pinned source commit even when a different local checkout is su
         fs.writeFileSync(zig, `#!${process.execPath}\nprocess.stdout.write('0.16.0\\n');\n`, { mode: 0o755 });
         const result = spawnSync(process.execPath, ['scripts/refresh-sqljs.mjs', '--emcc', emcc, '--zig', zig, '--sqljs-source', checkout], { encoding: 'utf8' });
         assert.equal(result.status, 1, result.stderr);
-        assert.match(result.stderr, /not a (?:valid object name|tree object): 653366ed214563ea95a57b34c92986b6ff584c23/);
+        assert.match(result.stderr, new RegExp(`not a (?:valid object name|tree object): ${before.sqlJsCommit}`));
         assert.deepEqual(verifyQueryPlanArtifacts(), before);
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
