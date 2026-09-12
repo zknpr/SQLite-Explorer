@@ -3864,6 +3864,41 @@ describe('NativeWorkerProcess', () => {
         }
     });
 
+    it('routes an in-flight query-plan abort without retiring the primary connection', async () => {
+        const calls: RecordedNativeCall[] = [];
+        const mockProcess = createRecordingNativeProcess(calls);
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        let kills = 0;
+        (worker as any).process = { stdin: mockProcess.stdin, kill: () => { kills++; } };
+        const controller = new AbortController();
+        const cancellation = new DOMException('Cancelled Explain', 'AbortError');
+        let pending: Promise<unknown> | undefined;
+        try {
+            pending = worker.call('workspaceQueryPlan', [], 1000, controller.signal);
+            await new Promise(resolve => setImmediate(resolve));
+            const plan = calls.find(call => call.method === 'workspaceQueryPlan');
+            assert.ok(plan, 'Explain must be dispatched before cancellation');
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+            const cancel = calls.find(call => call.method === 'cancel');
+            assert.ok(cancel, 'Explain cancellation must reach the running primary query');
+            assert.deepStrictEqual(cancel.args, [plan.id]);
+            assert.strictEqual(kills, 0);
+            (worker as any).handleMessage({ id: plan.id, error: '[workspaceQueryPlan] Operation cancelled', cancelled: true });
+            await assert.rejects(pending, error => error === cancellation);
+            pending = undefined;
+            assert.strictEqual((worker as any).pendingRequests.size, 0);
+            assert.strictEqual(kills, 0, 'cancellation must preserve the primary connection and its transaction');
+        } finally {
+            if (pending) {
+                const plan = calls.find(call => call.method === 'workspaceQueryPlan');
+                if (plan) (worker as any).handleMessage({ id: plan.id, error: 'test cleanup' });
+                await pending.catch(() => {});
+            }
+            worker.stop();
+        }
+    });
+
     it('routes an in-flight export-spool abort to the worker correlation id', async () => {
         const calls: RecordedNativeCall[] = [];
         const mockProcess = createRecordingNativeProcess(calls);

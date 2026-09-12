@@ -398,7 +398,7 @@ function runWithQueryDeadline(database, timeoutMs, operation) {
   }
 }
 
-/** Run one AsyncDatabase operation with worker deadline and host cancellation. */
+/** Run one threaded SQLite operation with worker deadline and host cancellation. */
 function executeInterruptibleAsyncOperation(requestId, timeoutMs, operation) {
   return (async () => {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -1964,17 +1964,22 @@ async function handleRequest(request) {
       case "workspaceQueryPlan": {
         const [sql, params, library, timeoutMs] = args;
         if (!db) throw new Error("Database not open");
+        if (typeof db.allAsync !== 'function') {
+          throw new Error('Native SQLite requires primary-connection allAsync support');
+        }
         if (!queryPlanDatabases.has(db)) {
           db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
           queryPlanDatabases.add(db);
         }
         // Use the primary connection so TEMP objects and pending DDL are
-        // included. The bundled C reader bounds compilation and extraction.
-        result = runWithQueryDeadline(db, timeoutMs, () => {
-          const statement = db.prepare(sql);
-          try { return statement.all(params ?? [])[0].plan; }
-          finally { statement.finalize(); }
-        });
+        // included. Threaded execution keeps cancel RPCs deliverable while the
+        // bundled C reader bounds compilation and extraction on that handle.
+        result = await runWithQueryDeadline(db, timeoutMs, () => (
+          executeInterruptibleAsyncOperation(id, timeoutMs, async signal => {
+            const rows = await db.allAsync(sql, params ?? [], { signal });
+            return rows[0].plan;
+          })
+        ));
         break;
       }
 

@@ -586,7 +586,8 @@ export class NativeWorkerProcess {
       }, timeoutMs);
 
       const abortListener = signal && (
-        method === 'queryBounded' || method === 'workspaceQuery' || method === 'queryExportSpool' || method === 'vacuumInto'
+        method === 'queryBounded' || method === 'workspaceQuery' || method === 'workspaceQueryPlan'
+        || method === 'queryExportSpool' || method === 'vacuumInto'
       )
         ? () => {
             if (!this.pendingRequests.has(id) || !this.process?.stdin) return;

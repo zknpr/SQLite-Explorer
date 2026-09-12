@@ -1,5 +1,5 @@
 /**
- * Refresh the exact txiki.js security-fix workflow artifacts.
+ * Refresh the exact txiki.js runtime workflow artifacts.
  *
  * Default usage re-validates the pinned GitHub Actions run before download:
  *   node scripts/refresh-natives.mjs
@@ -7,8 +7,8 @@
  * An already-downloaded artifact can be verified without network access only
  * when its complete pinned provenance is supplied explicitly:
  *   node scripts/refresh-natives.mjs --from /path/to/run-artifacts \
- *     --run 31648639100 --branch agent/v8-bounded-host-views \
- *     --commit acef1d0de4f16321bc24b81261aebcea064f5923
+ *     --run 34697570391 --branch master \
+ *     --commit 62b02dc97461662abc5a34cc1b97ddd49e43c808
  */
 
 import { execFileSync } from 'node:child_process';
@@ -19,15 +19,15 @@ import { fileURLToPath } from 'node:url';
 import { createPinnedArtifactPolicy } from './lib/pinned-artifacts.mjs';
 
 const REPOSITORY = 'zknpr/txiki.js';
-const SOURCE_BRANCH = 'agent/v8-bounded-host-views';
-const SOURCE_COMMIT = 'acef1d0de4f16321bc24b81261aebcea064f5923';
-const PINNED_RUN_ID = '31648639100';
+const SOURCE_BRANCH = 'master';
+const SOURCE_COMMIT = '62b02dc97461662abc5a34cc1b97ddd49e43c808';
+const PINNED_RUN_ID = '34697570391';
 const PINNED_SHA256 = Object.freeze({
-  'aarch64-linux-gnu/tjs': '0a3654ad7436c46d39add000e44ac169992b48d9ac2e0b47e86591636eb504d8',
-  'aarch64-macos/tjs': '9e8610bedbbec8130fdafe7456c22e63b5f4bee1fdde90993e56dc3204b0b1a1',
-  'x86_64-linux-gnu/tjs': '5ae6724ddffd888ad6d15ea097c5382d8a8c64703934200b1924a33c02570592',
-  'x86_64-macos/tjs': '57645ccb7bcfec8a220a05a37b2fae204c667ac703de7a6be7ce121b5ef8883a',
-  'x86_64-windows/tjs.exe': '78768640f59cd413bc0a6ed28709d9161d4d7fe3682c6d4276489f532399c5d9'
+  'aarch64-linux-gnu/tjs': '94cdc849413a62ad2f0521fb75bcbe166f423539af2a81ed56c26a900b26037e',
+  'aarch64-macos/tjs': '2927d5dfe7d240310d53d1ad583497ac9fc5f17c84354d43ee020d42e8ba6dfa',
+  'x86_64-linux-gnu/tjs': 'e82dac892d2370f71f118f83ea468a6befc13c74acd6b6ed4d23c3988ee77227',
+  'x86_64-macos/tjs': '226fe2164262c97350dd3beb0b365d82e931334138afb60441a5cd6244dba4b8',
+  'x86_64-windows/tjs.exe': '71adba65a4e14773cf4273e2acb6d08fd45e6790e7afafc6bd1c1c50e69c067f'
 });
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));

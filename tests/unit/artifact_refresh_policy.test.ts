@@ -27,9 +27,9 @@ const sourceRepositoryRoot = path.resolve(
     '..'
 );
 
-const TXIKI_BRANCH = 'agent/v8-bounded-host-views';
-const TXIKI_COMMIT = 'acef1d0de4f16321bc24b81261aebcea064f5923';
-const TXIKI_RUN = '31648639100';
+const TXIKI_BRANCH = 'master';
+const TXIKI_COMMIT = '62b02dc97461662abc5a34cc1b97ddd49e43c808';
+const TXIKI_RUN = '34697570391';
 
 interface ScriptSpec {
     name: string;
