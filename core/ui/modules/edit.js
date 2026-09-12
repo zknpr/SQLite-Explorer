@@ -428,7 +428,7 @@ export async function downloadCellPreview() {
     session.downloading = true;
     const button = document.getElementById('cellPreviewDownloadBtn');
     if (button) button.disabled = true;
-    const storedCell = session.tableType === 'table' && !session.readOnlyReason;
+    const storedCell = session.canReadStoredCell === true;
     try {
         const result = storedCell
             ? await backendApi.openCellEditor(
@@ -573,6 +573,9 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         connectionGeneration: state.connectionGeneration,
         contentGeneration: state.contentGeneration,
         readOnlyReason: readOnlyRowReason,
+        // Generated columns cannot be edited, but a stable row identity can
+        // still read their stored bytes. Snapshot that capability separately.
+        canReadStoredCell: state.selectedTableType === 'table' && !getReadOnlyRowReason(rowIdx),
         valueMode: 'value',
         dirty: false
     };
@@ -587,7 +590,7 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
     const downloadBtnEl = document.getElementById('cellPreviewDownloadBtn');
     if (downloadBtnEl) {
-        const storedCell = previewSession.tableType === 'table' && !readOnlyRowReason;
+        const storedCell = previewSession.canReadStoredCell;
         downloadBtnEl.disabled = false;
         downloadBtnEl.textContent = storedCell ? 'Download stored cell' : 'Download displayed text';
         downloadBtnEl.title = storedCell

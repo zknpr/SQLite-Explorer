@@ -165,10 +165,10 @@ function keysetResultNeedsOffsetRetry(
     const rowCount = (dataResult.rows || []).length;
     const expectedRows = recordCount - pageIndex * pageSize;
     if (rowCount === 0) return expectedRows > 0;
-    // 'before' targets an interior page, which the load's count says is full;
-    // a short result would shift the page phase, so prefer the OFFSET truth.
-    if (keyset.mode === 'before') return rowCount < Math.min(pageSize, expectedRows);
-    return false;
+    // A fresh count can expose deletes before an anchor too: its result may
+    // now overlap the preceding page or omit rows from this page. Restore the
+    // OFFSET phase whenever its length disagrees with the resolved count.
+    return rowCount !== Math.min(pageSize, expectedRows);
 }
 
 function keysetModeCanProveInexactCount(keyset) {
@@ -431,12 +431,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         let countResult = getCachedCount(countIdentity);
         let countWasFetchedForLoad = false;
 
-        if (countResult === undefined && navIntent === 'last') {
-            // 'last' must resolve the count before the data query: both its
-            // page index and the keyset remainder derive from it, and on huge
-            // tables the reversed remainder scan is far cheaper than the
-            // deep-OFFSET scan a count-blind query would need. This is exactly
-            // the original sequential flow.
+        if (navIntent === 'last' && (countResult === undefined || countResult.isExact)) {
+            // An exact 'last' page needs a fresh count: a reverse query can
+            // fill a stale remainder after external writes without revealing
+            // that either its page index or its row phase has changed. Inexact
+            // counts use a full reverse page and retain their bounded fast path.
             const storeCount = prepareCountStore(countIdentity);
             countResult = normalizeCountResult(
                 await backendApi.fetchTableCount(requestedTable, countOptions)
@@ -461,7 +460,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             totalRecordCount = countResult.count;
             totalRecordCountIsExact = countResult.isExact;
             totalPageCount = Math.max(1, Math.ceil(totalRecordCount / requestedPageSize));
-            if (currentPageIndex >= totalPageCount) {
+            if (navIntent === 'last' || currentPageIndex >= totalPageCount) {
                 currentPageIndex = Math.max(0, totalPageCount - 1);
             }
             queryOptions = buildDataQueryOptions(
@@ -583,13 +582,16 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                     returnedRowCount > cachedRemainingRows
                     || returnedRowCount >= requestedPageSize
                 );
+            const cachedPageMayHaveShrunk = totalRecordCountIsExact
+                && returnedRowCount < Math.min(requestedPageSize, cachedRemainingRows);
             const tighterBoundMayRecoverClippedCell = hasClippedCells(dataResult)
                 && queryOptions.limit > staleCountBoundOptions.limit;
-            if (cachedFinalPageMayHaveGrown || tighterBoundMayRecoverClippedCell) {
+            if (cachedFinalPageMayHaveGrown || cachedPageMayHaveShrunk || tighterBoundMayRecoverClippedCell) {
                 // A full or unexpectedly long cached final page cannot prove
                 // the table still ends here. Refresh before disabling Next.
-                // The same fresh count also keeps the containment retry from
-                // hiding rows inserted by another connection.
+                // A short page can instead reveal external deletes; the fresh
+                // count lets us clamp an index beyond the new end. It also
+                // keeps containment retries from hiding concurrently added rows.
                 const storeCount = prepareCountStore(countIdentity);
                 countResult = normalizeCountResult(
                     await backendApi.fetchTableCount(requestedTable, countOptions)
