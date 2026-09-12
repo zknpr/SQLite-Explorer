@@ -1099,6 +1099,14 @@ export function assertViewDefinitionStateCurrent(
 }
 
 /** Recognize the stable conflict after it crosses worker/webview RPC boundaries. */
+export const VIEW_SOURCE_CHANGED_MESSAGE =
+  'The database file changed on disk. This view draft was not saved. ' +
+  'Reload Database before loading the latest definition.';
+
+export function isViewSourceChangedError(error: unknown): boolean {
+  return (error instanceof Error ? error.message : String(error)).includes(VIEW_SOURCE_CHANGED_MESSAGE);
+}
+
 export function isViewDefinitionConflictError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.includes(VIEW_DEFINITION_CONFLICT_MESSAGE)

@@ -2,7 +2,15 @@ import './vscode_mock_setup';
 
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert';
-import { DEFAULT_INVOCATION_TIMEOUT_MS } from '../../src/core/rpc';
+import {
+  connectWorkerPort,
+  DEFAULT_INVOCATION_TIMEOUT_MS,
+  rejectPendingInvocations,
+  type PendingInvocation
+} from '../../src/core/rpc';
+import { runReadSnapshot } from '../../src/core/operation-serializer';
+import type { DatabaseOperations } from '../../src/core/types';
+import type { DatabaseConnectionBundle } from '../../src/connectionTypes';
 
 // 1. Mock module cache before importing the module under test
 const moduleCache = require('module')._cache;
@@ -22,6 +30,11 @@ let nativeBundleFactory: (() => Promise<any>) | undefined;
 let outputLines: string[] = [];
 let serializeOperationsCalls = 0;
 let maximumFileSizeBytes = 0;
+let localFileWritable = true;
+let useRealWorkerRpc = false;
+let workerMessageHandler: ((data: unknown) => void) | undefined;
+let postedWorkerMessages: { correlationId: string; methodName: string; parameters: unknown[] }[] = [];
+let realWorkerPending: Map<string, PendingInvocation> | undefined;
 
 const Module = require('module');
 
@@ -39,19 +52,31 @@ Module.prototype._compile = function(content: string, filename: string) {
 const originalRequire = Module.prototype.require;
 Module.prototype.require = function(id: string) {
     if (id === 'vscode') return require('./mocks/vscode').mockVscode;
+    if (id.endsWith('/fileWritability')) {
+        return { canPersistLocalDatabase: async () => localFileWritable };
+    }
     if (id.endsWith('core/rpc')) {
         return {
           connectWorkerPort: (
-            _port: unknown,
+            port: Parameters<typeof connectWorkerPort>[0],
             methods: string[],
             _onLog?: unknown,
             timeoutPolicy?: (methodName: string, parameters: readonly unknown[]) => number
           ) => {
             exposedWorkerMethods = methods;
             workerTimeoutPolicy = timeoutPolicy;
+            if (useRealWorkerRpc) {
+              const proxy = connectWorkerPort<Record<string, (...args: unknown[]) => Promise<unknown>>>(
+                port, methods, undefined, timeoutPolicy
+              );
+              realWorkerPending = (proxy as unknown as { __pendingInvocations: Map<string, PendingInvocation> })
+                .__pendingInvocations;
+              return proxy;
+            }
             return workerProxy;
           },
           DEFAULT_INVOCATION_TIMEOUT_MS,
+          rejectPendingInvocations,
           Transfer: class Transfer<T> {
             value: T;
             transferables: Transferable[];
@@ -77,8 +102,10 @@ Module.prototype.require = function(id: string) {
               workerTerminated = true;
               wasmWorkerTerminationCount++;
             }
-            postMessage() {}
-            on() {}
+            // Node accepts postMessage after termination without replying.
+            // Keep that transport behavior while exercising the real RPC code.
+            postMessage(data: typeof postedWorkerMessages[number]) { postedWorkerMessages.push(data); }
+            on(_event: string, handler: (data: unknown) => void) { workerMessageHandler = handler; }
             addEventListener() {}
           }
         };
@@ -149,6 +176,11 @@ describe('workerFactory error path tests', () => {
     outputLines = [];
     serializeOperationsCalls = 0;
     maximumFileSizeBytes = 0;
+    localFileWritable = true;
+    useRealWorkerRpc = false;
+    workerMessageHandler = undefined;
+    postedWorkerMessages = [];
+    realWorkerPending = undefined;
     workerProxy = {
       initializeDatabase: async () => {
         if (connectionFailed) throw new Error('Connection failed');
@@ -189,6 +221,36 @@ describe('workerFactory error path tests', () => {
     }
   } as any);
 
+  it('opens an OS-read-only local file read-only in the WASM backend', async () => {
+    localFileWritable = false;
+    let requestedReadOnly: boolean | undefined;
+    workerProxy.initializeDatabase = async (_name, transferred) => {
+      requestedReadOnly = transferred.value.readOnlyMode;
+      return { isReadOnly: requestedReadOnly, storage: 'memory' };
+    };
+    const bundle = await workerFactory.createDatabaseConnection(
+      { scheme: 'file', fsPath: '/test/extensionPath' } as any
+    );
+    try {
+      const connected = await bundle.establishConnection(testDbUri(), 'db.sqlite');
+      assert.strictEqual(requestedReadOnly, true);
+      assert.strictEqual(connected.isReadOnly, true);
+    } finally {
+      bundle.workerMethods[Symbol.dispose]();
+    }
+  });
+
+  it('forwards Create Table options through the desktop WASM facade', async () => {
+    const calls: unknown[][] = [];
+    workerProxy.createTable = async (...args: unknown[]) => { calls.push(args); return {}; };
+    const bundle = await workerFactory.createDatabaseConnection({ scheme: 'file', fsPath: '/test/extensionPath' } as any);
+    try {
+      const connected = await bundle.establishConnection(testDbUri(), 'db.sqlite');
+      await connected.databaseOps.createTable('keyed', [], { withoutRowid: true });
+      assert.deepStrictEqual(calls, [['keyed', [], { withoutRowid: true }]]);
+    } finally { bundle.workerMethods[Symbol.dispose](); }
+  });
+
   it('opens with WASM without an error notification when the install has no native binary', async () => {
     const showErrorMessage = mock.method(mockVscode.window, 'showErrorMessage');
     const extensionUri = { scheme: 'file', fsPath: '/test/natives-less-extension' } as any;
@@ -201,6 +263,25 @@ describe('workerFactory error path tests', () => {
     assert.strictEqual(await connection.databaseOps.engineKind, 'wasm');
     assert.strictEqual(showErrorMessage.mock.callCount(), 0);
     assert.deepStrictEqual(outputLines, ['[SQLite Explorer] Using WebAssembly SQLite backend']);
+  });
+
+  it('enforces the configured size limit before native open without disguising refusal as backend fallback', async () => {
+    nativeAvailable = true;
+    maximumFileSizeBytes = 1024;
+    let opened = 0;
+    const connection = { databaseOps: { engineKind: Promise.resolve('native') }, isReadOnly: false, storage: 'native' };
+    nativeBundleFactory = async () => ({ workerMethods: { [Symbol.dispose]() {} },
+      establishConnection: async () => { opened++; return connection; } });
+    mock.method(mockVscode.workspace.fs, 'stat', async () => ({ size: 2048 }));
+    const bundle = await workerFactory.createDatabaseConnection({ scheme: 'file', fsPath: '/test/extension' });
+    try {
+      await assert.rejects(() => bundle.establishConnection(testDbUri(), 'too-large.db'), /exceeds the maximum allowed size.*maxFileSize/);
+      assert.strictEqual(opened, 0);
+      assert.strictEqual(wasmWorkerCreationCount, 0);
+      maximumFileSizeBytes = 0;
+      assert.strictEqual(await bundle.establishConnection(testDbUri(), 'too-large.db'), connection);
+      assert.strictEqual(opened, 1);
+    } finally { bundle.workerMethods[Symbol.dispose](); }
   });
 
   it('does not create an unused WASM worker when the native connection succeeds', async () => {
@@ -296,6 +377,72 @@ describe('workerFactory error path tests', () => {
     } catch (err: any) {
       assert.strictEqual(err.message, 'Connection failed');
       assert.strictEqual(workerTerminated, true, 'terminateWorker should be called to prevent memory leaks');
+    }
+  });
+
+  it('rejects new worker calls after disposal without waiting for an RPC timeout', async () => {
+    useRealWorkerRpc = true;
+    const bundle: DatabaseConnectionBundle = await workerFactory.createDatabaseConnection(mockVscode.Uri.file('/test/extension'));
+    const pending = bundle.workerMethods.runQuery('SELECT 1');
+    const pendingRejected = assert.rejects(pending, /worker terminated/);
+    bundle.workerMethods[Symbol.dispose]();
+    await pendingRejected;
+
+    let outcome: unknown;
+    const afterDisposal = bundle.workerMethods.runQuery('SELECT 1').then(
+      () => { outcome = 'unexpected success'; },
+      (error: unknown) => { outcome = error; }
+    );
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.ok(outcome instanceof Error, 'a disposed worker call must reject before any timeout expires');
+      assert.match(outcome.message, /worker terminated/);
+      assert.strictEqual(realWorkerPending!.size, 0, 'retired calls must not leave expiration timers');
+      bundle.workerMethods[Symbol.dispose]();
+      assert.strictEqual(wasmWorkerTerminationCount, 1, 'disposal must terminate the worker once');
+    } finally {
+      rejectPendingInvocations(realWorkerPending!, new Error('test cleanup'));
+      await afterDisposal;
+    }
+  });
+
+  it('settles snapshot cleanup promptly when its worker is disposed during the operation', async () => {
+    useRealWorkerRpc = true;
+    const bundle: DatabaseConnectionBundle = await workerFactory.createDatabaseConnection(mockVscode.Uri.file('/test/extension'));
+    const started = Promise.withResolvers<void>();
+    const operations = {
+      executeQuery: bundle.workerMethods.runQuery
+    } as unknown as DatabaseOperations;
+    let outcome: unknown;
+    const snapshot = runReadSnapshot(operations, async () => {
+      const pending = bundle.workerMethods.runQuery('SELECT 1');
+      started.resolve();
+      await pending;
+    }).then(
+      () => { outcome = 'unexpected success'; },
+      (error: unknown) => { outcome = error; }
+    );
+    const savepoint = postedWorkerMessages[0];
+    assert.strictEqual(savepoint.methodName, 'runQuery');
+    assert.match(String(savepoint.parameters[0]), /^SAVEPOINT /);
+    workerMessageHandler!({ kind: 'result', correlationId: savepoint.correlationId, payload: [] });
+    await started.promise;
+    bundle.workerMethods[Symbol.dispose]();
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.ok(outcome instanceof AggregateError, 'snapshot rollback/release must settle before any timeout expires');
+      assert.strictEqual(outcome.errors.length, 3);
+      for (const error of outcome.errors) {
+        assert.match(error.message, /worker terminated/);
+      }
+      assert.strictEqual(realWorkerPending!.size, 0);
+    } finally {
+      // Also clean the unfixed path, where each cleanup step starts a new timer.
+      for (let step = 0; step < 3; step++) {
+        rejectPendingInvocations(realWorkerPending!, new Error('test cleanup'));
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      await snapshot;
     }
   });
 

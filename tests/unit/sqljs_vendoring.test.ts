@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 const vendoredDirectory = path.resolve(process.cwd(), 'vendor/sql.js');
 const vendoredGlue = path.join(vendoredDirectory, 'sql-wasm.js');
 const vendoredWasm = path.join(vendoredDirectory, 'sql-wasm.wasm');
-const PATCHED_WASM_SHA256 = 'bd2d54f78e35d1428ec640633c7c7677cb92b88e08ead911818016750e966fc4';
+const PATCHED_WASM_SHA256 = JSON.parse(readFileSync(path.resolve('vendor/query-plan-manifest.json'), 'utf8')).outputs['assets/sqlite3.wasm'];
 
 describe('vendored sql.js', () => {
   it('provides the patched preemption APIs', async () => {

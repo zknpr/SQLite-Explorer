@@ -17,6 +17,9 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import { createHash } from 'node:crypto';
+import { verifyQueryPlanArtifacts } from './build-query-plan.mjs';
+
+verifyQueryPlanArtifacts(undefined, { includeBuildAssets: false });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -463,6 +466,7 @@ const validateBuildOutputs = () => {
   if (missingFiles.length > 0) {
     throw new Error(`Build validation failed: missing files: ${missingFiles.join(', ')}`);
   }
+
 };
 
 /**
@@ -501,6 +505,7 @@ const compileExt = async (target) => {
 
   // Validate all required outputs exist
   validateBuildOutputs();
+  verifyQueryPlanArtifacts();
 };
 
 // Run if executed directly

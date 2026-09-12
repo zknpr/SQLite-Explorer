@@ -203,6 +203,9 @@ function loadDesktopWorkerFactory(options: {
 
   const originalRequire = Module.prototype.require;
   Module.prototype.require = function(request: string) {
+    if (request.endsWith('/fileWritability')) {
+      return { canPersistLocalDatabase: async () => true };
+    }
     if (request === 'vscode') return mockVscode;
     if (request.endsWith('nativeWorker')) {
       // Force the WASM fallback: behave like a platform without a native binary.

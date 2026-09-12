@@ -153,6 +153,18 @@ export function storedCellStatesEqual(left: StoredCellState, right: StoredCellSt
   }
   const leftValue = left.value;
   const rightValue = right.value;
+  // Native and WASM history can represent a small SQLite INTEGER differently.
+  // Compare only exact conversions; never equate REAL storage or a rounded
+  // unsafe JS number with an int64 value.
+  if (left.storageClass === 'integer' && typeof leftValue !== typeof rightValue) {
+    if (typeof leftValue === 'number' && Number.isSafeInteger(leftValue) && typeof rightValue === 'bigint') {
+      return BigInt(leftValue) === rightValue;
+    }
+    if (typeof rightValue === 'number' && Number.isSafeInteger(rightValue) && typeof leftValue === 'bigint') {
+      return leftValue === BigInt(rightValue);
+    }
+    return false;
+  }
   if (leftValue instanceof Uint8Array || rightValue instanceof Uint8Array) {
     if (!(leftValue instanceof Uint8Array) || !(rightValue instanceof Uint8Array)) return false;
     return leftValue.length === rightValue.length

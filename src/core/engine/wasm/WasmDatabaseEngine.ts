@@ -1,3 +1,4 @@
+import { prepareReadQuery, buildReadTransport, decodeReadTransport, queryPlanRequest, decodeQueryPlan, SQL_RESULT_ROWS, SQL_MAX_COLUMNS } from '../../sql-workspace';
 /**
  * WebAssembly-based SQLite database engine (sql.js).
  *
@@ -117,7 +118,8 @@ import {
   remapPrimaryKeyContainment
 } from '../../cell-containment';
 import { getNodeFs } from '../../platform/fs';
-import { writeDatabaseSnapshotAtomically } from '../../../atomicDatabaseWrite';
+import { assertDatabaseFileGenerationCurrent, writeDatabaseSnapshotAtomically, type DatabaseFileGeneration } from '../../../atomicDatabaseWrite';
+import { VIEW_SOURCE_CHANGED_MESSAGE } from '../../view-utils';
 import {
   buildCappedCountProbeSql,
   buildCountUpperBoundSql,
@@ -277,6 +279,7 @@ export interface WasmPagedHostIo {
 }
 
 export interface WasmEngineModule {
+  _sqlite_explorer_register_query_plan?: () => number;
   Database: (new (data?: ArrayLike<number>) => WasmDatabaseInstance) & {
     /**
      * Page-on-demand read-only open, present only in the patched sql.js
@@ -398,6 +401,8 @@ export interface WasmEnginePagedState {
   getReadError?: () => Error | undefined;
   /** Revalidate the frozen base even when every export read hits the host cache. */
   assertBaseUnchanged?: () => void;
+  /** Permit atomic replacement without discarding a retryable writable overlay. */
+  releaseBaseHandle?: () => void;
   /** Release host read resources; called once from shutdown(). */
   dispose?: () => void;
 }
@@ -431,7 +436,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       idleTimeoutMs?: number;
       absoluteTimeoutMs?: number;
     } = {},
-    pagedState?: WasmEnginePagedState
+    pagedState?: WasmEnginePagedState,
+    private readonly memorySource?: DatabaseFileGeneration
   ) {
     this.instance = instance;
     this.pagedState = pagedState;
@@ -501,6 +507,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
   /** Prepare only when SQLite proves the statement consumed our generated suffix. */
   private prepareSingleStatement(sql: string): WasmPreparedStatement {
+    this.restorePendingExportPragmas();
     const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
     const statement = this.instance.prepare(`${sql}\n${boundary}`);
     if (!statement.getSQL().trimEnd().endsWith(boundary)) {
@@ -625,6 +632,60 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * @param params - Optional bound parameters
    * @returns Array of result sets in sql.js format
    */
+  async executeReadQuery(sql: string, params: CellValue[] = [], explain = false, cancellation?: WasmQueryCancellation): Promise<QueryResultSet> {
+    this.assertNoActiveReadSession();
+    const prepared = prepareReadQuery(sql);
+    if (params.length !== prepared.parameterCount) throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
+    if (explain) {
+      return this.executeWithProgressHandler(() => {
+        const request = queryPlanRequest(prepared.sourceSql, params);
+        return decodeQueryPlan(this.queryRaw(request.sql, request.params).rows[0]?.[0]);
+      }, cancellation);
+    }
+    const metadataView = `query_columns_${crypto.randomUUID().replace(/-/g, '')}`;
+    let createdMetadataView = false;
+    const queryOnly = Number(this.queryRaw('PRAGMA query_only').rows[0]?.[0]) === 1;
+    let headers: string[];
+    try {
+      // query_only also blocks TEMP DDL. Lift it only for this synchronous,
+      // host-generated metadata view, then restore it before executing the
+      // user's SELECT. No await or user-query step occurs in this interval.
+      if (queryOnly) this.runSingleStatement('PRAGMA query_only = OFF');
+      headers = this.executeWithProgressHandler(() => {
+      // Bound schema-derived names before get() extracts strings into JS.
+      // getColumnNames() alone cannot enforce a pre-allocation label limit.
+      this.runSingleStatement(`CREATE TEMP VIEW "${metadataView}" AS ${prepared.metadataSql}`);
+      createdMetadataView = true;
+      const names = this.queryRaw(
+        "SELECT substr(name, 1, 4097) FROM pragma.pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?",
+        [metadataView, SQL_MAX_COLUMNS + 1]
+      ).rows.map(row => String(row[0]));
+      if (!names.length || names.length > SQL_MAX_COLUMNS) throw new Error('Queries support 1 to 128 result columns.');
+      if (names.some(header => header.length > 4096)) throw new Error('Result column labels must be at most 4096 characters.');
+      return names;
+      }, cancellation);
+    } finally {
+      // Remove an expired deadline before cleanup, including on compiler errors.
+      try { if (createdMetadataView) this.runSingleStatement(`DROP VIEW temp."${metadataView}"`); }
+      finally {
+        if (queryOnly) {
+          try { this.runSingleStatement('PRAGMA query_only = ON'); }
+          catch (error) { this.shutdown(); throw error; }
+        }
+      }
+    }
+    return this.executeWithProgressHandler(() => {
+      const transport = buildReadTransport(prepared.sql, headers.length);
+      const statement = this.prepareSingleStatement(transport.sql);
+      try {
+        statement.bind(normalizeWasmBindParams(params));
+        const rows: Array<Array<CellValue | bigint>> = [];
+        while (rows.length <= SQL_RESULT_ROWS && statement.step()) rows.push(statement.get(null, { useBigInt: true })!);
+        return decodeReadTransport(headers, rows, transport.valueColumnCount);
+      } finally { statement.free(); }
+    }, cancellation);
+  }
+
   async executeQuery(
     sql: string,
     params?: CellValue[],
@@ -702,6 +763,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         'A query read session is active; close it before running another database operation'
       );
     }
+    this.restorePendingExportPragmas();
   }
 
   private getCellTextEncoding(): CellTextEncoding {
@@ -974,8 +1036,25 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
   /** Export a buffer/paged-writable database and normalize the fork's save gate. */
   private exportDatabaseImage(): Uint8Array {
+    this.restorePendingExportPragmas();
     this.assertSerializable();
     this.pagedState?.assertBaseUnchanged?.();
+    // Buffer-mode sql.js export closes and reopens its connection. Preserve
+    // connection policy, especially foreign-key enforcement, even on a failed
+    // save. Paged export does not reopen SQLite and must not alter its snapshot.
+    const connectionPragmas = this.pagedState ? [] : [
+      'foreign_keys', 'journal_mode', 'synchronous', 'cache_size',
+      'locking_mode', 'temp_store', 'query_only'
+    ].map(pragma => {
+      const value = this.instance.exec(`PRAGMA ${pragma}`)[0]?.values[0]?.[0];
+      if (!(typeof value === 'number' && Number.isSafeInteger(value))
+        && !(typeof value === 'string' && /^[a-zA-Z0-9_-]+$/.test(value))) {
+        throw new Error(`SQLite returned an invalid PRAGMA ${pragma} value before export`);
+      }
+      return { pragma, value };
+    });
+    this.pendingExportPragmas = connectionPragmas;
+    let exportError: unknown;
     try {
       const data = this.instance.export();
       // A cached base page does not invoke hostIo.read(), so revalidate after
@@ -983,6 +1062,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.pagedState?.assertBaseUnchanged?.();
       return data;
     } catch (error) {
+      exportError = error;
       const message = error instanceof Error ? error.message : String(error);
       if (this.pagedState?.writable && /transaction is open/i.test(message)) {
         throw new Error(
@@ -991,6 +1071,39 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         );
       }
       throw error;
+    } finally {
+      try {
+        this.restorePendingExportPragmas();
+      } catch (error) {
+        if (exportError !== undefined) {
+          throw new AggregateError([exportError, error], 'Database export failed and connection PRAGMAs could not be restored');
+        }
+        throw error;
+      }
+    }
+  }
+
+  private pendingExportPragmas: Array<{ pragma: string; value: number | string }> | undefined;
+
+  private restorePendingExportPragmas(): void {
+    if (!this.pendingExportPragmas) return;
+    try {
+      for (const { pragma, value } of this.pendingExportPragmas) {
+        const current = this.instance.exec(`PRAGMA ${pragma}`)[0]?.values[0]?.[0];
+        if (current !== value) {
+          this.instance.exec(`PRAGMA ${pragma} = ${typeof value === 'number' ? value : `'${value}'`}`);
+          const restored = this.instance.exec(`PRAGMA ${pragma}`)[0]?.values[0]?.[0];
+          if (restored !== value) throw new Error(`SQLite did not restore PRAGMA ${pragma} after export`);
+        }
+      }
+      this.pendingExportPragmas = undefined;
+    } catch (error) {
+      // Retain the live overlay and its required policy. A transient failure
+      // can be retried, but no subsequent SQL may run with reset enforcement.
+      throw new Error(
+        `Connection PRAGMAs could not be restored; the operation was refused: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      );
     }
   }
 
@@ -1054,6 +1167,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         + 'save time, disk I/O, and required free space scale with the database size.'
       );
     }
+    // Desktop facade operations are serialized through the host save. Release
+    // our read handle now: Windows denies replacement while it is open. The
+    // base reader can reacquire it if Save As or a failed save leaves us alive.
+    pagedState.releaseBaseHandle?.();
     return snapshot;
   }
 
@@ -1384,6 +1501,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   private async undoRowInsert(targetTable: string, mod: ModificationEntry): Promise<void> {
+    if (mod.insertedRows?.length) {
+      // Reverse insertion order so a child is removed before its imported parent.
+      await this.deleteRowHistorySnapshots(targetTable, [...mod.insertedRows].reverse());
+      return;
+    }
     if (!mod.insertedRow || mod.targetRowId === undefined) {
       throw new LegacyRowHistoryError();
     }
@@ -1842,6 +1964,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             break;
 
         case 'row_insert':
+            if (mod.insertedRows?.length) {
+              await this.restoreRowHistorySnapshots(targetTable, mod.insertedRows);
+              break;
+            }
             if (!mod.insertedRow) throw new LegacyRowHistoryError();
             await this.restoreRowHistorySnapshots(targetTable, [mod.insertedRow]);
             break;
@@ -1886,7 +2012,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
         case 'table_create':
             if (tableDef && tableDef.columns) {
-                await this.createTable(targetTable, tableDef.columns);
+                await this.createTable(targetTable, tableDef.columns, tableDef.options);
             } else if (strict) {
                 throw new Error('Cannot apply table_create: missing table definition');
             }
@@ -2862,6 +2988,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     headers: string[];
     rows: Array<Array<CellValue | bigint>>;
   } {
+    this.restorePendingExportPragmas();
     const statement = this.instance.prepare(sql, normalizeWasmBindParams(params));
     try {
       const headers = statement.getColumnNames();
@@ -3437,9 +3564,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   async createTable(
     table: string,
-    columns: ColumnDefinition[]
+    columns: ColumnDefinition[],
+    options?: import('../../types').CreateTableOptions
   ): Promise<ColumnDropTableState> {
-    const sql = buildCreateTableSql(table, columns);
+    const sql = buildCreateTableSql(table, columns, options);
     const savepointName = this.createSavepointName('sp_create_table');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
@@ -3562,6 +3690,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   async getViewDefinition(view: string): Promise<ViewDefinition> {
+    // The in-memory schema cannot detect a different writer's file change.
+    // Refuse the draft before DDL, without discarding unrelated unsaved edits.
+    try {
+      if (this.memorySource) {
+        const fs = getNodeFs();
+        if (!fs) throw new Error('Cannot verify the database source file');
+        assertDatabaseFileGenerationCurrent(fs, this.memorySource);
+      }
+      this.pagedState?.assertBaseUnchanged?.();
+    } catch (error) {
+      throw new Error(VIEW_SOURCE_CHANGED_MESSAGE, { cause: error });
+    }
     return this.readViewDefinition(view, false);
   }
 
@@ -3943,12 +4083,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const rowIdPredicates = buildRecordIdentityPredicateChunks(rowIds, rowIdIdentity);
       const currentValues = new Map<string, Map<string, StoredCellState>>();
       for (const predicate of rowIdPredicates) {
-        const current = await this.executeQuery(
+        // History needs exact int64 values, not the display query conversion.
+        const current = this.queryRaw(
           `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
           `FROM ${escapedTable} WHERE ${predicate.sql}`,
           predicate.params
         );
-        for (const row of current[0]?.rows ?? []) {
+        for (const row of current.rows) {
           const values = new Map<string, StoredCellState>();
           columns.forEach((column, index) => values.set(column, parseStoredCellState(
             row[index * 2 + 1],
@@ -4317,7 +4458,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           sql,
           valueHeaders.length,
           queryOptions,
-          containmentRawTextColumnIndices
+          containmentRawTextColumnIndices,
+          'hex'
         );
         const transportQuery = buildExactNumericTextQuery(
           containmentQuery.sql,
@@ -4815,9 +4957,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const signal = cancellationCheck(cancellation);
     signal?.throwIfAborted();
     const data = this.exportDatabaseImage();
-    return writeDatabaseSnapshotAtomically(
+    await writeDatabaseSnapshotAtomically(
       fs,
-      undefined,
+      this.memorySource?.sourcePath,
       path,
       async temporaryPath => {
         // The helper supplies a collision-resistant sibling path. `wx` keeps
@@ -4825,7 +4967,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         await fs.promises.writeFile(temporaryPath, data, { flag: 'wx' });
       },
       signal,
-      (level, message, error) => this.logger(level, message, error)
+      (level, message, error) => this.logger(level, message, error),
+      this.memorySource
     );
+    // The image and its history remain authoritative in memory; only paged
+    // and native engines need to reopen a descriptor after replacing a file.
+    return { requiresReopen: false };
   }
 }

@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import Module from 'node:module';
 import esbuild from 'esbuild';
 import { mockVscode } from './mocks/vscode';
-import type { CellUpdate, CellValue, DatabaseInitConfig, ModificationEntry } from '../../src/core/types';
+import type { CellUpdate, CellValue, CreateTableOptions, DatabaseInitConfig, ModificationEntry } from '../../src/core/types';
 
 const workerFactoryPath = path.resolve(__dirname, '../../src/workerFactory.ts');
 const workerFactorySource = fs.readFileSync(workerFactoryPath, 'utf8');
@@ -25,6 +25,7 @@ interface FakeEndpoint {
   insertRow(table: string, data: Record<string, CellValue>): Promise<string | number | undefined>;
   updateCellBatch(table: string, updates: CellUpdate[]): Promise<void>;
   ping(): Promise<boolean>;
+  createTable?(table: string, columns: unknown[], options?: CreateTableOptions): Promise<unknown>;
   writeToFile?(path: string, signal?: AbortSignal): Promise<void>;
 }
 
@@ -137,6 +138,7 @@ describe('workerFactory browser WASM connection', () => {
     let updateCellPatch: string | undefined;
     let insertRowValue: CellValue | undefined;
     let updateBatchValue: CellValue | undefined;
+    let createOptions: CreateTableOptions | undefined;
 
     const endpoint: FakeEndpoint = {
       initializeDatabase: async (_filename, config) => {
@@ -156,7 +158,8 @@ describe('workerFactory browser WASM connection', () => {
       updateCellBatch: async (_table, updates) => {
         updateBatchValue = updates[0].value;
       },
-      ping: async () => true
+      ping: async () => true,
+      createTable: async (_table, _columns, options) => { createOptions = options; return {}; }
     };
 
     const workerFactory = loadBrowserWorkerFactory(endpoint);
@@ -191,6 +194,8 @@ describe('workerFactory browser WASM connection', () => {
     assert.strictEqual(updateCellPatch, '{"merged":true}');
     assert.strictEqual(insertRowValue, blobValue);
     assert.strictEqual(updateBatchValue, blobValue);
+    await connection.databaseOps.createTable('keyed', [], { withoutRowid: true });
+    assert.deepStrictEqual(createOptions, { withoutRowid: true });
   });
 
   it('opens browser WAL databases read-only instead of silently writing without WAL pages', async () => {

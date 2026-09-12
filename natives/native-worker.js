@@ -63,6 +63,7 @@ const stdinReader = usesLegacyStdio ? null : tjs.stdin.getReader();
 /** Currently open database instance */
 let db = null;
 let databasePath = null;
+let databaseReadOnly = false;
 
 /** Optional second connection used only for bounded reads outside transactions. */
 let asyncDb = null;
@@ -71,6 +72,7 @@ let asyncCapabilitySupported = false;
 
 /** AbortControllers for async operations addressable by their request id. */
 const activeOperations = new Map();
+const queryPlanDatabases = new WeakSet();
 
 /** TEMP export spools owned by the interruptible secondary connection. */
 const exportSpools = new Set();
@@ -233,8 +235,9 @@ async function readMessage() {
  * the same connection must remain usable afterwards. Escalating finite bounds
  * give a delayed timer a wider delivery window without making startup depend
  * on an unbounded query: at most 41 million recursive rows are requested. Once
- * the 10ms timer lands in flight, a signal-ignoring binary is rejected after
- * that finite attempt (normally the first 1-million-row query).
+ * an abort has been delivered, a normal reply is still inconclusive: SQLite
+ * may have finished before the event loop delivered its queued success.
+ * Retry with a fresh signal within the same finite three-query budget.
  */
 function probeAsyncDatabase(candidate) {
   return (async () => {
@@ -247,21 +250,28 @@ function probeAsyncDatabase(candidate) {
       return false;
     }
 
-    const controller = new AbortController();
+    let controller = new AbortController();
     let operationInFlight = false;
     let abortFired = false;
     let abortDeliveredInFlight = false;
-    const abortTimer = setTimeout(() => {
+    const deliverAbort = () => {
       // Retain this timer across inconclusive attempts. Once overdue, it can
       // land during the next larger query instead of being cleared and reset.
       abortFired = true;
       abortDeliveredInFlight = operationInFlight;
       controller.abort();
-    }, 10);
+    };
+    let abortTimer = setTimeout(deliverAbort, 10);
     let signalSupported = false;
     try {
       const rowBounds = [1000000, 8000000, 32000000];
       for (const rowBound of rowBounds) {
+        if (abortFired) {
+          controller = new AbortController();
+          abortFired = false;
+          abortDeliveredInFlight = false;
+          abortTimer = setTimeout(deliverAbort, 10);
+        }
         const probeSql =
           'WITH RECURSIVE sqlite_explorer_probe(value) AS (' +
           `SELECT 1 UNION ALL SELECT value + 1 FROM sqlite_explorer_probe WHERE value < ${rowBound}` +
@@ -270,20 +280,21 @@ function probeAsyncDatabase(candidate) {
         try {
           await candidate.all(probeSql, [], { signal: controller.signal });
         } catch (err) {
-          if (!abortDeliveredInFlight || (err && err.message) !== 'Aborted') return false;
+          if (!abortDeliveredInFlight || (err && err.message) !== 'Aborted') {
+            console.error('[native-worker] AsyncDatabase signal probe rejected without confirming cancellation:',
+              describeNativeError(err, 'Unknown probe failure'),
+              `abort delivered while awaiting query: ${abortDeliveredInFlight}`);
+            return false;
+          }
           signalSupported = true;
           break;
         } finally {
           operationInFlight = false;
         }
 
-        if (abortDeliveredInFlight) {
-          // The operation stayed in flight through delivery but ignored it.
-          return false;
-        }
-        if (abortFired) return false;
-        // Completion beat the still-pending timer, so retry immediately with a
-        // larger finite query and give that overdue callback another window.
+        // Awaiting the reply does not prove the native job is still running.
+        // Only an actual abort rejection establishes cancellation support.
+        // Keep an undelivered timer pending, or rearm a delivered one above.
       }
     } finally {
       operationInFlight = false;
@@ -291,15 +302,20 @@ function probeAsyncDatabase(candidate) {
     }
 
     if (!signalSupported) {
-      // All finite attempts completed before the abort callback ran. Capability
-      // remains inconclusive, so fail closed for this worker session.
+      // No finite attempt confirmed cancellation. Do not use this connection
+      // for operations that require host interruption.
+      console.error('[native-worker] AsyncDatabase cancellation support was not confirmed within the bounded probe');
       return false;
     }
 
     try {
       const rows = await candidate.all('SELECT 1 AS value', []);
-      return Array.isArray(rows) && rows[0]?.value === 1;
-    } catch {
+      const healthy = Array.isArray(rows) && rows[0]?.value === 1;
+      if (!healthy) console.error('[native-worker] AsyncDatabase post-abort health check returned an unexpected value');
+      return healthy;
+    } catch (error) {
+      console.error('[native-worker] AsyncDatabase post-abort health check failed:',
+        describeNativeError(error, 'Unknown health-check failure'));
       return false;
     }
   })();
@@ -530,7 +546,9 @@ function executeStatement(db, sql, params) {
 
   try {
     if (typeof stmt.run === 'function') {
-      const runResult = params && params.length > 0 ? stmt.run(...params) : stmt.run();
+      // txiki treats one object argument as a bindings container. Spreading
+      // [null] or [Uint8Array] confuses a SQL value with that container.
+      const runResult = stmt.run(params ?? []);
       if (runResult && typeof runResult === 'object') {
         result.changes = runResult.changes !== undefined ? runResult.changes : 0;
         result.lastInsertRowId = runResult.lastInsertRowId !== undefined ? runResult.lastInsertRowId : 0;
@@ -695,7 +713,7 @@ function executeQuery(db, sql, params) {
       }
 
       const rows = statementCount === 0 && params && params.length > 0
-        ? stmt.all(...params)
+        ? stmt.all(params)
         : stmt.all();
       const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
       lastResult = {
@@ -1329,7 +1347,7 @@ function executeSingleQuery(db, sql, params, requiredSuffix) {
     }
 
     if (typeof stmt.all === 'function') {
-      rows = params && params.length > 0 ? stmt.all(...params) : stmt.all();
+      rows = stmt.all(params ?? []);
     } else {
       if (params && params.length > 0 && typeof stmt.bind === 'function') {
         stmt.bind(...params);
@@ -1656,6 +1674,7 @@ async function handleRequest(request) {
         }
         db = new Database(path, { readOnly });
         databasePath = path;
+        databaseReadOnly = readOnly;
         await openAsyncDatabase(path, readOnly);
         result = { success: true };
         break;
@@ -1671,6 +1690,7 @@ async function handleRequest(request) {
         }
         db = new Database(":memory:");
         databasePath = null;
+        databaseReadOnly = false;
         result = { success: true };
         break;
       }
@@ -1690,6 +1710,7 @@ async function handleRequest(request) {
           db = null;
         }
         databasePath = null;
+        databaseReadOnly = false;
         result = { success: true };
         break;
       }
@@ -1697,6 +1718,29 @@ async function handleRequest(request) {
       // ========================================
       // Query execution
       // ========================================
+
+      case "setJournalMode": {
+        const [mode] = args;
+        if (!db) throw new Error("Database not open");
+        if (typeof mode !== 'string' || !['delete', 'truncate', 'persist', 'memory', 'wal', 'off'].includes(mode.toLowerCase())) {
+          throw new Error('Invalid journal mode');
+        }
+        if (exportSpools.size > 0) {
+          throw new Error('Cannot change journal mode while a native export is active');
+        }
+        // A completed read still leaves the private connection attached to WAL.
+        // SQLite needs that handle closed to leave WAL; never close caller-owned
+        // snapshots or external readers, whose real locks must remain visible.
+        const reopenAsync = Boolean(asyncDb);
+        if (reopenAsync) await closeAsyncDatabase();
+        try {
+          db.exec(`PRAGMA journal_mode = '${mode}'`);
+          result = { success: true };
+        } finally {
+          if (reopenAsync) await openAsyncDatabase(databasePath, databaseReadOnly);
+        }
+        break;
+      }
 
       case "exec": {
         // Execute SQL without returning results
@@ -1895,6 +1939,73 @@ async function handleRequest(request) {
         break;
       }
 
+      case "describeReadQuery": {
+        const [sql, metadataSql, boundary, maxColumns, timeoutMs] = args;
+        if (!db) throw new Error("Database not open");
+        result = runWithQueryDeadline(db, timeoutMs, () => {
+          assertSingleStatementPayload(db, `${sql}\n${boundary}`, sql, boundary);
+          const name = `__sql_workspace_${++savepointCounter}`;
+          const create = `CREATE TEMP VIEW "${name}" AS ${metadataSql}`;
+          assertSingleStatementPayload(db, `${create}\n${boundary}`, create, boundary);
+          db.exec(create);
+          try {
+            const statement = db.prepare(`SELECT substr(name, 1, 4097) AS name FROM pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?`);
+            try {
+              const rows = statement.all([name, maxColumns + 1]);
+              if (!rows.length || rows.length > maxColumns) throw new Error('Queries support 1 to 128 result columns.');
+              if (rows.some(row => row.name.length > 4096)) throw new Error('Result column labels must be at most 4096 characters.');
+              return rows.map(row => row.name);
+            } finally { statement.finalize(); }
+          } finally { db.exec(`DROP VIEW temp."${name}"`); }
+        });
+        break;
+      }
+
+      case "workspaceQueryPlan": {
+        const [sql, params, library, timeoutMs] = args;
+        if (!db) throw new Error("Database not open");
+        if (!queryPlanDatabases.has(db)) {
+          db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
+          queryPlanDatabases.add(db);
+        }
+        // Use the primary connection so TEMP objects and pending DDL are
+        // included. The bundled C reader bounds compilation and extraction.
+        result = runWithQueryDeadline(db, timeoutMs, () => {
+          const statement = db.prepare(sql);
+          try { return statement.all(params ?? [])[0].plan; }
+          finally { statement.finalize(); }
+        });
+        break;
+      }
+
+      case "workspaceQuery": {
+        const [sql, boundary, params, columns, timeoutMs] = args;
+        if (!db) throw new Error("Database not open");
+        assertSingleStatementPayload(db, `${sql}\n${boundary}`, sql, boundary);
+        let rows;
+        const tempProbe = db.prepare('SELECT 1 FROM sqlite_temp_schema LIMIT 1');
+        let hasTempObjects;
+        try { hasTempObjects = tempProbe.all().length > 0; } finally { tempProbe.finalize(); }
+        if (!hasTempObjects && shouldUseAsyncDatabase(db, asyncDb)) {
+          const operation = { controller: new AbortController(), reason: undefined };
+          activeOperations.set(id, operation);
+          const timer = setTimeout(() => { operation.reason = 'deadline'; operation.controller.abort(); }, timeoutMs);
+          try { rows = await asyncDb.all(sql, params, { signal: operation.controller.signal }); }
+          catch (error) {
+            if (operation.reason === 'deadline') throw new Error(`Query execution timed out after ${timeoutMs}ms`);
+            throw error;
+          } finally { clearTimeout(timer); activeOperations.delete(id); }
+        } else {
+          rows = runWithQueryDeadline(db, timeoutMs, () => {
+            const statement = db.prepare(sql);
+            try { return statement.all(params ?? []); } finally { statement.finalize(); }
+          });
+        }
+        const names = columns;
+        result = { columns: names, values: rows.map(row => names.map(name => row[name])) };
+        break;
+      }
+
       case "queryBounded": {
         const [markedSql, sql, requiredSuffix, columns, valueColumnCount, limit, timeoutMs] = args;
         if (!db) throw new Error("Database not open");
@@ -2000,6 +2111,12 @@ async function handleRequest(request) {
         const [sql, params] = args;
 
         if (!db) throw new Error("Database not open");
+        const transactionWasActive = typeof db.inTransaction === 'function'
+          ? db.inTransaction()
+          : db.inTransaction;
+        if (typeof transactionWasActive !== 'boolean') {
+          throw new Error('Native SQLite transaction state is unavailable');
+        }
 
         try {
           const runResult = executeStatement(db, sql, params);
@@ -2012,6 +2129,9 @@ async function handleRequest(request) {
               // never masquerade as a successful zero-row write.
               result = readRunFallbackResult(db);
           }
+          // Savepoint ownership must come from the same handle, before this
+          // statement, so cleanup never rolls back a caller-owned transaction.
+          result = { ...result, transactionWasActive };
         } catch (e) {
             throw e;
         }
@@ -2040,8 +2160,7 @@ async function handleRequest(request) {
                  const stmt = db.prepare(item.sql);
                  try {
                      for (const params of item.paramsList) {
-                         if (params && params.length > 0) stmt.run(...params);
-                         else stmt.run();
+                         stmt.run(params ?? []);
                      }
                  } finally {
                      if (typeof stmt.free === 'function') stmt.free();
@@ -2085,15 +2204,13 @@ async function handleRequest(request) {
         const [stmtId, params] = args;
         const stmt = statements.get(stmtId);
         if (!stmt) throw new Error(`Statement ${stmtId} not found`);
-        stmt.reset();
-        if (params && params.length > 0) {
-            if (typeof stmt.bind === 'function') stmt.bind(...params);
+        if (params !== undefined && params !== null && !Array.isArray(params)) {
+          throw new Error('SQL statement parameters must be an array');
         }
-        stmt.run();
-        result = {
-          changes: db.totalChanges,
-          lastInsertRowId: db.lastInsertRowId
-        };
+        // The bundled Statement run/all methods reset and bind on each call;
+        // there is no separate reset/bind API on this runtime.
+        stmt.run(params ?? []);
+        result = readRunFallbackResult(db);
         break;
       }
 
@@ -2101,11 +2218,10 @@ async function handleRequest(request) {
         const [stmtId, params] = args;
         const stmt = statements.get(stmtId);
         if (!stmt) throw new Error(`Statement ${stmtId} not found`);
-        stmt.reset();
-         if (params && params.length > 0) {
-            if (typeof stmt.bind === 'function') stmt.bind(...params);
+        if (params !== undefined && params !== null && !Array.isArray(params)) {
+          throw new Error('SQL query parameters must be an array');
         }
-        const rows = stmt.all();
+        const rows = stmt.all(params ?? []);
         let columns = [];
         if (rows.length > 0) {
           columns = Object.keys(rows[0]);

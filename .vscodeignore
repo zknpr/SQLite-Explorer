@@ -5,9 +5,8 @@
 !out/
 !out/**
 
-# Include core UI and utilities
-!core/
-!core/**
+# The viewer already bundles its JavaScript and CSS; ship only that artifact.
+!core/ui/viewer.html
 
 # Include WASM binary
 !assets/

@@ -285,6 +285,11 @@ export function planJsonPatchHistoryReplay(
         return { kind: 'conflict' };
     }
 
+    // With no intervening write, restore the recorded TEXT bytes, including
+    // key order, whitespace and escapes. Surgical replay is only needed when
+    // an unrelated sibling changed; its conflict/depth checks still run above.
+    if (cellValuesEqual(currentRaw, expectedRaw)) return { kind: 'write', value: targetRaw };
+
     const replayed = direction === 'undo'
         ? restoreInto(current, forwardPatch, prior, 0)
         : applyMergePatch(current, forwardPatch, 0);

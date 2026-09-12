@@ -400,10 +400,12 @@ export interface ModificationEntry {
   rowData?: Record<string, CellValue>;
   /** Authoritative post-insert row required for guarded undo/redo. */
   insertedRow?: DeletedRow;
+  /** Authoritative post-images for one atomic, guarded bulk insert. */
+  insertedRows?: DeletedRow[];
   /** Multiple deleted rows data */
   deletedRows?: DeletedRow[];
   /** Table definition for create/drop undo/redo */
-  tableDef?: { columns: ColumnDefinition[] };
+  tableDef?: { columns: ColumnDefinition[]; options?: CreateTableOptions };
   /** Exact post-create schema required before table_create undo may drop the table. */
   tableCreateSnapshot?: ColumnDropTableState;
   /** Column definition for add/drop undo/redo */
@@ -465,6 +467,9 @@ export interface DatabaseOperations {
   runReadSnapshot?<T>(
     operation: (snapshotOperations: DatabaseOperations) => Promise<T>
   ): Promise<T>;
+
+  /** Execute one bounded SELECT or its query plan; never a write/script. */
+  executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, signal?: AbortSignal): Promise<QueryResultSet>;
 
   /** Execute SQL query */
   executeQuery(
@@ -587,7 +592,7 @@ export interface DatabaseOperations {
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
 
   /** Create a new table */
-  createTable(table: string, columns: ColumnDefinition[]): Promise<ColumnDropTableState>;
+  createTable(table: string, columns: ColumnDefinition[], options?: CreateTableOptions): Promise<ColumnDropTableState>;
 
   /** Read a view and the INSTEAD OF triggers that must survive replacement. */
   getViewDefinition(view: string): Promise<ViewDefinition>;
@@ -710,6 +715,10 @@ export interface ColumnDefinition {
   primaryKey: boolean;
   notNull: boolean;
   defaultValue?: string;
+}
+
+export interface CreateTableOptions {
+  withoutRowid?: boolean;
 }
 
 // ============================================================================
