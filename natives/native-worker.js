@@ -1987,25 +1987,16 @@ async function handleRequest(request) {
         const [sql, boundary, params, columns, timeoutMs] = args;
         if (!db) throw new Error("Database not open");
         assertSingleStatementPayload(db, `${sql}\n${boundary}`, sql, boundary);
-        let rows;
-        const tempProbe = db.prepare('SELECT 1 FROM sqlite_temp_schema LIMIT 1');
-        let hasTempObjects;
-        try { hasTempObjects = tempProbe.all().length > 0; } finally { tempProbe.finalize(); }
-        if (!hasTempObjects && shouldUseAsyncDatabase(db, asyncDb)) {
-          const operation = { controller: new AbortController(), reason: undefined };
-          activeOperations.set(id, operation);
-          const timer = setTimeout(() => { operation.reason = 'deadline'; operation.controller.abort(); }, timeoutMs);
-          try { rows = await asyncDb.all(sql, params, { signal: operation.controller.signal }); }
-          catch (error) {
-            if (operation.reason === 'deadline') throw new Error(`Query execution timed out after ${timeoutMs}ms`);
-            throw error;
-          } finally { clearTimeout(timer); activeOperations.delete(id); }
-        } else {
-          rows = runWithQueryDeadline(db, timeoutMs, () => {
-            const statement = db.prepare(sql);
-            try { return statement.all(params ?? []); } finally { statement.finalize(); }
-          });
+        if (typeof db.allAsync !== 'function') {
+          throw new Error('Native SQLite requires primary-connection allAsync support');
         }
+        // Keep TEMP objects, pending changes and the host's metadata snapshot
+        // on this handle without blocking delivery of the cancellation RPC.
+        const rows = await runWithQueryDeadline(db, timeoutMs, () => (
+          executeInterruptibleAsyncOperation(id, timeoutMs, signal => (
+            db.allAsync(sql, params ?? [], { signal })
+          ))
+        ));
         const names = columns;
         result = { columns: names, values: rows.map(row => names.map(name => row[name])) };
         break;

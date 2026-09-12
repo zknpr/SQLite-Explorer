@@ -2647,12 +2647,23 @@ export async function createNativeDatabaseConnection(
             return decodeQueryPlan(value);
           }
           const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
-          const headers = await worker.call<string[]>('describeReadQuery', [prepared.sql, prepared.metadataSql, boundary, SQL_MAX_COLUMNS, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
-          signal?.throwIfAborted();
-          const transport = buildReadTransport(prepared.sql, headers.length);
-          const result = await worker.call<NativeQueryResult>('workspaceQuery', [transport.sql, boundary, params, transport.transportColumns, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
-          signal?.throwIfAborted();
-          return decodeReadTransport(headers, result.values, transport.valueColumnCount);
+          const savepointName = createSavepointName('sp_workspace_read');
+          await beginNativeSavepoint(savepointName);
+          try {
+            // Metadata and execution use the primary handle under one read
+            // snapshot, so external DDL cannot relabel a different row layout.
+            const headers = await worker.call<string[]>('describeReadQuery', [prepared.sql, prepared.metadataSql, boundary, SQL_MAX_COLUMNS, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
+            signal?.throwIfAborted();
+            const transport = buildReadTransport(prepared.sql, headers.length);
+            const result = await worker.call<NativeQueryResult>('workspaceQuery', [transport.sql, boundary, params, transport.transportColumns, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
+            signal?.throwIfAborted();
+            const decoded = decodeReadTransport(headers, result.values, transport.valueColumnCount);
+            await releaseNativeSavepoint(savepointName);
+            return decoded;
+          } catch (error) {
+            await safeRollbackSavepoint(savepointName, 'executeReadQuery snapshot', error);
+            throw error;
+          }
         },
 
         executeQuery: async (
