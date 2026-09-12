@@ -579,7 +579,7 @@ export default function DemoClient() {
     }
 
     // Create new worker (classic worker, not module, to support importScripts)
-    const worker = new Worker('/sqlite-viewer/worker.js');
+    const worker = new Worker(`${process.env.NEXT_PUBLIC_SQLITE_VIEWER_BASE_PATH}/worker.js`);
     workerRef.current = worker;
 
     // Handle worker messages
@@ -1047,7 +1047,7 @@ export default function DemoClient() {
             )}
             <iframe
               ref={iframeRef}
-              src="/sqlite-viewer/viewer.html"
+              src={`${process.env.NEXT_PUBLIC_SQLITE_VIEWER_BASE_PATH}/viewer.html`}
               className="flex-1 border-0"
               title="SQLite Viewer"
             />

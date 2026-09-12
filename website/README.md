@@ -18,6 +18,33 @@ npm run build
 npm run start
 ```
 
+## Demo runtime assets
+
+The website build hashes the generated worker, viewer, sql.js glue, and WASM
+binary together. All four are served under one content-versioned URL prefix.
+Only the current prefix is rewritten to the public assets, and only those URLs
+receive immutable caching. Unversioned files retain revalidation so a returning
+browser cannot mix cached JavaScript with a newly deployed WASM binary.
+
+Regenerate shared demo assets from the repository root with
+`node scripts/build.mjs` before building the website. Do not edit generated
+files. Restart the website development server after regenerating them.
+
+Run the warm-cache browser regression after a production build:
+
+```bash
+# From website/, with root and website dependencies installed
+npm run build
+npm run test:demo-cache
+```
+
+The test starts an isolated local server and headless Chromium, warms the old
+unversioned runtime URLs, then opens both sample databases through the real demo.
+It checks the versioned asset responses and rejects unknown revision URLs. Install
+the Chromium version required by the root `playwright-core` dependency, or set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to an existing Chrome executable. No user
+browser profile or production deployment is used.
+
 ## Deployment
 
 This website is configured for Vercel deployment.
