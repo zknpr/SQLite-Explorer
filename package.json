@@ -122,7 +122,7 @@
           "maximum": 4000,
           "exclusiveMinimum": false,
           "default": 200,
-          "markdownDescription": "Maximum file size in MB that can be opened. Set to 0 for unlimited."
+          "markdownDescription": "Maximum database size in MB for WebAssembly opens and buffered file-copy operations. Native database opens are not limited by this setting. Set to 0 for unlimited."
         },
         "sqliteExplorer.defaultPageSize": {
           "type": "number",

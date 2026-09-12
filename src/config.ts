@@ -57,7 +57,8 @@ const MAX_UNDO_MEMORY_BYTES = 512 * 1024 * 1024;
 // ============================================================================
 
 /**
- * Retrieve maximum file size from user configuration.
+ * Retrieve the size limit for WASM opens and buffered database copies.
+ * Native file opens do not materialize the database and do not use this cap.
  *
  * @returns Maximum size in bytes (0 = unlimited)
  */

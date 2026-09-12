@@ -265,7 +265,7 @@ describe('workerFactory error path tests', () => {
     assert.deepStrictEqual(outputLines, ['[SQLite Explorer] Using WebAssembly SQLite backend']);
   });
 
-  it('enforces the configured size limit before native open without disguising refusal as backend fallback', async () => {
+  it('opens a native database above maxFileSize without changing the configured limit', async () => {
     nativeAvailable = true;
     maximumFileSizeBytes = 1024;
     let opened = 0;
@@ -275,12 +275,43 @@ describe('workerFactory error path tests', () => {
     mock.method(mockVscode.workspace.fs, 'stat', async () => ({ size: 2048 }));
     const bundle = await workerFactory.createDatabaseConnection({ scheme: 'file', fsPath: '/test/extension' });
     try {
-      await assert.rejects(() => bundle.establishConnection(testDbUri(), 'too-large.db'), /exceeds the maximum allowed size.*maxFileSize/);
-      assert.strictEqual(opened, 0);
-      assert.strictEqual(wasmWorkerCreationCount, 0);
-      maximumFileSizeBytes = 0;
-      assert.strictEqual(await bundle.establishConnection(testDbUri(), 'too-large.db'), connection);
+      assert.strictEqual(await bundle.establishConnection(testDbUri(), 'large.db'), connection);
       assert.strictEqual(opened, 1);
+      assert.strictEqual(wasmWorkerCreationCount, 0);
+      assert.strictEqual(maximumFileSizeBytes, 1024);
+    } finally { bundle.workerMethods[Symbol.dispose](); }
+  });
+
+  it('retains maxFileSize and the WASM size refusal when native open fails for a large database', async () => {
+    nativeAvailable = true;
+    maximumFileSizeBytes = 1024;
+    let nativeOpens = 0;
+    let requestedMaxSize: number | undefined;
+    const wasmSizeError = new Error('file size (2048 bytes) exceeds the maximum allowed size (1024 bytes)');
+    nativeBundleFactory = async () => ({
+      workerMethods: { [Symbol.dispose]() {} },
+      establishConnection: async () => { nativeOpens++; throw new Error('native open failed'); }
+    });
+    mock.method(mockVscode.workspace.fs, 'stat', async (uri: { path: string }) => ({ size: uri.path.endsWith('-wal') ? 0 : 2048 }));
+    workerProxy.initializeDatabase = async (_name, transferred) => {
+      requestedMaxSize = transferred.value.maxSize;
+      throw wasmSizeError;
+    };
+    const bundle = await workerFactory.createDatabaseConnection({ scheme: 'file', fsPath: '/test/extension' });
+    try {
+      let refusal: Error | undefined;
+      await assert.rejects(() => bundle.establishConnection(testDbUri(), 'large.db'), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /exceeds the maximum allowed size.*maxFileSize/);
+        refusal = error;
+        return true;
+      });
+      assert.strictEqual(nativeOpens, 1);
+      assert.strictEqual(requestedMaxSize, 1024);
+      assert.strictEqual(refusal?.cause, wasmSizeError);
+      assert.strictEqual(wasmWorkerCreationCount, 1);
+      assert.strictEqual(workerTerminated, true);
+      assert.strictEqual(maximumFileSizeBytes, 1024);
     } finally { bundle.workerMethods[Symbol.dispose](); }
   });
 

@@ -502,17 +502,9 @@ export async function createDatabaseConnection(
           workerMethods,
           async establishConnection(fileUri, displayName, forceReadOnly, autoCommit) {
             if (wrapperDisposed) throw new Error('Database connection bundle has been disposed');
-            const maxSize = getMaximumFileSizeBytes();
-            if (fileUri.scheme === 'file' && maxSize !== 0) {
-              const { size } = await vsc.workspace.fs.stat(fileUri);
-              if (size > maxSize) {
-                // This is a user-selected limit, so changing backend cannot
-                // make an otherwise refused database admissible.
-                throw new DatabaseFileSizeLimitError(size, maxSize);
-              }
-            }
             try {
-              // Try native first
+              // Native opens do not buffer the database. WASM fallback keeps
+              // its own configured size checks if the native open fails.
               return await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             } catch (nativeErr) {
               disposeNative();
@@ -887,7 +879,7 @@ async function createWorkerBackedWasmDatabaseConnection(
       autoCommit?: boolean
     ) {
       // Keep the configured refusal message ready for local files above
-      // maxFileSize. The worker owns the authoritative backend-agnostic gate;
+      // maxFileSize. The WASM worker owns the authoritative size gate;
       // the host substitutes the existing user-facing units when it refuses.
       let oversizedFileError: DatabaseFileSizeLimitError | undefined;
       try {

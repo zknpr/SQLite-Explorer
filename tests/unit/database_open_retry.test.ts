@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 import esbuild from 'esbuild';
 import * as vscode from 'vscode';
-import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import { createDatabaseEngine, createWorkerEndpoint as createRealWorkerEndpoint } from '../../src/core/sqlite-db';
 import type { DatabaseOperations } from '../../src/core/types';
 import { createDeferred } from './helpers/deferred';
 import { mockVscode } from './mocks/vscode';
@@ -19,7 +19,7 @@ const token = { isCancellationRequested: false, onCancellationRequested: () => (
 const openContext = { backupId: undefined, untitledDocumentData: undefined };
 const workerFactoryPath = path.resolve(__dirname, '../../src/workerFactory.ts');
 const workerFactoryCode = esbuild.transformSync(fs.readFileSync(workerFactoryPath, 'utf8'), {
-  loader: 'ts', format: 'cjs', define: { 'import.meta.env.VSCODE_BROWSER_EXT': 'false' }
+  loader: 'ts', format: 'cjs', define: { 'import.meta.env.VSCODE_BROWSER_EXT': 'true' }
 }).code;
 let directory: string;
 let provider: Provider;
@@ -67,7 +67,7 @@ async function value(document: Document) {
   return (await document.databaseOperations.executeQuery('SELECT name FROM items WHERE id=1'))[0].rows[0][0];
 }
 
-describe('configured-size refusal custom-document recovery', () => {
+describe('configured-size WASM refusal custom-document recovery', () => {
   beforeEach(() => {
     fs.mkdirSync(path.resolve('.tmp/unit-open-retry'), { recursive: true });
     directory = fs.mkdtempSync(path.resolve('.tmp/unit-open-retry/run-'));
@@ -81,6 +81,12 @@ describe('configured-size refusal custom-document recovery', () => {
     mock.method(vscode.workspace, 'getConfiguration', () => ({
       get: (key: string, fallback: unknown) => key === 'maxFileSize' ? maximumMb : fallback
     }) as vscode.WorkspaceConfiguration);
+    const originalFileUri = vscode.Uri.file;
+    mock.method(vscode.Uri, 'file', (filePath: string) => ({
+      ...originalFileUri(filePath),
+      // The WASM opener checks the sibling WAL file before allowing writes.
+      with: (changes: { path?: string }) => vscode.Uri.file(changes.path ?? filePath)
+    }) as vscode.Uri);
     mock.method(vscode.Uri, 'parse', (value: string) => vscode.Uri.file(fileURLToPath(value)));
     mock.method(vscode.workspace.fs, 'stat', async (uri: vscode.Uri) => {
       const stat = await fs.promises.stat(uri.fsPath);
@@ -97,21 +103,22 @@ describe('configured-size refusal custom-document recovery', () => {
     compiled.paths = (Module as unknown as { _nodeModulePaths(directory: string): string[] })._nodeModulePaths(path.dirname(workerFactoryPath));
     const originalRequire = Module.prototype.require;
     Module.prototype.require = function (name: string) {
-      if (name.endsWith('/nativeWorker')) return {
-        isNativeAvailable: async () => true,
-        createNativeDatabaseConnection: async () => {
+      if (name.endsWith('/core/sqlite-db')) return {
+        // Exercise the real WASM size admission and endpoint. Native opens
+        // intentionally no longer produce configured-size refusal shells.
+        createWorkerEndpoint: (...args: Parameters<typeof createRealWorkerEndpoint>) => {
           allocations++;
-          let active: Engine | undefined;
+          const endpoint = createRealWorkerEndpoint(...args);
           return {
-            establishConnection: async (uri: vscode.Uri) => {
+            ...endpoint,
+            initializeDatabase: async (...initArgs: Parameters<typeof endpoint.initializeDatabase>) => {
               actualOpens++;
               openEntered?.resolve();
               await openBarrier?.promise;
               if (openFailure) throw openFailure;
-              active = await engineFor(fs.readFileSync(uri.fsPath));
-              return { databaseOps: active, isReadOnly: false, storage: 'memory' };
+              return endpoint.initializeDatabase(...initArgs);
             },
-            workerMethods: { [Symbol.dispose]() { disposals++; active?.shutdown?.(); } }
+            dispose() { disposals++; endpoint.dispose(); }
           };
         }
       };
@@ -122,12 +129,12 @@ describe('configured-size refusal custom-document recovery', () => {
       (compiled as unknown as { _compile(code: string, filename: string): void })._compile(workerFactoryCode, workerFactoryPath);
     } finally { Module.prototype.require = originalRequire; }
     cache[require.resolve('../../src/workerFactory')] = compiled;
-    compiled.exports.setDesktopTestDatabaseBackend('native');
+    compiled.exports.setDesktopTestDatabaseBackend('wasm');
     registry = require('../../src/documentRegistry').DocumentRegistry;
     const controller = require('../../src/editorController') as typeof import('../../src/editorController');
     mock.method(controller.DatabaseViewerProvider.prototype, 'resolveCustomEditor', async () => {});
     provider = new controller.DatabaseEditorProvider('open-retry.test', {
-      extensionUri: vscode.Uri.file(directory), globalState: { update: async () => {} }
+      extensionUri: vscode.Uri.file(path.resolve(__dirname, '../..')), globalState: { update: async () => {} }
     } as unknown as vscode.ExtensionContext, undefined, null, true);
     provider.onDidChangeCustomDocument(edit => edits.push(edit));
   });

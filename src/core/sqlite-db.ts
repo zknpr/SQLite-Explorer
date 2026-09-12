@@ -164,7 +164,7 @@ export async function createEngineFromModule(
       }
 
       // Paging policy and refusal policy are intentionally independent:
-      // maxSize is a backend-agnostic refusal gate, while files that pass it
+      // maxSize gates both WASM modes, while files that pass it
       // use the separate paging threshold to avoid a multi-GB readFile +
       // sql.js materialization. A zero cap remains unlimited.
       let pagedFailure: unknown;

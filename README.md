@@ -163,7 +163,7 @@ code --install-extension zknpr.sqlite-explorer
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `sqliteExplorer.maxFileSize` | `200` | Max file size in MB (0 = unlimited) |
+| `sqliteExplorer.maxFileSize` | `200` | Max database size in MB for WASM opens and buffered file copies; native opens are not capped (0 = unlimited) |
 | `sqliteExplorer.defaultPageSize` | `5000` | Rows per page |
 | `sqliteExplorer.instantCommit` | `never` | Auto-save strategy (`always`, `never`, `remote-only`) |
 | `sqliteExplorer.doubleClickBehavior` | `inline` | Cell double-click action (`inline`, `modal`, `vscode`) |
