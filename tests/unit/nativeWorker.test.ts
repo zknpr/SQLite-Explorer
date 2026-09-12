@@ -213,6 +213,8 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respo
     mockProcess.kill = mock.fn();
 
     let inputBuffer = Buffer.alloc(0);
+    let explicitTransaction = false;
+    const savepoints: string[] = [];
 
     const emitMessage = (message: unknown) => {
         mockProcess.stdout.emit('data', encodeNativeMessage(message));
@@ -252,12 +254,34 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respo
                         : call.method === 'query' && call.args[0] === 'PRAGMA encoding'
                             ? { result: { columns: ['encoding'], values: [['UTF-8']] } }
                         : await respondToCall?.(call);
-                    const response = call.method === 'compileBatch'
+                    const response: RecordedNativeResponse = call.method === 'compileBatch'
                         && suppliedResponse?.error === undefined
                         && !Array.isArray((suppliedResponse?.result as any)?.errors)
                         ? defaultResponse
                         : suppliedResponse ?? defaultResponse;
-                    emitMessage({ id: call.id, ...response });
+                    const transactionWasActive = explicitTransaction || savepoints.length > 0;
+                    if (!response.error && ['run', 'query'].includes(call.method)) {
+                        const sql = String(call.args[0]);
+                        const savepoint = /^SAVEPOINT (.+)$/.exec(sql);
+                        const release = /^RELEASE (.+)$/.exec(sql);
+                        const rollbackTo = /^ROLLBACK TO (.+)$/.exec(sql);
+                        if (savepoint) savepoints.push(savepoint[1]);
+                        else if (release) {
+                            const index = savepoints.lastIndexOf(release[1]);
+                            if (index >= 0) savepoints.splice(index);
+                        } else if (rollbackTo) {
+                            const index = savepoints.lastIndexOf(rollbackTo[1]);
+                            if (index >= 0) savepoints.splice(index + 1);
+                        } else if (/^BEGIN\b/.test(sql)) explicitTransaction = true;
+                        else if (/^(?:ROLLBACK|COMMIT)$/.test(sql)) {
+                            explicitTransaction = false;
+                            savepoints.length = 0;
+                        }
+                    }
+                    const result = call.method === 'run' && !response.error
+                        ? { transactionWasActive, ...(response.result as Record<string, unknown>) }
+                        : response.result;
+                    emitMessage({ id: call.id, ...response, result });
                 } catch (err) {
                     emitMessage({ id: call.id, error: err instanceof Error ? err.message : String(err) });
                 }
@@ -626,10 +650,12 @@ describe('createNativeDatabaseConnection', () => {
             outputChannel,
             queryTimeout
         );
+        // A successful native open has an OS file identity. The recording
+        // process does not open SQLite itself, so provide its backing file.
+        const databasePath = path.join(tempDir, 'path.sqlite');
+        fs.writeFileSync(databasePath, new Uint8Array());
         const connection = await bundle.establishConnection(
-            // Keep the leaf absent: native SQLite may legitimately create a
-            // new database when its parent directory is writable.
-            { fsPath: path.join(tempDir, 'path.sqlite') } as any,
+            { fsPath: databasePath } as any,
             'TestDB',
             forceReadOnly
         );
@@ -1499,7 +1525,7 @@ describe('createNativeDatabaseConnection', () => {
             );
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['query', 'run', 'queryBatch', 'run', 'run']
+                ['query', 'run', 'queryBatch', 'run']
             );
         } finally {
             connection.dispose();
@@ -1609,7 +1635,7 @@ describe('createNativeDatabaseConnection', () => {
             );
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['query', 'query', 'run', 'query', 'query', 'query', 'run', 'run']
+                ['query', 'query', 'run', 'query', 'query', 'query', 'run']
             );
             assert.ok(connection.calls.every(call => {
                 const sql = String(call.args[0]);
@@ -1744,15 +1770,14 @@ describe('createNativeDatabaseConnection', () => {
             );
             assert.deepStrictEqual(
                 connection.calls.map(call => call.method),
-                ['query', 'run', 'query', 'queryBatch', 'run', 'getCellMetadata', 'run', 'run']
+                ['query', 'run', 'query', 'queryBatch', 'run', 'getCellMetadata', 'run']
             );
             const runSql = connection.calls
                 .filter(call => call.method === 'run')
                 .map(call => String(call.args[0]));
             assert.match(runSql[0], /^SAVEPOINT "sp_update_rowid_cell_/);
             assert.strictEqual(runSql[1], 'UPDATE main."native_large" SET "payload" = ? WHERE rowid = ? AND NOT (typeof("payload") IN (\'text\', \'blob\') AND length(CAST("payload" AS BLOB)) > ?)');
-            assert.strictEqual(runSql[2], `ROLLBACK TO ${runSql[0].slice('SAVEPOINT '.length)}`);
-            assert.strictEqual(runSql[3], `RELEASE ${runSql[0].slice('SAVEPOINT '.length)}`);
+            assert.deepStrictEqual(runSql.slice(2), ['ROLLBACK']);
         } finally {
             connection.dispose();
         }
@@ -1935,7 +1960,7 @@ describe('createNativeDatabaseConnection', () => {
             assertSingleTextEncodingRead(connection.calls);
             assert.deepStrictEqual(
                 operationCalls.map(call => call.method),
-                ['query', 'run', 'queryBatch', 'query', 'run', 'run']
+                ['query', 'run', 'queryBatch', 'query', 'run']
             );
             assert.strictEqual(
                 connection.calls.some(call => (
@@ -1943,8 +1968,7 @@ describe('createNativeDatabaseConnection', () => {
                 )),
                 false
             );
-            assert.match(String(operationCalls[4].args[0]), /^ROLLBACK TO /);
-            assert.match(String(operationCalls[5].args[0]), /^RELEASE /);
+            assert.strictEqual(operationCalls[4].args[0], 'ROLLBACK');
         } finally {
             connection.dispose();
         }
@@ -1998,10 +2022,9 @@ describe('createNativeDatabaseConnection', () => {
             assertSingleTextEncodingRead(connection.calls);
             assert.deepStrictEqual(
                 operationCalls.map(call => call.method),
-                ['query', 'run', 'queryBatch', 'query', 'run', 'run', 'run']
+                ['query', 'run', 'queryBatch', 'query', 'run', 'run']
             );
-            assert.match(String(operationCalls[5].args[0]), /^ROLLBACK TO /);
-            assert.match(String(operationCalls[6].args[0]), /^RELEASE /);
+            assert.strictEqual(operationCalls[5].args[0], 'ROLLBACK');
         } finally {
             connection.dispose();
         }
@@ -2555,8 +2578,7 @@ describe('createNativeDatabaseConnection', () => {
                 .map(call => String(call.args[0]));
             assert.match(runSql[0], /^SAVEPOINT /);
             assert.strictEqual(runSql[1], 'ALTER TABLE main."docs" DROP COLUMN "payload"');
-            assert.strictEqual(runSql[2], `ROLLBACK TO ${runSql[0].slice('SAVEPOINT '.length)}`);
-            assert.strictEqual(runSql[3], `RELEASE ${runSql[0].slice('SAVEPOINT '.length)}`);
+            assert.deepStrictEqual(runSql.slice(2), ['ROLLBACK']);
         } finally {
             connection.dispose();
         }
@@ -2637,8 +2659,7 @@ describe('createNativeDatabaseConnection', () => {
             assert.match(calls[0].sql, /^SAVEPOINT "sp_validate_view_/);
             assert.strictEqual(calls[1].method, 'runSingle');
             assert.match(calls[1].sql, /^CREATE VIEW "parameter_view" AS SELECT \? AS value$/);
-            assert.match(calls[2].sql, /^ROLLBACK TO "sp_validate_view_/);
-            assert.match(calls[3].sql, /^RELEASE "sp_validate_view_/);
+            assert.deepStrictEqual(calls.slice(2), [{ method: 'run', sql: 'ROLLBACK' }]);
         } finally {
             connection.dispose();
         }
@@ -2831,7 +2852,7 @@ describe('createNativeDatabaseConnection', () => {
 
             assert.deepStrictEqual(preview.rows, [['MAIN']]);
             const queryIndex = order.findIndex(entry => entry.startsWith('QUERY '));
-            const rollbackIndex = order.findIndex(entry => entry.startsWith('ROLLBACK TO '));
+            const rollbackIndex = order.findIndex(entry => entry === 'ROLLBACK');
             assert.ok(queryIndex >= 0);
             assert.ok(rollbackIndex > queryIndex, 'preview query must run before disposable-view rollback');
         } finally {
@@ -3039,7 +3060,7 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
-    it('rolls back and releases the native numeric snapshot when a companion read fails', async () => {
+    it('rolls back the owned native numeric snapshot when a companion read fails', async () => {
         const columns = ['rowid', ...Array.from({ length: 1000 }, (_, index) => `c${index}`)];
         const connection = await createRecordingConnection(call => {
             if (call.method === 'queryNumeric') {
@@ -3087,18 +3108,17 @@ describe('createNativeDatabaseConnection', () => {
             const snapshotSql = connection.calls
                 .filter(call => (
                     call.method === 'run'
-                    && String(call.args[0]).includes('sp_numeric_snapshot_')
+                    && (String(call.args[0]).includes('sp_numeric_snapshot_') || call.args[0] === 'ROLLBACK')
                 ))
                 .map(call => String(call.args[0]));
             assert.match(snapshotSql[0], /^SAVEPOINT "sp_numeric_snapshot_/);
-            assert.match(snapshotSql[1], /^ROLLBACK TO "sp_numeric_snapshot_/);
-            assert.match(snapshotSql[2], /^RELEASE "sp_numeric_snapshot_/);
+            assert.deepStrictEqual(snapshotSql.slice(1), ['ROLLBACK']);
         } finally {
             connection.dispose();
         }
     });
 
-    it('logs a failed savepoint rollback through the extension output channel', async () => {
+    it('reports both failures and retires the connection when savepoint cleanup fails', async () => {
         const outputLines: string[] = [];
         const outputChannel = {
             appendLine(value: string) {
@@ -3111,7 +3131,7 @@ describe('createNativeDatabaseConnection', () => {
             if (call.method === 'runSingle' && String(call.args[1]).startsWith('CREATE VIEW')) {
                 return { error: 'create failed' };
             }
-            if (call.method === 'run' && sql.startsWith('ROLLBACK TO')) {
+            if (call.method === 'run' && sql === 'ROLLBACK') {
                 return { error: 'rollback failed' };
             }
             return { result: { changes: 1, lastInsertRowId: 1 } };
@@ -3120,12 +3140,20 @@ describe('createNativeDatabaseConnection', () => {
         try {
             await assert.rejects(
                 connection.databaseOps.createView('broken view', 'SELECT 1'),
-                /create failed/
+                error => {
+                    assert.strictEqual((error as Error & { code: string }).code, 'SQLITE_EXPLORER_TRANSACTION_RECOVERY_FAILED');
+                    const cause = (error as Error).cause as AggregateError;
+                    assert.ok(cause instanceof AggregateError);
+                    assert.deepStrictEqual(cause.errors.map(error => error.message), ['create failed', 'rollback failed']);
+                    return true;
+                }
             );
             assert.strictEqual(warnMock.mock.calls.length, 0);
             assert.deepStrictEqual(outputLines, [
                 '[NativeWorker] Failed to rollback native savepoint (createView): rollback failed'
             ]);
+            assert.ok(connection.calls.some(call => call.method === 'close'));
+            await assert.rejects(connection.databaseOps.executeQuery('SELECT 1'), /Reload Database/);
         } finally {
             connection.dispose();
         }
@@ -3254,11 +3282,11 @@ FROM orders o`;
             const transactionSql = connection.calls
                 .filter(call => call.method === 'run')
                 .map(call => String(call.args[0]));
-            assert.ok(transactionSql.some(sql => sql.startsWith('ROLLBACK TO "sp_edit_view_')));
+            assert.ok(transactionSql.includes('ROLLBACK'));
             assert.strictEqual(
                 transactionSql.filter(sql => sql.startsWith('RELEASE "sp_edit_view_')).length,
-                1,
-                'the only RELEASE must be the one that closes the rolled-back savepoint'
+                0,
+                'owned transaction cleanup must not attempt a commit'
             );
         } finally {
             connection.dispose();
@@ -3836,6 +3864,41 @@ describe('NativeWorkerProcess', () => {
         }
     });
 
+    it('routes an in-flight query-plan abort without retiring the primary connection', async () => {
+        const calls: RecordedNativeCall[] = [];
+        const mockProcess = createRecordingNativeProcess(calls);
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        let kills = 0;
+        (worker as any).process = { stdin: mockProcess.stdin, kill: () => { kills++; } };
+        const controller = new AbortController();
+        const cancellation = new DOMException('Cancelled Explain', 'AbortError');
+        let pending: Promise<unknown> | undefined;
+        try {
+            pending = worker.call('workspaceQueryPlan', [], 1000, controller.signal);
+            await new Promise(resolve => setImmediate(resolve));
+            const plan = calls.find(call => call.method === 'workspaceQueryPlan');
+            assert.ok(plan, 'Explain must be dispatched before cancellation');
+            controller.abort(cancellation);
+            await new Promise(resolve => setImmediate(resolve));
+            const cancel = calls.find(call => call.method === 'cancel');
+            assert.ok(cancel, 'Explain cancellation must reach the running primary query');
+            assert.deepStrictEqual(cancel.args, [plan.id]);
+            assert.strictEqual(kills, 0);
+            (worker as any).handleMessage({ id: plan.id, error: '[workspaceQueryPlan] Operation cancelled', cancelled: true });
+            await assert.rejects(pending, error => error === cancellation);
+            pending = undefined;
+            assert.strictEqual((worker as any).pendingRequests.size, 0);
+            assert.strictEqual(kills, 0, 'cancellation must preserve the primary connection and its transaction');
+        } finally {
+            if (pending) {
+                const plan = calls.find(call => call.method === 'workspaceQueryPlan');
+                if (plan) (worker as any).handleMessage({ id: plan.id, error: 'test cleanup' });
+                await pending.catch(() => {});
+            }
+            worker.stop();
+        }
+    });
+
     it('routes an in-flight export-spool abort to the worker correlation id', async () => {
         const calls: RecordedNativeCall[] = [];
         const mockProcess = createRecordingNativeProcess(calls);
@@ -4272,7 +4335,40 @@ describe('native async bounded-query capability routing', () => {
         assert.strictEqual(timers[0].cleared, true);
     });
 
-    it('reports unsupported when an in-flight abort is demonstrably ignored', async () => {
+    it('retries when a completed native query reply arrives after abort delivery', async () => {
+        const probeAsyncDatabase = loadProbeAsyncDatabase();
+        const signals: AbortSignal[] = [];
+        let healthChecks = 0;
+        const candidate = {
+            close() {},
+            run() {},
+            async all(_sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                if (!options?.signal) {
+                    healthChecks++;
+                    return [{ value: 1 }];
+                }
+                const signal = options.signal;
+                assert.strictEqual(signal.aborted, false, 'Each delivered-abort retry must start uncancelled');
+                signals.push(signal);
+                // The native job can finish before the event loop dispatches
+                // its reply. Aborting that already-completed job cannot turn
+                // its queued success into a rejection.
+                return new Promise((resolve, reject) => {
+                    signal.addEventListener('abort', () => {
+                        if (signals.length === 1) resolve([{ value: 1 }]);
+                        else reject(new Error('Aborted'));
+                    }, { once: true });
+                });
+            }
+        };
+
+        assert.strictEqual(await probeAsyncDatabase(candidate), true);
+        assert.strictEqual(signals.length, 2);
+        assert.notStrictEqual(signals[0], signals[1]);
+        assert.strictEqual(healthChecks, 1);
+    });
+
+    it('reports unsupported when every bounded attempt resolves without confirming cancellation', async () => {
         const probeAsyncDatabase = loadProbeAsyncDatabase();
         let probeCalls = 0;
         let healthChecks = 0;
@@ -4294,7 +4390,7 @@ describe('native async bounded-query capability routing', () => {
         };
 
         assert.strictEqual(await probeAsyncDatabase(candidate), false);
-        assert.strictEqual(probeCalls, 1);
+        assert.strictEqual(probeCalls, 3);
         assert.strictEqual(healthChecks, 0);
     });
 
@@ -4327,6 +4423,28 @@ describe('native async bounded-query capability routing', () => {
         assert.match(calls[0], /WITH RECURSIVE sqlite_explorer_probe/);
         assert.strictEqual(calls[1], 'SELECT 1 AS value');
     });
+
+    for (const failure of ['unexpected rejection', 'failed health check', 'invalid health reply']) {
+        it(`does not enable the async connection after ${failure}`, async () => {
+            const probeAsyncDatabase = loadProbeAsyncDatabase();
+            const candidate = {
+                close() {},
+                run() {},
+                async all(_sql: string, _params: unknown[], options?: { signal?: AbortSignal }) {
+                    if (!options?.signal) {
+                        if (failure === 'failed health check') throw new Error('Connection is closed');
+                        return [{ value: 2 }];
+                    }
+                    return new Promise((_resolve, reject) => {
+                        options.signal!.addEventListener('abort', () => reject(new Error(
+                            failure === 'unexpected rejection' ? 'Unrelated SQLite error' : 'Aborted'
+                        )), { once: true });
+                    });
+                }
+            };
+            assert.strictEqual(await probeAsyncDatabase(candidate), false);
+        });
+    }
 
     it('keeps bounded reads on the sync connection unless no transaction is active', () => {
         const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(

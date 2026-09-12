@@ -17,6 +17,7 @@ import {
     resolveDisplayedCell
 } from './data-utils.js';
 import { validateRowId, escapeIdentifier, getErrorMessage } from './utils.js';
+import { confirmLargeChange, LARGE_CHANGE_WARNING_THRESHOLD } from './large-change-guard.js';
 
 const TRUNCATED_COPY_NOTICE =
     'Copy blocked: selection contains truncated data. Use Open Full Content for one cell or Export for complete rows.';
@@ -165,7 +166,7 @@ export async function copySelectedRowsToClipboard() {
 export async function clearSelectedCellValues() {
     if (isClearingSelectedCellValues || state.selectedCells.length === 0) return;
     if (state.isReadOnly || state.selectedTableType !== 'table') {
-        updateStatus('Views are read-only');
+        updateStatus(state.isReadOnly ? 'Document is read-only' : 'Views are read-only');
         return;
     }
     for (const cell of state.selectedCells) {
@@ -199,6 +200,7 @@ export async function clearSelectedCellValues() {
     const targetSelectionSignature = cellSelectionSignature();
     isClearingSelectedCellValues = true;
     try {
+        if (updates.length > LARGE_CHANGE_WARNING_THRESHOLD && !(await confirmLargeChange(updates.length, 'cells'))) return;
         updateStatus('Clearing cells...');
         const outcomes = await backendApi.updateCellBatch(targetTable, updates, label);
         // Cleared values may leave an active filter's match set, so the

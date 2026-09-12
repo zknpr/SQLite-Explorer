@@ -459,13 +459,11 @@ describe('filter controls', () => {
         const { loadTableData } = await import(gridDataModulePath);
         const originalFetchCount = backendApi.fetchTableCount;
         const originalFetchData = backendApi.fetchTableData;
-        let countCalls = 0;
-        backendApi.fetchTableCount = async () => {
-            countCalls++;
-            if (countCalls === 2) throw new Error('malformed filter predicate');
-            return 1;
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            if (options.globalFilter === 'broken draft') throw new Error('malformed filter predicate');
+            return { rows: [['working row']] };
         };
-        backendApi.fetchTableData = async () => ({ rows: [['working row']] });
 
         try {
             assert.strictEqual(await loadTableData(false, false), true);

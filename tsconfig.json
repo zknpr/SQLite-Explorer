@@ -12,5 +12,5 @@
 		"allowImportingTsExtensions": true,
 		"types": ["node"]
 	},
-	"exclude": ["website", "node_modules"],
+	"exclude": ["website", "node_modules", "qa-evidence"],
 }

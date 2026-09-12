@@ -25,6 +25,7 @@ import type {
   SchemaSnapshot,
   ColumnMetadata,
   ColumnDefinition,
+  CreateTableOptions,
   ModificationEntry,
   ViewDefinitionIntent,
   ViewTriggerDefinition,
@@ -39,6 +40,10 @@ import type {
   ColumnDropTableState
 } from './types';
 import { getNodeFs } from './platform/fs';
+import {
+  captureDatabaseFileGeneration,
+  type DatabaseFileGeneration
+} from '../atomicDatabaseWrite';
 import {
   WasmDatabaseEngine,
   type WasmDatabaseInstance,
@@ -115,10 +120,13 @@ export async function createEngineFromModule(
   config: DatabaseInitConfig,
   logger?: WasmEngineLogHandler
 ): Promise<DatabaseInitResult> {
+  const registerPlan = SqlJsModule._sqlite_explorer_register_query_plan;
+  if (registerPlan && registerPlan() !== 0) throw new Error('Unable to initialize the bounded query-plan reader.');
   // Create database instance
   let wasmInstance: WasmDatabaseInstance;
   let buffer = config.content;
   let localFileFs: NodeFsModule | undefined;
+  let localFileGeneration: DatabaseFileGeneration | undefined;
 
   // If content is missing but filePath is provided, read from disk (Node.js only)
   // NOTE: this reads only the main database file — sql.js cannot merge a
@@ -156,7 +164,7 @@ export async function createEngineFromModule(
       }
 
       // Paging policy and refusal policy are intentionally independent:
-      // maxSize is a backend-agnostic refusal gate, while files that pass it
+      // maxSize gates both WASM modes, while files that pass it
       // use the separate paging threshold to avoid a multi-GB readFile +
       // sql.js materialization. A zero cap remains unlimited.
       let pagedFailure: unknown;
@@ -234,9 +242,19 @@ export async function createEngineFromModule(
       const stats = await fs.promises.stat(config.filePath);
       const statRoute = routeKnownSize(stats.size);
       if (statRoute) return statRoute;
-      buffer = await fs.promises.readFile(config.filePath);
-      const bufferRoute = routeKnownSize(buffer.byteLength);
-      if (bufferRoute) return bufferRoute;
+      const handle = await fs.promises.open(config.filePath, 'r');
+      try {
+        const descriptorStats = await handle.stat({ bigint: true });
+        const descriptorRoute = routeKnownSize(Number(descriptorStats.size));
+        if (descriptorRoute) return descriptorRoute;
+        buffer = await handle.readFile();
+        const generation = captureDatabaseFileGeneration(fs, config.filePath, descriptorStats, buffer);
+        const bufferRoute = routeKnownSize(buffer.byteLength);
+        if (bufferRoute) return bufferRoute;
+        localFileGeneration = generation;
+      } finally {
+        await handle.close();
+      }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
       throw new Error(
@@ -297,7 +315,9 @@ export async function createEngineFromModule(
     {
       idleTimeoutMs: config.cellReadSessionIdleTimeoutMs,
       absoluteTimeoutMs: config.cellReadSessionAbsoluteTimeoutMs
-    }
+    },
+    undefined,
+    localFileGeneration
   );
 
   return {
@@ -483,9 +503,9 @@ function assertNoRecoveryBearingRollbackJournal(
  * fs.readSync loop over one long-lived file descriptor, wrapped in the
  * shared chunked read cache so SQLite's per-4KB-page reads coalesce into
  * 64KiB host reads (see src/core/chunked-read-cache.ts). The descriptor
- * lives exactly as long as the engine: it is closed on shutdown, and on
- * every failure path out of this function — openPaged throwing, engine
- * construction throwing — before the error propagates.
+ * is released after overlay extraction so a Windows save can replace the
+ * base. Later reads reopen and verify the same generation, preserving the
+ * overlay after a failed save. Shutdown and failed opens also release it.
  */
 function openPagedDatabaseEngine(
   SqlJsModule: WasmEngineModule,
@@ -498,15 +518,16 @@ function openPagedDatabaseEngine(
   assertNoRecoveryBearingRollbackJournal(fs, filePath);
   assertNoSiblingWalFrames(fs, filePath);
 
-  const fd = fs.openSync(filePath, 'r');
+  let fd: number | undefined = fs.openSync(filePath, 'r');
   let engineOwnsFd = false;
-  let fdClosed = false;
-  const closeFd = (context: string): void => {
-    if (fdClosed) return;
-    fdClosed = true;
+  const closeFd = (context: string, propagateFailure = false): void => {
+    if (fd === undefined) return;
+    const closingFd = fd;
+    fd = undefined;
     try {
-      fs.closeSync(fd);
+      fs.closeSync(closingFd);
     } catch (closeError) {
+      if (propagateFailure) throw closeError;
       // Descriptor release must never mask the open's outcome.
       logger?.('warn', `Failed to close paged database file (${context}):`, closeError);
     }
@@ -522,17 +543,17 @@ function openPagedDatabaseEngine(
     let pagedReadError: Error | undefined;
     const assertFileGeneration = (): void => {
       if (pagedReadError) throw pagedReadError;
-      let descriptorIdentity: PagedFileIdentity;
+      let descriptorIdentity: PagedFileIdentity | undefined;
       let pathIdentity: PagedFileIdentity;
       try {
-        descriptorIdentity = readPagedFileIdentity(fs, fd);
+        descriptorIdentity = fd === undefined ? undefined : readPagedFileIdentity(fs, fd);
         pathIdentity = readPagedPathIdentity(fs, canonicalBasePath);
       } catch (error) {
         pagedReadError = new Error(PAGED_FILE_CHANGED_MESSAGE, { cause: error });
         throw pagedReadError;
       }
       if (
-        !samePagedFileIdentity(openedIdentity, descriptorIdentity)
+        (descriptorIdentity !== undefined && !samePagedFileIdentity(openedIdentity, descriptorIdentity))
         || !samePagedFileIdentity(openedIdentity, pathIdentity)
       ) {
         pagedReadError = new Error(PAGED_FILE_CHANGED_MESSAGE);
@@ -551,6 +572,15 @@ function openPagedDatabaseEngine(
       // the fstat/read window where a writer could otherwise replace bytes
       // immediately after a successful pre-read check.
       if (pagedReadError) throw pagedReadError;
+      if (fd === undefined) {
+        try {
+          fd = fs.openSync(canonicalBasePath, 'r');
+        } catch (error) {
+          pagedReadError = new Error(PAGED_FILE_CHANGED_MESSAGE, { cause: error });
+          throw pagedReadError;
+        }
+      }
+      assertFileGeneration();
       const out = new Uint8Array(length);
       let filled = 0;
       while (filled < length) {
@@ -630,6 +660,14 @@ function openPagedDatabaseEngine(
           baseIdentity: openedIdentity,
           getReadError: () => pagedReadError,
           assertBaseUnchanged: assertFileGeneration,
+          releaseBaseHandle: () => {
+            try {
+              closeFd('overlay export', true);
+            } catch (error) {
+              pagedReadError = new Error('Cannot release the paged database file for saving.', { cause: error });
+              throw pagedReadError;
+            }
+          },
           dispose: () => closeFd('shutdown')
         }
       );
@@ -742,6 +780,10 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
      * @param params - Bound parameters
      * @returns Query result sets
      */
+    async executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, cancellation?: WasmQueryCancellation): Promise<QueryResultSet> {
+      return requireEngine().executeReadQuery(sql, params, explain, cancellation);
+    },
+
     async runQuery(
       sql: string,
       params?: CellValue[],
@@ -917,9 +959,10 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
 
     async createTable(
       table: string,
-      columns: ColumnDefinition[]
+      columns: ColumnDefinition[],
+      options?: CreateTableOptions
     ): Promise<ColumnDropTableState> {
-      return requireEngine().createTable(table, columns);
+      return requireEngine().createTable(table, columns, options);
     },
 
     async getViewDefinition(view: string) {

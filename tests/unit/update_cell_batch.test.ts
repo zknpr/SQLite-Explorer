@@ -5,7 +5,7 @@ import assert from 'node:assert';
 
 import { OversizedCellReplacementRequiredError } from '../../src/core/cell-edit-policy';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import type { CellUpdate, CellValue, QueryResultSet } from '../../src/core/types';
+import type { CellUpdate, CellValue } from '../../src/core/types';
 
 describe('atomic cell batches', () => {
     it('returns authoritative prior values and derives JSON patches inside the savepoint', async () => {
@@ -146,18 +146,6 @@ describe('atomic cell batches', () => {
             // 32k per-row SQLite work so this boundary regression stays cheap.
             internals.readRowIdAliasColumn = async () => undefined;
             internals.assertUpdateHasNoTargetTableTriggerWrites = async () => {};
-            engine.executeQuery = async (sql, params, signal): Promise<QueryResultSet[]> => {
-                if (/^SELECT CAST\(rowid AS TEXT\),/.test(sql)) {
-                    const rowIds = params ?? [];
-                    assert.ok(rowIds.length <= 32_766);
-                    currentReadSizes.push(rowIds.length);
-                    return [{
-                        headers: ['rowid', 'storage_class', 'payload'],
-                        rows: rowIds.map(rowId => [String(rowId), 'text', 'before'])
-                    }];
-                }
-                return originalExecuteQuery(sql, params, signal);
-            };
             internals.instance.prepare = (sql: string, params?: CellValue[]) => {
                 if (/^UPDATE main\."batch_bind_limit" SET "payload" = \? WHERE rowid = \?$/.test(sql)) {
                     return {
@@ -175,10 +163,11 @@ describe('atomic cell batches', () => {
             internals.queryRaw = (sql: string, params: CellValue[] = []) => {
                 if (/^SELECT CAST\(rowid AS TEXT\),/.test(sql)) {
                     assert.ok(params.length <= 32_766);
-                    postReadSizes.push(params.length);
+                    const beforeWrites = writes === 0;
+                    (beforeWrites ? currentReadSizes : postReadSizes).push(params.length);
                     return {
                         columns: ['rowid', 'storage_class', 'payload'],
-                        rows: params.map(rowId => [String(rowId), 'text', 'after'])
+                        rows: params.map(rowId => [String(rowId), 'text', beforeWrites ? 'before' : 'after'])
                     };
                 }
                 if (/^SELECT CAST\(rowid AS TEXT\) FROM main\."batch_bind_limit"/.test(sql)) {

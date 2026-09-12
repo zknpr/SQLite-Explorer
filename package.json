@@ -3,7 +3,7 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.7.2",
+  "version": "1.8.0",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
@@ -122,7 +122,7 @@
           "maximum": 4000,
           "exclusiveMinimum": false,
           "default": 200,
-          "markdownDescription": "Maximum file size in MB that can be opened. Set to 0 for unlimited."
+          "markdownDescription": "Maximum database size in MB for WebAssembly opens and buffered file-copy operations. Native database opens are not limited by this setting. Set to 0 for unlimited."
         },
         "sqliteExplorer.defaultPageSize": {
           "type": "number",
@@ -185,11 +185,79 @@
     },
     "commands": [
       {
+        "command": "sqlite-explorer.importData",
+        "title": "Import CSV or JSON",
+        "category": "SQLite Explorer"
+      },
+      {
         "command": "sqlite-explorer.refresh",
         "title": "Refresh Database",
         "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.newQuery",
+        "title": "New SQL Query",
+        "icon": "$(code)",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.chooseQueryDatabase",
+        "title": "Choose Query Database",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.runQuery",
+        "title": "Run Query",
+        "icon": "$(play)",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.explainQuery",
+        "title": "Explain Query Plan",
+        "icon": "$(list-tree)",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.refreshQueryCompletions",
+        "title": "Refresh Query Completions",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.queryHistory",
+        "title": "Query History (Session)",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.clearQueryHistory",
+        "title": "Clear Query History",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.exportQueryResults",
+        "title": "Export Query Results",
+        "icon": "$(export)",
+        "category": "SQLite Explorer"
       }
-    ]
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "sqlite-explorer.runQuery",
+          "when": "editorLangId == sql || editorLangId == sqlite",
+          "group": "navigation"
+        },
+        {
+          "command": "sqlite-explorer.explainQuery",
+          "when": "editorLangId == sql || editorLangId == sqlite",
+          "group": "navigation"
+        },
+        {
+          "command": "sqlite-explorer.exportQueryResults",
+          "when": "resourceScheme == sqlite-query-result",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "clean": "rm -rf out && rm -rf assets",
@@ -204,29 +272,41 @@
     "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts",
     "compile:desktop-tests": "rm -rf .desktop-test-out && tsc -p tsconfig.desktop.json",
     "test:desktop": "npm run compile:desktop-tests && node scripts/run-desktop-tests.mjs",
+    "test:gui": "node tests/gui/installed-vsix.mjs",
+    "test:gui:lifecycle": "node tests/gui/lifecycle.mjs",
+    "test:gui:grid": "node tests/gui/grid-query.mjs",
+    "test:gui:cells": "node tests/gui/cell-workflows.mjs",
+    "test:gui:edges": "node tests/gui/interface-edges.mjs",
+    "test:gui:sharing": "node tests/gui/sharing-keys.mjs",
+    "test:gui:progress": "node tests/gui/progress-cancellation.mjs",
+    "test:gui:interactions": "node tests/gui/interaction-details.mjs",
+    "test:gui:contention": "node tests/gui/native-contention.mjs",
+    "test:gui:uploads": "node tests/gui/drop-upload.mjs",
     "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.4.0",
     "@types/vscode": "=1.110.0",
-    "@vscode/test-electron": "^2.5.2",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
-    "esbuild": "^0.28.1",
+    "esbuild": "^0.28.2",
     "esbuild-plugin-polyfill-node": "^0.3.0",
-    "mocha": "^11.7.5",
-    "ovsx": "1.0.2",
+    "mocha": "^12.0.0",
+    "ovsx": "1.1.1",
+    "playwright-core": "1.63.0",
     "ts-node": "^10.9.2",
-    "tsx": "^4.23.1",
+    "tsx": "^4.23.13",
     "typescript": "^6.0.3"
   },
   "dependencies": {
     "@scure/base": "^2.2.0",
     "@vscode/codicons": "^0.0.45",
     "@vscode/extension-telemetry": "^1.5.2",
-    "sql.js": "^1.14.1"
+    "sql.js": "^1.14.2"
   },
   "overrides": {
-    "qs": ">=6.15.2",
+    "qs": "^6.16.0",
+    "js-yaml@^4.0.0": "^4.3.2",
     "serialize-javascript": ">=7.0.5"
   }
 }

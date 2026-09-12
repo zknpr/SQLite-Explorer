@@ -8,6 +8,22 @@ describe('viewer connection state', () => {
         delete (globalThis as any).document;
     });
 
+    it('replaces a stale embedded editing preference with the current host preference', async () => {
+        (globalThis as any).document = { getElementById() { return null; } };
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const connectionStateModulePath = '../../core/ui/modules/connection-state.js';
+        const { state } = await import(stateModulePath);
+        const { applyConnectionResult } = await import(connectionStateModulePath);
+        for (const [stale, current] of [['vscode', 'inline'], ['inline', 'modal'], ['modal', 'vscode']]) {
+            state.cellEditBehavior = stale;
+            applyConnectionResult({ connected: true, readOnly: false, cellEditBehavior: current });
+            assert.strictEqual(state.cellEditBehavior, current);
+        }
+        applyConnectionResult({ connected: true, readOnly: false, cellEditBehavior: 'unexpected' });
+        assert.strictEqual(state.cellEditBehavior, 'vscode');
+        state.cellEditBehavior = 'inline';
+    });
+
     it('honors a read-only initialization response in either viewer entry point', async () => {
         const mutationControlIds = [
             'btnOpenCreateTable',

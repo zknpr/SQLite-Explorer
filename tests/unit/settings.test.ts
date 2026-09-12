@@ -26,6 +26,7 @@ class TestElement {
     checked = false;
     disabled = false;
     private text = '';
+    private readonly listeners = new Map<string, Array<(event: { target: TestElement }) => void>>();
 
     constructor(readonly tagName: string) {}
 
@@ -46,6 +47,20 @@ class TestElement {
     replaceChildren(...children: TestElement[]): void {
         this.text = '';
         this.children.splice(0, this.children.length, ...children);
+    }
+
+    addEventListener(type: string, listener: (event: { target: TestElement }) => void): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+    }
+
+    matches(selector: string): boolean {
+        return selector.startsWith('.') && this.className.split(/\s+/).includes(selector.slice(1));
+    }
+
+    dispatchChange(target: TestElement): void {
+        this.listeners.get('change')?.forEach(listener => listener({ target }));
     }
 }
 
@@ -194,6 +209,9 @@ describe('pragma settings', () => {
                 element => element.dataset.key === 'doubleClickBehavior'
             );
             assert.strictEqual(autoCommit?.disabled, true);
+            assert.strictEqual(autoCommit?.checked, false);
+            assert.match(collectText(container), /Auto-commit is unavailable in the web demo\. Download the database to save changes\./);
+            assert.doesNotMatch(collectText(container), /Native SQLite writes/);
             assert.deepStrictEqual(
                 doubleClick?.children.map(option => option.value),
                 ['inline', 'modal']
@@ -201,6 +219,72 @@ describe('pragma settings', () => {
         } finally {
             backendApi.getPragmas = originalGetPragmas;
             backendApi.getExtensionSettings = originalGetExtensionSettings;
+        }
+    });
+
+    it('shows native immediate persistence as checked and disabled even when configured auto-commit is off', async () => {
+        const { container } = installSettingsDocument();
+        const { backendApi } = await import(apiModulePath);
+        const { openSettingsModal } = await import(settingsModulePath);
+        const originalGetPragmas = backendApi.getPragmas;
+        const originalGetExtensionSettings = backendApi.getExtensionSettings;
+        backendApi.getPragmas = async () => ({ ...effectivePragmas });
+        backendApi.getExtensionSettings = async () => ({
+            autoCommit: false,
+            nativeWritesImmediately: true,
+            cellEditBehavior: 'inline'
+        });
+        try {
+            await openSettingsModal();
+            const autoCommit = findElement(container, element => element.dataset.key === 'autoCommit');
+            assert.strictEqual(autoCommit?.checked, true, 'native edits persist immediately even with instantCommit=never');
+            assert.strictEqual(autoCommit?.disabled, true, 'this checkbox must not suggest native writes can be deferred');
+            assert.match(collectText(container), /Native SQLite writes changes to the database immediately/i);
+            assert.doesNotMatch(collectText(container), /If disabled, you must save manually/i);
+        } finally {
+            backendApi.getPragmas = originalGetPragmas;
+            backendApi.getExtensionSettings = originalGetExtensionSettings;
+        }
+    });
+
+    it('keeps the WASM auto-commit checkbox editable and forwards its changed value', async () => {
+        const { container } = installSettingsDocument();
+        const { backendApi } = await import(apiModulePath);
+        const { initSettings, openSettingsModal } = await import(settingsModulePath);
+        const originalGetPragmas = backendApi.getPragmas;
+        const originalGetExtensionSettings = backendApi.getExtensionSettings;
+        const originalUpdateExtensionSetting = backendApi.updateExtensionSetting;
+        const changed = createDeferred<{ key: string; value: boolean }>();
+        let autoCommitEnabled = false;
+        backendApi.getPragmas = async () => ({ ...effectivePragmas });
+        backendApi.getExtensionSettings = async () => ({
+            autoCommit: autoCommitEnabled,
+            nativeWritesImmediately: false,
+            cellEditBehavior: 'inline'
+        });
+        backendApi.updateExtensionSetting = async (key: string, value: boolean) => {
+            autoCommitEnabled = value;
+            changed.resolve({ key, value });
+        };
+        try {
+            initSettings();
+            await openSettingsModal();
+            const autoCommit = findElement(container, element => element.dataset.key === 'autoCommit');
+            assert.ok(autoCommit);
+            assert.strictEqual(autoCommit.checked, false);
+            assert.strictEqual(autoCommit.disabled, false);
+            assert.match(collectText(container), /If disabled, you must save manually/i);
+            autoCommit.checked = true;
+            container.dispatchChange(autoCommit);
+            assert.deepStrictEqual(await changed.promise, { key: 'autoCommit', value: true });
+            await openSettingsModal();
+            const reopened = findElement(container, element => element.dataset.key === 'autoCommit');
+            assert.strictEqual(reopened?.checked, true);
+            assert.strictEqual(reopened?.disabled, false);
+        } finally {
+            backendApi.getPragmas = originalGetPragmas;
+            backendApi.getExtensionSettings = originalGetExtensionSettings;
+            backendApi.updateExtensionSetting = originalUpdateExtensionSetting;
         }
     });
 

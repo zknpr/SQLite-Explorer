@@ -33,6 +33,7 @@ const CELL_SOURCE_ALIAS = '__sqlite_explorer_cell_source';
 const CELL_VALUE_PREFIX = '__sqlite_explorer_cell_value_';
 const CELL_METADATA_ALIAS = '__sqlite_explorer_cell_metadata';
 const CELL_RAW_TEXT_PREFIX = '__sqlite_explorer_cell_raw_text_';
+const RAW_TEXT_DECODE_SLAB_BYTES = 64 * 1024;
 const METADATA_CHUNK_COLUMNS = 400;
 const MAX_UTF8_BYTES_PER_CODE_POINT = 4;
 // Both bundled SQLite builds use SQLite's default SQLITE_MAX_COLUMN. Private
@@ -55,6 +56,8 @@ export interface CellContainmentQuery {
   /** First private raw-TEXT byte slot, aligned with rawTextColumnIndices. */
   rawTextColumnStart: number;
   rawTextColumnCount: number;
+  /** Hex avoids one sql.js backing-store allocation per private TEXT cell. */
+  rawTextTransport: 'blob' | 'hex';
   /** Source-column indices actually represented by private raw-TEXT slots. */
   rawTextColumnIndices: readonly number[];
   /** Requested raw validation was omitted to stay within SQLite's width cap. */
@@ -165,7 +168,8 @@ export function buildCellContainmentQuery(
   sourceSql: string,
   columnCount: number,
   options: Pick<TableQueryOptions, 'limit' | 'maxInlineCellBytes' | 'maxPageResponseBytes'>,
-  rawTextColumnIndices: readonly number[] = []
+  rawTextColumnIndices: readonly number[] = [],
+  rawTextTransport: 'blob' | 'hex' = 'blob'
 ): CellContainmentQuery {
   const effectiveInlineCellBytes = deriveEffectiveInlineCellBytes(options, columnCount);
   const textCharacterWindow = Math.floor(
@@ -204,7 +208,7 @@ export function buildCellContainmentQuery(
     return (
       `CASE WHEN typeof(${column}) = 'text' ` +
       `AND octet_length(${column}) <= ${effectiveInlineCellBytes} ` +
-      `THEN CAST(${column} AS BLOB) END AS ` +
+      `THEN ${rawTextTransport === 'hex' ? `hex(CAST(${column} AS BLOB))` : `CAST(${column} AS BLOB)`} END AS ` +
       `${escapeIdentifier(`${CELL_RAW_TEXT_PREFIX}${keyIndex}`)}`
     );
   });
@@ -246,6 +250,7 @@ export function buildCellContainmentQuery(
     transportColumnCount: columnCount + 1 + projectedRawTextColumnIndices.length,
     rawTextColumnStart: columnCount + 1,
     rawTextColumnCount: projectedRawTextColumnIndices.length,
+    rawTextTransport,
     rawTextColumnIndices: projectedRawTextColumnIndices,
     rawTextValidationUnavailable,
     effectiveInlineCellBytes
@@ -343,14 +348,64 @@ export function prependCellContainmentColumn(
 /** Extract bounded raw bytes which never leave the engine-side fetch path. */
 export function decodeRawTextColumns(
   rows: readonly (readonly unknown[])[],
-  query: Pick<CellContainmentQuery, 'rawTextColumnStart' | 'rawTextColumnCount' | 'transportColumnCount'>
+  query: Pick<CellContainmentQuery,
+    'rawTextColumnStart' | 'rawTextColumnCount' | 'transportColumnCount'
+    | 'rawTextTransport' | 'effectiveInlineCellBytes'>
 ): Array<Array<Uint8Array | null>> {
+  // Keep ownership per page, but allocate only small slabs as bytes arrive.
+  // Hundreds of thousands of tiny sql.js BLOB ArrayBuffers otherwise trigger
+  // long backing-store GC pauses in the Windows Electron worker. Large cells
+  // retain an individually bounded buffer; ordinary native BLOBs stay intact.
+  let slab: Uint8Array | undefined;
+  let slabOffset = 0;
+  let emptyBytes: Uint8Array | undefined;
+  const hexDigit = (code: number): number => {
+    if (code >= 48 && code <= 57) return code - 48;
+    const lowerCase = code | 32;
+    return lowerCase >= 97 && lowerCase <= 102 ? lowerCase - 87 : -1;
+  };
+  const decodeHex = (value: unknown, rowIndex: number, keyIndex: number): Uint8Array => {
+    const byteLength = typeof value === 'string' ? value.length / 2 : NaN;
+    if (
+      typeof value !== 'string'
+      || !Number.isSafeInteger(byteLength)
+      || !Number.isSafeInteger(query.effectiveInlineCellBytes)
+      || query.effectiveInlineCellBytes < 0
+      || byteLength > query.effectiveInlineCellBytes
+    ) {
+      throw new Error(`Raw TEXT value at row ${rowIndex}, key ${keyIndex} is not bounded hexadecimal text`);
+    }
+    if (byteLength === 0) return emptyBytes ??= new Uint8Array(0);
+    let bytes: Uint8Array;
+    if (byteLength > RAW_TEXT_DECODE_SLAB_BYTES) {
+      bytes = new Uint8Array(byteLength);
+    } else {
+      if (!slab || slab.byteLength - slabOffset < byteLength) {
+        slab = new Uint8Array(RAW_TEXT_DECODE_SLAB_BYTES);
+        slabOffset = 0;
+      }
+      bytes = slab.subarray(slabOffset, slabOffset + byteLength);
+      slabOffset += byteLength;
+    }
+    for (let index = 0; index < byteLength; index++) {
+      const high = hexDigit(value.charCodeAt(index * 2));
+      const low = hexDigit(value.charCodeAt(index * 2 + 1));
+      if (high < 0 || low < 0) {
+        throw new Error(`Raw TEXT value at row ${rowIndex}, key ${keyIndex} contains invalid hexadecimal text`);
+      }
+      bytes[index] = high * 16 + low;
+    }
+    return bytes;
+  };
   return rows.map((row, rowIndex) => {
     if (row.length < query.transportColumnCount) {
       throw new Error(`Raw TEXT row ${rowIndex} is missing private transport columns`);
     }
     return Array.from({ length: query.rawTextColumnCount }, (_, keyIndex) => {
       const value = row[query.rawTextColumnStart + keyIndex];
+      if (value !== null && query.rawTextTransport === 'hex') {
+        return decodeHex(value, rowIndex, keyIndex);
+      }
       if (value !== null && !(value instanceof Uint8Array)) {
         throw new Error(`Raw TEXT value at row ${rowIndex}, key ${keyIndex} is not a BLOB`);
       }

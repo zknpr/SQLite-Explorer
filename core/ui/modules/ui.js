@@ -1,14 +1,27 @@
 /**
  * UI Helper Functions
  */
-import { state } from './state.js';
-import { backendApi } from './api.js';
+import { state, persistState } from './state.js';
+import { backendApi, getVsCodeState } from './api.js';
 import { escapeHtml, getErrorMessage } from './utils.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
+import { reloadFromDisk } from './sidebar.js';
 
-export function updateStatus(message) {
+let contentStatus = null;
+
+export function updateStatus(message, { clearOnRefresh = false } = {}) {
     const el = document.getElementById('statusText');
     if (el) el.textContent = message;
+    contentStatus = clearOnRefresh && el ? { element: el, message } : null;
+}
+
+export function clearContentStatus() {
+    const previous = contentStatus;
+    contentStatus = null;
+    if (previous && previous.element === document.getElementById('statusText')
+        && previous.element.textContent === previous.message) {
+        updateStatus('Ready');
+    }
 }
 
 export function showLoading() {
@@ -42,10 +55,17 @@ export function showErrorState(message) {
         container.innerHTML = `
             <div class="empty-view">
                 <span class="empty-icon codicon codicon-error error-icon"></span>
-                <span class="empty-title">Error</span>
-                <span class="empty-desc">${escapeHtml(message)}</span>
+                <span class="empty-title">${state.reloadRequiredReason ? (state.isDbConnected ? 'Reload required' : 'Database not opened') : 'Error'}</span>
+                <span class="empty-desc">${escapeHtml(state.reloadRequiredReason || message)}</span>
+                ${state.reloadRequiredReason ? `<button id="btnReloadDatabase" class="btn-primary">${state.isDbConnected ? 'Reload Database' : 'Retry Connection'}</button>` : ''}
             </div>
         `;
+        document.getElementById('btnReloadDatabase')?.addEventListener('click', async event => {
+            const button = event.currentTarget;
+            button.disabled = true;
+            try { await reloadFromDisk(); }
+            finally { button.disabled = false; }
+        });
     }
 }
 
@@ -97,20 +117,26 @@ export function initSidebarResize() {
     if (!sidebar || !handle) return;
 
     const normalizeWidth = value => {
+        if (value === null || value === undefined || value === '') return undefined;
         const width = Number(value);
         return Number.isFinite(width)
             ? Math.max(150, Math.min(400, width))
             : undefined;
     };
-    const persistedWidth = normalizeWidth(
+    // VS Code reuses this HTML after hide/show; its dataset predates any
+    // resize in this editor. The webview snapshot contains the latest width.
+    const persistedWidth = normalizeWidth(getVsCodeState()?.sidebarWidth) ?? normalizeWidth(
         document.getElementById('vscode-env')?.dataset.sidebarLeft
     );
+    state.sidebarWidth = persistedWidth ?? null;
     const applyWidth = width => {
         sidebar.style.width = width + 'px';
         handle.setAttribute?.('aria-valuenow', String(width));
     };
     let persistQueue = Promise.resolve();
     const persistWidth = width => {
+        state.sidebarWidth = width;
+        persistState();
         // Key repeat can issue a second save before the first RPC resolves.
         // Serialize them so an older completion cannot overwrite the latest width.
         persistQueue = persistQueue.then(async () => {

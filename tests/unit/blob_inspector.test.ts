@@ -40,6 +40,63 @@ function deferred<T>() {
     return { promise, resolve, reject };
 }
 
+interface PreviewElement {
+    tagName: string;
+    style: Record<string, string>;
+    children: PreviewElement[];
+    listeners: Map<string, (event: any) => void>;
+    attributes: Map<string, string>;
+    disabled: boolean;
+    value: string;
+    textContent: string;
+    appendChild(child: PreviewElement): void;
+    addEventListener(name: string, listener: (event: any) => void): void;
+    setAttribute(name: string, value: string): void;
+    contains(node: unknown): boolean;
+}
+
+function previewElement(tag = 'div'): PreviewElement {
+    let value = '';
+    const children: ReturnType<typeof previewElement>[] = [];
+    const listeners = new Map<string, (event: any) => void>();
+    const attributes = new Map<string, string>();
+    return {
+        tagName: tag.toUpperCase(), style: {} as Record<string, string>, children, listeners,
+        attributes, disabled: false, value: '',
+        get textContent(): string { return value + children.map(child => child.textContent).join(''); },
+        set textContent(text: string) { value = text; children.length = 0; },
+        appendChild(child: ReturnType<typeof previewElement>) { children.push(child); },
+        addEventListener(name: string, listener: (event: any) => void) { listeners.set(name, listener); },
+        setAttribute(name: string, value: string) { attributes.set(name, value); },
+        contains(node: unknown) { return node === this || children.some(child => child.contains(node)); }
+    };
+}
+
+function previewDescendants(element: PreviewElement): PreviewElement[] {
+    return [element, ...element.children.flatMap(previewDescendants)];
+}
+
+function previewText(element: PreviewElement): PreviewElement {
+    const pre = previewDescendants(element).find(child => child.tagName === 'PRE');
+    assert.ok(pre, 'The preview contains selectable text');
+    return pre;
+}
+
+function completePreviewText(element: PreviewElement): string {
+    const next = previewDescendants(element).find(child => child.tagName === 'BUTTON' && child.textContent === 'Next');
+    let text = '';
+    for (let page = 0; page < 10000; page++) {
+        const current = previewText(element).textContent;
+        assert.ok(current.length <= 65536);
+        assert.ok(current.split(/\r\n|[\r\n\v\f\u0085\u2028\u2029]/).length <= 1025);
+        assert.doesNotMatch(current, /^[\udc00-\udfff]|[\ud800-\udbff]$/);
+        text += current;
+        if (!next || next.disabled) return text;
+        next.listeners.get('click')!({});
+    }
+    assert.fail('Preview navigation did not reach its final page');
+}
+
 function inspectorHarness(BlobInspector: any) {
     const rendered: Uint8Array[] = [];
     const hexed: Uint8Array[] = [];
@@ -142,6 +199,255 @@ describe('BlobInspector oversized containment', () => {
         assert.doesNotMatch(new TextDecoder().decode(cappedText), /�/);
     });
 
+    it('makes every admitted TEXT byte accessible through bounded pages after Load more', async () => {
+        const { BlobInspector, MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES, OVERSIZED_INSPECTOR_LOAD_STEP_BYTES } =
+            await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const originalApi = {
+            openCellReadSession: backendApi.openCellReadSession,
+            readCellChunk: backendApi.readCellChunk,
+            closeCellReadSession: backendApi.closeCellReadSession
+        };
+        // The initial cap lands inside the first emoji. The leading BOM is
+        // stored content and must survive both initial and streamed rendering.
+        const admittedText = '\ufeff' + 'A'.repeat(MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES - 5);
+        const fullText = admittedText + '😀東京'.repeat(150_000);
+        const fullBytes = new TextEncoder().encode(fullText);
+        let opened = 0;
+        let closed = 0;
+        backendApi.openCellReadSession = async () => {
+            opened++;
+            return {
+                sessionId: `text-${opened}`,
+                metadata: { storageClass: 'text', byteLength: fullBytes.byteLength, textEncoding: 'utf-8' },
+                expiresAt: Date.now() + 30_000
+            };
+        };
+        backendApi.readCellChunk = async (_sessionId: string, offset: number, maxBytes: number) => {
+            const bytes = fullBytes.slice(offset, offset + maxBytes);
+            return { byteOffset: offset, bytes, done: offset + bytes.byteLength >= fullBytes.byteLength };
+        };
+        backendApi.closeCellReadSession = async () => { closed++; };
+        state.selectedTable = 'items';
+        (globalThis as any).document = {
+            createElement: previewElement
+        };
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+
+        try {
+            await inspector.inspectOversized(
+                fullText.slice(0, 100_000),
+                { storageClass: 'text', byteLength: fullBytes.byteLength },
+                1, 'body', 0, 0
+            );
+            const initialText = previewContainer.children.at(-1)?.textContent;
+            assert.strictEqual(new TextEncoder().encode(initialText).byteLength,
+                MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES - 2);
+            assert.strictEqual(initialText, admittedText);
+            assert.strictEqual(previewContainer.children.at(-1)?.style.whiteSpace, 'pre-wrap');
+            assert.strictEqual(opened, 0);
+
+            assert.strictEqual(await inspector.loadMoreOversizedContent(), true);
+            const prefix = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
+                fullBytes.subarray(0, OVERSIZED_INSPECTOR_LOAD_STEP_BYTES), { stream: true }
+            );
+            assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), prefix);
+            const expandedPreview = previewText(previewContainer.children.at(-1));
+            assert.strictEqual(expandedPreview.style.whiteSpace, 'pre-wrap');
+            assert.ok(expandedPreview.children.length > 1);
+            assert.ok(expandedPreview.children.every((block: { textContent: string }) =>
+                block.textContent.length <= 2048));
+            assert.ok(prefix.length > initialText.length);
+            assert.doesNotMatch(prefix, /�/);
+
+            assert.strictEqual(await inspector.loadMoreOversizedContent(), true);
+            assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), fullText);
+            assert.strictEqual(opened, 2);
+            assert.strictEqual(closed, 2);
+        } finally {
+            Object.assign(backendApi, originalApi);
+        }
+    });
+
+    for (const encoding of ['utf-16le', 'utf-16be']) {
+        it(`reads stored ${encoding} bytes before displaying the initial TEXT Hex`, async () => {
+            const { BlobInspector, MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES } = await import(inspectorModulePath);
+            const { backendApi } = await import(apiModulePath);
+            const { state } = await import(stateModulePath);
+            const originalApi = {
+                openCellReadSession: backendApi.openCellReadSession,
+                readCellChunk: backendApi.readCellChunk,
+                closeCellReadSession: backendApi.closeCellReadSession
+            };
+            const text = '\ufeffAZ東京😀'.repeat(100_000);
+            const bytes = Buffer.from(text, 'utf16le');
+            if (encoding === 'utf-16be') bytes.swap16();
+            let closed = 0;
+            backendApi.openCellReadSession = async () => ({ sessionId: 'utf16',
+                metadata: { storageClass: 'text', byteLength: bytes.byteLength, textEncoding: encoding }
+            });
+            backendApi.readCellChunk = async (_id: string, offset: number, count: number) => ({
+                bytes: new Uint8Array(bytes.subarray(offset, offset + count)), byteOffset: offset,
+                done: offset + count >= bytes.byteLength
+            });
+            backendApi.closeCellReadSession = async () => { closed++; };
+            state.selectedTable = 'items';
+            state.selectedTableType = 'table';
+            (globalThis as any).document = {
+                getElementById(id: string) {
+                    return id === 'tab-preview' || id === 'tab-hex' ? { style: {} } : null;
+                }
+            };
+            const { inspector, hexed } = inspectorHarness(BlobInspector);
+            inspector.modal.querySelectorAll = () => [];
+            try {
+                await inspector.inspectOversized(text.slice(0, 1000),
+                    { storageClass: 'text', byteLength: bytes.byteLength }, 1, 'body', 0, 0);
+                assert.strictEqual(hexed.length, 0, 'A decoded string is not authoritative SQLite bytes');
+                await BlobInspector.prototype.switchTab.call(inspector, 'hex');
+                assert.deepStrictEqual(hexed.at(-1), new Uint8Array(bytes.subarray(0, MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES)));
+                assert.strictEqual(closed, 1);
+            } finally { Object.assign(backendApi, originalApi); }
+        });
+    }
+
+    it('keeps ordinary preview lines wrapped even when the whole value is large', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        (globalThis as any).document = { createElement: previewElement };
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+        const text = ('é東京😀'.repeat(1000) + '\n').repeat(50);
+
+        inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
+
+        assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), text);
+        const preview = previewText(previewContainer.children.at(-1));
+        assert.strictEqual(preview.style.whiteSpace, 'pre-wrap');
+        assert.strictEqual(preview.style.wordBreak, 'break-all');
+    });
+
+    it('bounds layout blocks for large Unicode text containing many short lines', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        (globalThis as any).document = { createElement: previewElement };
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+        const text = 'é😀\n'.repeat(150_000);
+
+        inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
+
+        const preview = previewText(previewContainer.children.at(-1));
+        assert.ok(preview.children.length > 1);
+        assert.ok(preview.children.length <= 33);
+        assert.ok(preview.children.every((block: { textContent: string }) =>
+            block.textContent.length <= 2048 && !/[\ud800-\udbff]$/.test(block.textContent)));
+        assert.strictEqual(preview.style.whiteSpace, 'pre-wrap');
+        assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), text);
+    });
+
+    it('keeps only a bounded selectable page in the DOM after loading many Unicode lines', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        (globalThis as any).document = { createElement: previewElement };
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+        const text = 'é😀\n'.repeat(20_000);
+
+        inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
+
+        const preview = previewContainer.children.at(-1);
+        // CSS offscreen skipping is not a memory boundary: selection makes
+        // skipped text eligible for layout. Do not attach the whole value.
+        assert.ok(preview.textContent.length <= 65536 + 512,
+            `A selectable preview retained ${preview.textContent.length} code units`);
+        assert.ok(preview.textContent.split('\n').length <= 1026,
+            'A selectable page must also bound many-short-line layout');
+    });
+
+    for (const [name, text] of [
+        ['Unicode line', 'A'.repeat(65535) + '😀é東京'.repeat(20_000)],
+        ['LF-only lines below the byte cap', '\n'.repeat(4097)],
+        ['CRLF lines', 'é😀\r\n'.repeat(3073)],
+        ['CR-only lines', 'é😀\r'.repeat(3073)],
+        ['Unicode separator lines', 'é😀\u2028\u2029'.repeat(3073)],
+        ['control separator lines', 'é😀\v\f\u0085'.repeat(3073)]
+    ]) {
+        it(`navigates every bounded ${name} page without losing or duplicating text`, async () => {
+            const { BlobInspector } = await import(inspectorModulePath);
+            (globalThis as any).document = { createElement: previewElement };
+            const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+            inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
+
+            assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), text);
+        });
+    }
+
+    it('rejects invalid text page navigation and preserves the displayed page', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        (globalThis as any).document = { createElement: previewElement };
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+        inspector.renderPreview(new TextEncoder().encode('A'.repeat(131073)), { type: 'text' });
+        const preview = previewContainer.children.at(-1);
+        const elements = previewDescendants(preview);
+        const input = elements.find(element => element.tagName === 'INPUT');
+        const go = elements.find(element => element.tagName === 'BUTTON' && element.textContent === 'Go');
+        assert.ok(input && go, 'Large text must expose bounded page navigation');
+        const first = previewText(preview).textContent;
+        for (const invalid of ['0', '-1', '1.5', '4', 'NaN', 'Infinity', '']) {
+            input.value = invalid;
+            go.listeners.get('click')!({});
+            assert.strictEqual(previewText(preview).textContent, first);
+            assert.strictEqual(input.value, '1');
+        }
+        input.value = '3';
+        input.listeners.get('keydown')!({ key: 'Enter', preventDefault() {} });
+        assert.strictEqual(previewText(preview).textContent, 'A');
+        const previous = elements.find(element => element.tagName === 'BUTTON' && element.textContent === 'Previous')!;
+        previous.listeners.get('click')!({});
+        assert.strictEqual(input.value, '2');
+        assert.strictEqual(previewText(preview).textContent, 'A'.repeat(65536));
+    });
+
+    it('copies selected long-preview text without adding formatting-block newlines', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+        let selectedPreview: ReturnType<typeof previewElement>;
+        (globalThis as any).document = {
+            createElement: previewElement,
+            getSelection: () => ({
+                rangeCount: 1,
+                anchorNode: selectedPreview.children[0],
+                focusNode: selectedPreview.children[1],
+                getRangeAt: () => ({ cloneContents: () => ({ textContent: 'é東京😀original\nline break' }) })
+            })
+        };
+        const text = 'é東京😀'.repeat(20_000);
+        inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
+        selectedPreview = previewText(previewContainer.children.at(-1));
+        const copied = new Map<string, string>();
+        let prevented = false;
+
+        selectedPreview.listeners.get('copy')?.({
+            clipboardData: { setData: (type: string, data: string) => copied.set(type, data) },
+            preventDefault() { prevented = true; }
+        });
+
+        assert.strictEqual(selectedPreview.textContent, text.slice(0, 65536));
+        assert.ok(selectedPreview.children.every(block => !/[\ud800-\udbff]$/.test(block.textContent)));
+        assert.strictEqual(copied.get('text/plain'), 'é東京😀original\nline break');
+        assert.strictEqual(prevented, true);
+    });
+
+    it('bounds the long-preview DOM at the complete eight MiB read limit', async () => {
+        const { BlobInspector, MAX_OVERSIZED_INSPECTOR_LOAD_BYTES } = await import(inspectorModulePath);
+        (globalThis as any).document = { createElement: previewElement };
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+        const text = 'A'.repeat(MAX_OVERSIZED_INSPECTOR_LOAD_BYTES);
+
+        inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
+
+        assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), text);
+        const preview = previewText(previewContainer.children.at(-1));
+        assert.ok(preview.children.length <= 33);
+        assert.ok(preview.children.every((block: PreviewElement) => block.textContent.length <= 2048));
+    });
+
     it('decodes database-encoded TEXT prefixes without corrupting split characters', async () => {
         const { decodeCellTextPrefix } = await import(inspectorModulePath);
 
@@ -191,17 +497,7 @@ describe('BlobInspector oversized containment', () => {
             calls.push({ method: 'close', args });
         };
         state.selectedTable = 'items';
-        (globalThis as any).document = {
-            createElement() {
-                return {
-                    style: {},
-                    className: '',
-                    textContent: '',
-                    appendChild() {},
-                    addEventListener() {}
-                };
-            }
-        };
+        (globalThis as any).document = { createElement: previewElement };
         const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
 
         try {
@@ -227,7 +523,7 @@ describe('BlobInspector oversized containment', () => {
         }
     });
 
-    it('keeps full-content access separate from bounded TEXT load-more', async () => {
+    for (const storageClass of ['text', 'blob']) it(`keeps full-content access separate from bounded ${storageClass} load-more`, async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const listeners = new Map<string, () => void>();
         const loadButton = {
@@ -243,7 +539,7 @@ describe('BlobInspector oversized containment', () => {
         let loads = 0;
         Object.assign(inspector, {
             modal: { querySelectorAll() { return []; } },
-            currentOversizedMetadata: { storageClass: 'text', byteLength: 4 * 1024 * 1024 },
+            currentOversizedMetadata: { storageClass, byteLength: 4 * 1024 * 1024 },
             oversizedLoadedBytes: 1024 * 1024,
             isLoadingOversized: false,
             isUploading: false,
@@ -265,6 +561,69 @@ describe('BlobInspector oversized containment', () => {
         assert.strictEqual(loadButton.textContent, 'Load more');
         assert.match(loadButton.title, /next 1 MB.*snapshot/i);
         assert.strictEqual(loads, 1);
+    });
+
+    it('preserves modal focus during pointer tab switches without blocking activation', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const listeners = new Map<string, (event: any) => void>();
+        const tabButton = {
+            dataset: { tab: 'hex' },
+            addEventListener(type: string, listener: (event: any) => void) {
+                listeners.set(type, listener);
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        const switched: string[] = [];
+        Object.assign(inspector, {
+            modal: {
+                querySelectorAll(selector: string) {
+                    return selector === '.tab-btn' ? [tabButton] : [];
+                }
+            },
+            switchTab(tab: string) { switched.push(tab); }
+        });
+        (globalThis as any).document = { getElementById() { return null; } };
+
+        inspector.setupEventListeners();
+
+        let pointerDefaultPrevented = false;
+        listeners.get('mousedown')?.({
+            preventDefault() { pointerDefaultPrevented = true; }
+        });
+        let activationDefaultPrevented = false;
+        listeners.get('click')?.({
+            target: tabButton,
+            preventDefault() { activationDefaultPrevented = true; }
+        });
+
+        assert.strictEqual(pointerDefaultPrevented, true);
+        assert.strictEqual(activationDefaultPrevented, false);
+        assert.deepStrictEqual(switched, ['hex']);
+    });
+
+    it('pages through loaded BLOB Hex with bounded text nodes and no form-control value', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const inspector = Object.create(BlobInspector.prototype);
+        const hexContainer = previewElement('pre');
+        Object.defineProperty(hexContainer, 'value', {
+            set() { throw new Error('Hex data must not become one accessibility form-control value'); }
+        });
+        inspector.hexContainer = hexContainer;
+        const data = new Uint8Array(1024 * 1024).fill(0xa5);
+        data[16 * 1024] = 0x42;
+        (globalThis as any).document = { getElementById() { return null; }, createElement: previewElement };
+        inspector.renderHex(data, 1);
+        assert.match(hexContainer.textContent, /^00004000  42 a5/);
+        assert.ok(hexContainer.textContent.length < 100_000);
+        assert.ok(hexContainer.children.length > 1 && hexContainer.children.length <= 40);
+        assert.ok(hexContainer.children.every(block => block.textContent.length <= 2048));
+        inspector.renderHex(data, 63);
+        assert.match(hexContainer.textContent, /^000fc000  a5 a5/);
+        assert.ok(hexContainer.textContent.includes('000ffff0'));
+        assert.ok(hexContainer.children.every(block => block.textContent.length <= 2048));
+        inspector.renderHex(new Uint8Array());
+        assert.strictEqual(hexContainer.textContent, '');
+        assert.strictEqual(hexContainer.children.length, 0);
     });
 
     it('hides load-more after the current snapshot has been read completely', async () => {
@@ -1291,7 +1650,54 @@ describe('BlobInspector oversized containment', () => {
         }
     });
 
-    it('routes full oversized content to the desktop temp-file host flow', async () => {
+    it('does not mutate tab UI when the active tab is selected again', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        let styleWrites = 0;
+        let classWrites = 0;
+        let uploadStateCalls = 0;
+        const style = (initial: Record<string, string>) => new Proxy(initial, {
+            set(target, property, value) {
+                styleWrites++;
+                return Reflect.set(target, property, value);
+            }
+        });
+        const buttons = ['preview', 'hex'].map(tab => ({
+            dataset: { tab },
+            classList: {
+                add() { classWrites++; },
+                remove() { classWrites++; }
+            },
+            style: style(tab === 'preview'
+                ? { borderBottom: '2px solid var(--accent-color)', color: 'var(--text-primary)' }
+                : { borderBottom: 'none', color: 'var(--text-secondary)' })
+        }));
+        const preview = { style: style({ display: 'flex' }) };
+        const hex = { style: style({ display: 'none' }) };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'tab-preview') return preview;
+                if (id === 'tab-hex') return hex;
+                return null;
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, {
+            currentTab: 'preview',
+            currentHexNeedsSnapshot: false,
+            currentTableType: 'table',
+            isUploading: false,
+            modal: { querySelectorAll: () => buttons },
+            setUploadState() { uploadStateCalls++; }
+        });
+
+        inspector.switchTab('preview');
+
+        assert.strictEqual(styleWrites, 0);
+        assert.strictEqual(classWrites, 0);
+        assert.strictEqual(uploadStateCalls, 0);
+    });
+
+    it('opens the selected full Hex view even when the content type is PDF', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const { backendApi } = await import(apiModulePath);
         const { state } = await import(stateModulePath);
@@ -1299,24 +1705,30 @@ describe('BlobInspector oversized containment', () => {
         const openCellEditor = mock.fn(async () => undefined);
         backendApi.openCellEditor = openCellEditor;
         state.selectedTable = 'large_cells';
+        const downloadButton = { textContent: '', title: '', disabled: false };
         (globalThis as any).document = {
             getElementById(id: string) {
                 if (id === 'vscode-env') return { dataset: { webviewId: 'wv-large' } };
                 if (id === 'statusText') return { textContent: '' };
+                if (id === 'blob-download-btn') return downloadButton;
+                if (id === 'tab-preview' || id === 'tab-hex') return { style: {} };
                 return null;
             }
         };
         const inspector = Object.create(BlobInspector.prototype);
         Object.assign(inspector, {
             currentData: Uint8Array.from([1, 2, 3]),
-            currentType: { type: 'binary', ext: 'bin' },
+            currentType: { type: 'pdf', ext: 'pdf' },
+            modal: { querySelectorAll: () => [] },
             currentRowId: 1,
             currentColName: 'payload',
             currentOversizedMetadata: { storageClass: 'blob', byteLength: 256 * 1024 * 1024 }
         });
 
         try {
-            await inspector.openFullContent();
+            inspector.switchTab('hex');
+            assert.strictEqual(downloadButton.textContent, 'Open Full Hex');
+            await inspector.download();
             assert.strictEqual(openCellEditor.mock.callCount(), 1);
             assert.deepStrictEqual(openCellEditor.mock.calls[0].arguments, [
                 { table: 'large_cells', name: '' },
@@ -1325,13 +1737,113 @@ describe('BlobInspector oversized containment', () => {
                 {},
                 {
                     type: inspector.currentType,
+                    view: 'hex',
                     webviewId: 'wv-large',
                     sourceByteLength: 256 * 1024 * 1024
+                }
+            ]);
+            inspector.switchTab('preview');
+            assert.strictEqual(downloadButton.textContent, 'Open Full Content');
+            await inspector.download();
+            assert.deepStrictEqual(openCellEditor.mock.calls[1].arguments, [
+                { table: 'large_cells', name: '' },
+                1,
+                'payload',
+                {},
+                {
+                    type: inspector.currentType,
+                    webviewId: 'wv-large',
+                    sourceByteLength: 256 * 1024 * 1024,
+                    download: true
                 }
             ]);
         } finally {
             backendApi.openCellEditor = originalOpenCellEditor;
         }
+    });
+
+    for (const fixture of [
+        { name: 'PDF', data: new TextEncoder().encode('%PDF-1.7\n%%EOF'), type: { type: 'pdf', ext: 'pdf' } },
+        { name: 'empty BLOB', data: new Uint8Array(), type: { type: 'binary', ext: 'bin' } }
+    ]) it(`opens an inline ${fixture.name} as full Hex and still downloads raw bytes from Preview`, async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const originalApi = {
+            openCellEditor: backendApi.openCellEditor,
+            getExtensionSettings: backendApi.getExtensionSettings,
+            saveFile: backendApi.saveFile
+        };
+        const opened: unknown[][] = [];
+        const saved: Uint8Array[] = [];
+        backendApi.openCellEditor = async (...args: unknown[]) => {
+            opened.push(args);
+            return { success: true, mode: 'temporary-read-only' };
+        };
+        backendApi.getExtensionSettings = async () => ({ fileOperations: 'native' });
+        backendApi.saveFile = async (_name: string, data: Uint8Array) => {
+            saved.push(data);
+            return { success: true };
+        };
+        const downloadButton = { textContent: '', title: '', disabled: false };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'vscode-env') return { dataset: { webviewId: 'wv-inline', browserExt: 'false' } };
+                if (id === 'statusText') return { textContent: '' };
+                if (id === 'blob-download-btn') return downloadButton;
+                if (id === 'tab-preview' || id === 'tab-hex') return { style: {} };
+                return null;
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, {
+            currentTable: 'small_cells', currentTableType: 'table', currentStorageClass: 'blob',
+            currentData: fixture.data, currentType: fixture.type,
+            currentRowId: 0, currentColName: '', currentOversizedMetadata: null,
+            previewGeneration: 1, modal: { querySelectorAll: () => [] }
+        });
+        try {
+            inspector.switchTab('hex');
+            assert.strictEqual(downloadButton.textContent, 'Open Full Hex');
+            await inspector.download();
+            assert.deepStrictEqual(opened, [[
+                { table: 'small_cells', name: '' }, 0, '', {},
+                { type: fixture.type, webviewId: 'wv-inline', sourceByteLength: fixture.data.byteLength, view: 'hex' }
+            ]]);
+            assert.deepStrictEqual(saved, []);
+            inspector.switchTab('preview');
+            assert.strictEqual(downloadButton.textContent, 'Download');
+            await inspector.download();
+            assert.deepStrictEqual(saved, [fixture.data]);
+            assert.strictEqual(opened.length, 1);
+        } finally {
+            Object.assign(backendApi, originalApi);
+        }
+    });
+
+    for (const fixture of [
+        { name: 'web demo', env: null, tableType: 'table', storageClass: 'blob' },
+        { name: 'browser extension', env: { dataset: { browserExt: 'true' } }, tableType: 'table', storageClass: 'blob' },
+        { name: 'view result', env: { dataset: { browserExt: 'false' } }, tableType: 'view', storageClass: 'blob' },
+        { name: 'decoded TEXT without a stored-byte snapshot', env: { dataset: { browserExt: 'false' } }, tableType: 'table', storageClass: 'text' }
+    ]) it(`keeps the ordinary inline download for a ${fixture.name}`, async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const button = { textContent: '', title: '', disabled: false };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'vscode-env') return fixture.env;
+                if (id === 'blob-download-btn') return button;
+                if (id === 'tab-preview' || id === 'tab-hex') return { style: {} };
+                return null;
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, {
+            currentTable: 'items', currentTableType: fixture.tableType, currentStorageClass: fixture.storageClass,
+            currentData: Uint8Array.of(1), currentOversizedMetadata: null,
+            currentRowId: 1, currentColName: 'payload', modal: { querySelectorAll: () => [] }
+        });
+        inspector.switchTab('hex');
+        assert.strictEqual(button.textContent, 'Download');
     });
 
     it('coalesces duplicate full-content opens and suppresses stale completion status', async () => {
@@ -1726,6 +2238,26 @@ describe('BlobInspector oversized containment', () => {
         }
     });
 
+    it('offers the PDF download preview without preparing an unsupported inline PDF resource', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const original = backendApi.prepareCellMediaPreview;
+        const prepare = mock.fn(async () => ({ success: false }));
+        backendApi.prepareCellMediaPreview = prepare;
+        state.selectedTable = 'large_cells';
+        (globalThis as any).document = { getElementById: () => null };
+        const { inspector, rendered, hexed } = inspectorHarness(BlobInspector);
+        try {
+            await inspector.inspectOversized(new TextEncoder().encode('%PDF-1.4\n'),
+                { storageClass: 'blob', byteLength: 32 * 1024 * 1024 }, 1, 'payload', 0, 0);
+            assert.strictEqual(prepare.mock.callCount(), 0);
+            assert.strictEqual(rendered.length, 1);
+            assert.strictEqual(hexed.length, 1);
+            assert.strictEqual(inspector.currentType.type, 'pdf');
+        } finally { backendApi.prepareCellMediaPreview = original; }
+    });
+
     it('cancels pending media materialization on close and releases a stale success fallback', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const { backendApi } = await import(apiModulePath);
@@ -1798,6 +2330,34 @@ describe('BlobInspector oversized containment', () => {
         } finally {
             Object.assign(backendApi, originalApi);
         }
+    });
+
+    for (const type of ['image', 'audio', 'video']) it(`releases an undecodable normal ${type} preview and preserves a newer inspector`, async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const revoked: string[] = [];
+        let nextId = 0;
+        mock.method(URL, 'createObjectURL', () => `blob:preview-${++nextId}`);
+        mock.method(URL, 'revokeObjectURL', (uri: string) => { revoked.push(uri); });
+        const elements: Array<PreviewElement & { tagName: string }> = [];
+        (globalThis as any).document = { createElement(tagName: string) {
+            const element = { ...previewElement(), tagName }; elements.push(element); return element;
+        } };
+        const statuses: string[] = [];
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, { previewGeneration: 1, currentObjectUrl: null,
+            previewContainer: previewElement(), renderOversizedMediaStatus: (message: string) => statuses.push(message) });
+        inspector.renderPreview(Uint8Array.of(1), { type, mime: `${type}/test`, ext: 'test' });
+        const media = elements.find(element => element.tagName === (type === 'image' ? 'img' : type))!;
+        assert.ok(media.listeners.has('error'));
+        media.listeners.get('error')!({});
+        assert.deepStrictEqual(revoked, ['blob:preview-1']);
+        assert.strictEqual(inspector.currentObjectUrl, null);
+        assert.match(statuses[0], /could not be decoded.*Download/i);
+        inspector.previewGeneration++;
+        inspector.currentObjectUrl = 'blob:newer-preview';
+        media.listeners.get('error')!({});
+        assert.strictEqual(statuses.length, 1);
+        assert.strictEqual(inspector.currentObjectUrl, 'blob:newer-preview');
     });
 
     it('releases a failed media decode before degrading to the bounded Hex path', async () => {

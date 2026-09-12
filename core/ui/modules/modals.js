@@ -117,14 +117,17 @@ export function openModal(modalId, modalElement = null) {
     }
 }
 
-export function closeModal(modalId, modalElement = null) {
+export function closeModal(modalId, modalElement = null, { restoreFocus = true } = {}) {
     const el = modalElement ?? globalThis.document?.getElementById?.(modalId);
     if (el) el.classList.add('hidden');
     if (modalId === 'cellPreviewModal') state.cellPreviewInfo = null;
     modalCloseHandlers.get(modalId)?.();
     const focusOrigin = modalFocusOrigins.get(modalId);
     modalFocusOrigins.delete(modalId);
-    if (focusOrigin?.focus && focusOrigin.isConnected !== false) focusOrigin.focus();
+    // Opening an external editor can move focus out of the webview before its
+    // modal closes. That completed handoff must keep the new editor focused.
+    if (restoreFocus && focusOrigin?.focus && focusOrigin.isConnected !== false
+        && globalThis.document?.hasFocus?.() !== false) focusOrigin.focus();
 }
 
 /** Invalidate every draft or confirmation bound to the old database content. */

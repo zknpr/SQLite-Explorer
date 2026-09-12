@@ -154,6 +154,17 @@ describe('guarded JSON patch history replay', () => {
         return (plan as { kind: 'write'; value: string }).value;
     };
 
+    for (const direction of ['undo', 'redo'] as const) {
+        it(`${direction} restores recorded JSON text exactly when no concurrent change exists`, () => {
+            const prior = '{ "keep": 1, "nested": {"old":2}, "remove":true, "literal":null, "escaped":"\\u0041" }';
+            const post = '{ "keep":1,"nested":{"old":2,"new":7},"literal":null,"escaped":"\\u0041" }';
+            const patch = '{"nested":{"new":7},"remove":null}';
+            assert.strictEqual(writeValue(planJsonPatchHistoryReplay(
+                direction === 'undo' ? post : prior, patch, prior, post, direction
+            )), direction === 'undo' ? prior : post);
+        });
+    }
+
     it('undo rejects drift on a touched path but allows untouched siblings', () => {
         const prior = '{"status":"draft","owner":"ada"}';
         const patch = '{"status":"published"}';

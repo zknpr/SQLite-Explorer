@@ -64,6 +64,43 @@ describe('SQLiteFileSystemProvider', () => {
         assert.ok(provider.onDidChangeFile);
     });
 
+    it('reports the served cell byte length for BLOB, UTF-16 TEXT, and exact integers', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const engine = result.operations!;
+        setupMockDocument('stat-cells', engine);
+        const provider = new SQLiteFileSystemProvider();
+        try {
+            await engine.executeQuery(
+                "PRAGMA encoding = 'UTF-16le'; " +
+                'CREATE TABLE cells (payload BLOB, body TEXT, counter INTEGER); ' +
+                "INSERT INTO cells VALUES (X'00010203ff', 'é😀', 9223372036854775807)"
+            );
+            for (const [column, expected] of [['payload', 5], ['body', 6], ['counter', 19]] as const) {
+                const uri = vscode.Uri.from({ scheme: 'sqlite-explorer', path: `/stat-cells/cells/-/1/${column}.bin` });
+                const stat = await provider.stat(uri);
+                assert.strictEqual(stat.size, expected, column);
+                assert.strictEqual((await provider.readFile(uri)).byteLength, expected, column);
+            }
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('reports oversized BLOB length without materializing it through readFile', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const engine = result.operations!;
+        setupMockDocument('stat-large', engine);
+        const provider = new SQLiteFileSystemProvider();
+        try {
+            await engine.executeQuery('CREATE TABLE cells (payload BLOB); INSERT INTO cells VALUES (zeroblob(2097152))');
+            const uri = vscode.Uri.from({ scheme: 'sqlite-explorer', path: '/stat-large/cells/-/1/payload.bin' });
+            assert.strictEqual((await provider.stat(uri)).size, 2097152);
+            await assert.rejects(provider.readFile(uri), /oversized.*cannot be returned/i);
+        } finally {
+            (engine as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     describe('readFile', () => {
         const provider = new SQLiteFileSystemProvider();
         const docKey = 'test-doc';
@@ -1947,9 +1984,11 @@ describe('SQLiteFileSystemProvider', () => {
             assert.deepStrictEqual(res, []);
         });
 
-        it('stat should return generic file stat for normal cell', async () => {
+        it('stat returns an empty BLOB file without read-only permissions', async () => {
             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
-            setupMockDocument(docKey, {});
+            setupMockDocument(docKey, {
+                getCellMetadata: async () => ({ storageClass: 'blob', byteLength: 0 })
+            });
             const s = await provider.stat(uri);
             assert.strictEqual(s.type, vscode.FileType.File);
             assert.strictEqual(s.size, 0);
@@ -1958,7 +1997,9 @@ describe('SQLiteFileSystemProvider', () => {
 
         it('stat marks a normal cell document read-only with its database', async () => {
             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/1/col.txt`);
-            const document = setupMockDocument(docKey, {});
+            const document = setupMockDocument(docKey, {
+                getCellMetadata: async () => ({ storageClass: 'blob', byteLength: 0 })
+            });
             (document as any).isReadOnlyMode = true;
 
             const s = await provider.stat(uri);
@@ -1966,12 +2007,14 @@ describe('SQLiteFileSystemProvider', () => {
             assert.strictEqual(s.permissions, vscode.FilePermission.Readonly);
         });
 
-        it('stat should return generic file stat with Readonly for __create__.sql', async () => {
+        it('stat reports CREATE SQL length and read-only permissions', async () => {
             const uri = vscode.Uri.parse(`vscode-sqlite://${docKey}/users/group/__create__.sql/create.sql`);
-            setupMockDocument(docKey, {});
+            setupMockDocument(docKey, {
+                executeQuery: async () => [{ rows: [['CREATE TABLE users (id)']] }]
+            });
             const s = await provider.stat(uri);
             assert.strictEqual(s.type, vscode.FileType.File);
-            assert.strictEqual(s.size, 0);
+            assert.strictEqual(s.size, 23);
             assert.strictEqual(s.permissions, vscode.FilePermission.Readonly);
         });
 

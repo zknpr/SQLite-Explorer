@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "sqlJsCommit": "424163d6c9c34acec7bac07eb2cecedd86185a60",
+  "emcc": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 5.0.0 (a7c5deabd7c88ba1c38ebe988112256775f944c6)",
+  "zig": "0.16.0",
+  "inputs": {
+    "src/runtime/query-plan.c": "a2e6d39c36152bf36bb3729aff12567ed4fa2d9c7ef3751e60db580f5276cc8f",
+    "scripts/build-query-plan.mjs": "ed06af73937ffef2f8339eb4f9d35469704090a8d0273c241c80cdf9579aec78"
+  },
+  "outputs": {
+    "natives/aarch64-macos/query-plan.dylib": "3a51dcd0ebc627e63d664e9b9c317667cb356f197e0d5645262bc3b5ef7b8c3c",
+    "natives/x86_64-macos/query-plan.dylib": "6fe67e3149912a0bab1d4bc212dcab29e5a1138539f108facaf33975324ff773",
+    "natives/x86_64-linux-gnu/query-plan.so": "25d7cfc5a5ee6cd3a6ff8cda5e7f21c167431911cf448057710930217134d763",
+    "natives/aarch64-linux-gnu/query-plan.so": "2116570714d59da17ba34c55cec087cd93c6b30e622de4681173a5750c3ed98c",
+    "natives/x86_64-windows/query-plan.dll": "8ac0a58303c8ae9eb27534878b7775d2476157db8e01ee8d275325848778a177",
+    "vendor/sql.js/sql-wasm.js": "8d044434bd1ed032816b7fe3559fa77421033b175c080bd9f6190df166bd846a",
+    "website/public/sqlite-viewer/sql-wasm.js": "8d044434bd1ed032816b7fe3559fa77421033b175c080bd9f6190df166bd846a",
+    "vendor/sql.js/sql-wasm.wasm": "10013ab296e8adfa5df66c86e3fc5b10726078185646c7f31d11b527bbbca063",
+    "assets/sqlite3.wasm": "10013ab296e8adfa5df66c86e3fc5b10726078185646c7f31d11b527bbbca063",
+    "website/public/sqlite-viewer/sql-wasm.wasm": "10013ab296e8adfa5df66c86e3fc5b10726078185646c7f31d11b527bbbca063"
+  }
+}

@@ -6,6 +6,7 @@ import { LoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
 import type { DatabaseOperations, CellValue, QueryResultSet, ModificationEntry, CellUpdate, TableQueryOptions, TableCountOptions, SchemaSnapshot, ColumnMetadata, ColumnDefinition, CellReadTarget, CellMetadata, CellReadSession, CellReadChunk, ColumnDropTableState, RecordId } from '../../src/core/types';
 
 class MockDatabaseOperations implements DatabaseOperations {
+    async executeReadQuery(): Promise<QueryResultSet> { return { headers: [], rows: [] }; }
     engineKind = Promise.resolve('wasm' as const);
     async executeQuery(sql: string, params?: CellValue[]): Promise<QueryResultSet[]> { return []; }
     async getCellMetadata(_target: CellReadTarget): Promise<CellMetadata> {

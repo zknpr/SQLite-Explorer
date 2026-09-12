@@ -22,11 +22,13 @@ import { DocumentRegistry } from './documentRegistry';
 
 import { createDatabaseConnection } from './workerFactory';
 import { getMaximumFileSizeBytes } from './config';
+import { DatabaseFileSizeLimitError } from './databaseFileSizeLimit';
 import { GlobalOutputChannel } from './main';
 
 import { ModificationTracker } from './core/undo-history';
 import { reconcileRestoredDatabase, revertDatabaseToSaved } from './core/restore-reconciler';
 import { isInvocationTimeoutError } from './core/rpc';
+import { type DatabaseConnectionInvalidatedError, isDatabaseConnectionInvalidatedError } from './core/database-connection-invalidated';
 import type { LabeledModification, DatabaseOperations } from './core/types';
 import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
 import {
@@ -42,6 +44,12 @@ import {
  * Modification entry with display label.
  */
 export type DocumentModification = LabeledModification;
+
+interface DocumentEdit {
+  readonly label: string;
+  undo(): void | Promise<void>;
+  redo(): void | Promise<void>;
+}
 
 /** Database content change, optionally tied to the history entry just applied. */
 export interface DocumentContentChange {
@@ -116,6 +124,12 @@ function pagedNonFilePersistenceError(): Error {
   ));
 }
 
+function isSaveCancellation(error: unknown): boolean {
+  // VS Code's RPC revives errors without their original class prototype.
+  return error instanceof vsc.CancellationError
+    || (error instanceof Error && error.name === 'Canceled' && error.message === 'Canceled');
+}
+
 /** Apply the document's SQL logging decorator consistently across reconnects. */
 function withSqlLogging(
   databaseOps: DatabaseOperations,
@@ -128,6 +142,21 @@ function withSqlLogging(
 }
 
 type DatabaseConnectionFactory = () => Promise<DatabaseConnectionBundle>;
+
+interface OpenedDocumentConnection {
+  connectionState: EstablishedDatabaseConnection;
+  workerMethods: DatabaseConnectionBundle['workerMethods'];
+  tracker: ModificationTracker<DocumentModification> | null;
+  autoCommit: boolean;
+  forceReadOnlyOnReconnect: boolean;
+}
+
+type InitialConnectionFactory = (cancellation?: vsc.CancellationToken) => Promise<OpenedDocumentConnection>;
+type DisconnectedDocumentConnection = {
+  databaseOps?: undefined;
+  isReadOnly: true;
+  storage?: undefined;
+};
 
 // ============================================================================
 // Document Class
@@ -157,23 +186,59 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     cancellation?: vsc.CancellationToken,
     knownDocumentKey?: string
   ): Promise<DatabaseDocument> {
-    const { reporter, isVerified, context: { extensionUri } } = viewerProvider;
+    if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+    const { reporter, context: { extensionUri } } = viewerProvider;
+    const documentKey = knownDocumentKey ?? await generateDatabaseDocumentKey(fileUri);
+    const connectionFactory: DatabaseConnectionFactory = () => createDatabaseConnection(extensionUri, reporter);
+    const initialConnectionFactory: InitialConnectionFactory = async cancellation => {
+      if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+      const bundle = await connectionFactory();
+      try {
+        const opened = await DatabaseDocument.#initializeConnection(viewerProvider, fileUri, openContext, bundle, cancellation);
+        if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+        return opened;
+      } catch (error) {
+        try { bundle.workerMethods[Symbol.dispose](); }
+        catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], 'Opening the database failed and its worker could not be disposed');
+        }
+        throw error;
+      }
+    };
+    let opened: OpenedDocumentConnection;
+    try {
+      opened = await initialConnectionFactory(cancellation);
+    } catch (error) {
+      if (!(error instanceof DatabaseFileSizeLimitError)) throw error;
+      if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+      // VS Code retains a rejected custom-document creation promise, including
+      // after close/reopen. Register a real disconnected document for a settings
+      // refusal so Retry can open a fresh worker without changing resource identity.
+      return new DatabaseDocument(
+        viewerProvider, fileUri, null, isAutoCommitEnabled(), { isReadOnly: true },
+        undefined, connectionFactory, reporter, viewerProvider.forceReadOnly ?? false,
+        documentKey, { factory: initialConnectionFactory, error }
+      );
+    }
+    return new DatabaseDocument(
+      viewerProvider, fileUri, opened.tracker, opened.autoCommit,
+      opened.connectionState, opened.workerMethods, connectionFactory, reporter,
+      opened.forceReadOnlyOnReconnect, documentKey
+    );
+  }
+
+  static async #initializeConnection(
+    viewerProvider: DatabaseViewerProvider,
+    fileUri: vsc.Uri,
+    openContext: vsc.CustomDocumentOpenContext,
+    connectionBundle: DatabaseConnectionBundle,
+    cancellation?: vsc.CancellationToken
+  ): Promise<OpenedDocumentConnection> {
     const configuredForceReadOnly = viewerProvider.forceReadOnly ?? false;
     let forceReadOnlyOnReconnect = configuredForceReadOnly;
-
-    // Use WebAssembly-based worker for database operations
-    const connectionFactory: DatabaseConnectionFactory = () => (
-      createDatabaseConnection(extensionUri, reporter)
-    );
-
     const { filename } = getUriParts(fileUri);
-    const documentKey = knownDocumentKey ?? await generateDatabaseDocumentKey(fileUri);
     const autoCommit = isAutoCommitEnabled();
-
-    let connectionBundle: DatabaseConnectionBundle;
     let databaseOps: DatabaseOperations;
-
-    connectionBundle = await connectionFactory();
     let result = await connectionBundle.establishConnection(
       fileUri,
       filename,
@@ -259,18 +324,13 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       }
     }
 
-    return new DatabaseDocument(
-      viewerProvider,
-      fileUri,
+    return {
       tracker,
       autoCommit,
-      { databaseOps, isReadOnly, storage: result.storage },
-      connectionBundle.workerMethods,
-      connectionFactory,
-      reporter,
-      forceReadOnlyOnReconnect,
-      documentKey
-    );
+      connectionState: { databaseOps, isReadOnly, storage: result.storage, onDidInvalidate: result.onDidInvalidate },
+      workerMethods: connectionBundle.workerMethods,
+      forceReadOnlyOnReconnect
+    };
   }
 
   /** Get configured max file size */
@@ -279,43 +339,75 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   }
 
   // Private state
-  readonly #modificationTracker: ModificationTracker<DocumentModification>;
+  #modificationTracker: ModificationTracker<DocumentModification>;
+  #historyGeneration = 0;
+  #hasPublishedHistory = false;
+  #acknowledgingReloadedCheckpoint = false;
   readonly #hostBridge: HostBridge;
-  readonly #forceReadOnlyOnReconnect: boolean;
+  #forceReadOnlyOnReconnect: boolean;
+  #initialConnectionFactory: InitialConnectionFactory | undefined;
+  #initialOpenError: Error | undefined;
   #connectionGeneration = 0;
+  #connectionInvalidatedError: DatabaseConnectionInvalidatedError | undefined;
+  #connectionInvalidationListener: vsc.Disposable | undefined;
   #activeMutations = 0;
   #activePersistenceOperations = 0;
   /** Serializes history admission through post-backend recording. */
   #historyMutationTail: Promise<void> = Promise.resolve();
   #pagedSaveExclusive = false;
   #pagedSaveRecoveryRequired = false;
-  #connectionExclusiveOperation: 'Reload' | 'File Revert' | undefined;
+  #connectionExclusiveOperation: 'Reload' | 'File Revert' | 'Save As' | undefined;
   readonly #mutationDrainWaiters = new Set<() => void>();
   readonly #reloadDrainWaiters = new Set<() => void>();
   #referenceCount = 1;
   #workerDisposeRequested = false;
+  readonly #restoredEditEvents = new WeakMap<DocumentModification, DocumentEdit>();
 
   private constructor(
     readonly viewerProvider: DatabaseViewerProvider,
     readonly uri: vsc.Uri,
     tracker: ModificationTracker<DocumentModification> | null,
     public autoCommitEnabled: boolean,
-    private connectionState: EstablishedDatabaseConnection,
-    private workerMethods: DatabaseConnectionBundle['workerMethods'],
+    private connectionState: EstablishedDatabaseConnection | DisconnectedDocumentConnection,
+    private workerMethods: DatabaseConnectionBundle['workerMethods'] | undefined,
     private readonly connectionFactory: DatabaseConnectionFactory,
     private readonly reporter?: TelemetryReporter,
     forceReadOnlyOnReconnect: boolean = viewerProvider.forceReadOnly ?? false,
-    documentKey: string = ''
+    documentKey: string = '',
+    initialOpen?: { factory: InitialConnectionFactory; error: Error }
   ) {
     super();
     this.#forceReadOnlyOnReconnect = forceReadOnlyOnReconnect;
+    this.#initialConnectionFactory = initialOpen?.factory;
+    this.#initialOpenError = initialOpen?.error;
     this.#modificationTracker = tracker ?? new ModificationTracker<DocumentModification>(
       MODIFICATION_LIMIT,
       getMaxUndoMemoryBytes()
     );
+    if (tracker && !connectionState.isReadOnly) {
+      for (const entry of tracker.getUncommittedEntries()) {
+        this.#restoredEditEvents.set(entry, this.#createEditEvent(entry));
+      }
+    }
     this.#hostBridge = new HostBridge(viewerProvider, this);
     this.#documentKey = Promise.resolve(documentKey);
+    if (connectionState.databaseOps) this.#observeConnectionInvalidation(connectionState);
     DocumentRegistry.set(documentKey, this);
+  }
+
+  #observeConnectionInvalidation(connection: EstablishedDatabaseConnection): void {
+    this.#connectionInvalidationListener?.dispose();
+    this.#connectionInvalidatedError = undefined;
+    this.#connectionInvalidationListener = connection.onDidInvalidate?.(error => {
+      if (this.connectionState !== connection || this.#connectionInvalidatedError || this.#workerDisposeRequested) return;
+      this.#connectionInvalidatedError = error;
+      this.#connectionGeneration++;
+      this.connectionState.isReadOnly = true;
+      // The retired connection's history cannot safely be replayed or restored
+      // through hot exit after its file identity or transaction state was lost.
+      this.#resetHistoryToClean();
+      this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+    });
   }
 
   // Public accessors
@@ -325,10 +417,24 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   get undoMemoryLimitBytes() { return this.#modificationTracker.memoryLimitBytes; }
   /** Monotonic barrier for host operations that span a database reload. */
   get connectionGeneration() { return this.#connectionGeneration; }
+  get isConnected() { return !!this.connectionState.databaseOps && !this.#workerDisposeRequested; }
+  get reloadRequiredReason() { return this.#initialOpenError?.message ?? this.#connectionInvalidatedError?.message; }
 
   /** Bind provider-created listeners to this document's actual lifetime. */
   registerLifecycleDisposable<T extends vsc.Disposable>(disposable: T): T {
     return this._register(disposable);
+  }
+
+  /** Applied recovery edits whose callbacks can be installed in a new editor. */
+  getRestoredEditEvents(): readonly DocumentEdit[] {
+    if (this.isReadOnlyMode) return [];
+    // VS Code exposes neither a restored save-point index nor a way to seed
+    // its Redo stack. Publishing saved history would let Undo mark unsaved
+    // reversions clean, so only restore the applied suffix after the checkpoint.
+    return this.#modificationTracker.getUncommittedEntries().flatMap(entry => {
+      const edit = this.#restoredEditEvents.get(entry);
+      return edit ? [edit] : [];
+    });
   }
 
   /**
@@ -339,6 +445,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     operation: () => T | PromiseLike<T>,
     recordsHistory: boolean = false
   ): Promise<T> {
+    if (this.#initialOpenError) throw this.#initialOpenError;
+    if (this.#connectionInvalidatedError) throw this.#connectionInvalidatedError;
     if (this.#pagedSaveExclusive) {
       throw new Error(vsc.l10n.t(
         'The document is temporarily read-only while its page-on-demand save is in progress.'
@@ -348,7 +456,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       throw new Error(vsc.l10n.t(
         this.#connectionExclusiveOperation === 'Reload'
           ? 'The document is temporarily read-only while Reload is in progress.'
-          : 'The document is temporarily read-only while File Revert is in progress.'
+          : this.#connectionExclusiveOperation === 'File Revert'
+            ? 'The document is temporarily read-only while File Revert is in progress.'
+            : 'The document is temporarily read-only while Save As is in progress.'
       ));
     }
     this.#activeMutations++;
@@ -366,6 +476,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     try {
       if (waitForHistoryMutation) {
         await waitForHistoryMutation;
+        if (this.#connectionInvalidatedError) throw this.#connectionInvalidatedError;
         this.#modificationTracker.ensureCanRecord();
       }
       return await operation();
@@ -382,11 +493,15 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
   /** Keep Save/Save As from crossing a connection replacement in either direction. */
   #beginPersistenceOperation(): void {
+    if (this.#initialOpenError) throw this.#initialOpenError;
+    if (this.#connectionInvalidatedError) throw this.#connectionInvalidatedError;
     if (this.#connectionExclusiveOperation) {
       throw new Error(vsc.l10n.t(
         this.#connectionExclusiveOperation === 'Reload'
           ? 'The document is temporarily read-only while Reload is in progress.'
-          : 'The document is temporarily read-only while File Revert is in progress.'
+          : this.#connectionExclusiveOperation === 'File Revert'
+            ? 'The document is temporarily read-only while File Revert is in progress.'
+            : 'The document is temporarily read-only while Save As is in progress.'
       ));
     }
     this.#activePersistenceOperations++;
@@ -436,7 +551,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
   /** Reject new work and drain admitted mutations/persistence before Reload. */
   #beginReloadExclusive(
-    operation: 'Reload' | 'File Revert' = 'Reload'
+    operation: 'Reload' | 'File Revert' | 'Save As' = 'Reload'
   ): Promise<void> | undefined {
     if (this.#pagedSaveExclusive) {
       throw new Error(vsc.l10n.t(
@@ -447,7 +562,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       throw new Error(vsc.l10n.t(
         this.#connectionExclusiveOperation === 'Reload'
           ? 'A Reload operation is already in progress.'
-          : 'A File Revert operation is already in progress.'
+          : this.#connectionExclusiveOperation === 'File Revert'
+            ? 'A File Revert operation is already in progress.'
+            : 'A Save As operation is already in progress.'
       ));
     }
     this.#connectionExclusiveOperation = operation;
@@ -502,7 +619,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       DocumentRegistry.delete(key);
     }
     this.#workerDisposeRequested = true;
-    this.workerMethods[Symbol.dispose]();
+    this.#connectionInvalidationListener?.dispose();
+    this.#connectionInvalidationListener = undefined;
+    this.workerMethods?.[Symbol.dispose]();
     // Consumers must see disposal before the registered emitter itself is
     // disposed by the base class, otherwise their cleanup callbacks never run.
     this.#disposeEmitter.fire();
@@ -517,6 +636,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * Record a modification for undo/redo tracking.
    */
   recordModification(modification: DocumentModification): void {
+    if (this.#initialOpenError) throw this.#initialOpenError;
+    if (this.#connectionInvalidatedError) throw this.#connectionInvalidatedError;
     const tracker = this.#modificationTracker;
     const historyWasBlocked = tracker.isHistoryRecordingBlockedByBarrierLimit;
     if (modification.undoPolicy === 'barrier') {
@@ -525,9 +646,37 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       tracker.record(modification);
     }
 
-    // Ensure future stack is cleared so we don't have stale redo actions
-    // This is handled by tracker.record, but explicit check in emitter helps
+    this.#modificationEmitter.fire(this.#createEditEvent(modification));
 
+    if (
+      !historyWasBlocked
+      && tracker.isHistoryRecordingBlockedByBarrierLimit
+    ) {
+      const message = vsc.l10n.t(
+        'Undo history reached its configured limit after a forward-only edit. ' +
+        'Current changes remain dirty and protected for recovery, but further edits are blocked. ' +
+        'Save the database before making more changes.'
+      );
+      try {
+        void Promise.resolve(vsc.window.showWarningMessage(message)).catch(error => {
+          GlobalOutputChannel?.appendLine(
+            `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      } catch (error) {
+        GlobalOutputChannel?.appendLine(
+          `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+
+    this.#autoSaveIfNeeded();
+  }
+
+  #createEditEvent(modification: DocumentModification): DocumentEdit {
+    const tracker = this.#modificationTracker;
+    const historyGeneration = this.#historyGeneration;
+    this.#hasPublishedHistory = true;
     // VS Code keeps one custom-document model per viewType. When two viewTypes
     // share this DatabaseDocument, both models receive this event and retain
     // distinct host edit IDs whose callbacks point at this one logical edit.
@@ -535,9 +684,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // cannot advance the shared tracker to an unrelated modification.
     let editState: 'applied' | 'undoing' | 'undone' | 'redoing' = 'applied';
 
-    this.#modificationEmitter.fire({
+    return {
       label: modification.label,
-      undo: () => this.runTrackedMutation(async () => {
+      undo: () => this.#runHistoryCallback(historyGeneration, async () => {
         if (editState !== 'applied') return;
         editState = 'undoing';
 
@@ -588,9 +737,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             const errorMessage = e instanceof Error ? e.message : String(e);
             GlobalOutputChannel?.appendLine(`[Undo] Failed: ${errorMessage}`);
             vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', errorMessage));
+            // A fulfilled callback tells VS Code that its edit was undone and
+            // can clear the dirty marker, even though SQLite rolled it back.
+            throw e;
         }
       }),
-      redo: () => this.runTrackedMutation(async () => {
+      redo: () => this.#runHistoryCallback(historyGeneration, async () => {
         if (editState !== 'undone') return;
         editState = 'redoing';
 
@@ -632,33 +784,59 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
              const errorMessage = e instanceof Error ? e.message : String(e);
              GlobalOutputChannel?.appendLine(`[Redo] Failed: ${errorMessage}`);
              vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', errorMessage));
+             throw e;
         }
       })
-    });
+    };
+  }
 
-    if (
-      !historyWasBlocked
-      && tracker.isHistoryRecordingBlockedByBarrierLimit
-    ) {
-      const message = vsc.l10n.t(
-        'Undo history reached its configured limit after a forward-only edit. ' +
-        'Current changes remain dirty and protected for recovery, but further edits are blocked. ' +
-        'Save the database before making more changes.'
-      );
-      try {
-        void Promise.resolve(vsc.window.showWarningMessage(message)).catch(error => {
-          GlobalOutputChannel?.appendLine(
-            `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
-          );
-        });
-      } catch (error) {
-        GlobalOutputChannel?.appendLine(
-          `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
-        );
+  #runHistoryCallback(generation: number, operation: () => Promise<void>): Promise<void> {
+    return generation === this.#historyGeneration
+      ? this.runTrackedMutation(operation)
+      : this.#acknowledgeObsoleteHostEdit();
+  }
+
+  #resetHistoryToClean(): void {
+    this.#modificationTracker.resetToCleanState();
+    this.#historyGeneration++;
+  }
+
+  async #acknowledgeObsoleteHostEdit(): Promise<void> {
+    if (this.#initialOpenError) throw this.#initialOpenError;
+    if (this.#connectionInvalidatedError) throw this.#connectionInvalidatedError;
+    const drain = this.#beginReloadExclusive();
+    try {
+      if (drain) await drain;
+      // VS Code moves its undo cursor before invoking our callback. Old host
+      // entries survive a connection reload, but cannot describe or save any
+      // new edits. Only acknowledge a still-clean replacement checkpoint.
+      if (!this.#modificationTracker.hasUncommittedChanges()) {
+        await this.#acknowledgeReloadedHostCheckpoint();
       }
+    } finally {
+      this.#endReloadExclusive();
     }
+  }
 
-    this.#autoSaveIfNeeded();
+  async #acknowledgeReloadedHostCheckpoint(): Promise<void> {
+    if (!this.#hasPublishedHistory) return;
+    // The custom-editor API has no mark-clean/reset-history event. A scoped
+    // Save can acknowledge bytes already loaded from disk, without rewriting
+    // them. Keep the connection barrier raised for the entire host round trip;
+    // no new mutation may become part of this no-write acknowledgement.
+    this.#acknowledgingReloadedCheckpoint = true;
+    try {
+      if (!await vsc.workspace.save(this.uri)) {
+        throw new Error(vsc.l10n.t(
+          'The database was reloaded, but VS Code could not acknowledge its saved checkpoint. Close and reopen this database editor.'
+        ));
+      }
+      this.#saveRequestGeneration++;
+      this.#savePending = false;
+      this.#autoSaveFailureNotified = false;
+    } finally {
+      this.#acknowledgingReloadedCheckpoint = false;
+    }
   }
 
   /**
@@ -678,6 +856,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
   /** Verify document is writable */
   ensureWritable = async (): Promise<void> => {
+    if (this.#initialOpenError) throw this.#initialOpenError;
+    if (this.#connectionInvalidatedError) throw this.#connectionInvalidatedError;
     if (this.isReadOnlyMode) {
       throw new Error(vsc.l10n.t('Document is read-only'));
     }
@@ -693,9 +873,26 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
    * writable paged databases use the local streaming writer.
    */
   async save(cancellation?: vsc.CancellationToken): Promise<void> {
+    if (this.#acknowledgingReloadedCheckpoint) {
+      if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+      if (this.#connectionInvalidatedError) throw this.#connectionInvalidatedError;
+      if (!this.#connectionExclusiveOperation || this.#activeMutations !== 0
+        || this.#activePersistenceOperations !== 0 || this.#modificationTracker.hasUncommittedChanges()) {
+        throw new Error('The reloaded checkpoint changed before VS Code could acknowledge it');
+      }
+      return;
+    }
     this.#beginPersistenceOperation();
+    const requestGeneration = this.#saveRequestGeneration;
     try {
       await this.#save(cancellation);
+      // Manual Save bypasses triggerSave. A completed current checkpoint also
+      // clears its cancelled auto-save retry, but cannot clear a newer request.
+      if (requestGeneration === this.#saveRequestGeneration
+        && !this.#modificationTracker.hasUncommittedChanges()) {
+        this.#savePending = false;
+        this.#autoSaveFailureNotified = false;
+      }
     } finally {
       this.#endPersistenceOperation();
     }
@@ -711,11 +908,13 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // Check if using native engine - changes are already on disk
     const engineKind = await this.databaseOperations.engineKind;
     if (engineKind === 'native') {
+      await this.#historyMutationTail;
       // Native SQLite writes directly to file - no export needed
       // Just ensure WAL is checkpointed for consistency
       try {
         await this.databaseOperations.executeQuery('PRAGMA wal_checkpoint(PASSIVE)');
       } catch (err) {
+        if (isDatabaseConnectionInvalidatedError(err)) throw err;
         // Ignore checkpoint errors - database may not be using WAL mode
         // Log at debug level for troubleshooting if needed
         GlobalOutputChannel?.appendLine(`[WAL checkpoint skipped] ${err instanceof Error ? err.message : String(err)}`);
@@ -753,6 +952,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             // changes the retained timeline while the async filesystem write is
             // pending, the saved bytes no longer match the live tracker state.
             // Paged saves take this position only after their mutation drain.
+            // Memory saves also wait for admitted edits to record their history.
+            // Keep checkpoint capture and backend snapshot admission contiguous.
+            await this.#historyMutationTail;
             const fileCheckpoint = this.#modificationTracker.getCurrentPosition();
             const fileCheckpointInvalidationRevision =
               this.#modificationTracker.getCheckpointInvalidationRevision();
@@ -818,14 +1020,13 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     // Whole-image transfer remains only for non-file workspace providers.
     const destinationGeneration = await captureWorkspaceFileGeneration(this.uri);
     saveSignal?.throwIfAborted();
-    const binaryContent = await this.databaseOperations.serializeDatabase(saveSignal);
-    saveSignal?.throwIfAborted();
-    // Capture the tracker position immediately after serialization. The bytes
-    // below represent edits up to this position only; edits recorded while the
-    // asynchronous workspace write is pending must remain dirty.
+    // Pair history with snapshot admission; later edits must remain dirty.
+    await this.#historyMutationTail;
     const serializedCheckpoint = this.#modificationTracker.getCurrentPosition();
     const serializedCheckpointInvalidationRevision =
       this.#modificationTracker.getCheckpointInvalidationRevision();
+    const binaryContent = await this.databaseOperations.serializeDatabase(saveSignal);
+    saveSignal?.throwIfAborted();
     try {
       await writeWorkspaceFileAtomically(
         this.uri,
@@ -867,6 +1068,68 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       await this.#saveAs(targetUri, cancellation);
     } finally {
       this.#endPersistenceOperation();
+    }
+  }
+
+  /** Keep an already-open destination authoritative across another document's Save As. */
+  async replaceFromSaveAs(write: () => Promise<void>, cancellation: vsc.CancellationToken): Promise<void> {
+    if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+    this.retainReference();
+    let exclusiveOwned = false;
+    let workerRetired = false;
+    let written = false;
+    try {
+      const drain = this.#beginReloadExclusive('Save As');
+      exclusiveOwned = true;
+      if (drain) await drain;
+      await this.ensureWritable();
+      if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+      if (await this.databaseOperations.engineKind === 'wasm'
+        && this.#modificationTracker.hasUncommittedChanges()) {
+        throw new Error(vsc.l10n.t(
+          'Cannot replace {0}: it has unsaved changes. Save or revert that database before using Save As to replace it.',
+          this.fileParts.filename
+        ));
+      }
+      await this.databaseOperations.ping();
+      if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+      this.#connectionGeneration++;
+      this.connectionState.isReadOnly = true;
+      this.#connectionInvalidationListener?.dispose();
+      this.#connectionInvalidationListener = undefined;
+      // Windows also requires the destination's existing SQLite handle to be
+      // closed before replacement. The barrier keeps its clients from writing
+      // while the source owns the snapshot/rename, and its URI stays unchanged.
+      workerRetired = true;
+      this.workerMethods?.[Symbol.dispose]();
+      await write();
+      written = true;
+      this.#resetHistoryToClean();
+      try {
+        await this.#reconnectFromDisk(false);
+      } catch (error) {
+        throw new Error(vsc.l10n.t(
+          'The database was saved, but the destination could not be reopened. Use Reload Database before editing it.'
+        ), { cause: error });
+      }
+      workerRetired = false;
+      await this.#acknowledgeReloadedHostCheckpoint();
+      this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+    } catch (error) {
+      if (workerRetired && !written) {
+        try {
+          await this.#reconnectFromDisk(false);
+          this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+        } catch (recoveryError) {
+          throw new AggregateError([error, recoveryError], vsc.l10n.t(
+            'Save As failed and the destination could not be reopened. Use Reload Database before editing it.'
+          ));
+        }
+      }
+      throw error;
+    } finally {
+      if (exclusiveOwned) this.#endReloadExclusive();
+      await this.dispose();
     }
   }
 
@@ -1057,19 +1320,38 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   // Auto-save
   // ============================================================================
 
+  #autoSaveFailureNotified = false;
+
   async #autoSaveIfNeeded(): Promise<void> {
     try {
       if (this.autoCommitEnabled) {
-        if (this.#activeViewers.size > 0) {
-          await this.triggerSave();
-        } else {
-          this.#savePending = true;
-        }
+        await this.triggerSave();
       }
     } catch (err) {
-      // Record auto-save failures in the output channel for debugging instead of showing a UI error
+      if (isSaveCancellation(err)) {
+        // Starting another custom-editor Save cancels the previous host request.
+        // Keep unsaved edits retryable; cancellation is not a failed write.
+        GlobalOutputChannel?.appendLine('[Auto-save cancelled]');
+        return;
+      }
       const errorMessage = err instanceof Error ? err.message : String(err);
       GlobalOutputChannel?.appendLine(`[Auto-save failed] ${errorMessage}`);
+      if (!this.#autoSaveFailureNotified) {
+        // One failed-save episode can contain many edits. Keep its retry state
+        // and one visible warning until a current save request actually succeeds.
+        this.#autoSaveFailureNotified = true;
+        try {
+          void Promise.resolve(vsc.window.showErrorMessage(vsc.l10n.t(
+            'Auto-save failed for {0}: {1}. Changes remain unsaved. Keep the database editor open and retry Save.',
+            this.fileParts.filename,
+            errorMessage
+          ))).catch(error => {
+            GlobalOutputChannel?.appendLine(`[Auto-save notification failed] ${error instanceof Error ? error.message : String(error)}`);
+          });
+        } catch (error) {
+          GlobalOutputChannel?.appendLine(`[Auto-save notification failed] ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     }
   }
 
@@ -1099,15 +1381,26 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const requestGeneration = ++this.#saveRequestGeneration;
     this.#savePending = true;
     try {
-      await vsc.commands.executeCommand('workbench.action.files.save');
+      // Imports and SQL workspaces can edit a database while a text preview is
+      // active. Save its URI through VS Code so the custom-editor save point
+      // advances with the database's checkpoint without changing editor focus.
+      const saved = await vsc.workspace.save(this.uri);
+      if (!saved) {
+        throw new Error(vsc.l10n.t(
+          'VS Code could not save {0}. Keep the database editor open and retry Save.',
+          this.fileParts.filename
+        ));
+      }
       // A newer request owns the pending state. Its result, not this older
-      // command, determines whether another activation must retry the save.
+      // request, determines whether another activation must retry the save.
       if (requestGeneration === this.#saveRequestGeneration) {
         this.#savePending = false;
+        this.#autoSaveFailureNotified = false;
       }
     } catch (error) {
       if (requestGeneration === this.#saveRequestGeneration) {
-        this.#savePending = true;
+        this.#savePending = !isSaveCancellation(error)
+          || this.#modificationTracker.hasUncommittedChanges();
       }
       throw error;
     }
@@ -1118,6 +1411,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   // ============================================================================
 
   get databaseOperations(): DatabaseOperations {
+    if (!this.connectionState.databaseOps) {
+      throw this.#initialOpenError ?? new Error('The database is not connected');
+    }
     return this.connectionState.databaseOps;
   }
 
@@ -1179,6 +1475,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const mutationDrain = this.#beginReloadExclusive();
     try {
       if (mutationDrain) await mutationDrain;
+      if (this.#initialConnectionFactory) return await this.#retryInitialConnection();
       if (this.#modificationTracker.hasUncommittedChanges()) {
         const answer = await vsc.window.showWarningMessage(
           vsc.l10n.t(
@@ -1193,7 +1490,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       }
 
       const reloaded = await this.#reloadFromDisk();
-      this.#modificationTracker.resetToCleanState();
+      this.#resetHistoryToClean();
+      await this.#acknowledgeReloadedHostCheckpoint();
       return reloaded;
     } finally {
       this.#endReloadExclusive();
@@ -1220,8 +1518,47 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     return reloadedOps;
   }
 
+  async #retryInitialConnection(): Promise<DatabaseOperations> {
+    const factory = this.#initialConnectionFactory;
+    if (!factory) throw new Error('The database has no pending initial connection');
+    this.#connectionGeneration++;
+    let opened: OpenedDocumentConnection;
+    try {
+      opened = await factory();
+    } catch (error) {
+      this.#initialOpenError = error instanceof Error ? error : new Error(String(error));
+      throw error;
+    }
+    if (this.#workerDisposeRequested || this.#referenceCount === 0) {
+      const error = new Error('Database document was disposed while opening its connection');
+      try { opened.workerMethods[Symbol.dispose](); }
+      catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'The document was disposed and its new worker could not be closed');
+      }
+      throw error;
+    }
+
+    this.connectionState = opened.connectionState;
+    this.workerMethods = opened.workerMethods;
+    this.autoCommitEnabled = opened.autoCommit;
+    this.#forceReadOnlyOnReconnect = opened.forceReadOnlyOnReconnect;
+    if (opened.tracker) {
+      this.#modificationTracker = opened.tracker;
+      if (!opened.connectionState.isReadOnly) {
+        for (const entry of opened.tracker.getUncommittedEntries()) {
+          this.#restoredEditEvents.set(entry, this.#createEditEvent(entry));
+        }
+      }
+    }
+    this.#initialConnectionFactory = undefined;
+    this.#initialOpenError = undefined;
+    this.#observeConnectionInvalidation(opened.connectionState);
+    this.#contentChangeEmitter.fire({ invalidateAllViewDocuments: true });
+    return opened.connectionState.databaseOps;
+  }
+
   /** Replace the active engine handle with a newly opened connection to this file. */
-  async #reconnectFromDisk(): Promise<DatabaseOperations> {
+  async #reconnectFromDisk(disposePrevious: boolean = true): Promise<DatabaseOperations> {
     const filename = this.fileParts.filename;
     const replacementBundle = await this.connectionFactory();
     let result: EstablishedDatabaseConnection;
@@ -1266,14 +1603,16 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const nextConnectionState: EstablishedDatabaseConnection = {
       databaseOps,
       isReadOnly: this.#forceReadOnlyOnReconnect || !!result.isReadOnly,
-      storage: result.storage
+      storage: result.storage,
+      onDidInvalidate: result.onDidInvalidate
     };
 
     const previousWorkerMethods = this.workerMethods;
     this.workerMethods = replacementBundle.workerMethods;
     this.connectionState = nextConnectionState;
+    this.#observeConnectionInvalidation(nextConnectionState);
     try {
-      previousWorkerMethods[Symbol.dispose]();
+      if (disposePrevious) previousWorkerMethods?.[Symbol.dispose]();
     } catch (error) {
       // The new connection is already authoritative. Failing the Reload now
       // would leave callers believing the old database is still active, so
@@ -1300,6 +1639,17 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   ): Promise<vsc.CustomDocumentBackup> {
     if (cancellation?.isCancellationRequested) {
       throw new vsc.CancellationError();
+    }
+    if (this.#initialOpenError) throw this.#initialOpenError;
+    if (!this.#connectionInvalidatedError && await this.databaseOperations.engineKind === 'native') {
+      try {
+        // Backup can be the first activity after an external replacement. Let
+        // native identity admission retire that file's history before encoding
+        // it, without materializing the database or replaying any edits.
+        await this.databaseOperations.ping();
+      } catch (error) {
+        if (!isDatabaseConnectionInvalidatedError(error) || !this.#connectionInvalidatedError) throw error;
+      }
     }
     // Hot-exit persists only ModificationTracker history. It never copies the
     // database image, so a multi-gigabyte paged base is not materialized here.

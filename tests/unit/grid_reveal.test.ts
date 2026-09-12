@@ -88,6 +88,26 @@ describe('grid cell reveal geometry', () => {
         assert.strictEqual(container.scrollTop, 80);
     });
 
+    it('keeps the whole target inside the client viewport, clear of borders and native scrollbars', async () => {
+        const container = {
+            scrollLeft: 40, scrollTop: 25,
+            clientLeft: 2, clientTop: 2, clientWidth: 482, clientHeight: 382,
+            getBoundingClientRect: () => rect(10, 20, 510, 420),
+            querySelector: () => null, querySelectorAll: () => []
+        };
+        const target = {
+            classList: { contains: () => false }, closest: () => null,
+            getBoundingClientRect: () => rect(470, 380, 505, 415)
+        };
+        (globalThis as any).document = { getElementById: () => container };
+        const { revealGridCell } = await import(revealModulePath);
+
+        revealGridCell(target);
+
+        assert.strictEqual(container.scrollLeft, 51);
+        assert.strictEqual(container.scrollTop, 36);
+    });
+
     it('measures only representative sticky elements regardless of grid size', async () => {
         let layoutReads = 0;
         const measured = (bounds: ReturnType<typeof rect>) => ({

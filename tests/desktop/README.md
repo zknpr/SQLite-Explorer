@@ -1,9 +1,21 @@
 # Desktop extension-host integration lane
 
 Run `node scripts/build.mjs` first. `npm run test:desktop` then compiles this
-directory, downloads/caches the exact VS Code version pinned by `engines.vscode`,
-and runs the complete matrix in one Extension Development Host launch. Fixtures
-are generated with sql.js under the temporary workspace created by the runner;
+directory and runs the complete matrix in one Extension Development Host launch.
+This lane tests the exact minimum version in the `engines.vscode` caret pin.
+The runner downloads/caches that version, then checks the selected application's
+actual `resources/app/package.json` version before launching. An app may update
+inside a cache directory that still carries its old version name; that mismatch
+now fails with the expected and actual versions. The runner does not delete or
+reinstall an app to resolve drift.
+
+To use a fresh app already on disk, set `VSCODE_TEST_EXECUTABLE_PATH` to its desktop
+executable when running `npm run test:desktop`. On macOS this is the file inside
+`Visual Studio Code.app/Contents/MacOS/`, such as `Code` or `Electron`. The override
+is checked against the same exact version and bypasses the download/cache lookup.
+The launcher prints the verified version and executable path for the test record.
+
+Fixtures are generated with sql.js under the temporary workspace created by the runner;
 nothing depends on machine-local `test_db/` files.
 
 The suite exercises real custom-editor providers, extension-host lifecycle, native
@@ -12,10 +24,12 @@ and the production table-export stream. A non-production-only object returned by
 `activate()` supplies the narrow observation/control surface that cannot be shared by
 importing source modules into the separately bundled test extension.
 
-Webview-internal behavior is deliberately out of scope: grid rendering, modals, media
-panels, and other webview DOM behavior belong to the demo Playwright lane. Electron
-extension tests cannot reach into the isolated webview DOM, and this lane does not fake
-coverage with webview message injection.
+Grid rendering, modals, media panels, and other webview DOM behavior are outside
+this extension-host lane. The separate [installed-VSIX suites](../gui/README.md)
+exercise visible controls with mouse and keyboard actions in an isolated desktop
+profile. Each result records the actual application version and tested VSIX;
+neither lane establishes behavior in the user's existing profile. This host lane
+does not substitute webview message injection for visible UI interaction.
 
 The `sqliteExplorer.fileOperations` setting controls blob-inspector I/O (`native` or
 `web`); it does not select a database backend. The desktop test API therefore forces

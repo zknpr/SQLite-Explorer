@@ -363,3 +363,167 @@ it('reserves the upload before asynchronous file retrieval', async () => {
         backendApi.updateCell = originalUpdate;
     }
 });
+
+it('Ctrl/Cmd+Z cancels a pending file read without reaching the previous Undo entry', async () => {
+    const listeners = new Map<string, (event: any) => unknown>();
+    const status = { textContent: '' };
+    const cell: any = {
+        dataset: { rowidx: '0', colidx: '0' },
+        classList: { contains: () => false, remove() {} },
+        closest: () => cell
+    };
+    (globalThis as any).document = {
+        addEventListener(type: string, listener: (event: any) => unknown) { listeners.set(type, listener); },
+        getElementById(id: string) {
+            if (id === 'gridContainer') return this;
+            if (id === 'statusText') return status;
+            return null;
+        }
+    };
+    let aborted = 0;
+    let reader: any;
+    (globalThis as any).FileReader = class {
+        result = new ArrayBuffer(1);
+        onload?: () => void;
+        onabort?: () => void;
+        readAsArrayBuffer() { reader = this; }
+        abort() { aborted++; this.onabort?.(); }
+    };
+    const { backendApi } = await import(apiModulePath);
+    const { state } = await import(stateModulePath);
+    const update = mock.method(backendApi, 'updateCell', async () => 1);
+    state.selectedTable = 'drop_target';
+    state.selectedTableType = 'table';
+    state.tableColumns = [{ name: 'payload', type: 'TEXT' }];
+    state.gridData = [[1, new Uint8Array([0])]];
+    const { initDragAndDrop } = await import(dndModulePath);
+    initDragAndDrop();
+    const pending = listeners.get('drop')!({
+        preventDefault() {}, target: cell,
+        dataTransfer: { files: [{ name: 'pending.bin', size: 1 }] }
+    });
+    let prevented = false;
+    let stopped = false;
+    try {
+        listeners.get('keydown')?.({ key: 'z', ctrlKey: true, metaKey: false, shiftKey: false,
+            altKey: false, isComposing: false, target: cell,
+            preventDefault() { prevented = true; },
+            stopImmediatePropagation() { stopped = true; }
+        });
+        // Let the old implementation settle too, so the failing regression
+        // cannot leave an upload in flight for subsequent tests.
+        if (!aborted) reader.onload();
+        await pending;
+        assert.equal(prevented, true, 'Undo must not be forwarded to the host while this drop is pending');
+        assert.equal(stopped, true);
+        assert.equal(aborted, 1);
+        assert.equal(update.mock.callCount(), 0);
+        assert.match(status.textContent, /upload cancelled/i);
+    } finally { update.mock.restore(); }
+});
+
+it('blocks the previous Undo entry while the posted cell mutation is finishing', async () => {
+    const listeners = new Map<string, (event: any) => unknown>();
+    const status = { textContent: '' };
+    const cell: any = {
+        dataset: { rowidx: '0', colidx: '0' },
+        classList: { contains: () => false, remove() {} }, closest: () => cell
+    };
+    (globalThis as any).document = {
+        addEventListener(type: string, listener: (event: any) => unknown) { listeners.set(type, listener); },
+        getElementById(id: string) {
+            if (id === 'gridContainer') return this;
+            if (id === 'statusText') return status;
+            if (id === 'vscode-env') return {};
+            return null;
+        }
+    };
+    const { backendApi } = await import(apiModulePath);
+    const { state } = await import(stateModulePath);
+    state.selectedTable = 'drop_target';
+    state.selectedTableType = 'table';
+    state.tableColumns = [{ name: 'payload', type: 'TEXT' }];
+    state.gridData = [[1, new Uint8Array([0])]];
+    const committed = createDeferred<number>();
+    const posted = createDeferred<void>();
+    let signal: AbortSignal | undefined;
+    const read = mock.method(backendApi, 'readWorkspaceFileUri', async () => new Uint8Array([1]));
+    const update = mock.method(backendApi, 'updateCell', async (...args: any[]) => {
+        const options = args[5];
+        signal = options.signal;
+        options.onDidPost();
+        posted.resolve();
+        return committed.promise;
+    });
+    const { initDragAndDrop } = await import(dndModulePath);
+    initDragAndDrop();
+    const pending = listeners.get('drop')!({
+        preventDefault() {}, target: cell,
+        dataTransfer: { files: [], getData: () => 'file:///private/committing.bin' }
+    });
+    try {
+        await posted.promise;
+        let prevented = 0;
+        const undo = { key: 'z', metaKey: true, target: cell,
+            preventDefault() { prevented++; }, stopImmediatePropagation() {} };
+        listeners.get('keydown')!(undo);
+        assert.equal(prevented, 1);
+        assert.equal(signal?.aborted, false);
+        assert.match(status.textContent, /finishing.*Undo after it completes/i);
+        committed.resolve(1); await pending;
+        listeners.get('keydown')!(undo);
+        assert.equal(prevented, 1, 'normal Undo is available again once the mutation finishes');
+    } finally {
+        committed.resolve(1);
+        await pending;
+        read.mock.restore(); update.mock.restore();
+    }
+});
+
+it('cancels an Explorer upload while workspace file retrieval is pending', async () => {
+    const listeners = new Map<string, (event: any) => unknown>();
+    const status = { textContent: '' };
+    const cell: any = {
+        dataset: { rowidx: '0', colidx: '0' },
+        classList: { contains: () => false, remove() {} }, closest: () => cell
+    };
+    (globalThis as any).document = {
+        addEventListener(type: string, listener: (event: any) => unknown) { listeners.set(type, listener); },
+        getElementById(id: string) {
+            if (id === 'gridContainer') return this;
+            if (id === 'statusText') return status;
+            if (id === 'vscode-env') return {};
+            return null;
+        }
+    };
+    const { backendApi } = await import(apiModulePath);
+    const { state } = await import(stateModulePath);
+    state.selectedTable = 'drop_target';
+    state.selectedTableType = 'table';
+    state.tableColumns = [{ name: 'payload', type: 'TEXT' }];
+    state.gridData = [[1, new Uint8Array([0])]];
+    const retrieved = createDeferred<Uint8Array>();
+    const read = mock.method(backendApi, 'readWorkspaceFileUri', async () => retrieved.promise);
+    const update = mock.method(backendApi, 'updateCell', async () => 1);
+    const { initDragAndDrop } = await import(dndModulePath);
+    initDragAndDrop();
+    const event = { preventDefault() {}, target: cell,
+        dataTransfer: { files: [], getData: () => 'file:///private/pending-workspace.bin' } };
+    const pending = listeners.get('drop')!(event);
+    try {
+        assert.equal(read.mock.callCount(), 1);
+        let prevented = false;
+        listeners.get('keydown')!({ key: 'z', ctrlKey: true, target: cell,
+            preventDefault() { prevented = true; }, stopImmediatePropagation() {} });
+        assert.equal(prevented, true, 'pending Explorer reads must protect the preceding Undo entry');
+        retrieved.resolve(new Uint8Array([1, 2]));
+        await pending;
+        assert.equal(update.mock.callCount(), 0, 'a late file read must not write after cancellation');
+        assert.match(status.textContent, /Upload cancelled/);
+        await listeners.get('drop')!(event);
+        assert.equal(update.mock.callCount(), 1, 'the cancelled upload releases its reservation after I/O settles');
+    } finally {
+        retrieved.resolve(new Uint8Array([1, 2])); await pending;
+        read.mock.restore(); update.mock.restore();
+    }
+});

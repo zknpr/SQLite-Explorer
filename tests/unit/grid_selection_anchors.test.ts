@@ -980,6 +980,104 @@ describe('grid selection anchors', () => {
         }
     });
 
+    for (const failure of [undefined, 'columns', 'rows']) it(failure
+        ? `preserves a failed batch host echo (${failure}) instead of reporting success`
+        : 'waits for the batch host echo instead of loading the same page twice', async () => {
+        installDocumentStub({ batchInputs: [{ value: 'updated', dataset: { colidx: '0' } }] });
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { applyBatchUpdate } = await import(sidebarModulePath);
+        const rpcModulePath = '../../core/ui/modules/rpc.js';
+        const { refreshContent } = await import(rpcModulePath);
+        const originals = {
+            updateCellBatch: backendApi.updateCellBatch, fetchSchema: backendApi.fetchSchema,
+            getTableInfo: backendApi.getTableInfo, fetchTableCount: backendApi.fetchTableCount,
+            fetchTableData: backendApi.fetchTableData
+        };
+        let reads = 0;
+        let echo: Promise<unknown> | undefined;
+        backendApi.fetchSchema = async () => ({ tables: [{ identifier: 'items' }], views: [], indexes: [] });
+        backendApi.getTableInfo = async () => {
+            if (failure === 'columns') throw new Error('Controlled column refresh failure');
+            return [{
+            ordinal: 0, identifier: 'value', declaredType: 'TEXT', isRequired: 0,
+            defaultExpression: null, primaryKeyPosition: 0
+            }];
+        };
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async () => {
+            reads++;
+            if (failure === 'rows') throw new Error('Controlled row refresh failure');
+            return { rows: [[1, 'updated']] };
+        };
+        backendApi.updateCellBatch = async () => {
+            // The document broadcasts after recording history, before the
+            // originating mutation receives its RPC response.
+            echo = refreshContent('test.db');
+            return [{ rowId: 1, columnName: 'value' }];
+        };
+        state.isDbConnected = true;
+        state.isReadOnly = false;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.renderedTable = 'items';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = [[1, 'before']];
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.selectedCells = [{ rowIdx: 0, colIdx: 0, rowId: 1, value: 'before' }];
+        try {
+            await applyBatchUpdate();
+            await echo;
+            const status = (globalThis as any).document.getElementById('statusText').textContent;
+            if (failure) {
+                assert.doesNotMatch(status, /Batch update completed/);
+                assert.match(status, failure === 'columns' ? /Error loading columns/ : /Controlled row refresh failure/);
+            } else {
+                assert.equal(reads, 1, 'the host echo already fetched the committed batch');
+                assert.deepEqual(state.gridData, [[1, 'updated']]);
+                assert.equal(status, 'Batch update completed');
+            }
+        } finally {
+            await echo;
+            Object.assign(backendApi, originals);
+        }
+    });
+
+    it('resolves displayed batch rows with linear work after an RPC', async () => {
+        installDocumentStub({ batchInputs: [{ value: 'updated', dataset: { colidx: '0' } }] });
+        const { state } = await import(stateModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { applyBatchUpdate } = await import(sidebarModulePath);
+        const originals = {
+            updateCellBatch: backendApi.updateCellBatch,
+            fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData
+        };
+        const rowCount = 400;
+        let identityReads = 0;
+        state.isReadOnly = false;
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.renderedTable = 'items';
+        state.tableColumns = [{ name: 'value', type: 'TEXT' }];
+        state.gridData = Array.from({ length: rowCount }, (_, index) => {
+            const row = [index + 1, 'before'];
+            Object.defineProperty(row, '0', { get() { identityReads++; return index + 1; } });
+            return row;
+        });
+        state.currentPageIndex = 0;
+        state.rowsPerPage = 500;
+        state.selectedCells = Array.from({ length: rowCount }, (_, index) => ({ rowIdx: index, colIdx: 0, rowId: index + 1, value: 'before' }));
+        backendApi.updateCellBatch = async () => Array.from({ length: rowCount }, (_, index) => ({ rowId: index + 1, columnName: 'value' }));
+        backendApi.fetchTableCount = async () => rowCount;
+        backendApi.fetchTableData = async () => ({ rows: Array.from({ length: rowCount }, (_, index) => [index + 1, 'updated']) });
+        try {
+            await applyBatchUpdate();
+            assert.equal((globalThis as any).document.getElementById('statusText').textContent, 'Batch update completed');
+            assert.ok(identityReads < rowCount * 10, `${rowCount} updates read ${identityReads} displayed row identities`);
+        } finally { Object.assign(backendApi, originals); }
+    });
+
     it('coalesces duplicate Batch Apply clicks and leaves a newly selected table untouched', async () => {
         const elements = installDocumentStub({
             batchInputs: [{ value: 'updated', dataset: { colidx: '0' } }]

@@ -3243,10 +3243,10 @@ async function deleteColumns(table, columns, dropDependentIndexes) {
  * @param {string} table - Table name
  * @param {Array<Object>} columns - Column definitions
  */
-async function createTable(table, columns) {
+async function createTable(table, columns, options) {
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Table creation');
-  const createSql = buildCreateTableSql(table, columns);
+  const createSql = buildCreateTableSql(table, columns, options);
   const savepointName = createViewSavepointName('sp_create_table');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {

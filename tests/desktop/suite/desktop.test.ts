@@ -298,6 +298,62 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
         await setMaxFileSize(DEFAULT_MAX_FILE_SIZE_MIB);
       });
 
+      test('SQL workspace commands run a selected query in the real extension host', async () => {
+        const fixture = createFixture(`query-workspace-${backend}`);
+        await openDirect(fixture);
+        await vscode.commands.executeCommand('sqlite-explorer.newQuery');
+        const editor = vscode.window.activeTextEditor;
+        assert.ok(editor);
+        assert.equal(editor.document.languageId, 'sql');
+        await editor.edit(edit => edit.replace(new vscode.Range(0, 0, editor.document.lineCount, 0), 'SELECT 42 AS selected;\nSELECT 99 AS ignored;\n'));
+        editor.selection = new vscode.Selection(0, 0, 0, 'SELECT 42 AS selected;'.length);
+        const queryDocument = editor.document;
+        try {
+          await vscode.commands.executeCommand('sqlite-explorer.runQuery');
+          const result = vscode.window.activeTextEditor?.document;
+          assert.equal(result?.uri.scheme, 'sqlite-query-result');
+          assert.match(result!.getText(), /"42"/);
+          assert.doesNotMatch(result!.getText(), /"99"/);
+          assert.match(result!.getText(), /1 row \|/);
+        } finally {
+          await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+          await vscode.window.showTextDocument(queryDocument);
+          await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+        }
+      });
+
+      test('SQL result documents cap displayed rows and explain queries through the shipped command', async () => {
+        const fixture = createFixture(`query-limits-${backend}`);
+        await openDirect(fixture);
+        const queryPath = path.join(fixtureRoot, `query-limits-${backend}.sql`);
+        fs.writeFileSync(queryPath, 'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1001) SELECT x AS sequence FROM n;');
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(queryPath));
+        await vscode.window.showTextDocument(document);
+        try {
+          await vscode.commands.executeCommand('sqlite-explorer.runQuery');
+          const result = vscode.window.activeTextEditor?.document;
+          assert.equal(result?.uri.scheme, 'sqlite-query-result');
+          const text = result!.getText();
+          assert.match(text, /1000 rows.*TRUNCATED at 1000 rows/);
+          // VS Code normalizes the provider's mixed metadata/CSV line endings.
+          const csv = text.replace(/\r\n/g, '\n').split('\n\n')[1].split('\n');
+          assert.equal(csv.length, 1001, 'the CSV contains one header and exactly 1000 displayed rows');
+          assert.equal(csv[0], '"sequence"'); assert.equal(csv[1000], '"1000"');
+          assert.ok((await vscode.commands.getCommands(true)).includes('sqlite-explorer.explainQuery'));
+          await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+          await vscode.window.showTextDocument(document);
+          await vscode.commands.executeCommand('sqlite-explorer.explainQuery');
+          const plan = vscode.window.activeTextEditor?.document;
+          assert.equal(plan?.uri.scheme, 'sqlite-query-result');
+          assert.match(plan!.getText(), /Query plan/);
+          assert.match(plan!.getText(), /RECURSIVE STEP/);
+        } finally {
+          await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+          await vscode.window.showTextDocument(document);
+          await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+        }
+      });
+
       test('[row 1] real custom-editor open resolves, registers, and tears down its document worker', async () => {
         const fixture = createFixture(`lifecycle-${backend}`);
         await vscode.commands.executeCommand(
@@ -614,6 +670,54 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           assert.deepEqual(fs.readFileSync(fixture.filePath), fixture.originalBytes);
         }
         await disposeDirect(handle);
+      });
+
+      test('[row 4] Reload and obsolete host history acknowledge only the target saved checkpoint', async () => {
+        const fixture = createFixture(`reload-checkpoint-${backend}`);
+        const other = createFixture(`reload-unrelated-${backend}`);
+        await vscode.commands.executeCommand('vscode.openWith', fixture.uri, viewTypes[0], vscode.ViewColumn.One);
+        await waitFor('the reload target editor', () => findCustomTab(fixture.uri, viewTypes[0]));
+        await waitFor('the reload target document', () => api.inspectDocument(fixture.uri.toString()));
+        await api.updateCell(fixture.uri.toString(), 'items', 1, 'value', 'saved-edit');
+        assert.ok(await vscode.workspace.save(fixture.uri));
+        await waitFor('the saved host checkpoint', () => findCustomTab(fixture.uri, viewTypes[0])?.isDirty === false);
+
+        await vscode.commands.executeCommand('vscode.openWith', other.uri, viewTypes[0], vscode.ViewColumn.Beside);
+        await waitFor('the unrelated document', () => api.inspectDocument(other.uri.toString()));
+        await api.updateCell(other.uri.toString(), 'items', 1, 'value', 'unrelated-pending');
+        await waitFor('the unrelated dirty tab', () => findCustomTab(other.uri, viewTypes[0])?.isDirty === true);
+        const unrelatedBytes = fs.readFileSync(other.filePath);
+
+        // An external writer replaces the saved baseline while the target has
+        // retained host Undo entries but no unsaved data (no discard prompt).
+        const disk = new SQL.Database(fs.readFileSync(fixture.filePath));
+        try {
+          disk.run('UPDATE items SET value=? WHERE id=1', ['external-baseline']);
+          fs.writeFileSync(fixture.filePath, disk.export());
+        } finally { disk.close(); }
+        const reloadedBytes = fs.readFileSync(fixture.filePath);
+        await vscode.commands.executeCommand('vscode.openWith', fixture.uri, viewTypes[0], vscode.ViewColumn.One);
+        await vscode.commands.executeCommand('sqlite-explorer.refresh');
+        assertSingleValue(await api.query(fixture.uri.toString(), 'SELECT value FROM items'), 'external-baseline');
+        await waitFor('the clean reloaded tab', () => findCustomTab(fixture.uri, viewTypes[0])?.isDirty === false);
+
+        for (const command of ['undo', 'redo']) {
+          await vscode.commands.executeCommand(command);
+          await waitFor(`clean state after obsolete ${command}`, () => findCustomTab(fixture.uri, viewTypes[0])?.isDirty === false);
+          assertSingleValue(await api.query(fixture.uri.toString(), 'SELECT value FROM items'), 'external-baseline');
+          assert.deepEqual(fs.readFileSync(fixture.filePath), reloadedBytes, `${command} must not rewrite the reloaded database`);
+          assert.equal(findCustomTab(other.uri, viewTypes[0])?.isDirty, true);
+          assert.deepEqual(fs.readFileSync(other.filePath), unrelatedBytes, 'the target acknowledgement must not save another database');
+        }
+
+        await api.updateCell(fixture.uri.toString(), 'items', 1, 'value', 'new-edit');
+        await vscode.commands.executeCommand('undo');
+        assertSingleValue(await api.query(fixture.uri.toString(), 'SELECT value FROM items'), 'external-baseline');
+        await vscode.commands.executeCommand('redo');
+        assertSingleValue(await api.query(fixture.uri.toString(), 'SELECT value FROM items'), 'new-edit');
+        assert.ok(await vscode.workspace.save(fixture.uri));
+        assert.ok(await vscode.workspace.save(other.uri));
+        await closeAllCustomTabs();
       });
 
       test('[row 5] backup reopens through openCustomDocument(backupId) with unsaved mutations present', async () => {

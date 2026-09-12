@@ -60,6 +60,9 @@ function loadDesktopWorkerFactory(options: {
   const originalRequire = Module.prototype.require;
   Module.prototype.require = function(request: string) {
     if (request === 'vscode') return mockVscode;
+    if (request.endsWith('/fileWritability')) {
+      return { canPersistLocalDatabase: async () => true };
+    }
     if (request.endsWith('nativeWorker')) {
       return {
         isNativeAvailable: async () => false,

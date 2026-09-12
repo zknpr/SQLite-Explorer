@@ -30,6 +30,152 @@ after(() => {
     delete (globalThis as any).document;
 });
 
+it('expires the Drop View completion when Undo restores an unselected view', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const rpcModulePath = '../../core/ui/modules/rpc.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const viewsModulePath = '../../core/ui/modules/views.js';
+    const { backendApi } = await import(apiModulePath);
+    const { refreshContent } = await import(rpcModulePath);
+    const { state } = await import(stateModulePath);
+    const { dropViewFromSidebar } = await import(viewsModulePath);
+    const originals = { dropView: backendApi.dropView, fetchSchema: backendApi.fetchSchema };
+    const status = { textContent: '', innerHTML: '', disabled: false };
+    paginationElements.set('statusText', status);
+    paginationElements.set('tableNameLabel', { textContent: '', innerHTML: '', disabled: false });
+    paginationElements.set('gridContainer', { textContent: '', innerHTML: '', disabled: false });
+    let restored = false;
+    backendApi.dropView = async () => ({});
+    backendApi.fetchSchema = async () => ({
+        tables: [], views: restored ? [{ identifier: 'editable_contacts' }] : [], indexes: []
+    });
+    state.isDbConnected = true;
+    state.isReadOnly = false;
+    state.selectedTable = 'editable_contacts';
+    state.selectedTableType = 'view';
+    try {
+        await dropViewFromSidebar('editable_contacts');
+        assert.strictEqual(state.selectedTable, null);
+        assert.match(status.textContent, /View "editable_contacts" dropped/);
+
+        restored = true;
+        const result = await refreshContent('qa.db');
+        assert.strictEqual(result.success, true);
+        assert.deepStrictEqual(state.schemaCache.views, [{ name: 'editable_contacts' }]);
+        assert.strictEqual(state.selectedTable, null);
+        assert.doesNotMatch(status.textContent, /dropped/,
+            'Undo must not leave a completed drop message beside the restored view');
+        assert.ok(status.textContent.length > 0, 'the unselected viewer retains a neutral status');
+    } finally {
+        Object.assign(backendApi, originals);
+        for (const id of ['statusText', 'tableNameLabel', 'gridContainer']) paginationElements.delete(id);
+        state.isDbConnected = false;
+        state.selectedTable = null;
+        state.selectedTableType = 'table';
+    }
+});
+
+it('preserves in-flight operation and error feedback during a content refresh', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const rpcModulePath = '../../core/ui/modules/rpc.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const uiModulePath = '../../core/ui/modules/ui.js';
+    const { backendApi } = await import(apiModulePath);
+    const { refreshContent } = await import(rpcModulePath);
+    const { state } = await import(stateModulePath);
+    const { updateStatus } = await import(uiModulePath);
+    const originalFetchSchema = backendApi.fetchSchema;
+    const status = { textContent: '', innerHTML: '', disabled: false };
+    paginationElements.set('statusText', status);
+    backendApi.fetchSchema = async () => ({ tables: [], views: [], indexes: [] });
+    state.isDbConnected = true;
+    state.selectedTable = null;
+    try {
+        for (const message of ['Creating table...', 'Error: Save failed; retry required']) {
+            updateStatus(message);
+            await refreshContent('qa.db');
+            assert.strictEqual(status.textContent, message);
+        }
+    } finally {
+        backendApi.fetchSchema = originalFetchSchema;
+        paginationElements.delete('statusText');
+        state.isDbConnected = false;
+    }
+});
+
+it('does not erase newer completion feedback when an older refresh settles', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const rpcModulePath = '../../core/ui/modules/rpc.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const uiModulePath = '../../core/ui/modules/ui.js';
+    const { backendApi } = await import(apiModulePath);
+    const { refreshContent } = await import(rpcModulePath);
+    const { state } = await import(stateModulePath);
+    const { updateStatus } = await import(uiModulePath);
+    const originalFetchSchema = backendApi.fetchSchema;
+    const status = { textContent: '', innerHTML: '', disabled: false };
+    paginationElements.set('statusText', status);
+    let resolveSchema!: (schema: { tables: []; views: []; indexes: [] }) => void;
+    let refreshing: Promise<unknown> | undefined;
+    backendApi.fetchSchema = () => new Promise(resolve => { resolveSchema = resolve; });
+    state.isDbConnected = true;
+    state.selectedTable = null;
+    try {
+        updateStatus('Older schema action completed', { clearOnRefresh: true });
+        refreshing = refreshContent('qa.db');
+        assert.notStrictEqual(status.textContent, 'Older schema action completed',
+            'stale completion feedback must expire before the first asynchronous read');
+        updateStatus('Newer schema action completed', { clearOnRefresh: true });
+        resolveSchema({ tables: [], views: [], indexes: [] });
+        await refreshing;
+        assert.strictEqual(status.textContent, 'Newer schema action completed');
+
+        backendApi.fetchSchema = async () => ({ tables: [], views: [], indexes: [] });
+        await refreshContent('qa.db');
+        assert.notStrictEqual(status.textContent, 'Newer schema action completed');
+    } finally {
+        resolveSchema?.({ tables: [], views: [], indexes: [] });
+        await refreshing;
+        backendApi.fetchSchema = originalFetchSchema;
+        paginationElements.delete('statusText');
+        state.isDbConnected = false;
+    }
+});
+
+it('offers Reload Database without querying a retired connection', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const rpcModulePath = '../../core/ui/modules/rpc.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const { backendApi } = await import(apiModulePath);
+    const { refreshContent } = await import(rpcModulePath);
+    const { state } = await import(stateModulePath);
+    const originalFetchSchema = backendApi.fetchSchema;
+    let schemaReads = 0;
+    backendApi.fetchSchema = async () => { schemaReads++; throw new Error('retired connection'); };
+    const grid = { textContent: '', innerHTML: '', disabled: false };
+    paginationElements.set('gridContainer', grid);
+    state.isDbConnected = true;
+    state.selectedTable = 'items';
+    try {
+        const result = await refreshContent('changed.db', {
+            connected: true, readOnly: true, connectionGeneration: 20,
+            reloadRequiredReason: 'The database file was replaced. Reload to open the current file.'
+        });
+        assert.equal(schemaReads, 0);
+        assert.equal(result.reloadRequired, true);
+        assert.match(grid.innerHTML, /Reload Database/);
+        assert.match(grid.innerHTML, /database file was replaced/);
+        assert.equal(state.isReadOnly, true);
+    } finally {
+        backendApi.fetchSchema = originalFetchSchema;
+        paginationElements.delete('gridContainer');
+        state.isDbConnected = false;
+        state.selectedTable = null;
+        state.isReadOnly = false;
+        state.reloadRequiredReason = null;
+    }
+});
+
 it('clears positional selection before externally refreshing a displayed view', async () => {
     const apiModulePath = '../../core/ui/modules/api.js';
     const rpcModulePath = '../../core/ui/modules/rpc.js';
@@ -216,16 +362,10 @@ it('clears and persists selection when refresh removes the selected table', asyn
     const { state } = await import(stateModulePath);
     const originalFetchSchema = backendApi.fetchSchema;
     const persistCountBefore = persistedStates.length;
-    const originalSetTimeout = globalThis.setTimeout;
-    let persistCallback: (() => void) | undefined;
 
     backendApi.fetchSchema = async () => ({ tables: [], views: [], indexes: [] });
     paginationElements.set('tableNameLabel', { textContent: '', innerHTML: '', disabled: false });
     paginationElements.set('gridContainer', { textContent: '', innerHTML: '', disabled: false });
-    (globalThis as any).setTimeout = (callback: () => void) => {
-        persistCallback = callback;
-        return 1;
-    };
     state.isDbConnected = true;
     state.selectedTable = 'removed_table';
     state.selectedTableType = 'table';
@@ -243,15 +383,13 @@ it('clears and persists selection when refresh removes the selected table', asyn
         assert.deepStrictEqual(state.selectedCells, []);
         assert.deepStrictEqual([...state.selectedRowIds], []);
         assert.deepStrictEqual([...state.selectedColumns], []);
-        assert.ok(persistCallback, 'removal should schedule persisted state');
-        persistCallback();
-        assert.strictEqual(persistedStates.length, persistCountBefore + 1);
+        assert.strictEqual(persistedStates.length, persistCountBefore + 1,
+            'removal must persist before VS Code can hide and discard the webview');
         assert.strictEqual((persistedStates.at(-1) as any).selectedTable, null);
     } finally {
         backendApi.fetchSchema = originalFetchSchema;
         paginationElements.delete('tableNameLabel');
         paginationElements.delete('gridContainer');
-        globalThis.setTimeout = originalSetTimeout;
         state.isDbConnected = false;
         state.selectedTable = null;
         state.selectedTableType = 'table';

@@ -34,6 +34,16 @@ interface FileFingerprint {
   gid: bigint;
 }
 
+/** The local file whose bytes back an in-memory WASM connection. */
+export interface DatabaseFileGeneration {
+  readonly sourcePath: string;
+  readonly canonicalPath: string;
+  /** Undefined after a committed save whose new generation could not be verified. */
+  fingerprint: FileFingerprint | undefined;
+  /** Hash of the opened or committed bytes, never of the unsaved memory image. */
+  contentSha256?: string;
+}
+
 interface ExistingGeneration {
   exists: true;
   fingerprint: FileFingerprint;
@@ -80,15 +90,102 @@ function fingerprint(stats: {
   };
 }
 
-function sameFingerprint(left: FileFingerprint, right: FileFingerprint): boolean {
+function sameFingerprint(left: FileFingerprint, right: FileFingerprint, compareChangeTime = true): boolean {
   return left.dev === right.dev
     && left.ino === right.ino
     && left.size === right.size
     && left.mtimeNs === right.mtimeNs
-    && left.ctimeNs === right.ctimeNs
+    && (!compareChangeTime || left.ctimeNs === right.ctimeNs)
     && left.mode === right.mode
     && left.uid === right.uid
     && left.gid === right.gid;
+}
+
+function sourceChangedError(cause?: unknown): Error {
+  return new Error(
+    'The database file changed on disk since it was opened or last saved. '
+    + 'Your unsaved changes remain available. Use Save As to recover them to a different file, '
+    + 'or Reload Database to open the current file.',
+    { cause }
+  );
+}
+
+function contentHash(): import('node:crypto').Hash {
+  if (import.meta.env?.VSCODE_BROWSER_EXT) {
+    throw new Error('Local database file verification requires VS Code Desktop');
+  }
+  return (require('crypto') as typeof import('node:crypto')).createHash('sha256');
+}
+
+function hashFileDescriptor(fs: NodeFs, descriptor: number, expected: FileFingerprint): string {
+  if (!sameFingerprint(expected, fingerprint(fs.fstatSync(descriptor, { bigint: true })))) {
+    throw sourceChangedError();
+  }
+  const hash = contentHash();
+  const chunk = Buffer.alloc(1024 * 1024);
+  let remaining = expected.size;
+  while (remaining > 0n) {
+    const length = Number(remaining < BigInt(chunk.length) ? remaining : BigInt(chunk.length));
+    const count = fs.readSync(descriptor, chunk, 0, length, null);
+    if (count === 0) throw sourceChangedError();
+    hash.update(chunk.subarray(0, count));
+    remaining -= BigInt(count);
+  }
+  if (!sameFingerprint(expected, fingerprint(fs.fstatSync(descriptor, { bigint: true })))) {
+    throw sourceChangedError();
+  }
+  return hash.digest('hex');
+}
+
+/** Pin the descriptor's generation, then verify its original pathname still names it. */
+export function captureDatabaseFileGeneration(
+  fs: NodeFs,
+  sourcePath: string,
+  stats: FileFingerprint,
+  content: Uint8Array
+): DatabaseFileGeneration {
+  const generation: DatabaseFileGeneration = {
+    sourcePath: path.resolve(sourcePath),
+    // Match promises.realpath in destination resolution. On Windows the JS
+    // resolver can retain drive-letter casing that the native resolver changes.
+    canonicalPath: fs.realpathSync.native(sourcePath),
+    fingerprint: fingerprint(stats)
+  };
+  // No hash fallback during open: the descriptor's pre-read fingerprint must
+  // still match before the bytes can establish a trusted content baseline.
+  assertDatabaseFileGenerationCurrent(fs, generation);
+  generation.contentSha256 = contentHash().update(content).digest('hex');
+  return generation;
+}
+
+/** Synchronous so the last check and rename share the same commit turn. */
+export function assertDatabaseFileGenerationCurrent(fs: NodeFs, generation: DatabaseFileGeneration): void {
+  if (!generation.fingerprint) throw sourceChangedError();
+  try {
+    const canonicalPath = fs.realpathSync.native(generation.sourcePath);
+    const current = fingerprint(fs.statSync(canonicalPath, { bigint: true }));
+    if (canonicalPath !== generation.canonicalPath) throw sourceChangedError();
+    if (sameFingerprint(generation.fingerprint, current)) return;
+    // Windows file dialogs can change ctime without changing the database.
+    // Accept only a ctime-only difference whose bytes still match our baseline;
+    // same-size edits with a restored mtime must continue to fail closed.
+    if (!generation.contentSha256 || !sameFingerprint(generation.fingerprint, current, false)) {
+      throw sourceChangedError();
+    }
+    const descriptor = fs.openSync(canonicalPath, 'r');
+    try {
+      if (hashFileDescriptor(fs, descriptor, current) !== generation.contentSha256
+        || fs.realpathSync.native(generation.sourcePath) !== canonicalPath
+        || !sameFingerprint(current, fingerprint(fs.statSync(canonicalPath, { bigint: true })))) {
+        throw sourceChangedError();
+      }
+      generation.fingerprint = current;
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  } catch (error) {
+    throw sourceChangedError(error);
+  }
 }
 
 async function hasSqliteHeader(fs: NodeFs, filePath: string): Promise<boolean> {
@@ -243,11 +340,21 @@ export async function writeDatabaseSnapshotAtomically(
   targetPath: string,
   writeTemporary: (temporaryPath: string) => Promise<void>,
   signal?: CancellationCheck,
-  logger?: AtomicDatabaseWriteLogger
+  logger?: AtomicDatabaseWriteLogger,
+  openedSource?: DatabaseFileGeneration
 ): Promise<DatabaseWriteResult> {
   signal?.throwIfAborted();
   const target = await resolveTarget(fs, sourcePath, targetPath);
   signal?.throwIfAborted();
+  const replacingOpenedSource = openedSource && (
+    target.requiresReopen || target.replacementPath === openedSource.canonicalPath
+  );
+  const assertOpenedSourceCurrent = () => {
+    if (!replacingOpenedSource || !openedSource) return;
+    if (target.replacementPath !== openedSource.canonicalPath) throw sourceChangedError();
+    assertDatabaseFileGenerationCurrent(fs, openedSource);
+  };
+  assertOpenedSourceCurrent();
 
   const temporaryPath = path.join(
     path.dirname(target.replacementPath),
@@ -273,6 +380,9 @@ export async function writeDatabaseSnapshotAtomically(
     }
     await temporary.sync();
     const expectedTemporary = fingerprint(await temporary.stat({ bigint: true }));
+    const committedContentSha256 = replacingOpenedSource
+      ? hashFileDescriptor(fs, temporary.fd, expectedTemporary)
+      : undefined;
     await temporary.close();
     temporary = undefined;
     signal?.throwIfAborted();
@@ -311,8 +421,32 @@ export async function writeDatabaseSnapshotAtomically(
       }
 
       signal?.throwIfAborted();
+      // A destination fingerprint captured only when Save starts would accept
+      // an external replacement made since the in-memory image was opened.
+      // Keep distinct Save As targets available even when the source is stale.
+      assertOpenedSourceCurrent();
       fs.renameSync(temporaryPath, target.replacementPath);
       renamed = true;
+      if (replacingOpenedSource && openedSource) {
+        // Never adopt an unrelated replacement that races our committed rename.
+        // Rename can change ctime, so accept its new value only after every
+        // other field still identifies the private snapshot we just installed.
+        openedSource.fingerprint = undefined;
+        openedSource.contentSha256 = undefined;
+        try {
+          const committed = fingerprint(fs.statSync(target.replacementPath, { bigint: true }));
+          if (!sameFingerprint(expectedTemporary, committed, false)
+            || fs.realpathSync.native(openedSource.sourcePath) !== target.replacementPath) {
+            throw sourceChangedError();
+          }
+          openedSource.contentSha256 = committedContentSha256;
+          openedSource.fingerprint = committed;
+        } catch (error) {
+          safeWarn(logger,
+            'Database saved, but its new file generation could not be verified. '
+            + 'Use Save As to preserve later edits, or Reload Database before saving again.', error);
+        }
+      }
     } catch (error) {
       primaryError = error;
       throw error;

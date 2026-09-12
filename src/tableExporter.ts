@@ -13,6 +13,7 @@ import { DocumentRegistry } from './documentRegistry';
 import { escapeIdentifier, cellValueToSql } from './core/sql-utils';
 import { encodeCsvExportText } from './core/export-encoding';
 import { getNodeFs } from './core/sqlite-db';
+import { confirmFileReplacement } from './fileReplacementConfirmation';
 import {
   EXPORT_CELL_CHUNK_BYTES,
   streamTableExport,
@@ -43,6 +44,10 @@ const NON_LOCAL_CAP_DESCRIPTION =
   '16 MiB (16,777,216 bytes)';
 const NON_LOCAL_EXPORT_PAGE_BYTES = 64 * 1024;
 const LOCAL_EXPORT_BUFFER_BYTES = 64 * 1024;
+
+interface BinaryExportSink extends AsyncExportSink {
+  writeBytes(bytes: Uint8Array): Promise<void>;
+}
 
 /**
  * Minimal writable sink consumed by the streaming exporters. Satisfied by Node's
@@ -250,6 +255,14 @@ class AwaitedNodeStreamSink implements AsyncExportSink {
     }
   }
 
+  async writeBytes(bytes: Uint8Array): Promise<void> {
+    if (this.ended) throw new Error('Cannot write to a completed export stream');
+    await this.flushBuffered();
+    // Own every queued buffer until the stream accepts it; callers may reuse
+    // a read buffer as soon as this promise resolves.
+    await this.writeToStream(Buffer.from(bytes));
+  }
+
   async restoreMetadata(
     fs: NodeFs,
     metadata: ReplacementFileMetadata
@@ -340,7 +353,10 @@ export class CappedWorkspaceSink implements AsyncExportSink {
   private totalBytes = 0;
 
   async write(chunk: string): Promise<void> {
-    const bytes = this.encoder.encode(chunk);
+    await this.writeBytes(this.encoder.encode(chunk));
+  }
+
+  async writeBytes(bytes: Uint8Array): Promise<void> {
     const nextBytes = this.totalBytes + bytes.byteLength;
     if (!Number.isSafeInteger(nextBytes) || nextBytes > NON_LOCAL_EXPORT_MAX_BYTES) {
       throw new Error(
@@ -535,7 +551,11 @@ async function resolveLocalExportDestination(
     await fs.promises.lstat(finalPath);
   } catch (error) {
     if (nodeErrorCode(error) === 'ENOENT') {
-      return { replacementPath: finalPath, generation: { exists: false } };
+      const path = require('node:path') as typeof import('node:path');
+      const parent = await fs.promises.realpath(path.dirname(finalPath));
+      // Pin an absent leaf to its resolved parent just as an existing target
+      // is pinned above. Validation and rename must inspect the same path.
+      return { replacementPath: path.join(parent, path.basename(finalPath)), generation: { exists: false } };
     }
     throw error;
   }
@@ -580,9 +600,27 @@ async function exportLocalAtomic(
   tableName: string,
   columns: string[],
   options: ExportOptions,
-  cancellation?: ExportCancellation
+  cancellation?: ExportCancellation,
+  confirmReplacement = false
+): Promise<number> {
+  return writeLocalAtomic(fs, uri, sink => streamTableExport(
+    document.databaseOperations, tableName, columns, options, sink, cancellation
+  ), cancellation, undefined, confirmReplacement);
+}
+
+async function writeLocalAtomic(
+  fs: NodeFs,
+  uri: vsc.Uri,
+  write: (sink: BinaryExportSink) => Promise<number>,
+  cancellation?: ExportCancellation,
+  validateDestination?: (resolvedPath: string) => void,
+  confirmReplacement = false
 ): Promise<number> {
   const destination = await resolveLocalExportDestination(fs, uri.fsPath);
+  validateDestination?.(destination.replacementPath);
+  if (confirmReplacement && !(await confirmFileReplacement(uri, destination.generation.exists))) {
+    throw new vsc.CancellationError();
+  }
   const destinationPath = destination.replacementPath;
   const tempPath = localSiblingTempPath(destinationPath);
   let sink: AwaitedNodeStreamSink | undefined;
@@ -597,14 +635,7 @@ async function exportLocalAtomic(
     });
     sink = new AwaitedNodeStreamSink(stream);
     await sink.ready();
-    const rowCount = await streamTableExport(
-      document.databaseOperations,
-      tableName,
-      columns,
-      options,
-      sink,
-      cancellation
-    );
+    const rowCount = await write(sink);
     assertExportNotCancelled(cancellation);
     if (destination.metadata) {
       ownershipPreservationFailure = await sink.restoreMetadata(fs, destination.metadata);
@@ -612,6 +643,7 @@ async function exportLocalAtomic(
     await sink.close();
     assertExportNotCancelled(cancellation);
     assertLocalExportDestinationUnchanged(fs, destination);
+    validateDestination?.(destinationPath);
     await fs.promises.rename(tempPath, destinationPath);
     if (ownershipPreservationFailure) {
       warnAfterSuccessfulLocalExportRename(ownershipPreservationFailure);
@@ -780,18 +812,28 @@ async function exportWorkspaceAtomic(
   tableName: string,
   columns: string[],
   options: ExportOptions,
-  cancellation?: ExportCancellation
+  cancellation?: ExportCancellation,
+  confirmReplacement = false
 ): Promise<number> {
+  return writeWorkspaceAtomic(uri, sink => streamTableExport(
+    document.databaseOperations, tableName, columns, options, sink, cancellation
+  ), cancellation, undefined, confirmReplacement);
+}
+
+async function writeWorkspaceAtomic(
+  uri: vsc.Uri,
+  write: (sink: BinaryExportSink) => Promise<number>,
+  cancellation?: ExportCancellation,
+  validateDestination?: () => void,
+  confirmReplacement = false
+): Promise<number> {
+  validateDestination?.();
   const destinationGeneration = await captureWorkspaceExportGeneration(uri);
+  if (confirmReplacement && !(await confirmFileReplacement(uri, destinationGeneration.exists))) {
+    throw new vsc.CancellationError();
+  }
   const sink = new CappedWorkspaceSink();
-  const rowCount = await streamTableExport(
-    document.databaseOperations,
-    tableName,
-    columns,
-    options,
-    sink,
-    cancellation
-  );
+  const rowCount = await write(sink);
   assertExportNotCancelled(cancellation);
   const bytes = sink.finish();
   const tempUri = workspaceSiblingTempUri(uri);
@@ -799,11 +841,90 @@ async function exportWorkspaceAtomic(
     await vsc.workspace.fs.writeFile(tempUri, bytes);
     assertExportNotCancelled(cancellation);
     await assertWorkspaceExportDestinationUnchanged(uri, destinationGeneration);
+    validateDestination?.();
     await vsc.workspace.fs.rename(tempUri, uri, { overwrite: true });
     return rowCount;
   } catch (error) {
     return removeWorkspaceTemp(tempUri, error);
   }
+}
+
+function exportDestinationValidator(uri: vsc.Uri, fs: NodeFs | undefined): (resolvedPath?: string) => void {
+  return (resolvedPath = uri.fsPath) => {
+    const identity = fs ? statIfPresent(resolvedPath) : undefined;
+    const canonicalDestination = fs ? canonicalPath(resolvedPath) : undefined;
+    for (const document of DocumentRegistry.values()) {
+      const canonicalDatabase = fs && document.uri.scheme === 'file'
+        ? canonicalPath(document.uri.fsPath) : undefined;
+      for (const suffix of ['', '-wal', '-shm', '-journal']) {
+        if (uri.toString() === document.uri.with({ path: document.uri.path + suffix }).toString()) {
+          throw new Error('Choose an export destination outside open database files and their journals.');
+        }
+        if (fs && canonicalDatabase !== undefined && canonicalDestination !== undefined) {
+          // Missing SQLite sidecars have no inode. Compare their names under
+          // the real database parent as well as any existing sidecar target.
+          if (sameReservedPath(canonicalDestination, canonicalDatabase + suffix)
+            || sameReservedPath(canonicalDestination, canonicalPath(document.uri.fsPath + suffix))) {
+            throw new Error('The export destination aliases an open database file or journal.');
+          }
+          const databaseIdentity = statIfPresent(document.uri.fsPath + suffix);
+          if (identity && databaseIdentity && identity.dev === databaseIdentity.dev && identity.ino === databaseIdentity.ino) {
+            throw new Error('The export destination aliases an open database file or journal.');
+          }
+        }
+      }
+    }
+  };
+  function statIfPresent(file: string) {
+    try { return fs!.statSync(file, { bigint: true }); }
+    catch (error) { if (nodeErrorCode(error) === 'ENOENT') return undefined; throw error; }
+  }
+  function sameReservedPath(left: string, right: string): boolean {
+    // Reserve case/normalization variants even on case-sensitive volumes.
+    // Missing sidecars have no inode; this key only rejects destinations and
+    // must never select or change the path that the atomic writer replaces.
+    return left === right || left.normalize('NFC').toLowerCase() === right.normalize('NFC').toLowerCase();
+  }
+  function canonicalPath(file: string): string {
+    try { return fs!.realpathSync(file); }
+    catch (error) {
+      if (nodeErrorCode(error) !== 'ENOENT') throw error;
+      const path = require('node:path') as typeof import('node:path');
+      return path.join(fs!.realpathSync(path.dirname(file)), path.basename(file));
+    }
+  }
+}
+
+/** Export a bounded query result through the same atomic writers as table exports. */
+export async function writeQueryResultFile(uri: vsc.Uri, text: string): Promise<void> {
+  if (text.length > NON_LOCAL_EXPORT_MAX_BYTES || new TextEncoder().encode(text).length > NON_LOCAL_EXPORT_MAX_BYTES) {
+    throw new Error('Query CSV exceeds the 16 MiB export limit. Select fewer rows or columns.');
+  }
+  const fs = uri.scheme === 'file' ? getNodeFs() : undefined;
+  const validate = exportDestinationValidator(uri, fs);
+  const write = async (sink: AsyncExportSink) => { await sink.write(text); return 0; };
+  if (fs) await writeLocalAtomic(fs, uri, write, undefined, validate, true);
+  else await writeWorkspaceAtomic(uri, write, undefined, validate, true);
+}
+
+/** Save cell bytes or a host-owned snapshot with the same replacement fences. */
+export async function writeCellFile(uri: vsc.Uri, source: Uint8Array | vsc.Uri): Promise<void> {
+  const fs = uri.scheme === 'file' ? getNodeFs() : undefined;
+  const validate = exportDestinationValidator(uri, fs);
+  const write = async (sink: BinaryExportSink) => {
+    if (source instanceof Uint8Array) await sink.writeBytes(source);
+    else {
+      const sourceFs = getNodeFs();
+      if (!sourceFs || source.scheme !== 'file') throw new Error('Cell snapshots require a local desktop file');
+      const stream = sourceFs.createReadStream(source.fsPath, { highWaterMark: 256 * 1024 });
+      try {
+        for await (const chunk of stream) await sink.writeBytes(chunk as Buffer);
+      } finally { stream.destroy(); }
+    }
+    return 0;
+  };
+  if (fs) await writeLocalAtomic(fs, uri, write, undefined, validate, true);
+  else await writeWorkspaceAtomic(uri, write, undefined, validate, true);
 }
 
 
@@ -933,7 +1054,8 @@ export async function exportTableCommand(
             tableName,
             columns,
             options,
-            cancellation
+            cancellation,
+            true
           );
         }
         return exportWorkspaceAtomic(
@@ -942,7 +1064,8 @@ export async function exportTableCommand(
           tableName,
           columns,
           options,
-          cancellation
+          cancellation,
+          true
         );
       }
     );

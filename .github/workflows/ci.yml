@@ -1,10 +1,10 @@
 name: CI
 
-# Runs on every PR to main and on pushes to main, so type errors and test
-# failures are caught before merge (release.yml only runs on version tags).
+# Runs on every PR to main or dev and on pushes to main, so type errors and
+# test failures are caught before integration (release.yml only runs on tags).
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   push:
     branches: [main]
 

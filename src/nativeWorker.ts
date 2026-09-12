@@ -1,3 +1,4 @@
+import { prepareReadQuery, buildReadTransport, decodeReadTransport, queryPlanRequest, decodeQueryPlan, SQL_MAX_COLUMNS } from './core/sql-workspace';
 /**
  * Native SQLite Worker Manager
  *
@@ -14,6 +15,7 @@ import * as fs from 'fs';
 import * as os from 'node:os';
 import { spawn, ChildProcess } from 'child_process';
 import * as v8 from 'node:v8';
+import { canPersistLocalDatabase } from './fileWritability';
 
 import { uiKindToString } from './helpers';
 
@@ -159,6 +161,8 @@ import {
   remapPrimaryKeyContainment
 } from './core/cell-containment';
 import { serializeOperations } from './core/operation-serializer';
+import { DatabaseFileChangedError } from './core/database-file-changed';
+import { type DatabaseConnectionInvalidatedError, DatabaseTransactionRecoveryError } from './core/database-connection-invalidated';
 import { InvocationTimeoutError } from './core/rpc';
 import {
   assertViewDefinitionSnapshotCurrent,
@@ -366,33 +370,22 @@ async function getNativeBinaryPath(extensionPath: string): Promise<string | null
   }
 }
 
-/**
- * Native SQLite needs write access to both the database and its directory so
- * it can create rollback-journal or WAL sidecars. txiki's SQLite binding can
- * successfully open a requested read-write connection after SQLite falls back
- * to an OS-read-only file descriptor, so infer the effective mode up front.
- */
-async function canPersistNativeDatabase(filePath: string): Promise<boolean> {
-  const isReadOnlyAccessError = (error: unknown): boolean => {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === 'EACCES' || code === 'EPERM' || code === 'EROFS';
-  };
-  try {
-    await fs.promises.access(filePath, fs.constants.W_OK);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (isReadOnlyAccessError(error)) return false;
-    // SQLite can create a new database when the leaf does not exist. In that
-    // case the parent directory is the only meaningful persistence gate.
-    if (code !== 'ENOENT') throw error;
-  }
-  try {
-    await fs.promises.access(path.dirname(filePath), fs.constants.W_OK);
-    return true;
-  } catch (error) {
-    if (isReadOnlyAccessError(error)) return false;
-    throw error;
-  }
+interface NativeFileIdentity {
+  canonicalPath: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+async function readNativeFileIdentity(filePath: string): Promise<NativeFileIdentity> {
+  const canonicalPath = await fs.promises.realpath(filePath);
+  const stats = await fs.promises.stat(canonicalPath, { bigint: true });
+  if (!stats.isFile()) throw new Error('The native database path is no longer a regular file');
+  return { canonicalPath, dev: stats.dev, ino: stats.ino };
+}
+
+function sameNativeFileIdentity(left: NativeFileIdentity, right: NativeFileIdentity): boolean {
+  // Size and timestamps change during ordinary SQLite DML and checkpoints.
+  return left.canonicalPath === right.canonicalPath && left.dev === right.dev && left.ino === right.ino;
 }
 
 // ============================================================================
@@ -593,7 +586,8 @@ export class NativeWorkerProcess {
       }, timeoutMs);
 
       const abortListener = signal && (
-        method === 'queryBounded' || method === 'queryExportSpool' || method === 'vacuumInto'
+        method === 'queryBounded' || method === 'workspaceQuery' || method === 'workspaceQueryPlan'
+        || method === 'queryExportSpool' || method === 'vacuumInto'
       )
         ? () => {
             if (!this.pendingRequests.has(id) || !this.process?.stdin) return;
@@ -853,6 +847,8 @@ export async function createNativeDatabaseConnection(
   // Create and start worker
   const worker = new NativeWorkerProcess(binaryPath, workerScript);
   await worker.start();
+  let currentOperations: DatabaseOperations | undefined;
+  let invalidationEmitter: vsc.EventEmitter<DatabaseConnectionInvalidatedError> | undefined;
 
   const exportNativeDatabase = async (signal?: AbortSignal): Promise<Uint8Array> => {
     // The txiki SQLite binding has no in-memory serialize primitive. Give
@@ -880,14 +876,19 @@ export async function createNativeDatabaseConnection(
 
   // Termination handler
   const terminateWorker = () => {
+    invalidationEmitter?.dispose();
     worker.stop();
   };
 
   return {
     workerMethods: {
       initializeDatabase: async (...args: unknown[]) => worker.call('open', args),
-      runQuery: async (...args: unknown[]) => worker.call('query', args),
-      exportDatabase: exportNativeDatabase,
+      runQuery: async (sql: string, params?: CellValue[]) => currentOperations
+        ? currentOperations.executeQuery(sql, params)
+        : worker.call('query', [sql, params]),
+      exportDatabase: () => currentOperations
+        ? currentOperations.serializeDatabase()
+        : exportNativeDatabase(),
       [Symbol.dispose]: terminateWorker
     },
 
@@ -902,6 +903,81 @@ export async function createNativeDatabaseConnection(
     ) {
       const filePath = fileUri.fsPath;
       let readOnly = forceReadOnly ?? false;
+      let identity: NativeFileIdentity;
+      let invalidatedError: DatabaseConnectionInvalidatedError | undefined;
+      let closingInvalidatedWorker: Promise<never> | undefined;
+      invalidationEmitter?.dispose();
+      const connectionInvalidationEmitter = new vsc.EventEmitter<DatabaseConnectionInvalidatedError>();
+      invalidationEmitter = connectionInvalidationEmitter;
+
+      const retireConnection = (error: DatabaseConnectionInvalidatedError): Promise<never> => {
+        if (closingInvalidatedWorker) return closingInvalidatedWorker;
+        invalidatedError = error;
+        // Close gracefully so open read sessions and any snapshot transaction are
+        // released. Reopening and discarding history require an explicit reload.
+        closingInvalidatedWorker = (async () => {
+          try {
+            await worker.call('close');
+          } catch (closeError) {
+            outputChannel?.appendLine(`[NativeWorker] Closing an invalidated database failed: ${String(closeError)}`);
+          } finally {
+            worker.stop();
+          }
+          throw error;
+        })();
+        try {
+          connectionInvalidationEmitter.fire(error);
+        } catch (listenerError) {
+          outputChannel?.appendLine(`[NativeWorker] Database invalidation listener failed: ${String(listenerError)}`);
+        }
+        return closingInvalidatedWorker;
+      };
+      const invalidateConnection = (cause?: unknown): Promise<never> => (
+        retireConnection(new DatabaseFileChangedError({ cause }))
+      );
+
+      const assertCurrentFile = async (): Promise<void> => {
+        if (invalidatedError) throw invalidatedError;
+        try {
+          if (sameNativeFileIdentity(identity, await readNativeFileIdentity(filePath))) return;
+        } catch (error) {
+          return invalidateConnection(error);
+        }
+        return invalidateConnection();
+      };
+
+      const openTrackedDatabase = async (expectedIdentity?: NativeFileIdentity): Promise<void> => {
+        let before: NativeFileIdentity | undefined;
+        try {
+          before = await readNativeFileIdentity(filePath);
+        } catch (error) {
+          if (expectedIdentity) return invalidateConnection(error);
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        if (expectedIdentity && (!before || !sameNativeFileIdentity(expectedIdentity, before))) {
+          return invalidateConnection();
+        }
+        // Pin the resolved spelling too: SQLite's sidecar paths must not follow
+        // a different symlink target from the identity we admitted.
+        await worker.call('open', [before?.canonicalPath ?? filePath, readOnly]);
+        const after = await readNativeFileIdentity(filePath);
+        if (before && !sameNativeFileIdentity(before, after)) return invalidateConnection();
+        identity = after;
+      };
+
+      const withCurrentFile = async <T>(operation: () => Promise<T>): Promise<T> => {
+        await assertCurrentFile();
+        try {
+          const result = await operation();
+          // Do not publish a result if replacement occurred during asynchronous
+          // native work. The next operation can only use an explicit reload.
+          await assertCurrentFile();
+          return result;
+        } catch (error) {
+          await assertCurrentFile();
+          throw error;
+        }
+      };
 
       // Open database
       // Note: If this fails (e.g., SQLite error 14: unable to open database file),
@@ -911,8 +987,8 @@ export async function createNativeDatabaseConnection(
       // - File is locked by another process
       // - Path encoding issues with special characters
       try {
-        if (!readOnly) readOnly = !(await canPersistNativeDatabase(filePath));
-        await worker.call('open', [filePath, readOnly]);
+        if (!readOnly) readOnly = !(await canPersistLocalDatabase(filePath));
+        await openTrackedDatabase();
       } catch (err) {
         // Re-throw with more context to help debugging
         const message = err instanceof Error ? err.message : String(err);
@@ -926,22 +1002,56 @@ export async function createNativeDatabaseConnection(
         escapeIdentifier(`${prefix}_${crypto.randomUUID().replace(/-/g, '')}`)
       );
 
-      const safeRollbackSavepoint = async (savepointName: string, context: string): Promise<void> => {
-        try {
+      const nativeSavepoints = new Map<string, boolean>();
+      const beginNativeSavepoint = async (savepointName: string): Promise<void> => {
+        const result = await worker.call<{ transactionWasActive?: unknown }>(
+          'run', [`SAVEPOINT ${savepointName}`]
+        );
+        if (typeof result?.transactionWasActive !== 'boolean') {
+          return retireConnection(new DatabaseTransactionRecoveryError('savepoint ownership admission', {
+            cause: new Error('Native SQLite returned invalid transaction ownership metadata')
+          }));
+        }
+        nativeSavepoints.set(savepointName, !result.transactionWasActive);
+      };
+
+      const releaseNativeSavepoint = async (savepointName: string): Promise<void> => {
+        await worker.call('run', [`RELEASE ${savepointName}`]);
+        nativeSavepoints.delete(savepointName);
+      };
+
+      const rollbackNativeSavepoint = async (savepointName: string): Promise<void> => {
+        const ownsTransaction = nativeSavepoints.get(savepointName);
+        if (ownsTransaction === undefined) {
+          throw new Error('Native savepoint ownership is unavailable during rollback');
+        }
+        if (ownsTransaction) {
+          // ROLLBACK TO retains a write transaction. Its following RELEASE can
+          // still need an exclusive lock, so a competing reader can block both
+          // the original commit and cleanup. Only this owned outer transaction
+          // may be aborted completely; nested savepoints preserve their caller.
+          await worker.call('run', ['ROLLBACK']);
+          nativeSavepoints.clear();
+        } else {
           await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
-          await worker.call('run', [`RELEASE ${savepointName}`]);
-        } catch (rollbackErr) {
-          const message = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
-          outputChannel?.appendLine(`[NativeWorker] Failed to rollback native savepoint (${context}): ${message}`);
+          await releaseNativeSavepoint(savepointName);
         }
       };
 
-      const safeRollbackTransaction = async (context: string): Promise<void> => {
+      const safeRollbackSavepoint = async (
+        savepointName: string,
+        context: string,
+        operationError: unknown
+      ): Promise<void> => {
+        if (invalidatedError) throw invalidatedError;
         try {
-          await worker.call('run', ['ROLLBACK']);
+          await rollbackNativeSavepoint(savepointName);
         } catch (rollbackErr) {
           const message = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
-          outputChannel?.appendLine(`[NativeWorker] Failed to rollback native transaction (${context}): ${message}`);
+          outputChannel?.appendLine(`[NativeWorker] Failed to rollback native savepoint (${context}): ${message}`);
+          return retireConnection(new DatabaseTransactionRecoveryError(context, {
+            cause: new AggregateError([operationError, rollbackErr], 'Native operation and savepoint cleanup both failed')
+          }));
         }
       };
 
@@ -1711,7 +1821,7 @@ export async function createNativeDatabaseConnection(
               maxEditValueBytes
             );
         const savepointName = createSavepointName('sp_update_pk_batch');
-        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        await beginNativeSavepoint(savepointName);
         try {
           await assertNativeUpdateHasNoTargetTableTriggerWrites(
             table,
@@ -1848,10 +1958,10 @@ export async function createNativeDatabaseConnection(
             }
           }
 
-          await worker.call('run', [`RELEASE ${savepointName}`]);
+          await releaseNativeSavepoint(savepointName);
           return results;
         } catch (error) {
-          await safeRollbackSavepoint(savepointName, 'updateNativePrimaryKeyCellBatch');
+          await safeRollbackSavepoint(savepointName, 'updateNativePrimaryKeyCellBatch', error);
           throw error;
         }
       };
@@ -1905,7 +2015,7 @@ export async function createNativeDatabaseConnection(
         replacement: ViewDefinition | null
       ): Promise<void> => {
         const savepointName = createSavepointName('sp_restore_view');
-        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        await beginNativeSavepoint(savepointName);
         try {
           const current = await findNativeViewDefinition(view, true);
           if (current) assertViewTriggerSnapshotIsMutationSafe(current);
@@ -1925,9 +2035,9 @@ export async function createNativeDatabaseConnection(
             dependenciesBefore,
             await captureNativeViewDependencySnapshot()
           );
-          await worker.call('run', [`RELEASE ${savepointName}`]);
+          await releaseNativeSavepoint(savepointName);
         } catch (err) {
-          await safeRollbackSavepoint(savepointName, 'restoreViewDefinition');
+          await safeRollbackSavepoint(savepointName, 'restoreViewDefinition', err);
           throw err;
         }
       };
@@ -2010,7 +2120,7 @@ export async function createNativeDatabaseConnection(
           if (foreignKeysBefore !== 0) await setPragma('foreign_keys', 0);
           if (legacyAlterBefore !== 1) await setPragma('legacy_alter_table', 1);
 
-          await worker.call('run', [`SAVEPOINT ${restoreSavepoint}`]);
+          await beginNativeSavepoint(restoreSavepoint);
           savepointStarted = true;
           const foreignKeyBaseline = captureColumnDropForeignKeyBaseline(
             table,
@@ -2069,12 +2179,12 @@ export async function createNativeDatabaseConnection(
             foreignKeyBaseline,
             await readBoundedForeignKeyViolations()
           );
-          await worker.call('run', [`RELEASE ${restoreSavepoint}`]);
+          await releaseNativeSavepoint(restoreSavepoint);
           savepointStarted = false;
         } catch (error) {
           operationError = error;
           if (savepointStarted) {
-            await safeRollbackSavepoint(restoreSavepoint, 'undoColumnDrop');
+            await safeRollbackSavepoint(restoreSavepoint, 'undoColumnDrop', error);
           }
         }
 
@@ -2166,13 +2276,75 @@ export async function createNativeDatabaseConnection(
         }
 
         const savepointName = createSavepointName('sp_replay_cell_history');
-        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        await beginNativeSavepoint(savepointName);
         try {
           await assertNativeUpdateHasNoTargetTableTriggerWrites(
             table,
             cells.map(cell => cell.columnName),
             identity.kind === 'rowid'
           );
+          // Stable, whole-value edits are independent rows. Keep the same
+          // byte/storage checks and guarded writes, but amortize IPC in bounded
+          // chunks. Identity moves and JSON merges still need ordered replay.
+          if (groups.length > 1 && cells.every(cell => cell.operation !== 'json_patch'
+            && (cell.newRowId === undefined || cell.newRowId === cell.rowId))) {
+            const chunkRows = 128;
+            for (let offset = 0; offset < groups.length; offset += chunkRows) {
+              const plans = groups.slice(offset, offset + chunkRows).map(([rowId, rowCells]) => {
+                const predicate = buildRecordIdentityPredicate(rowId, identity);
+                const expected = rowCells.map(cell => direction === 'undo' ? cell.postState : cell.priorState);
+                const target = rowCells.map(cell => direction === 'undo' ? cell.priorState : cell.postState);
+                return {
+                  rowCells, predicate, expected, target,
+                  query: {
+                    sql: `SELECT ${rowCells.map(cell => buildStoredCellStateProjection(cell.columnName)).join(', ')} `
+                      + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+                    params: predicate.params
+                  }
+                };
+              });
+              const assertStates = (result: NativeQueryBatchResult, target: boolean): void => {
+                if (result.results?.length !== plans.length) {
+                  throw new Error('Cell history batch returned incomplete results');
+                }
+                plans.forEach((plan, index) => {
+                  const rows = result.results[index].values;
+                  const states = target ? plan.target : plan.expected;
+                  if (rows?.length !== 1 || !states.every((state, column) => storedCellStatesEqual(
+                    state,
+                    parseStoredCellState(rows[0][column * 2], rows[0][column * 2 + 1],
+                      `${table}.${plan.rowCells[column].columnName}`, { textEncoding })
+                  ))) {
+                    throw new CellHistoryConflictError(table, plan.rowCells.map(cell => cell.columnName));
+                  }
+                });
+              };
+              const queries = plans.map(plan => plan.query);
+              assertStates(await worker.call<NativeQueryBatchResult>('queryBatch', [queries]), false);
+              const batch: { sql: string; paramsList: CellValue[][]; expectedChanges: number }[] = [];
+              for (const plan of plans) {
+                const writes = plan.target.map(state => buildStoredCellWrite(state));
+                const guards = plan.expected.map((state, index) => (
+                  buildStoredCellPredicate(plan.rowCells[index].columnName, state)
+                ));
+                const sql = `UPDATE ${escapeMainIdentifier(table)} SET `
+                  + plan.rowCells.map((cell, index) => `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`).join(', ')
+                  + ` WHERE ${plan.predicate.sql} AND ${guards.map(guard => `(${guard.sql})`).join(' AND ')}`;
+                const params = [
+                  ...writes.flatMap(write => write.params), ...plan.predicate.params,
+                  ...guards.flatMap(guard => guard.params)
+                ];
+                // Reuse only adjacent statement shapes so row order is unchanged.
+                const last = batch[batch.length - 1];
+                if (last?.sql === sql) last.paramsList.push(params);
+                else batch.push({ sql, paramsList: [params], expectedChanges: 1 });
+              }
+              await worker.call('execBatch', [batch, savepointName]);
+              assertStates(await worker.call<NativeQueryBatchResult>('queryBatch', [queries]), true);
+            }
+            await releaseNativeSavepoint(savepointName);
+            return;
+          }
           for (const [originalRowId, rowCells] of groups) {
             const recordedNewRowIds = new Set(
               rowCells.map(cell => cell.newRowId ?? cell.rowId)
@@ -2271,9 +2443,9 @@ export async function createNativeDatabaseConnection(
               throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
             }
           }
-          await worker.call('run', [`RELEASE ${savepointName}`]);
+          await releaseNativeSavepoint(savepointName);
         } catch (error) {
-          await safeRollbackSavepoint(savepointName, 'replayNativeCellHistory');
+          await safeRollbackSavepoint(savepointName, 'replayNativeCellHistory', error);
           throw error;
         }
       };
@@ -2306,7 +2478,7 @@ export async function createNativeDatabaseConnection(
         const savepointName = createSavepointName(
           identity.kind === 'primaryKey' ? 'sp_insert_pk_row' : 'sp_insert_rowid_row'
         );
-        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        await beginNativeSavepoint(savepointName);
         try {
           await assertNativeMutationHasNoUntrackedPrograms('INSERT', table, columns);
           let rowId: RecordId;
@@ -2359,10 +2531,10 @@ export async function createNativeDatabaseConnection(
                 maxUndoSnapshotBytes
               )
             : undefined;
-          await worker.call('run', [`RELEASE ${savepointName}`]);
+          await releaseNativeSavepoint(savepointName);
           return history ?? rowId;
         } catch (error) {
-          await safeRollbackSavepoint(savepointName, 'insertNativeRow');
+          await safeRollbackSavepoint(savepointName, 'insertNativeRow', error);
           throw error;
         }
       };
@@ -2375,7 +2547,7 @@ export async function createNativeDatabaseConnection(
         snapshots.forEach(rowHistoryStates);
         const identity = await resolveNativeTableIdentity(table);
         const savepointName = createSavepointName('sp_history_delete_rows');
-        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        await beginNativeSavepoint(savepointName);
         try {
           await assertNativeMutationHasNoUntrackedPrograms('DELETE', table);
           for (const snapshot of snapshots) {
@@ -2388,9 +2560,9 @@ export async function createNativeDatabaseConnection(
             ]);
             if (result?.changes !== 1) throw new RowHistoryConflictError(table);
           }
-          await worker.call('run', [`RELEASE ${savepointName}`]);
+          await releaseNativeSavepoint(savepointName);
         } catch (error) {
-          await safeRollbackSavepoint(savepointName, 'deleteNativeRowHistorySnapshots');
+          await safeRollbackSavepoint(savepointName, 'deleteNativeRowHistorySnapshots', error);
           throw error;
         }
       };
@@ -2407,7 +2579,7 @@ export async function createNativeDatabaseConnection(
           writes: buildRowHistoryWrites(snapshot)
         }));
         const savepointName = createSavepointName('sp_history_restore_rows');
-        await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+        await beginNativeSavepoint(savepointName);
         try {
           for (const entry of prepared) {
             await assertNativeMutationHasNoUntrackedPrograms(
@@ -2452,15 +2624,47 @@ export async function createNativeDatabaseConnection(
             ]);
             if (verified.values.length !== 1) throw new RowHistoryConflictError(table);
           }
-          await worker.call('run', [`RELEASE ${savepointName}`]);
+          await releaseNativeSavepoint(savepointName);
         } catch (error) {
-          await safeRollbackSavepoint(savepointName, 'restoreNativeRowHistorySnapshots');
+          await safeRollbackSavepoint(savepointName, 'restoreNativeRowHistorySnapshots', error);
           throw error;
         }
       };
 
       const rawOperations: DatabaseOperations = {
         engineKind: Promise.resolve('native'),
+
+        executeReadQuery: async (sql, params = [], explain = false, signal) => {
+          signal?.throwIfAborted();
+          const prepared = prepareReadQuery(sql);
+          if (params.length !== prepared.parameterCount) throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
+          if (explain) {
+            const request = queryPlanRequest(prepared.sourceSql, params);
+            const library = path.join(path.dirname(binaryPath), `query-plan.${process.platform === 'darwin' ? 'dylib' : process.platform === 'win32' ? 'dll' : 'so'}`);
+            const value = await worker.call<CellValue>('workspaceQueryPlan', [request.sql, request.params, library, queryTimeout],
+              queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
+            signal?.throwIfAborted();
+            return decodeQueryPlan(value);
+          }
+          const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+          const savepointName = createSavepointName('sp_workspace_read');
+          await beginNativeSavepoint(savepointName);
+          try {
+            // Metadata and execution use the primary handle under one read
+            // snapshot, so external DDL cannot relabel a different row layout.
+            const headers = await worker.call<string[]>('describeReadQuery', [prepared.sql, prepared.metadataSql, boundary, SQL_MAX_COLUMNS, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
+            signal?.throwIfAborted();
+            const transport = buildReadTransport(prepared.sql, headers.length);
+            const result = await worker.call<NativeQueryResult>('workspaceQuery', [transport.sql, boundary, params, transport.transportColumns, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
+            signal?.throwIfAborted();
+            const decoded = decodeReadTransport(headers, result.values, transport.valueColumnCount);
+            await releaseNativeSavepoint(savepointName);
+            return decoded;
+          } catch (error) {
+            await safeRollbackSavepoint(savepointName, 'executeReadQuery snapshot', error);
+            throw error;
+          }
+        },
 
         executeQuery: async (
           sql: string,
@@ -2568,6 +2772,11 @@ export async function createNativeDatabaseConnection(
             }
 
             case 'row_insert':
+              if (mod.insertedRows?.length) {
+                // Reverse insertion order so imported foreign-key children go first.
+                await deleteNativeRowHistorySnapshots(targetTable, [...mod.insertedRows].reverse());
+                break;
+              }
               if (!mod.insertedRow || targetRowId === undefined) {
                 throw new LegacyRowHistoryError();
               }
@@ -2619,7 +2828,7 @@ export async function createNativeDatabaseConnection(
               }
               {
               const savepointName = createSavepointName('sp_undo_table_create');
-              await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+              await beginNativeSavepoint(savepointName);
               try {
                 const dependenciesBefore = await captureNativeViewDependencySnapshot();
                 const current = await readNativeColumnDropTableState(targetTable);
@@ -2645,9 +2854,9 @@ export async function createNativeDatabaseConnection(
                   dependenciesBefore,
                   await captureNativeViewDependencySnapshot()
                 );
-                await worker.call('run', [`RELEASE ${savepointName}`]);
+                await releaseNativeSavepoint(savepointName);
                 } catch (error) {
-                  await safeRollbackSavepoint(savepointName, 'undoTableCreate');
+                  await safeRollbackSavepoint(savepointName, 'undoTableCreate', error);
                   throw error;
                 }
               }
@@ -2704,6 +2913,10 @@ export async function createNativeDatabaseConnection(
               break;
 
             case 'row_insert':
+              if (mod.insertedRows?.length) {
+                await restoreNativeRowHistorySnapshots(targetTable, mod.insertedRows);
+                break;
+              }
               if (!mod.insertedRow) throw new LegacyRowHistoryError();
               await restoreNativeRowHistorySnapshots(targetTable, [mod.insertedRow]);
               break;
@@ -2747,7 +2960,7 @@ export async function createNativeDatabaseConnection(
 
             case 'table_create':
               if (tableDef && tableDef.columns) {
-                await rawOperations.createTable(targetTable, tableDef.columns);
+                await rawOperations.createTable(targetTable, tableDef.columns, tableDef.options);
               } else {
                 throw new Error('Cannot redo table_create: missing table definition');
               }
@@ -2836,7 +3049,7 @@ export async function createNativeDatabaseConnection(
               if (foreignKeysBefore !== 0) await setBooleanPragma('foreign_keys', 0);
               if (legacyAlterBefore !== 1) await setBooleanPragma('legacy_alter_table', 1);
             }
-            await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+            await beginNativeSavepoint(savepointName);
             savepointStarted = true;
             for (let index = discard.length - 1; index >= 0; index--) {
               signal?.throwIfAborted();
@@ -2847,12 +3060,12 @@ export async function createNativeDatabaseConnection(
               await rawOperations.redoModification(modification);
             }
             signal?.throwIfAborted();
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             savepointStarted = false;
           } catch (error) {
             operationError = error;
             if (savepointStarted) {
-              await safeRollbackSavepoint(savepointName, 'revertModifications');
+              await safeRollbackSavepoint(savepointName, 'revertModifications', error);
             }
           }
 
@@ -2921,7 +3134,7 @@ export async function createNativeDatabaseConnection(
           const rowIdNum = validateRowId(rowId);
           await assertNativeRowIdAuthority(table);
           const savepointName = createSavepointName('sp_update_rowid_cell');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
 
           try {
             const rowIdAliasColumn = await readNativeRowIdAliasColumn(table);
@@ -2980,10 +3193,10 @@ export async function createNativeDatabaseConnection(
               column,
               patch ?? value
             );
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return newRowId;
           } catch (error) {
-            await safeRollbackSavepoint(savepointName, 'updateCell');
+            await safeRollbackSavepoint(savepointName, 'updateCell', error);
             throw error;
           }
         },
@@ -3043,7 +3256,7 @@ export async function createNativeDatabaseConnection(
           };
 
           const savepointName = createSavepointName('sp_replace_oversized_cell');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             await assertNativeUpdateHasNoTargetTableTriggerWrites(
               table,
@@ -3051,10 +3264,10 @@ export async function createNativeDatabaseConnection(
               identity.kind === 'rowid'
             );
             const newRowId = await updateAndResolveIdentity();
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return newRowId;
           } catch (error) {
-            await safeRollbackSavepoint(savepointName, 'replaceOversizedCell');
+            await safeRollbackSavepoint(savepointName, 'replaceOversizedCell', error);
             throw error;
           }
         },
@@ -3168,7 +3381,7 @@ export async function createNativeDatabaseConnection(
             }
             const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
             const savepointName = createSavepointName('sp_delete_pk_rows');
-            await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+            await beginNativeSavepoint(savepointName);
             try {
               await assertNativeMutationHasNoUntrackedPrograms('DELETE', table);
               const insertableColumns = await getNativeInsertableColumnNames(table);
@@ -3233,10 +3446,10 @@ export async function createNativeDatabaseConnection(
                   predicate.params
                 ]);
               }
-              await worker.call('run', [`RELEASE ${savepointName}`]);
+              await releaseNativeSavepoint(savepointName);
               return deletedRows;
             } catch (error) {
-              await safeRollbackSavepoint(savepointName, 'deleteNativePrimaryKeyRows');
+              await safeRollbackSavepoint(savepointName, 'deleteNativePrimaryKeyRows', error);
               throw error;
             }
           }
@@ -3249,7 +3462,7 @@ export async function createNativeDatabaseConnection(
           // shape as primary-key deletion.
           const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
           const savepointName = createSavepointName('sp_delete_rowid_rows');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             await assertNativeMutationHasNoUntrackedPrograms('DELETE', table);
             const insertableColumns = await getNativeInsertableColumnNames(table);
@@ -3305,10 +3518,10 @@ export async function createNativeDatabaseConnection(
                 predicate.params
               ]);
             }
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return deletedRows;
           } catch (error) {
-            await safeRollbackSavepoint(savepointName, 'deleteNativeRowidRows');
+            await safeRollbackSavepoint(savepointName, 'deleteNativeRowidRows', error);
             throw error;
           }
         },
@@ -3341,13 +3554,13 @@ export async function createNativeDatabaseConnection(
           const probeIndex = `__sqlite_explorer_index_candidate_${suffix}`;
           const savepointName = createSavepointName('sp_index_dependencies');
 
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             await worker.call('run', [
               buildIndexDependencyProbeTableSql(probeTable, tableColumns)
             ]);
             const baselineSavepoint = createSavepointName('sp_index_baseline');
-            await worker.call('run', [`SAVEPOINT ${baselineSavepoint}`]);
+            await beginNativeSavepoint(baselineSavepoint);
             try {
               for (const column of targetColumns) {
                 await worker.call('run', [
@@ -3355,10 +3568,9 @@ export async function createNativeDatabaseConnection(
                   + `DROP COLUMN ${escapeIdentifier(column)}`
                 ]);
               }
-              await worker.call('run', [`ROLLBACK TO ${baselineSavepoint}`]);
-              await worker.call('run', [`RELEASE ${baselineSavepoint}`]);
+              await rollbackNativeSavepoint(baselineSavepoint);
             } catch (error) {
-              await safeRollbackSavepoint(baselineSavepoint, 'findDependentIndexBaseline');
+              await safeRollbackSavepoint(baselineSavepoint, 'findDependentIndexBaseline', error);
               throw new Error(
                 'Cannot establish the index dependency probe baseline',
                 { cause: error }
@@ -3368,7 +3580,7 @@ export async function createNativeDatabaseConnection(
             const dependentIndexes: string[] = [];
             for (const index of indexes) {
               const candidateSavepoint = createSavepointName('sp_index_candidate');
-              await worker.call('run', [`SAVEPOINT ${candidateSavepoint}`]);
+              await beginNativeSavepoint(candidateSavepoint);
               try {
                 await worker.call('run', [buildIndexDependencyProbeIndexSql(
                   probeTable,
@@ -3387,11 +3599,10 @@ export async function createNativeDatabaseConnection(
                     break;
                   }
                 }
-                await worker.call('run', [`ROLLBACK TO ${candidateSavepoint}`]);
-                await worker.call('run', [`RELEASE ${candidateSavepoint}`]);
+                await rollbackNativeSavepoint(candidateSavepoint);
                 if (isDependent) dependentIndexes.push(index.name);
               } catch (error) {
-                await safeRollbackSavepoint(candidateSavepoint, 'findDependentIndex');
+                await safeRollbackSavepoint(candidateSavepoint, 'findDependentIndex', error);
                 throw new Error(
                   `Cannot inspect dependency for index ${escapeIdentifier(index.name)}`,
                   { cause: error }
@@ -3399,11 +3610,10 @@ export async function createNativeDatabaseConnection(
               }
             }
 
-            await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await rollbackNativeSavepoint(savepointName);
             return dependentIndexes;
           } catch (error) {
-            await safeRollbackSavepoint(savepointName, 'findDependentIndexes');
+            await safeRollbackSavepoint(savepointName, 'findDependentIndexes', error);
             throw error;
           }
         },
@@ -3423,7 +3633,7 @@ export async function createNativeDatabaseConnection(
           // A SAVEPOINT composes with replay's outer transaction. The post-drop
           // snapshot is read before RELEASE so capture failure rolls the DDL back.
           const savepointName = createSavepointName('sp_delete_columns');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             if (expectedCurrentState) {
               const current = await readNativeColumnDropTableState(table);
@@ -3444,10 +3654,10 @@ export async function createNativeDatabaseConnection(
               }
             );
             const stateAfter = await readNativeColumnDropTableState(table);
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return stateAfter;
           } catch (error) {
-            await safeRollbackSavepoint(savepointName, 'deleteColumns');
+            await safeRollbackSavepoint(savepointName, 'deleteColumns', error);
             throw error;
           }
         },
@@ -3457,11 +3667,12 @@ export async function createNativeDatabaseConnection(
          */
         createTable: async (
           table: string,
-          columns: ColumnDefinition[]
+          columns: ColumnDefinition[],
+          options?: import('./core/types').CreateTableOptions
         ): Promise<ColumnDropTableState> => {
-          const sql = buildCreateTableSql(table, columns);
+          const sql = buildCreateTableSql(table, columns, options);
           const savepointName = createSavepointName('sp_create_table');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             const dependenciesBefore = await captureNativeViewDependencySnapshot();
             await worker.call('run', [sql]);
@@ -3470,10 +3681,10 @@ export async function createNativeDatabaseConnection(
               await captureNativeViewDependencySnapshot()
             );
             const stateAfter = await readNativeColumnDropTableState(table);
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return stateAfter;
           } catch (error) {
-            await safeRollbackSavepoint(savepointName, 'createTable');
+            await safeRollbackSavepoint(savepointName, 'createTable', error);
             throw error;
           }
         },
@@ -3493,7 +3704,7 @@ export async function createNativeDatabaseConnection(
           const { storedSql: existingSql, columnListSql } =
             await resolveExistingViewForIntent(view, intent);
           const savepointName = createSavepointName('sp_validate_view');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             const dependenciesBefore = await captureNativeViewDependencySnapshot();
             if (typeof existingSql === 'string') {
@@ -3505,10 +3716,9 @@ export async function createNativeDatabaseConnection(
               dependenciesBefore,
               await captureNativeViewDependencySnapshot()
             );
-            await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await rollbackNativeSavepoint(savepointName);
           } catch (err) {
-            await safeRollbackSavepoint(savepointName, 'validateViewDefinition');
+            await safeRollbackSavepoint(savepointName, 'validateViewDefinition', err);
             throw normalizeViewDefinitionError(err, view, body);
           }
         },
@@ -3534,7 +3744,7 @@ export async function createNativeDatabaseConnection(
           // only as their read-only fallback. Replace the real target name here
           // so even schema-qualified self-references cannot resolve the old view.
           const savepointName = createSavepointName('sp_preview_view');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           let columns: string[];
           let result: NativeQueryResult;
           try {
@@ -3561,10 +3771,9 @@ export async function createNativeDatabaseConnection(
               boundedLimit,
               signal
             );
-            await worker.call('run', [`ROLLBACK TO ${savepointName}`]);
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await rollbackNativeSavepoint(savepointName);
           } catch (err) {
-            await safeRollbackSavepoint(savepointName, 'previewViewDefinition');
+            await safeRollbackSavepoint(savepointName, 'previewViewDefinition', err);
             throw normalizeViewDefinitionError(err, view, body);
           }
 
@@ -3591,7 +3800,7 @@ export async function createNativeDatabaseConnection(
           }
           const body = normalizeViewSelectSql(selectSql);
           const savepointName = createSavepointName('sp_create_view');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             const dependenciesBefore = await captureNativeViewDependencySnapshot();
             await runNativeSingleStatement(buildCreateViewSql(view, body));
@@ -3601,10 +3810,10 @@ export async function createNativeDatabaseConnection(
               await captureNativeViewDependencySnapshot()
             );
             const definition = await getNativeViewDefinition(view);
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return definition;
           } catch (err) {
-            await safeRollbackSavepoint(savepointName, 'createView');
+            await safeRollbackSavepoint(savepointName, 'createView', err);
             throw err;
           }
         },
@@ -3621,7 +3830,7 @@ export async function createNativeDatabaseConnection(
           }
           const body = normalizeViewSelectSql(selectSql);
           const savepointName = createSavepointName('sp_edit_view');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             const before = await getNativeViewDefinition(view);
             assertViewTriggerSnapshotIsMutationSafe(before);
@@ -3655,10 +3864,10 @@ export async function createNativeDatabaseConnection(
               dependenciesBefore,
               await captureNativeViewDependencySnapshot()
             );
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return { before, after };
           } catch (err) {
-            await safeRollbackSavepoint(savepointName, 'editView');
+            await safeRollbackSavepoint(savepointName, 'editView', err);
             throw err;
           }
         },
@@ -3672,7 +3881,7 @@ export async function createNativeDatabaseConnection(
             throw new Error('View deletion is unavailable because the database is read-only');
           }
           const savepointName = createSavepointName('sp_drop_view');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             const before = await getNativeViewDefinition(view, true);
             assertViewTriggerSnapshotIsMutationSafe(before);
@@ -3688,10 +3897,10 @@ export async function createNativeDatabaseConnection(
               dependenciesBefore,
               await captureNativeViewDependencySnapshot()
             );
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return before;
           } catch (err) {
-            await safeRollbackSavepoint(savepointName, 'dropView');
+            await safeRollbackSavepoint(savepointName, 'dropView', err);
             throw err;
           }
         },
@@ -3737,7 +3946,7 @@ export async function createNativeDatabaseConnection(
             // WAL commit from another process between RPCs. The first read
             // inside this savepoint fixes one SQLite snapshot for the rowid
             // authority, the page values, and any companion text alike.
-            await worker.call('run', [`SAVEPOINT ${snapshotName}`]);
+            await beginNativeSavepoint(snapshotName);
           }
 
           try {
@@ -4002,7 +4211,7 @@ export async function createNativeDatabaseConnection(
             if (primaryKeyContext && remapped) {
               const resultHeaders = ['rowid', ...primaryKeyContext.visibleColumns];
               if (snapshotName) {
-                await worker.call('run', [`RELEASE ${snapshotName}`]);
+                await releaseNativeSavepoint(snapshotName);
               }
               return {
                 headers: resultHeaders,
@@ -4019,7 +4228,7 @@ export async function createNativeDatabaseConnection(
             }
 
             if (snapshotName) {
-              await worker.call('run', [`RELEASE ${snapshotName}`]);
+              await releaseNativeSavepoint(snapshotName);
             }
             return {
               headers: columns,
@@ -4039,7 +4248,7 @@ export async function createNativeDatabaseConnection(
             };
           } catch (err) {
             if (snapshotName) {
-              await safeRollbackSavepoint(snapshotName, 'fetchTableData numeric snapshot');
+              await safeRollbackSavepoint(snapshotName, 'fetchTableData numeric snapshot', err);
             }
             throw err;
           }
@@ -4167,7 +4376,11 @@ export async function createNativeDatabaseConnection(
               throw new Error(`Invalid PRAGMA value type: ${typeof value}`);
           }
 
-          await worker.call('exec', [sql]);
+          if (pragma === 'journal_mode') {
+            await worker.call('setJournalMode', [value]);
+          } else {
+            await worker.call('exec', [sql]);
+          }
         },
 
         /**
@@ -4244,12 +4457,17 @@ export async function createNativeDatabaseConnection(
           let result: DatabaseWriteResult | undefined;
           let writeError: unknown;
           let writeCompleted = false;
+          let savedIdentity: NativeFileIdentity | undefined;
           try {
             result = await writeDatabaseSnapshotAtomically(
               fs,
               filePath,
               targetPath,
               async temporaryPath => {
+                // The atomic helper has now captured its target generation.
+                // A replacement between admission and that capture must not be
+                // accepted as a new destination for the retired native source.
+                await assertCurrentFile();
                 // VACUUM INTO itself refuses an existing path. The atomic helper
                 // keeps that private snapshot off the destination until fsync and
                 // target-generation validation have both succeeded.
@@ -4259,7 +4477,10 @@ export async function createNativeDatabaseConnection(
                   queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS,
                   signal
                 );
+                await assertCurrentFile();
                 if (replacingActiveSource) {
+                  const snapshotIdentity = await readNativeFileIdentity(temporaryPath);
+                  savedIdentity = { ...snapshotIdentity, canonicalPath: identity.canonicalPath };
                   // A WAL connection keeps a shared main-file lock even with no
                   // frames. Close both native handles before the helper obtains
                   // its exclusive lock; serialized operations prevent this
@@ -4283,8 +4504,11 @@ export async function createNativeDatabaseConnection(
 
           if (sourceConnectionClosed) {
             try {
-              await worker.call('open', [filePath, readOnly]);
+              // A failed save may reopen only the original inode. A completed
+              // save may adopt only the exact snapshot this operation wrote.
+              await openTrackedDatabase(writeCompleted ? savedIdentity : identity);
             } catch (reopenError) {
+              if (invalidatedError) throw invalidatedError;
               if (!writeCompleted) {
                 throw new AggregateError(
                   [writeError, reopenError],
@@ -4298,6 +4522,7 @@ export async function createNativeDatabaseConnection(
                 `[NativeWorker] Database saved, but the native source connection `
                 + `could not be reopened: ${details}`
               );
+              return invalidateConnection(reopenError);
             }
           }
           if (!writeCompleted) throw writeError;
@@ -4366,7 +4591,7 @@ export async function createNativeDatabaseConnection(
           const batchItems: { sql: string; paramsList?: CellValue[][], params?: CellValue[] }[] = [];
           const escapedTable = escapeMainIdentifier(table);
           const savepointName = createSavepointName('sp_update_batch');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
 
           try {
           if (!isHistoryReplay && maxUndoSnapshotBytes !== undefined) {
@@ -4400,7 +4625,7 @@ export async function createNativeDatabaseConnection(
               editLimitBytes,
               isHistoryReplay
             );
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return results;
           }
           const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
@@ -4532,10 +4757,10 @@ export async function createNativeDatabaseConnection(
             }
             return { ...result, postState };
           });
-          await worker.call('run', [`RELEASE ${savepointName}`]);
+          await releaseNativeSavepoint(savepointName);
           return completedResults;
           } catch (err) {
-            await safeRollbackSavepoint(savepointName, 'updateCellBatch');
+            await safeRollbackSavepoint(savepointName, 'updateCellBatch', err);
             throw err;
           }
         },
@@ -4556,7 +4781,7 @@ export async function createNativeDatabaseConnection(
             + `${escapeIdentifier(column)} ${type}${buildColumnDefaultClause(defaultValue)}`;
 
           const savepointName = createSavepointName('sp_add_column');
-          await worker.call('run', [`SAVEPOINT ${savepointName}`]);
+          await beginNativeSavepoint(savepointName);
           try {
             const current = await readNativeColumnDropTableState(table);
             if (expectedCurrentState) {
@@ -4576,20 +4801,53 @@ export async function createNativeDatabaseConnection(
               dependenciesBefore,
               await captureNativeViewDependencySnapshot()
             );
-            await worker.call('run', [`RELEASE ${savepointName}`]);
+            await releaseNativeSavepoint(savepointName);
             return stateAfter;
           } catch (error) {
-            await safeRollbackSavepoint(savepointName, 'addColumn');
+            await safeRollbackSavepoint(savepointName, 'addColumn', error);
             throw error;
           }
         }
       };
 
-      const operationsFacade = serializeOperations(rawOperations);
+      const guardedMethods = new Map<PropertyKey, unknown>();
+      const guardedOperations = new Proxy(rawOperations, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver);
+          if (typeof value !== 'function' || typeof property === 'symbol') return value;
+          if (!guardedMethods.has(property)) {
+            guardedMethods.set(property, (...args: unknown[]) => (
+              withCurrentFile(() => value.apply(target, args))
+            ));
+          }
+          return guardedMethods.get(property);
+        }
+      });
+      // Checks execute after queue admission. Snapshot callbacks receive the
+      // guarded raw methods, so a caller awaiting between chunks/rows cannot
+      // bypass identity checks, and composite engine helpers avoid duplicate I/O.
+      const serializedOperations = serializeOperations(guardedOperations);
+      const runSnapshot = serializedOperations.runReadSnapshot!.bind(serializedOperations);
+      const guardedSnapshot = async <T>(operation: (operations: DatabaseOperations) => Promise<T>): Promise<T> => {
+        try {
+          return await runSnapshot(operation);
+        } catch (error) {
+          // Snapshot cleanup can fail after terminal invalidation closed SQLite.
+          // Preserve the actionable cause instead of its cleanup AggregateError.
+          throw invalidatedError ?? error;
+        }
+      };
+      const operationsFacade = new Proxy(serializedOperations, {
+        get(target, property, receiver) {
+          return property === 'runReadSnapshot' ? guardedSnapshot : Reflect.get(target, property, receiver);
+        }
+      });
+      currentOperations = operationsFacade;
 
       return {
         databaseOps: operationsFacade,
-        isReadOnly: readOnly
+        isReadOnly: readOnly,
+        onDidInvalidate: connectionInvalidationEmitter.event
       };
     }
   };

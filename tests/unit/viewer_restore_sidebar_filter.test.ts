@@ -95,6 +95,7 @@ it('restores and renders a saved sidebar filter without a selected table', async
                         './modules/dnd.js': 'export function initDragAndDrop() {}',
                         './modules/views.js': 'export function initViews() {}',
                         './modules/connection-state.js': `
+                            export function updateMutationControlCapabilities() {}
                             export function applyConnectionResult(result) {
                                 ${harness}.state.isDbConnected = !!result?.connected;
                                 return ${harness}.state.isDbConnected;

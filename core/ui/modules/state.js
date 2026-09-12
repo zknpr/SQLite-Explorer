@@ -62,6 +62,7 @@ export function resolveStartupPageSize(configuredValue, persistedValue) {
 export const state = {
     isDbConnected: false,
     isReadOnly: false,
+    reloadRequiredReason: null,
     // Host connection identity. Async UI intents capture this so a reload
     // cannot retarget them to an unrelated row with the same table/rowid.
     connectionGeneration: 0,
@@ -80,6 +81,8 @@ export const state = {
     rowsPerPage: DEFAULT_ROWS_PER_PAGE,
     totalRecordCount: 0,
     totalRecordCountIsExact: true,
+    // Unknown totals are distinct from the existing numeric upper-bound mode.
+    countStatus: 'ready',
     totalPageCount: 1,
     tableColumns: [],
     sortedColumn: null,
@@ -111,6 +114,7 @@ export const state = {
     isLoadingData: false,
     isLoadingColumns: false,
     isRefreshingContent: false,
+    contentRefreshPromise: null,
     // Dedicated guard for "a grid data reload is in flight", owned solely by
     // loadTableData. Kept separate from isLoadingData (which BLOB uploads also set)
     // so the grid-interaction guards can't be cleared by an unrelated upload. The
@@ -167,6 +171,8 @@ export const state = {
 
     // Sidebar filter (filters tables, views, indexes by name)
     sidebarFilter: '',
+    collapsedSections: new Set(['views', 'indexes']),
+    sidebarWidth: null,
 
     // Settings
     dateFormat: 'raw', // 'raw', 'local', 'iso', 'relative'
@@ -182,31 +188,31 @@ export const state = {
 };
 
 /**
- * Debounced state persistence to VS Code.
+ * Persist the current user-facing state before another event can hide the editor.
  * Saves a snapshot of user-facing state so it survives tab switches
  * when retainContextWhenHidden is false.
  */
-let _persistTimer;
 export function persistState() {
-    if (_persistTimer) clearTimeout(_persistTimer);
-    _persistTimer = setTimeout(() => {
-        saveVsCodeState({
-            connectionGeneration: state.connectionGeneration,
-            selectedTable: state.selectedTable,
-            selectedTableType: state.selectedTableType,
-            currentPageIndex: state.currentPageIndex,
-            rowsPerPage: state.rowsPerPage,
-            sortedColumn: state.sortedColumn,
-            sortAscending: state.sortAscending,
-            filterQuery: state.filterQuery,
-            columnWidths: state.columnWidths,
-            columnFilters: state.columnFilters,
-            pinnedColumns: Array.from(state.pinnedColumns),
-            pinnedRowIds: Array.from(state.pinnedRowIds),
-            selectedColumns: Array.from(state.selectedColumns),
-            sidebarFilter: state.sidebarFilter,
-            scrollPosition: state.scrollPosition,
-            dateFormat: state.dateFormat,
-        });
-    }, 500);
+    // A hidden webview can be destroyed before any timer runs. The snapshot
+    // contains only view preferences and identities, never the grid rows.
+    saveVsCodeState({
+        connectionGeneration: state.connectionGeneration,
+        selectedTable: state.selectedTable,
+        selectedTableType: state.selectedTableType,
+        currentPageIndex: state.currentPageIndex,
+        rowsPerPage: state.rowsPerPage,
+        sortedColumn: state.sortedColumn,
+        sortAscending: state.sortAscending,
+        filterQuery: state.filterQuery,
+        columnWidths: createSafeColumnState(state.columnWidths),
+        columnFilters: createSafeColumnState(state.columnFilters),
+        pinnedColumns: Array.from(state.pinnedColumns),
+        pinnedRowIds: Array.from(state.pinnedRowIds),
+        selectedColumns: Array.from(state.selectedColumns),
+        sidebarFilter: state.sidebarFilter,
+        collapsedSections: Array.from(state.collapsedSections),
+        sidebarWidth: state.sidebarWidth,
+        scrollPosition: { ...state.scrollPosition },
+        dateFormat: state.dateFormat,
+    });
 }

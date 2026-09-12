@@ -997,6 +997,50 @@ describe('paged writable host save', () => {
     assert.ok(events.indexOf('release') < events.indexOf('post-release-base-check'));
   });
 
+  it('closes the copy source before replacement and rejects changes during its close', async () => {
+    for (const mutateAtClose of [false, true]) {
+      const basePath = path.join(fixtureDir, `source-close-${mutateAtClose}.db`);
+      fs.writeFileSync(basePath, Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]));
+      let sourceOpen = false;
+      let renamed = false;
+      const open = async (...args: Parameters<typeof fs.promises.open>) => {
+        const handle = await fs.promises.open(...args);
+        if (String(args[0]) !== basePath) return handle;
+        sourceOpen = true;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'close') return async () => {
+              await target.close();
+              sourceOpen = false;
+              if (mutateAtClose) fs.writeFileSync(basePath, Buffer.alloc(16, 7));
+            };
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          }
+        });
+      };
+      const capability = capabilityWithOpen(open as typeof fs.promises.open, {}, {
+        renameSync: ((...args: Parameters<typeof fs.renameSync>) => {
+          assert.strictEqual(sourceOpen, false, 'Windows replacement cannot retain a read handle');
+          renamed = true;
+          return fs.renameSync(...args);
+        }) as typeof fs.renameSync
+      });
+      const save = writePagedWritableOverlayToFile(
+        capability, basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock
+      );
+      if (mutateAtClose) {
+        await assert.rejects(save, /file changed on disk|save target changed on disk/i);
+        assert.strictEqual(renamed, false);
+        assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.alloc(16, 7));
+      } else {
+        await save;
+        assert.strictEqual(renamed, true);
+        assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
+      }
+    }
+  });
+
   it('rejects WAL frames that appear after releasing a Windows-style lock', async () => {
     const basePath = path.join(fixtureDir, 'windows-post-release-wal-base.db');
     const walPath = `${basePath}-wal`;

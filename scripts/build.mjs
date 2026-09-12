@@ -17,6 +17,9 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import { createHash } from 'node:crypto';
+import { verifyQueryPlanArtifacts } from './build-query-plan.mjs';
+
+verifyQueryPlanArtifacts(undefined, { includeBuildAssets: false });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -463,6 +466,21 @@ const validateBuildOutputs = () => {
   if (missingFiles.length > 0) {
     throw new Error(`Build validation failed: missing files: ${missingFiles.join(', ')}`);
   }
+
+  // Keep the measured telemetry savings while allowing the SQL workspace to
+  // grow. These are shipped byte sizes; readable development builds are exempt.
+  if (!DEV) {
+    const entryBudgets = {
+      'out/extension.js': 450_000,
+      'out/extension-browser.js': 550_000,
+    };
+    for (const [file, budget] of Object.entries(entryBudgets)) {
+      const bytes = fs.statSync(resolve(file)).size;
+      if (bytes > budget) {
+        throw new Error(`Bundle size budget exceeded: ${file} is ${bytes} bytes (budget ${budget})`);
+      }
+    }
+  }
 };
 
 /**
@@ -501,6 +519,7 @@ const compileExt = async (target) => {
 
   // Validate all required outputs exist
   validateBuildOutputs();
+  verifyQueryPlanArtifacts();
 };
 
 // Run if executed directly

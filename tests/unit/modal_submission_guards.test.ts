@@ -481,6 +481,7 @@ describe('modal submission re-entry guards', () => {
         };
         const tableName = { value: '' };
         const definitions = { replaceChildren() {}, appendChild() {} };
+        const status = { textContent: '' };
         const columnDefinition = {
             querySelector(selector: string) {
                 if (selector === '.col-name') return { value: 'id' };
@@ -501,7 +502,7 @@ describe('modal submission re-entry guards', () => {
                 if (id === 'createTableModal') return modal;
                 if (id === 'newTableName') return tableName;
                 if (id === 'columnDefinitions') return definitions;
-                if (id === 'statusText') return { textContent: '' };
+                if (id === 'statusText') return status;
                 return null;
             },
             createElement() { return makeElement(); },
@@ -521,13 +522,92 @@ describe('modal submission re-entry guards', () => {
             closeModal('createTableModal');
             openCreateTableModal();
             tableName.value = 'second_table';
+            status.textContent = 'Newer operation is active';
             resolveCreate();
             await pending;
 
             assert.strictEqual(modal.classList.contains('hidden'), false);
             assert.strictEqual(tableName.value, 'second_table');
+            assert.strictEqual(status.textContent, 'Newer operation is active');
         } finally {
             backendApi.createTable = originalCreateTable;
+        }
+    });
+
+    it('reports Create Table completion after its host refresh and expires it on Undo', async () => {
+        const state = await prepareSubmissionState();
+        const { backendApi } = await import(apiModulePath);
+        const rpcModulePath = '../../core/ui/modules/rpc.js';
+        const { refreshContent } = await import(rpcModulePath);
+        const { openCreateTableModal, submitCreateTable } = await import(crudModulePath);
+        const originalCreateTable = backendApi.createTable;
+        const originalFetchSchema = backendApi.fetchSchema;
+        const modal = {
+            id: 'createTableModal',
+            classList: createClassList(['modal-overlay', 'hidden']),
+            querySelector() { return null; }
+        };
+        const tableName = { value: '' };
+        const definitions = { replaceChildren() {}, appendChild() {} };
+        const status = { textContent: '' };
+        const columnDefinition = {
+            querySelector(selector: string) {
+                if (selector === '.col-name') return { value: 'id' };
+                if (selector === '.col-type') return { value: 'INTEGER' };
+                if (selector === '.col-pk') return { checked: true };
+                if (selector === '.col-nn') return { checked: true };
+                return null;
+            }
+        };
+        const makeElement = () => ({
+            className: '', id: '', value: '', type: '', placeholder: '',
+            dataset: {}, style: {}, disabled: false, checked: false,
+            appendChild() {}, focus() {}
+        });
+        (globalThis as any).document = {
+            activeElement: null,
+            getElementById(id: string) {
+                if (id === 'createTableModal') return modal;
+                if (id === 'newTableName') return tableName;
+                if (id === 'columnDefinitions') return definitions;
+                if (id === 'statusText') return status;
+                return null;
+            },
+            createElement() { return makeElement(); },
+            createTextNode() { return {}; },
+            querySelectorAll(selector: string) {
+                return selector === '.column-def-row' ? [columnDefinition] : [];
+            },
+            querySelector() { return null; }
+        };
+        backendApi.createTable = async () => {
+            // The extension host echoes the committed DDL before replying to
+            // createTable, which closes every modal tied to the old content.
+            await refreshContent('qa.db');
+            assert.strictEqual(status.textContent, 'Creating table...',
+                'the host echo must preserve the in-flight operation status');
+        };
+        backendApi.fetchSchema = async () => ({ tables: [], views: [], indexes: [] });
+        state.isDbConnected = true;
+        state.selectedTable = null;
+
+        try {
+            openCreateTableModal();
+            tableName.value = 'host_echo_table';
+            await submitCreateTable();
+
+            assert.strictEqual(modal.classList.contains('hidden'), true);
+            assert.strictEqual(
+                status.textContent,
+                'Table "host_echo_table" created - Ctrl+S to save'
+            );
+            await refreshContent('qa.db');
+            assert.doesNotMatch(status.textContent, /created/,
+                'a later Undo refresh must expire the completed create message');
+        } finally {
+            backendApi.createTable = originalCreateTable;
+            backendApi.fetchSchema = originalFetchSchema;
+            state.isDbConnected = false;
         }
     });
 
@@ -748,7 +828,7 @@ describe('modal submission re-entry guards', () => {
             querySelectorAll() { return []; }
         };
         const preview = { innerHTML: '' };
-        const hex = { value: '' };
+        const hex = { textContent: 'stored hex', addEventListener() {} };
         const info = { textContent: '' };
         (globalThis as any).document = {
             addEventListener(type: string, listener: (event: any) => void) {
@@ -790,5 +870,6 @@ describe('modal submission re-entry guards', () => {
         assert.strictEqual(inspector.currentRowId, null);
         assert.strictEqual(inspector.currentColName, null);
         assert.strictEqual(inspector.currentCellInfo, null);
+        assert.strictEqual(hex.textContent, '');
     });
 });

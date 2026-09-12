@@ -3,6 +3,7 @@ import './vscode_mock_setup';
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
 import { createDeferred } from './helpers/deferred';
+import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 
 function installDocumentMock() {
     const elements: Record<string, any> = {
@@ -55,6 +56,7 @@ function primeTableState(state: any, table: string, pageIndex = 0) {
     state.editingCellInfo = null;
     state.keysetAnchors = null;
     state.gridData = [];
+    state.countStatus = 'ready';
     state.selectedRowIds = new Set();
     state.selectedColumns = new Set();
     state.selectedCells = [];
@@ -84,6 +86,23 @@ function installCountSpy(backendApi: any, respond: (call: number) => any) {
         return respond(calls.length);
     };
     return calls;
+}
+
+async function installTableEngine(backendApi: any, rowCount: number) {
+    const initialized = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+    const engine = initialized.operations!;
+    await engine.executeQuery('CREATE TABLE items (value TEXT)');
+    await engine.executeQuery(
+        'WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < ?) ' +
+        'INSERT INTO items SELECT printf(\'row-%d\', x) FROM n', [rowCount]
+    );
+    const countCalls: string[] = [];
+    backendApi.fetchTableCount = async (table: string, options: any) => {
+        countCalls.push(table);
+        return engine.fetchTableCount(table, options);
+    };
+    backendApi.fetchTableData = (table: string, options: any) => engine.fetchTableData(table, options);
+    return { engine: engine as WasmDatabaseEngine, countCalls };
 }
 
 describe('grid count cache', () => {
@@ -164,18 +183,23 @@ describe('grid count cache', () => {
         }
     });
 
-    it('fetches a missing count in parallel with the data query', async () => {
-        installDocumentMock();
+    it('commits first-page rows before requesting a missing count', async () => {
+        const elements = installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
         const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
         const count = createDeferred<number>();
+        const countStarted = createDeferred<void>();
+        const calls: string[] = [];
         let countRequested = 0;
         let dataRequested = 0;
         backendApi.fetchTableCount = async () => {
+            calls.push('count');
             countRequested += 1;
+            countStarted.resolve();
             return count.promise;
         };
         backendApi.fetchTableData = async () => {
+            calls.push('data');
             dataRequested += 1;
             return { rows: [[1, 'row']] };
         };
@@ -183,16 +207,25 @@ describe('grid count cache', () => {
 
         try {
             const load = loadTableData(false, false);
-            // Both RPCs are dispatched in the same synchronous section: the
-            // data query does not wait for the count to resolve.
-            assert.strictEqual(countRequested, 1);
+            // Counting must not take the database queue before the useful rows.
+            assert.deepStrictEqual(calls, ['data']);
             assert.strictEqual(dataRequested, 1);
-
+            await countStarted.promise;
+            assert.strictEqual(countRequested, 1);
+            assert.deepStrictEqual(state.gridData, [[1, 'row']]);
+            assert.strictEqual(state.countStatus, 'pending');
+            assert.strictEqual(state.isGridReloading, true);
+            assert.strictEqual(elements.pageIndicator.textContent, '1 / ?');
+            assert.strictEqual(elements.btnLast.disabled, true);
+            state.selectedCells = [{ row: 0, col: 1 }];
             count.resolve(40);
             assert.strictEqual(await load, true);
             assert.strictEqual(state.totalRecordCount, 40);
             assert.strictEqual(state.totalPageCount, 2);
+            assert.strictEqual(state.countStatus, 'ready');
+            assert.deepStrictEqual(state.selectedCells, [{ row: 0, col: 1 }], 'count completion must not reset a new selection');
         } finally {
+            count.resolve(40);
             resetHarness(state, backendApi, originals);
         }
     });
@@ -274,6 +307,140 @@ describe('grid count cache', () => {
         }
     });
 
+    for (const scenario of [
+        { name: 'empty OFFSET page', page: 3, nav: undefined, remaining: 25, wantPage: 1, wantIds: [21, 22, 23, 24, 25] },
+        { name: 'short anchored next page', page: 1, nav: 'next', remaining: 25, wantPage: 1, wantIds: [21, 22, 23, 24, 25] },
+        { name: 'short first page', page: 0, nav: 'first', remaining: 5, wantPage: 0, wantIds: [1, 2, 3, 4, 5] },
+        { name: 'emptied table', page: 0, nav: 'first', remaining: 0, wantPage: 0, wantIds: [] }
+    ]) {
+        it(`recounts a cached exact count after external deletes: ${scenario.name}`, async () => {
+            const elements = installDocumentMock();
+            const { state, backendApi, loadTableData } = await loadHarness();
+            const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+            const { engine, countCalls } = await installTableEngine(backendApi, 100);
+            primeTableState(state, 'items');
+            try {
+                assert.strictEqual(await loadTableData(false, false), true);
+                // Bypass webview mutation notifications, as a second native
+                // connection does when it changes the same database file.
+                await engine.executeQuery('DELETE FROM items WHERE rowid > ?', [scenario.remaining]);
+                state.currentPageIndex = scenario.page;
+                assert.strictEqual(await loadTableData(false, false, scenario.nav), true);
+
+                assert.strictEqual(state.totalRecordCount, scenario.remaining);
+                assert.strictEqual(state.totalRecordCountIsExact, true);
+                assert.strictEqual(state.currentPageIndex, scenario.wantPage);
+                assert.deepStrictEqual(state.gridData.map((row: unknown[]) => row[0]), scenario.wantIds);
+                assert.strictEqual(elements.btnNext.disabled, true);
+                assert.strictEqual(countCalls.length, 2);
+            } finally {
+                engine.shutdown();
+                resetHarness(state, backendApi, originals);
+            }
+        });
+    }
+
+    for (const scenario of [
+        { name: 'the last page moved backward', rows: 26, wantPage: 1, wantIds: [21, 22, 23, 24, 25, 26] },
+        { name: 'only the remainder shrank', rows: 43, wantPage: 2, wantIds: [41, 42, 43] },
+        { name: 'the last page moved forward', rows: 66, wantPage: 3, wantIds: [61, 62, 63, 64, 65, 66] }
+    ]) {
+        it(`refreshes cached Last navigation when ${scenario.name}`, async () => {
+            const elements = installDocumentMock();
+            const { state, backendApi, loadTableData } = await loadHarness();
+            const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+            const { engine, countCalls } = await installTableEngine(backendApi, 45);
+            primeTableState(state, 'items');
+            try {
+                assert.strictEqual(await loadTableData(false, false), true);
+                if (scenario.rows < 45) {
+                    await engine.executeQuery('DELETE FROM items WHERE rowid > ?', [scenario.rows]);
+                } else {
+                    await engine.executeQuery(
+                        'WITH RECURSIVE n(x) AS (VALUES(46) UNION ALL SELECT x + 1 FROM n WHERE x < 66) ' +
+                        'INSERT INTO items SELECT printf(\'row-%d\', x) FROM n'
+                    );
+                }
+                // The button's target comes from the old cached page count.
+                // A reverse query can still fill that stale five-row remainder.
+                state.currentPageIndex = 2;
+                assert.strictEqual(await loadTableData(false, false, 'last'), true);
+
+                assert.strictEqual(state.totalRecordCount, scenario.rows);
+                assert.strictEqual(state.currentPageIndex, scenario.wantPage);
+                assert.deepStrictEqual(state.gridData.map((row: unknown[]) => row[0]), scenario.wantIds);
+                assert.strictEqual(elements.btnNext.disabled, true);
+                assert.strictEqual(countCalls.length, 2);
+            } finally {
+                engine.shutdown();
+                resetHarness(state, backendApi, originals);
+            }
+        });
+    }
+
+    for (const nav of ['next', 'refetch']) {
+        it(`restores the page phase when a short ${nav} recount exposes deletes before its anchor`, async () => {
+            installDocumentMock();
+            const { state, backendApi, loadTableData } = await loadHarness();
+            const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+            const { engine, countCalls } = await installTableEngine(backendApi, 100);
+            primeTableState(state, 'items', nav === 'next' ? 0 : 1);
+            try {
+                assert.strictEqual(await loadTableData(false, false), true);
+                await engine.executeQuery('DELETE FROM items WHERE rowid <= 10 OR rowid > 35');
+                state.currentPageIndex = 1;
+                assert.strictEqual(await loadTableData(false, false, nav), true);
+
+                assert.strictEqual(state.totalRecordCount, 25);
+                assert.strictEqual(state.currentPageIndex, 1);
+                // Of the remaining rowids 11..35, the second page is 31..35.
+                // Reusing the old anchor would incorrectly keep 21..35 here.
+                assert.deepStrictEqual(state.gridData.map((row: unknown[]) => row[0]), [31, 32, 33, 34, 35]);
+                assert.strictEqual(countCalls.length, 2);
+            } finally {
+                engine.shutdown();
+                resetHarness(state, backendApi, originals);
+            }
+        });
+    }
+
+    it('discards a short-page recount when a table switch supersedes it', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData, countCache } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const { engine } = await installTableEngine(backendApi, 45);
+        const recount = createDeferred<{ count: number; isExact: boolean }>();
+        const recountStarted = createDeferred<void>();
+        primeTableState(state, 'items');
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            await engine.executeQuery('DELETE FROM items WHERE rowid > 25');
+            backendApi.fetchTableCount = () => {
+                recountStarted.resolve();
+                return recount.promise;
+            };
+            state.currentPageIndex = 1;
+            const load = loadTableData(false, false, 'next');
+            assert.strictEqual(await Promise.race([
+                recountStarted.promise.then(() => 'counting'),
+                load.then(() => 'finished')
+            ]), 'counting');
+            state.selectedTable = 'other_items';
+            state.gridData = [[91, 'new table']];
+            state.totalRecordCount = 900;
+            recount.resolve({ count: 25, isExact: true });
+            assert.strictEqual(await load, undefined);
+            assert.deepStrictEqual(state.gridData, [[91, 'new table']]);
+            assert.strictEqual(state.totalRecordCount, 900);
+            const identity = countCache.buildCountIdentity('items', [], undefined, ['value']);
+            assert.deepStrictEqual(countCache.getCachedCount(identity), { count: 45, isExact: true });
+        } finally {
+            recount.resolve({ count: 25, isExact: true });
+            engine.shutdown();
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
     it('refetches a clipped short exact page at its real row bound', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
@@ -337,7 +504,10 @@ describe('grid count cache', () => {
             const filtered = (options.filters?.length ?? 0) > 0 || options.globalFilter !== undefined;
             return filtered ? 10 : 60;
         };
-        backendApi.fetchTableData = async () => ({ rows: [[1, 'row']] });
+        backendApi.fetchTableData = async (_table: string, options: any) => {
+            const filtered = (options.filters?.length ?? 0) > 0 || options.globalFilter !== undefined;
+            return { rows: Array.from({ length: Math.min(options.limit, filtered ? 10 : 60) }, (_, row) => [row + 1, 'row']) };
+        };
         primeTableState(state, 'items');
 
         try {
@@ -393,7 +563,7 @@ describe('grid count cache', () => {
             deleteRows: backendApi.deleteRows
         };
         const countCalls = installCountSpy(backendApi, () => 60);
-        backendApi.fetchTableData = async () => ({ rows: [[1, 'row']] });
+        backendApi.fetchTableData = async () => ({ rows: Array.from({ length: 20 }, (_, row) => [row + 1, 'row']) });
         let inserted = 0;
         let deletedIds: any[] = [];
         backendApi.insertRow = async () => { inserted += 1; return 99; };
@@ -436,7 +606,9 @@ describe('grid count cache', () => {
             const filtered = (options.filters?.length ?? 0) > 0;
             return filtered ? 10 : 60;
         };
-        backendApi.fetchTableData = async () => ({ rows: [[1, 'row']] });
+        backendApi.fetchTableData = async (_table: string, options: any) => ({
+            rows: Array.from({ length: options.filters?.length ? 10 : 20 }, (_, row) => [row + 1, 'row'])
+        });
         primeTableState(state, 'items');
 
         try {
@@ -697,7 +869,7 @@ describe('grid count cache', () => {
             countCalls.push({});
             return countCalls.length === 1 ? staleCount.promise : 40;
         };
-        backendApi.fetchTableData = async () => ({ rows: [[1, 'row']] });
+        backendApi.fetchTableData = async () => ({ rows: Array.from({ length: 20 }, (_, row) => [row + 1, 'row']) });
         primeTableState(state, 'items');
 
         try {
@@ -758,11 +930,15 @@ describe('grid count cache', () => {
         installDocumentMock();
         const { state, backendApi, loadTableData, countCache } = await loadHarness();
         const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
-        const countCalls = installCountSpy(backendApi, () => 21); // 2 pages of 20
+        let databaseRows = 22;
+        const countCalls = installCountSpy(backendApi, () => databaseRows); // 2 pages of 20
         const dataRequests: any[] = [];
         backendApi.fetchTableData = async (_table: string, options: any) => {
             dataRequests.push({ offset: options.offset, keyset: options.keyset });
-            return { rows: [[1, 'row']] };
+            return { rows: Array.from(
+                { length: Math.min(options.limit, databaseRows - options.offset) },
+                (_, row) => [options.offset + row + 1, 'row']
+            ) };
         };
         primeTableState(state, 'items', 1);
 
@@ -771,12 +947,13 @@ describe('grid count cache', () => {
             assert.strictEqual(state.totalPageCount, 2);
             assert.strictEqual(state.currentPageIndex, 1);
 
-            // The last remaining row of page 1 is deleted; the cached count
-            // shrinks to 20 and the next load clamps back to page 0 from it.
-            countCache.noteRowCountChanged('items', -1);
+            // Delete the last three rows. The cache alone can clamp back to
+            // the short first page; its 19 rows confirm the adjusted count.
+            databaseRows = 19;
+            countCache.noteRowCountChanged('items', -3);
             await loadTableData(false, false);
             assert.strictEqual(countCalls.length, 1, 'the clamp must run from the cached count');
-            assert.strictEqual(state.totalRecordCount, 20);
+            assert.strictEqual(state.totalRecordCount, 19);
             assert.strictEqual(state.totalPageCount, 1);
             assert.strictEqual(state.currentPageIndex, 0);
             assert.strictEqual(dataRequests.at(-1).offset, 0);
@@ -822,8 +999,8 @@ describe('grid count cache', () => {
         }
     });
 
-    it('fails the load on a count fetch error without caching or committing anything', async () => {
-        installDocumentMock();
+    it('keeps successful rows when counting fails and retries the count on reload', async () => {
+        const elements = installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();
         const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
         const countCalls: any[] = [];
@@ -838,11 +1015,12 @@ describe('grid count cache', () => {
         state.totalRecordCount = 7;
 
         try {
-            assert.strictEqual(await loadTableData(false, false), false);
-            assert.strictEqual(state.lastGridLoadError, 'count exploded');
-            // Nothing committed: the failed load's data result never surfaces.
-            assert.deepStrictEqual(state.gridData, [['old']]);
-            assert.strictEqual(state.totalRecordCount, 7);
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.strictEqual(state.lastGridLoadError, null);
+            assert.deepStrictEqual(state.gridData, [[1, 'fresh']]);
+            assert.strictEqual(state.countStatus, 'unavailable');
+            assert.match(elements.statusText.textContent, /count unavailable: count exploded/);
+            assert.strictEqual(elements.pageIndicator.textContent, '1 / ?');
 
             // Nothing cached either: the retry fetches the count again.
             assert.strictEqual(await loadTableData(false, false), true);

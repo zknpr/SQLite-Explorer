@@ -315,10 +315,12 @@ describe('viewer template accessibility', () => {
         assert.match(cellEditor, /\baria-labelledby=["']cellPreviewTitle["']/i);
 
         const hexDump = template.match(
-            /<textarea\b(?=[^>]*\bclass=["'][^"']*\bhex-dump-textarea\b[^"']*["'])[^>]*>/i
+            /<pre\b(?=[^>]*\bclass=["'][^"']*\bhex-dump\b[^"']*["'])[^>]*>/i
         )?.[0];
         assert.ok(hexDump, 'BLOB hex dump must exist');
         assert.match(hexDump, /\baria-label=["']BLOB hexadecimal data["']/i);
+        assert.match(hexDump, /\brole=["']region["']/i);
+        assert.match(hexDump, /\btabindex=["']0["']/i);
     });
 
     it('marks selection-dependent controls so click-away handling preserves the selection', () => {

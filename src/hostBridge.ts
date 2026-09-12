@@ -48,6 +48,8 @@ import { normalizeTablePageOptions } from './core/table-pagination';
 import { normalizeCellTextEncoding } from './core/cell-read';
 import { estimateUndoMemoryBytes } from './core/undo-history';
 import type { CellMaterializationService } from './cellMaterialization';
+import { openCellContentViewer } from './cellContentViewer';
+import { writeCellFile } from './tableExporter';
 import {
   assertCellValueWithinEditLimit,
   assertCellValuesWithinEditLimit,
@@ -242,51 +244,6 @@ function pathLeaf(value: string): string {
   return withoutTrailingSeparators.slice(separator + 1);
 }
 
-function isMissingWorkspaceResource(error: unknown): boolean {
-  const code = (error as { code?: unknown } | undefined)?.code;
-  return code === 'FileNotFound' || code === 'ENOENT';
-}
-
-/** Stage provider output beside the destination so a failed write cannot truncate it. */
-async function writeWorkspaceFileAtomically(
-  target: vsc.Uri,
-  bytes: Uint8Array
-): Promise<void> {
-  const leaf = pathLeaf(target.path);
-  if (leaf.length === 0) throw new Error('Cannot save a file without a destination name');
-  const temporary = vsc.Uri.joinPath(
-    uriDirectory(target),
-    `.${leaf}.${crypto.randomUUID()}.tmp`
-  );
-  if (temporary.toString() === target.toString()) {
-    throw new Error('The workspace provider did not produce a distinct temporary save URI');
-  }
-
-  let temporaryMayExist = false;
-  try {
-    // Mark this before awaiting: a provider is allowed to create or truncate a
-    // resource and then reject its write promise.
-    temporaryMayExist = true;
-    await vsc.workspace.fs.writeFile(temporary, bytes);
-    await vsc.workspace.fs.rename(temporary, target, { overwrite: true });
-    temporaryMayExist = false;
-  } catch (error) {
-    if (temporaryMayExist) {
-      try {
-        await vsc.workspace.fs.delete(temporary, { recursive: false, useTrash: false });
-      } catch (cleanupError) {
-        if (!isMissingWorkspaceResource(cleanupError)) {
-          throw new AggregateError(
-            [error, cleanupError],
-            'Saving failed and the private temporary file could not be removed'
-          );
-        }
-      }
-    }
-    throw error;
-  }
-}
-
 // Type for Uint8Array-like objects (transferable over postMessage)
 type Uint8ArrayLike = { buffer: ArrayBufferLike, byteOffset: number, byteLength: number };
 
@@ -321,8 +278,17 @@ function isUriContainedInDirectory(
     return false;
   }
   const baseDir = baseKind === 'directory' ? base.path : uriPathDirname(base.path);
-  const resolvedDir = normalizeUriPath(baseDir);
-  const resolvedCandidate = normalizeUriPath(candidate.path);
+  let resolvedDir = normalizeUriPath(baseDir);
+  let resolvedCandidate = normalizeUriPath(candidate.path);
+  if (candidate.scheme === 'file' && !candidate.authority && !import.meta.env?.VSCODE_BROWSER_EXT
+    && typeof process !== 'undefined' && process.platform === 'win32') {
+    // Uri.file may retain /C:/ while its serialized drag URI round-trips as /c:/.
+    // Fold only that local Windows drive letter, never directory/provider case.
+    const drive = /^\/([A-Z]):(?=\/|$)/;
+    const lowerDrive = (_match: string, letter: string) => `/${letter.toLowerCase()}:`;
+    resolvedDir = resolvedDir.replace(drive, lowerDrive);
+    resolvedCandidate = resolvedCandidate.replace(drive, lowerDrive);
+  }
   const prefix = resolvedDir.endsWith('/') ? resolvedDir : resolvedDir + '/';
   return resolvedCandidate === resolvedDir || resolvedCandidate.startsWith(prefix);
 }
@@ -505,9 +471,11 @@ export class HostBridge implements ToastService {
       this.reporter?.sendTelemetryEvent("open");
       // Return connection info instead of proxying databaseOps directly.
       return {
-        connected: true,
+        connected: document.isConnected,
         filename: document.fileParts.filename,
         readOnly: this.isReadOnly,
+        cellEditBehavior: document.cellEditBehavior,
+        ...(document.reloadRequiredReason ? { reloadRequiredReason: document.reloadRequiredReason } : {}),
         ...(Number.isSafeInteger(document.connectionGeneration)
           ? { connectionGeneration: document.connectionGeneration }
           : {}),
@@ -1101,7 +1069,7 @@ export class HostBridge implements ToastService {
   /**
    * Create a new table.
    */
-  async createTable(table: string, columns: import('./core/types').ColumnDefinition[]) {
+  async createTable(table: string, columns: import('./core/types').ColumnDefinition[], options?: import('./core/types').CreateTableOptions) {
     assertUsableSqlIdentifier(table, 'Table name');
     for (const column of columns) {
       assertUsableSqlIdentifier(column.name, 'Column name');
@@ -1114,7 +1082,7 @@ export class HostBridge implements ToastService {
 
     let tableCreateSnapshot: ColumnDropTableState;
     if ('createTable' in dbOps) {
-      tableCreateSnapshot = await dbOps.createTable(table, columns);
+      tableCreateSnapshot = options === undefined ? await dbOps.createTable(table, columns) : await dbOps.createTable(table, columns, options);
     } else {
       throw new Error("Backend does not support createTable");
     }
@@ -1125,7 +1093,7 @@ export class HostBridge implements ToastService {
       description: `Create table ${table}`,
       modificationType: 'table_create',
       targetTable: table,
-      tableDef: { columns },
+      tableDef: { columns, ...(options === undefined ? {} : { options }) },
       tableCreateSnapshot
     });
   }
@@ -1133,6 +1101,12 @@ export class HostBridge implements ToastService {
   /** Read the editable SELECT body and attached INSTEAD OF triggers for a view. */
   async getViewDefinition(view: string) {
     return this.ensureDatabaseInitialized().getViewDefinition(view);
+  }
+
+  /** The owning viewer supplies the binding; another active tab cannot retarget it. */
+  async openQueryEditor() {
+    this.ensureDatabaseInitialized();
+    await vsc.commands.executeCommand(`${ExtensionId}.newQuery`, this.document.uri);
   }
 
   /** Ask SQLite to compile a proposed view definition without changing the schema. */
@@ -1315,7 +1289,11 @@ export class HostBridge implements ToastService {
   /**
    * Update multiple cells in batch.
    */
-  async updateCellBatch(table: string, updates: CellUpdate[], label: string) {
+  async updateCellBatch(
+    table: string,
+    updates: CellUpdate[],
+    label: string
+  ): Promise<Pick<CellUpdateResult, 'rowId' | 'newRowId' | 'columnName'>[] | undefined> {
     const dbOps = this.ensureDatabaseInitialized();
     const connectionGeneration = this.captureConnectionGeneration();
 
@@ -1379,7 +1357,13 @@ export class HostBridge implements ToastService {
       ...modification,
       affectedCells: historyCells
     });
-    return historyCells;
+    // The viewer only reconciles identities. Exact INTEGERs and prior BLOBs
+    // belong to host history, not VS Code's JSON-only webview reply channel.
+    return historyCells.map(({ rowId, newRowId, columnName }) => ({
+      rowId,
+      ...(newRowId !== undefined ? { newRowId } : {}),
+      columnName
+    }));
   }
 
   /**
@@ -1684,14 +1668,20 @@ export class HostBridge implements ToastService {
    * @param options - Additional options
    */
   async openCellEditor(params: DbParams, rowId: RecordId, colName?: string, colTypes: ColumnTypeInfo = {}, {
-    value, type, webviewId, rowCount
+    value, type, webviewId, rowCount, download = false, view = 'content'
   }: {
     value?: CellValue,
     type?: CellContentType,
     webviewId?: string,
     rowCount?: number,
+    download?: boolean,
+    view?: 'content' | 'hex' | 'snapshot',
   } = {}) {
     assertMutableRecordId(rowId);
+    if (typeof download !== 'boolean') throw new Error('Invalid full-content download option');
+    if (view !== 'content' && view !== 'hex' && view !== 'snapshot') throw new Error('Invalid full-content view');
+    const openHex = view === 'hex' && !download;
+    const openSnapshot = view === 'snapshot' && !download;
     const { document } = this;
     if (document.uri.scheme !== 'untitled') {
       let cellParts: string[];
@@ -1707,10 +1697,18 @@ export class HostBridge implements ToastService {
         // Determine file extension based on content type
         const extname = await determineCellExtension(value, type);
         const materializer = this.cellMaterializer;
+        if (download && !materializer) throw new Error('Full-content downloads require the desktop extension');
+        if (openHex && !materializer) throw new Error('Full Hex documents require the desktop extension');
+        if (openSnapshot && !materializer) throw new Error('Cell snapshot documents require the desktop extension');
         if (materializer) {
           const target = { table: params.table, rowId, column: colName };
           const metadata = await this.ensureDatabaseInitialized().getCellMetadata(target);
-          if (metadata.byteLength > getMaxInlineCellBytes()) {
+          if (metadata.byteLength > getMaxInlineCellBytes() || download || openHex || openSnapshot) {
+            const destination = download ? await vsc.window.showSaveDialog({
+              defaultUri: vsc.Uri.joinPath(document.uri, '..', `cell${extname}`),
+              saveLabel: 'Save Cell'
+            }) : undefined;
+            if (download && !destination) return { success: false, cancelled: true, message: 'Save cancelled' };
             let materialized;
             this.activeCellMaterializationController?.abort();
             const materializationController = new AbortController();
@@ -1725,7 +1723,8 @@ export class HostBridge implements ToastService {
                 {
                   signal: materializationController.signal,
                   fileExtension: extname.slice(1),
-                  owner: document
+                  owner: document,
+                  format: openHex ? 'hex' : 'raw'
                 }
               );
             } catch (error) {
@@ -1742,12 +1741,50 @@ export class HostBridge implements ToastService {
               }
             }
 
+            if (destination) {
+              try {
+                // Copy the verified complete snapshot through the host. Sending
+                // its bytes through the webview would defeat the preview bounds.
+                await writeCellFile(destination, materialized.uri);
+                return { success: true, mode: 'download' as const };
+              } catch (error) {
+                if (error instanceof vsc.CancellationError) return { success: false, cancelled: true, message: 'Save cancelled' };
+                throw error;
+              } finally {
+                materializer.release(materialized.uri);
+              }
+            }
+
             try {
-              await vsc.commands.executeCommand(
-                'vscode.open',
-                materialized.uri,
-                vsc.ViewColumn.Two
-              );
+              if (openHex) {
+                await vsc.commands.executeCommand('vscode.openWith', materialized.uri, 'default', vsc.ViewColumn.Two);
+              } else if (!openSnapshot && type?.type === 'video'
+                && (type.mime === 'video/mp4' || type.mime === 'video/webm')
+                && extname === `.${OVERSIZED_MEDIA_TYPES[type.mime].extension}`
+                && materialized.metadata.storageClass === 'blob'
+                && materialized.contentEncoding === 'raw-database-bytes'
+                && materialized.sourcePrefix instanceof Uint8Array
+                && mediaSignatureMatches(type.mime, materialized.sourcePrefix)) {
+                // Keep supported videos out of the raw pager. Trust only the
+                // same-snapshot signature, and never fall back to a text editor.
+                await vsc.commands.executeCommand('vscode.openWith', materialized.uri, 'vscode.videoPreview', vsc.ViewColumn.Two);
+              } else {
+                const snapshot = materialized;
+                openCellContentViewer(snapshot, {
+                  title: `${colName} — cell content`,
+                  owner: document,
+                  release: () => materializer.release(snapshot.uri),
+                  download: async () => {
+                    const targetUri = await vsc.window.showSaveDialog({
+                      defaultUri: vsc.Uri.joinPath(document.uri, '..', `cell${extname}`), saveLabel: 'Save Cell'
+                    });
+                    if (!targetUri) return false;
+                    try { await writeCellFile(targetUri, snapshot.uri); return true; }
+                    catch (error) { if (error instanceof vsc.CancellationError) return false; throw error; }
+                  }
+                });
+                return { success: true, mode: 'paged-read-only' as const };
+              }
               await vsc.commands.executeCommand(
                 'workbench.action.files.setActiveEditorReadonlyInSession'
               );
@@ -1898,7 +1935,8 @@ export class HostBridge implements ToastService {
       materialized = await materializer.materialize(operations, target, {
         signal: controller.signal,
         fileExtension: media.extension,
-        owner: panel
+        owner: panel,
+        mediaPreview: true
       });
       assertRequestCurrent();
       if (materialized.metadata.storageClass !== 'blob') {
@@ -1925,12 +1963,7 @@ export class HostBridge implements ToastService {
       }
 
       const previewId = crypto.randomUUID();
-      const runDirectory = uriDirectory(materialized.uri);
       const resourceUri = panel.webview.asWebviewUri(materialized.uri).toString();
-      panel.webview.options = {
-        ...panel.webview.options,
-        localResourceRoots: [this.codiconsResourceRoot(), runDirectory]
-      };
       assertRequestCurrent();
 
       const previous = this.activeCellMediaPreviews.get(options.webviewId);
@@ -1991,18 +2024,6 @@ export class HostBridge implements ToastService {
 
     this.activeCellMediaPreviews.delete(webviewId);
     this.cellMaterializer?.release(active.uri);
-    if (this.webviews.getByWebviewId(webviewId) === active.panel) {
-      active.panel.webview.options = {
-        ...active.panel.webview.options,
-        localResourceRoots: [this.codiconsResourceRoot()]
-      };
-    }
-  }
-
-  private codiconsResourceRoot(): vsc.Uri {
-    // build.mjs copies codicon.css + codicon.ttf here; the full
-    // @vscode/codicons package is not shipped in the .vsix.
-    return vsc.Uri.joinPath(this.context.extensionUri, 'assets', 'codicons');
   }
 
   private trackMediaPanel(panel: vsc.WebviewPanel): void {
@@ -2063,9 +2084,11 @@ export class HostBridge implements ToastService {
    *
    * @returns True if the user confirms
    */
-  async confirmLargeChanges(): Promise<boolean> {
+  async confirmLargeChanges(itemCount: number, unit: 'rows' | 'cells'): Promise<boolean> {
+    if (!Number.isSafeInteger(itemCount) || itemCount <= 0) throw new Error('Large change count must be a positive safe integer');
+    if (unit !== 'rows' && unit !== 'cells') throw new Error('Large change unit must be rows or cells');
     const answer = await vsc.window.showWarningMessage(vsc.l10n.t('Large Change Warning'), {
-      detail: vsc.l10n.t('You are about to make changes that affect many rows. Do you want to continue?'),
+      detail: `This operation changes ${itemCount.toLocaleString()} ${unit}. Do you want to continue?`,
       modal: true,
     }, { title: vsc.l10n.t('Continue'), value: true }, { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true });
     return answer?.value ?? false;
@@ -2113,9 +2136,11 @@ export class HostBridge implements ToastService {
     // Read fileOperations setting from VS Code configuration
     const config = vsc.workspace.getConfiguration(ConfigurationSection);
     const fileOperations = config.get<string>('fileOperations', 'native');
+    const nativeWritesImmediately = await this.ensureDatabaseInitialized().engineKind === 'native';
     
     return {
       autoCommit: this.document.autoCommitEnabled,
+      nativeWritesImmediately,
       cellEditBehavior: this.document.cellEditBehavior,
       fileOperations: fileOperations
     };
@@ -2264,7 +2289,8 @@ export class HostBridge implements ToastService {
     } else {
         buffer = new Uint8Array(data.buffer || (data as unknown as ArrayBufferLike), data.byteOffset, data.byteLength);
     }
-    await writeWorkspaceFileAtomically(uri, buffer);
+    try { await writeCellFile(uri, buffer); }
+    catch (error) { if (error instanceof vsc.CancellationError) return { success: false, cancelled: true }; throw error; }
     return { success: true };
   }
 

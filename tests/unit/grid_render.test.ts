@@ -87,12 +87,45 @@ describe('grid header rendering', () => {
         state.selectedColumns.clear();
         state.pinnedColumns.clear();
         state.pinnedRowIds.clear();
+        state.totalRecordCountIsExact = true;
+        state.currentPageIndex = 0;
         state.matchNav = {
             scope: null,
             term: null,
             matches: [],
             currentIndex: -1
         };
+    });
+
+    it('uses page-local row numbers when a bounded count cannot establish global offsets', async () => {
+        const { state } = await import(stateModulePath);
+        const { renderDataGrid } = await import(gridRenderModulePath);
+        const container = new FakeNode('div');
+        (globalThis as any).document = {
+            createElement: (name: string) => new FakeNode(name),
+            createDocumentFragment: () => new FakeNode('#fragment'),
+            createTextNode(text: string) { const node = new FakeNode('#text'); node.textContent = text; return node; },
+            getElementById: (id: string) => id === 'gridContainer' ? container : null,
+            querySelectorAll: () => [], querySelector: () => null
+        };
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'id', type: 'INTEGER', isPrimaryKey: true }];
+        state.currentPageIndex = 655;
+        state.rowsPerPage = 100;
+        state.totalRecordCountIsExact = false;
+        state.gridData = Array.from({ length: 100 }, (_, index) => [65437 + index, 65437 + index]);
+        renderDataGrid();
+        let buttons = findAllByClass(container, 'row-select-button');
+        assert.strictEqual(buttons[0].textContent, '1');
+        assert.strictEqual(buttons.at(-1)?.textContent, '100');
+        assert.strictEqual(buttons.at(-1)?.ariaLabel, 'Select row 100 on this page');
+
+        state.totalRecordCountIsExact = true;
+        state.gridData = state.gridData.slice(-36);
+        renderDataGrid();
+        buttons = findAllByClass(container, 'row-select-button');
+        assert.strictEqual(buttons[0].textContent, '65501');
+        assert.strictEqual(buttons.at(-1)?.textContent, '65536');
     });
 
     it('constructs hostile column headers with text and value properties only', async () => {
@@ -220,7 +253,8 @@ describe('grid header rendering', () => {
         state.selectedTableType = 'table';
         state.tableColumns = [
             { name: 'body', type: 'TEXT', isPrimaryKey: false },
-            { name: 'payload', type: 'BLOB', isPrimaryKey: false }
+            // SQLite accepts a BLOB in a TEXT-affinity column after a file drop.
+            { name: 'payload', type: 'TEXT', isPrimaryKey: false }
         ];
         state.gridData = [[1, 'ab', new Uint8Array([0xde, 0xad])]];
         state.gridOversizedCells = {
@@ -243,7 +277,7 @@ describe('grid header rendering', () => {
         );
         assert.match(
             collectText(oversized[1]),
-            /^de ad… · BLOB · 20 bytes · full byte-exact value not shown in grid$/
+            /^\[BLOB\] · 20 bytes$/
         );
         const expandIcons = findAllByClass(elements.get('gridContainer')!, 'expand-icon');
         assert.strictEqual(expandIcons.length, 2);

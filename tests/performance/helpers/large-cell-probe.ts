@@ -12,7 +12,8 @@ import { createNativeDatabaseConnection } from '../../../src/nativeWorker';
 import { serializeValue } from '../../../src/core/serialization';
 import { ModificationTracker } from '../../../src/core/undo-history';
 import { HostBridge, toWebviewQueryResultSet } from '../../../src/hostBridge';
-import { CellMaterializationService } from '../../../src/cellMaterialization';
+import { CellMaterializationService, type MaterializedCell } from '../../../src/cellMaterialization';
+import { CELL_TEXT_PAGE_BYTES } from '../../../src/cellContentViewer';
 import {
   WEBVIEW_TRANSPORT_SURFACES,
   toWebviewPayloadLimitErrorData
@@ -332,34 +333,46 @@ async function probeBlobInspector(options: ProbeOptions): Promise<Record<string,
     if (!metadata) throw new Error('BLOB fixture was not marked oversized');
 
     let largestDomTextChars = 0;
-    const createElement = () => {
+    interface ProbeElement {
+      style: Record<string, string>;
+      className: string;
+      textContent: string;
+      appendChild(child: ProbeElement): void;
+      addEventListener(): void;
+      setAttribute(): void;
+    }
+    const createElement = (): ProbeElement => {
       let text = '';
+      const children: ProbeElement[] = [];
       return {
         style: {},
         className: '',
-        appendChild: () => undefined,
+        appendChild: child => { children.push(child); },
+        addEventListener: () => undefined,
+        setAttribute: () => undefined,
         set textContent(value: string) {
           text = value;
+          children.length = 0;
           largestDomTextChars = Math.max(largestDomTextChars, value.length);
         },
-        get textContent() { return text; }
+        get textContent() { return text + children.map(child => child.textContent).join(''); }
       };
     };
-    (globalThis as any).document = { createElement };
+    (globalThis as any).document = { createElement, getElementById: () => null };
     const modulePath = pathToFileURL(
       path.join(REPO_ROOT, 'core', 'ui', 'modules', 'blob-inspector.js')
     ).href;
     const { BlobInspector } = await import(`${modulePath}?large-cell-probe=${process.pid}`);
     const inspector = Object.create(BlobInspector.prototype);
     inspector.currentObjectUrl = null;
-    inspector.previewContainer = { innerHTML: '', appendChild: () => undefined };
-    inspector.hexContainer = { value: '' };
+    inspector.previewContainer = createElement();
+    inspector.hexContainer = createElement();
     inspector.infoContainer = { textContent: '' };
     inspector.modal = { classList: { remove: () => undefined } };
     inspector.cleanup = () => undefined;
     inspector.setUploadState = () => undefined;
     inspector.switchTab = () => undefined;
-    inspector.inspectOversized(value, metadata, 1, 'payload', 0, 0);
+    await inspector.inspectOversized(value, metadata, 1, 'payload', 0, 0);
     const after = memorySnapshot();
 
     return {
@@ -370,6 +383,8 @@ async function probeBlobInspector(options: ProbeOptions): Promise<Record<string,
       inspectorPreviewBytes: inspector.currentData.byteLength,
       detectedType: inspector.currentType.type,
       largestDomTextChars,
+      previewRenderedChars: inspector.previewContainer.textContent.length,
+      hexRenderedChars: inspector.hexContainer.textContent.length,
       elapsedMs: performance.now() - startedAt,
       memoryBefore: before,
       memoryAfter: after,
@@ -387,9 +402,20 @@ async function probeVfsRead(options: ProbeOptions): Promise<Record<string, unkno
       path.join(options.scratchRoot, `materialized-${process.pid}`)
     );
     const materializer = new CellMaterializationService(storageRoot);
-    let openedUri: vscode.Uri | undefined;
-    let markedReadOnly = false;
+    let snapshot: MaterializedCell | undefined;
+    const materialize = materializer.materialize.bind(materializer);
+    materializer.materialize = async (...args) => {
+      snapshot = await materialize(...args);
+      return snapshot;
+    };
+    let panel: vscode.WebviewPanel | undefined;
+    let receive: ((message: unknown) => unknown) | undefined;
+    const messages: unknown[] = [];
+    const openedCommandUris: string[] = [];
+    let vfsReadFileCalled = false;
     const originalExecuteCommand = vscode.commands.executeCommand;
+    const originalCreatePanel = vscode.window.createWebviewPanel;
+    const originalReadFile = vscode.workspace.fs.readFile;
     const document = {
       uri: vscode.Uri.file(options.fixture),
       documentKey: Promise.resolve('large-cell-probe'),
@@ -405,10 +431,26 @@ async function probeVfsRead(options: ProbeOptions): Promise<Record<string, unkno
         command: string,
         uri?: vscode.Uri
       ) => {
-        if (command === 'vscode.open') openedUri = uri;
-        if (command === 'workbench.action.files.setActiveEditorReadonlyInSession') {
-          markedReadOnly = true;
-        }
+        if (command === 'vscode.open' || command === 'vscode.openWith') openedCommandUris.push(uri?.scheme ?? 'missing');
+      };
+      vscode.workspace.fs.readFile = async uri => {
+        vfsReadFileCalled = true;
+        return originalReadFile(uri);
+      };
+      vscode.window.createWebviewPanel = (...args) => {
+        const original = originalCreatePanel(...args);
+        panel = {
+          ...original,
+          webview: {
+            ...original.webview,
+            onDidReceiveMessage: listener => {
+              receive = listener;
+              return new vscode.Disposable(() => undefined);
+            },
+            postMessage: async message => { messages.push(message); return true; }
+          }
+        };
+        return panel;
       };
       const bridge = new HostBridge({
         webviews: new Map(),
@@ -416,35 +458,61 @@ async function probeVfsRead(options: ProbeOptions): Promise<Record<string, unkno
         isReadOnly: true,
         cellMaterializer: materializer
       } as any, document as any);
-      await bridge.openCellEditor(
+      const opened = await bridge.openCellEditor(
         { table: 'large_cells', name: '' },
         rowId,
         'payload',
         {},
         { value }
       );
-      if (!openedUri || openedUri.scheme !== 'file') {
-        throw new Error('Oversized VFS flow did not open a temp-backed file URI');
+      if (opened.mode !== 'paged-read-only' || !panel || !receive || !snapshot) {
+        throw new Error('Oversized cell did not open the snapshot-backed paginated viewer');
       }
-      const stat = await fs.stat(openedUri.fsPath);
-      const handle = await fs.open(openedUri.fsPath, 'r');
-      const sample = new Uint8Array(64 * 1024);
-      let sampledBytes = 0;
-      try {
-        sampledBytes = (await handle.read(sample, 0, sample.byteLength, 0)).bytesRead;
-      } finally {
-        await handle.close();
-      }
+      const stat = await fs.stat(snapshot.uri.fsPath);
+      type ContentPage = Awaited<ReturnType<typeof import('../../../src/cellContentViewer').readCellContentPage>>;
+      const requestPage = async (page: number, mode: 'text' | 'hex'): Promise<ContentPage> => {
+        messages.length = 0;
+        await receive!({ type: 'page', page, mode });
+        const reply = messages[0];
+        if (messages.length !== 1 || !reply || typeof reply !== 'object' || !('type' in reply) || reply.type !== 'page') {
+          throw new Error(`Paginated viewer did not return a page: ${JSON.stringify(messages)}`);
+        }
+        return reply as ContentPage;
+      };
+      // Exercise the production panel handler against the complete snapshot,
+      // including the tail. A manually sampled file alone does not test bounds
+      // on the bytes sent to the webview.
+      const first = await requestPage(0, 'text');
+      const last = await requestPage(Math.ceil(options.sizeBytes / CELL_TEXT_PAGE_BYTES) - 1, 'text');
+      const hex = await requestPage(0, 'hex');
+      panel.dispose();
+      const snapshotReleased = await fs.stat(snapshot.uri.fsPath).then(() => false, error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+        throw error;
+      });
       const after = memorySnapshot();
       return {
         mode: options.mode,
         kind: options.kind,
         rawCellBytes: options.sizeBytes,
-        openedScheme: openedUri.scheme,
-        vfsReadFileCalled: false,
-        markedReadOnly,
+        openedMode: opened.mode,
+        openedScheme: snapshot.uri.scheme,
+        openedCommandUris,
+        vfsReadFileCalled,
         materializedBytes: stat.size,
-        sampledBytes,
+        textPagesMatchExpected: first.text === 'T'.repeat(Math.min(options.sizeBytes, CELL_TEXT_PAGE_BYTES))
+          && last.text === 'T'.repeat(options.sizeBytes % CELL_TEXT_PAGE_BYTES || CELL_TEXT_PAGE_BYTES),
+        firstPageStart: first.byteStart,
+        firstPageEnd: first.byteEnd,
+        lastPageStart: last.byteStart,
+        lastPageEnd: last.byteEnd,
+        reportedCellBytes: first.byteLength,
+        largestTextPageBytes: Math.max(first.byteEnd - first.byteStart, last.byteEnd - last.byteStart),
+        largestTextPageChars: Math.max(first.text.length, last.text.length),
+        hexPageBytes: hex.byteEnd - hex.byteStart,
+        hexPageChars: hex.text.length,
+        hexPrefixMatches: hex.text.startsWith('00000000  ' + '54 '.repeat(15) + '54'),
+        snapshotReleased,
         elapsedMs: performance.now() - startedAt,
         memoryBefore: before,
         memoryAfter: after,
@@ -452,6 +520,9 @@ async function probeVfsRead(options: ProbeOptions): Promise<Record<string, unkno
       };
     } finally {
       (vscode.commands as any).executeCommand = originalExecuteCommand;
+      vscode.window.createWebviewPanel = originalCreatePanel;
+      vscode.workspace.fs.readFile = originalReadFile;
+      panel?.dispose();
       materializer.dispose();
     }
   });

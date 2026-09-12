@@ -32,6 +32,8 @@ import { closeModal, openModal } from './modals.js';
 
 let blobInspector;
 let isSavingCellPreview = false;
+// Engine transport limits do not bound browser editable-text layout work.
+const MAX_EMBEDDED_TEXT_CODE_UNITS = 64 * 1024;
 
 export function initEdit() {
     blobInspector = new BlobInspector();
@@ -46,6 +48,7 @@ export function initEdit() {
     document.getElementById('cellPreviewNullBtn')?.addEventListener('click', setCellPreviewNull);
     document.getElementById('btnCancelCellPreview')?.addEventListener('click', closeCellPreview);
     document.getElementById('cellPreviewSaveBtn')?.addEventListener('click', saveCellPreview);
+    document.getElementById('cellPreviewDownloadBtn')?.addEventListener('click', downloadCellPreview);
     const previewTextarea = document.getElementById('cellPreviewTextarea');
     previewTextarea?.addEventListener('keydown', onCellPreviewKeydown);
     previewTextarea?.addEventListener('blur', () => resetTextareaTabFocusEscape(previewTextarea));
@@ -57,7 +60,7 @@ export function initEdit() {
 
 export function startCellEdit(rowIdx, colIdx, rowId) {
     if (state.isReadOnly || state.selectedTableType !== 'table') {
-        updateStatus('Views are read-only');
+        updateStatus(state.isReadOnly ? 'Document is read-only' : 'Views are read-only');
         return;
     }
 
@@ -98,6 +101,10 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     if (value instanceof Uint8Array) {
         openCellPreview(rowIdx, colIdx, rowId);
         return;
+    }
+
+    if (typeof value === 'string' && value.length > MAX_EMBEDDED_TEXT_CODE_UNITS) {
+        return openCellPreview(rowIdx, colIdx, rowId);
     }
 
     // Auto-open JSON in modal
@@ -314,6 +321,7 @@ async function saveCellEditAndMove(direction) {
     // already drifted, the post-save advance below must compare against the
     // table the edit belongs to, not whatever is now selected.
     const targetTable = editSession.table;
+    const targetConnectionGeneration = state.connectionGeneration;
     const { rowIdx, colIdx, originalValue, originalText } = editSession;
     const submittedValue = state.activeCellInput?.value;
 
@@ -352,12 +360,27 @@ async function saveCellEditAndMove(direction) {
     const submittedOriginalText = originalText
         ?? (originalValue === null ? '' : String(originalValue));
     if (submittedValue !== submittedOriginalText) {
-        // recordExternalModification posts refreshContent before the update RPC
-        // response, but that broadcast is not awaited. Start an authoritative
-        // post-commit reload after the editor is cleaned up; its load token
-        // supersedes any still-running broadcast refresh and it renders the row
-        // indices that startCellEdit will use below.
-        if (await loadTableData(false) !== true) return;
+        // The host echo reloads schema before rows. Its slower schema request
+        // can supersede our row load during the first-paint yield, dropping Tab
+        // navigation. Finish that echo before rendering the next edit target.
+        for (;;) {
+            while (state.contentRefreshPromise) {
+                try {
+                    await state.contentRefreshPromise;
+                } catch {
+                    // refreshContent already displays the failure. Leave its
+                    // error visible instead of opening an editor on stale rows.
+                    return;
+                }
+            }
+            if (state.selectedTable !== targetTable
+                || state.connectionGeneration !== targetConnectionGeneration
+                || state.editingCellInfo) return;
+            const loaded = await loadTableData(false);
+            if (state.contentRefreshPromise) continue;
+            if (loaded !== true) return;
+            break;
+        }
     }
 
     const nextRowIdx = state.gridData.findIndex((row, index) => (
@@ -393,6 +416,37 @@ function cleanupCellEdit() {
 // CELL PREVIEW MODAL
 // ================================================================
 
+
+export async function downloadCellPreview() {
+    const session = state.cellPreviewInfo;
+    if (!session || session.downloading) return;
+    if ((session.connectionGeneration !== undefined && session.connectionGeneration !== state.connectionGeneration)
+        || (session.contentGeneration !== undefined && session.contentGeneration !== state.contentGeneration)) {
+        updateStatus('The database content changed. Reopen this cell before downloading.');
+        return;
+    }
+    session.downloading = true;
+    const button = document.getElementById('cellPreviewDownloadBtn');
+    if (button) button.disabled = true;
+    const storedCell = session.canReadStoredCell === true;
+    try {
+        const result = storedCell
+            ? await backendApi.openCellEditor(
+                { table: session.table, name: '' }, validateRowId(session.rowId), session.columnName, {},
+                { download: true, type: { type: 'text', ext: 'txt', mime: 'text/plain' } }
+            )
+            : await backendApi.saveFile('cell.txt', new TextEncoder().encode(session.originalText ?? ''));
+        if (state.cellPreviewInfo !== session) return;
+        updateStatus(result?.success === false
+            ? (result.cancelled ? 'Save cancelled. Your draft is unchanged.' : result.message || 'Download failed')
+            : `${storedCell ? 'Stored cell' : 'Displayed text'} downloaded. Your draft is unchanged.`);
+    } catch (error) {
+        if (state.cellPreviewInfo === session) updateStatus(`Download failed: ${getErrorMessage(error)}`);
+    } finally {
+        session.downloading = false;
+        if (state.cellPreviewInfo === session && button) button.disabled = false;
+    }
+}
 
 export async function openCellInVsCode() {
     if (!state.cellPreviewInfo) return;
@@ -490,6 +544,19 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         return;
     }
 
+    if (typeof value === 'string' && value.length > MAX_EMBEDDED_TEXT_CODE_UNITS) {
+        if (!blobInspector) {
+            updateStatus('Large TEXT preview is unavailable. Reopen the database editor.');
+            return;
+        }
+        if (state.selectedTableType === 'table' && !getReadOnlyRowReason(rowIdx)) {
+            return blobInspector.inspectStoredText(rowId, column.name, rowIdx, colIdx);
+        }
+        // Views and rows without a stable identity cannot supply stored bytes.
+        // Their complete displayed value remains copyable in bounded text blocks.
+        return blobInspector.inspect(value, rowId, column.name, rowIdx, colIdx);
+    }
+
     const originalText = String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '');
     state.cellPreviewInfo = {
         rowIdx,
@@ -503,7 +570,12 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         documentReadOnly: state.isReadOnly,
         originalValue: value,
         originalText,
+        connectionGeneration: state.connectionGeneration,
+        contentGeneration: state.contentGeneration,
         readOnlyReason: readOnlyRowReason,
+        // Generated columns cannot be edited, but a stable row identity can
+        // still read their stored bytes. Snapshot that capability separately.
+        canReadStoredCell: state.selectedTableType === 'table' && !getReadOnlyRowReason(rowIdx),
         valueMode: 'value',
         dirty: false
     };
@@ -516,6 +588,15 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     resetTextareaTabFocusEscape(textarea);
     const readonlyBadgeEl = document.getElementById('cellPreviewReadonlyBadge');
     const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
+    const downloadBtnEl = document.getElementById('cellPreviewDownloadBtn');
+    if (downloadBtnEl) {
+        const storedCell = previewSession.canReadStoredCell;
+        downloadBtnEl.disabled = false;
+        downloadBtnEl.textContent = storedCell ? 'Download stored cell' : 'Download displayed text';
+        downloadBtnEl.title = storedCell
+            ? 'Download the byte-exact stored cell; unsaved modal text is excluded'
+            : 'Download the original displayed value as UTF-8; unsaved modal text is excluded';
+    }
     const openInVsCodeBtnEl = document.getElementById('openInVsCodeBtn');
     const emptyBtnEl = document.getElementById('cellPreviewEmptyBtn');
     const nullBtnEl = document.getElementById('cellPreviewNullBtn');

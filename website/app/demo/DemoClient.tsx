@@ -13,6 +13,7 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
+import Link from 'next/link';
 import { Upload, Database, FileUp, ArrowLeft, Download, RefreshCw, AlertCircle } from 'lucide-react';
 import { isTrustedViewerMessage } from './messageGuard';
 import {
@@ -669,11 +670,16 @@ export default function DemoClient() {
     }
   }, [callWorker]);
 
-  reloadDatabaseRef.current = () => reloadDemoDatabase(
-    databaseBinary.current ?? databaseFile.current,
-    databaseName,
-    initializeWorker
-  );
+  useEffect(() => {
+    reloadDatabaseRef.current = () => reloadDemoDatabase(
+      databaseBinary.current ?? databaseFile.current,
+      databaseName,
+      initializeWorker
+    );
+    return () => {
+      reloadDatabaseRef.current = null;
+    };
+  }, [databaseName, initializeWorker]);
 
   // -------------------------------------------------------------------------
   // File Handling
@@ -863,13 +869,13 @@ export default function DemoClient() {
       {/* Header */}
       <header className="border-b border-(--ui-edge) px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <a
+          <Link
             href="/"
             className="flex items-center gap-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
           >
             <ArrowLeft className="w-4 h-4" />
             <span className="text-sm">Back</span>
-          </a>
+          </Link>
           <div className="h-6 w-px bg-(--ui-edge)" />
           <div className="flex items-center gap-2">
             <Database className="w-5 h-5 text-(--ui-accent)" />

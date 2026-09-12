@@ -72,6 +72,7 @@ const WEBVIEW_RPC_METHODS = new Set<string>([
   'deleteColumns',
   'createTable',
   'getViewDefinition',
+  'openQueryEditor',
   'validateViewDefinition',
   'previewViewDefinition',
   'createView',
@@ -93,6 +94,7 @@ const WEBVIEW_RPC_METHODS = new Set<string>([
   'releaseCellMediaPreview',
   'openViewEditor',
   'confirmLargeSelection',
+  'confirmLargeChanges',
   'getExtensionSettings',
   'updateExtensionSetting',
   'exportTable',
@@ -223,7 +225,9 @@ export class WebviewMessageHandler {
           const serializedResult = serializeValue(result, {
             surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
           });
-          this.postMessage({
+          // postMessage can reject asynchronously (for example during JSON
+          // serialization). Keep it in this chain so the caller gets a failure.
+          return this.postMessage({
             channel: 'rpc',
             content: {
               kind: 'response',
@@ -300,7 +304,7 @@ export class WebviewMessageHandler {
         const serializedResult = serializeValue(result, {
           surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
         });
-        this.postMessage({
+        return this.postMessage({
           type: 'rpc-response',
           id: responseId,
           result: serializedResult

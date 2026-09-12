@@ -1,5 +1,6 @@
 
 import { EventEmitter } from 'events';
+import type { Uri } from 'vscode';
 
 class classEventEmitter {
     private _listeners: Function[] = [];
@@ -108,6 +109,18 @@ export const mockVscode = {
         executeCommand: (command: string, ...args: any[]) => Promise.resolve()
     },
     window: {
+        createWebviewPanel: (..._args: unknown[]) => {
+            const dispose = new classEventEmitter();
+            return {
+                webview: {
+                    html: '',
+                    postMessage: async (_message: unknown) => true,
+                    onDidReceiveMessage: new classEventEmitter().event
+                },
+                onDidDispose: dispose.event,
+                dispose: () => dispose.fire(undefined)
+            };
+        },
         tabGroups: {
             onDidChangeTabs: changeTabsEmitter.event,
             __fireDidChangeTabs: (event: any) => changeTabsEmitter.fire(event)
@@ -126,6 +139,7 @@ export const mockVscode = {
         ),
     },
     workspace: {
+        save: (uri: Uri): Promise<Uri | undefined> => Promise.resolve(uri),
         _config: new Map<string, unknown>(),
         getConfiguration: function() {
             const store = (this as any)._config as Map<string, unknown>;
