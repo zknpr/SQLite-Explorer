@@ -214,6 +214,69 @@ async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown
     return result[0]?.rows?.[0]?.[0];
 }
 
+describe('web demo SQL editor queries', () => {
+    it('runs parameterized reads with exact integers, NULL and BLOB values', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('executeReadQuery',
+            "SELECT ? AS label, CAST(? AS INTEGER) AS exact, NULL AS empty, x'0102' AS bytes",
+            '["hello", "9223372036854775807"]');
+        assert.deepStrictEqual(Array.from(result.headers), ['label', 'exact', 'empty', 'bytes']);
+        assert.strictEqual(result.rows[0][0], 'hello');
+        assert.strictEqual(result.exactIntegerTexts[0][1], '9223372036854775807');
+        assert.strictEqual(result.rows[0][2], null);
+        assert.deepStrictEqual(result.rows[0][3], new Uint8Array([1, 2]));
+    });
+
+    it('keeps read-only databases queryable and cleans up after errors', async () => {
+        const worker = await createWorkerHarness({ readOnlyMode: true });
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT 1 AS value')).rows[0][0], 1);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT * FROM missing_table'), /missing_table/);
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT query_only FROM pragma_query_only')).rows[0][0], 1);
+        assert.strictEqual((await worker.invoke('executeReadQuery',
+            "SELECT count(*) FROM sqlite_temp_schema WHERE name LIKE 'query_columns_%'")).rows[0][0], 0);
+        await assert.rejects(worker.invoke('runQuery', 'CREATE TABLE items (id INTEGER)'), /read-only/);
+    });
+
+    it('rejects writes, multiple statements and invalid bindings without changing the database', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', "CREATE TABLE items (label TEXT); INSERT INTO items VALUES ('original')");
+        for (const sql of ["UPDATE items SET label = 'changed'", 'SELECT 1; SELECT 2']) {
+            await assert.rejects(worker.invoke('executeReadQuery', sql));
+        }
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[]'), /Expected 1/);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[true]'), /null, string/);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[9007199254740993]'), /safe integer/);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '{'), /JSON/);
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT label FROM items')).rows[0][0], 'original');
+    });
+
+    it('bounds rows, columns and bytes before transporting results', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('executeReadQuery',
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1200) SELECT x, zeroblob(10000) AS payload FROM n');
+        assert.strictEqual(result.rows.length, 1001, 'one extra row signals truncation at 1000');
+        assert.ok(result.oversizedCells[0][1]);
+        assert.ok(result.rows.reduce((bytes: number, row: [number, Uint8Array]) => bytes + row[1].byteLength, 0) <= 4 * 1024 * 1024);
+        await assert.rejects(worker.invoke('executeReadQuery',
+            `SELECT ${Array.from({ length: 129 }, (_, i) => `${i} AS c${i}`).join(',')}`), /128/);
+        const clipped = await worker.invoke('executeReadQuery', 'SELECT zeroblob(70000) AS payload');
+        assert.strictEqual(clipped.oversizedCells[0][0].byteLength, 70000);
+        assert.ok(clipped.rows[0][0].byteLength <= 65536);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+    });
+
+    it('clears the VM deadline after a timed-out query', async () => {
+        let expired = false;
+        let clock = 0;
+        const worker = await createWorkerHarness({ queryTimeout: 10, now: () => expired ? (clock += 20) : clock });
+        expired = true;
+        await assert.rejects(worker.invoke('executeReadQuery',
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n'), /timed out/);
+        expired = false;
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT 1')).rows[0][0], 1);
+    });
+});
+
 describe('web demo view worker', () => {
     it('bounds database-controlled errors before response and diagnostic delivery', async () => {
         const diagnostics: unknown[][] = [];

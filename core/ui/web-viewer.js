@@ -227,6 +227,9 @@ async function initializeApp() {
         const vscodeBtn = document.getElementById('openInVsCodeBtn');
         if (vscodeBtn) vscodeBtn.style.display = 'none';
 
+        // The demo parent supplies its own SQL editor through the web RPC adapter.
+        document.getElementById('btnOpenQuery')?.classList.remove('hidden');
+
         updateStatus('Connecting to database...');
 
         // Initialize connection - parent window handles this

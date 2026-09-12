@@ -388,6 +388,7 @@ export function sendRpcError(correlationId, error) {
 export const backendApi = {
     initialize: () => sendRpcRequest('initialize', []),
     refreshFile: () => sendRpcRequest('refreshFile', []),
+    openQueryEditor: () => sendRpcRequest('openQueryEditor', []),
     // The standalone demo has no VS Code globalState; keep the shared resize
     // lifecycle callable without pretending the width persists outside it.
     saveSidebarState: async () => undefined,

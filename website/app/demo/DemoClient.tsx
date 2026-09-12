@@ -28,6 +28,8 @@ import {
   type PendingWorkerCall
 } from './lifecycle';
 import { DEMO_INLINE_CONTENT_MAX_BYTES } from '../../../src/core/paged-open';
+import type { QueryResultSet } from '../../../src/core/types';
+import DemoSqlEditor from './DemoSqlEditor';
 import {
   demoRpcErrorFields,
   demoRpcErrorFromResponse,
@@ -116,6 +118,7 @@ const SAMPLE_DATABASES = [
 
 const CANCELLATION_PARAMETER_INDEX: Readonly<Record<string, number>> = {
   runQuery: 2,
+  executeReadQuery: 2,
   previewViewDefinition: 4
 };
 
@@ -153,6 +156,8 @@ function createSharedCancellationFlag(signal?: AbortSignal) {
 // ============================================================================
 
 export default function DemoClient() {
+  const [queryEditorOpen, setQueryEditorOpen] = useState(false);
+  const [querySession, setQuerySession] = useState(0);
   // -------------------------------------------------------------------------
   // State
   // -------------------------------------------------------------------------
@@ -366,6 +371,18 @@ export default function DemoClient() {
       }
 
       // Special handling for extension-specific methods
+      if (targetMethod === 'openQueryEditor') {
+        const connected = workerRef.current !== null;
+        if (connected) setQueryEditorOpen(true);
+        postIframeRpcResponse(event.source, viewerOrigin, {
+          kind: 'response',
+          messageId,
+          success: connected,
+          ...(connected ? {} : { errorMessage: 'No database initialized' })
+        });
+        return;
+      }
+
       if (targetMethod === 'initialize') {
         // Already initialized, just return success. Read-only reflects how
         // the worker actually opened the database (stale-runtime paged
@@ -565,6 +582,8 @@ export default function DemoClient() {
    * File — the guard rejects larger inline Uint8Arrays.
    */
   const initializeWorker = useCallback(async (source: Uint8Array | File, filename: string) => {
+    setQueryEditorOpen(false);
+    setQuerySession(session => session + 1);
     // Terminate existing worker
     activePreviewController.current?.abort();
     activePreviewController.current = null;
@@ -1050,6 +1069,14 @@ export default function DemoClient() {
               src={`${process.env.NEXT_PUBLIC_SQLITE_VIEWER_BASE_PATH}/viewer.html`}
               className="flex-1 border-0"
               title="SQLite Viewer"
+            />
+            <DemoSqlEditor
+              key={querySession}
+              open={queryEditorOpen}
+              databaseName={databaseName ?? 'Database'}
+              onClose={() => setQueryEditorOpen(false)}
+              executeQuery={async (sql, parameters) =>
+                await callWorker('executeReadQuery', [sql, parameters]) as QueryResultSet}
             />
           </div>
         )}

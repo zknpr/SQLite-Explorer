@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "test:demo-cache": "node --test tests/demo-cache.test.mjs"
+    "test:demo-cache": "node --test tests/demo-cache.test.mjs",
+    "test:demo-sql": "node --test tests/demo-sql.test.mjs"
   },
   "dependencies": {
     "@vercel/analytics": "^2.0.1",

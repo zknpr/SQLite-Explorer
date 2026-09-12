@@ -52,6 +52,14 @@ import {
   encodeSqlExportCell
 } from '../../../src/core/export-encoding.ts';
 import { executeSchemaPreservingColumnDrop } from '../../../src/core/column-drop.ts';
+import {
+  prepareReadQuery,
+  parseQueryParameters,
+  buildReadTransport,
+  decodeReadTransport,
+  SQL_RESULT_ROWS,
+  SQL_MAX_COLUMNS
+} from '../../../src/core/sql-workspace.ts';
 import { getActiveFilterValue } from '../../../src/core/filter-utils.ts';
 import {
   applyMergePatch,
@@ -988,6 +996,65 @@ async function runQuery(sql, params = [], cancellationFlag) {
   } catch (error) {
     throw error;
   }
+}
+
+/** Browser SQL workspace: one read query, with the extension's transport limits. */
+async function executeReadQuery(sql, parameterText = '[]', cancellationFlag) {
+  if (!db) throw new Error('No database initialized');
+  if (typeof sql !== 'string' || typeof parameterText !== 'string') {
+    throw new TypeError('SQL and parameter JSON must be strings');
+  }
+  const prepared = prepareReadQuery(sql);
+  const params = parseQueryParameters(parameterText);
+  if (params.length !== prepared.parameterCount) {
+    throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
+  }
+  const metadataView = `query_columns_${crypto.randomUUID().replace(/-/g, '')}`;
+  const queryOnly = Number(db.exec('PRAGMA query_only')[0]?.values[0]?.[0]) === 1;
+  let createdMetadataView = false;
+  let headers;
+  try {
+    // Match the WASM engine: TEMP metadata DDL needs query_only lifted, but no
+    // user query is stepped and no await occurs before the guard is restored.
+    if (queryOnly) runSingleStatement('PRAGMA query_only = OFF');
+    headers = executeWithProgressHandler(() => {
+      runSingleStatement(`CREATE TEMP VIEW "${metadataView}" AS ${prepared.metadataSql}`);
+      createdMetadataView = true;
+      // Bound database-controlled labels before extracting them into JavaScript.
+      const names = (db.exec(
+        "SELECT substr(name, 1, 4097) FROM pragma.pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?",
+        [metadataView, SQL_MAX_COLUMNS + 1]
+      )[0]?.values ?? []).map(row => String(row[0]));
+      if (!names.length || names.length > SQL_MAX_COLUMNS) throw new Error('Queries support 1 to 128 result columns.');
+      if (names.some(header => header.length > 4096)) throw new Error('Result column labels must be at most 4096 characters.');
+      return names;
+    }, cancellationFlag);
+  } finally {
+    try { if (createdMetadataView) runSingleStatement(`DROP VIEW temp."${metadataView}"`); }
+    finally {
+      if (queryOnly) {
+        try { runSingleStatement('PRAGMA query_only = ON'); }
+        catch (error) {
+          const failedDatabase = db;
+          db = null;
+          failedDatabase.close();
+          throw error;
+        }
+      }
+    }
+  }
+  return executeWithProgressHandler(() => {
+    const transport = buildReadTransport(prepared.sql, headers.length);
+    const statement = prepareSingleStatement(transport.sql);
+    try {
+      statement.bind(params);
+      const rows = [];
+      while (rows.length <= SQL_RESULT_ROWS && statement.step()) {
+        rows.push(statement.get(null, { useBigInt: true }));
+      }
+      return decodeReadTransport(headers, rows, transport.valueColumnCount);
+    } finally { statement.free(); }
+  }, cancellationFlag);
 }
 
 /**
@@ -4469,6 +4536,7 @@ async function refreshFile() {
 const methods = {
   initializeDatabase,
   runQuery,
+  executeReadQuery,
   getCellMetadata,
   openCellReadSession,
   readCellChunk,

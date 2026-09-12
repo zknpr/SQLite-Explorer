@@ -20,6 +20,18 @@ npm run start
 
 ## Demo runtime assets
 
+The demo's **SQL Query** button opens a browser editor on the current database,
+including read-only files. Run one SELECT or WITH query with optional positional
+parameters (a JSON array). Cmd/Ctrl+Enter runs the query; Escape closes the editor.
+Drafts and results survive closing it, but reset when the database is reloaded or
+replaced. Database writes remain in the table viewer.
+
+Queries use the extension's read-only SQL helpers: a 30-second SQLite deadline,
+1,000 displayed rows, 128 columns, and a 4 MiB raw result budget. Large cells are
+marked as previews; long display values are also shortened. Exact large integers
+are preserved. Results render 50 rows per page. No database content leaves the
+browser.
+
 The website build hashes the generated worker, viewer, sql.js glue, and WASM
 binary together. All four are served under one content-versioned URL prefix.
 Only the current prefix is rewritten to the public assets, and only those URLs
@@ -36,6 +48,7 @@ Run the warm-cache browser regression after a production build:
 # From website/, with root and website dependencies installed
 npm run build
 npm run test:demo-cache
+npm run test:demo-sql
 ```
 
 The test starts an isolated local server and headless Chromium, warms the old
@@ -44,6 +57,10 @@ It checks the versioned asset responses and rejects unknown revision URLs. Insta
 the Chromium version required by the root `playwright-core` dependency, or set
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to an existing Chrome executable. No user
 browser profile or production deployment is used.
+
+The SQL regression exercises the actual sidebar button, reads on both samples,
+parameters, errors and recovery, exact values, row limits, pagination, keyboard
+controls, reload isolation, and the mobile dialog layout.
 
 ## Deployment
 
