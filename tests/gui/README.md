@@ -8,7 +8,7 @@ independently through SQLite on the test files.
 Build and package first, then run from the repository with Node 24:
 
 ```sh
-GUI_VSIX=release/sqlite-explorer-darwin-arm64-1.8.0-dev.vsix npm run test:gui
+GUI_VSIX=release/sqlite-explorer-darwin-arm64-1.8.0.vsix npm run test:gui
 ```
 
 The default application version is the supported minimum, 1.110.0. The runner can
