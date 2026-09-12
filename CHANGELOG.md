@@ -13,6 +13,9 @@
 
 ### Fixes
 
+- Keep native Run Query cancellable with TEMP objects or pending transactions, and bind query headers and results to one SQLite snapshot across external schema changes.
+- Refuse query and cell exports to missing SQLite sidecars through directory or database-file aliases. Pin new export destinations to the resolved parent directory.
+- Refresh stale exact page counts after external row deletions and before Last navigation. Download generated TEXT cells through the stored-byte path while keeping them read-only.
 - Allow native database opens above the default 200 MB file-size limit without a configuration change. Keep the limit for WASM fallback and buffered database copies.
 - Batch native Undo/Redo reads and guarded writes while preserving conflict detection and rollback. Avoid repeated grid scans and duplicate in-flight table refreshes after batch updates, and retain refresh errors instead of reporting false completion.
 - Cancel an in-progress native Explain without closing its primary connection or losing TEMP objects and pending transactions. Expected Run/Explain cancellation no longer displays an error notification; SQL failures and deadlines remain visible.
