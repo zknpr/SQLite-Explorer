@@ -272,6 +272,16 @@
     "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts",
     "compile:desktop-tests": "rm -rf .desktop-test-out && tsc -p tsconfig.desktop.json",
     "test:desktop": "npm run compile:desktop-tests && node scripts/run-desktop-tests.mjs",
+    "test:gui": "node tests/gui/installed-vsix.mjs",
+    "test:gui:lifecycle": "node tests/gui/lifecycle.mjs",
+    "test:gui:grid": "node tests/gui/grid-query.mjs",
+    "test:gui:cells": "node tests/gui/cell-workflows.mjs",
+    "test:gui:edges": "node tests/gui/interface-edges.mjs",
+    "test:gui:sharing": "node tests/gui/sharing-keys.mjs",
+    "test:gui:progress": "node tests/gui/progress-cancellation.mjs",
+    "test:gui:interactions": "node tests/gui/interaction-details.mjs",
+    "test:gui:contention": "node tests/gui/native-contention.mjs",
+    "test:gui:uploads": "node tests/gui/drop-upload.mjs",
     "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts"
   },
   "devDependencies": {
