@@ -30,7 +30,68 @@ import type { CellMaterializationService } from './cellMaterialization';
 import { confirmFileReplacement } from './fileReplacementConfirmation';
 
 /** Coalesce provider opens that race before their shared document is registered. */
-const PendingDocumentOpens = new Map<string, Promise<DatabaseDocument>>();
+const PendingDocumentOpens = new Map<string, { uri: vsc.Uri; document: Promise<DatabaseDocument> }>();
+
+/** Match the path the atomic writer replaces without changing persisted document keys. */
+async function findSaveAsDestinations(destination: vsc.Uri): Promise<{ targets: DatabaseDocument[]; writeUri: vsc.Uri }> {
+  const key = await generateDatabaseDocumentKey(destination);
+  const targets = new Set<DatabaseDocument>();
+  const exact = DocumentRegistry.get(key) ?? await PendingDocumentOpens.get(key)?.document;
+  if (exact) targets.add(exact);
+  if (destination.scheme !== 'file' || uiKindToString(vsc.env.uiKind) === 'web') return { targets: [...targets], writeUri: destination };
+
+  const { realpath } = (await import('fs')).promises;
+  const canonicalPath = async (uri: vsc.Uri): Promise<string | undefined> => {
+    if (uri.scheme !== 'file') return undefined;
+    try { return await realpath(uri.fsPath); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  };
+  const destinationPath = await canonicalPath(destination);
+  if (destinationPath === undefined) return { targets: [...targets], writeUri: destination };
+  const candidates = [
+    ...[...DocumentRegistry.values()].map(document => ({ uri: document.uri, document: Promise.resolve(document) })),
+    ...PendingDocumentOpens.values()
+  ];
+  await Promise.all(candidates.map(async candidate => {
+    if (await canonicalPath(candidate.uri) === destinationPath) targets.add(await candidate.document);
+  }));
+  // Pin the writer to this resolution too: a retargeted symlink must not make
+  // it overwrite a different open database whose handles were never retired.
+  return { targets: [...targets], writeUri: vsc.Uri.file(destinationPath) };
+}
+
+/** Close all aliases before writing, then let each document recover independently. */
+async function replaceSaveAsDestinations(
+  targets: DatabaseDocument[], write: () => Promise<void>, cancellation: vsc.CancellationToken
+): Promise<void> {
+  if (!targets.length) return write();
+  let ready = 0;
+  let finish!: (outcome: { error: unknown } | { saved: true }) => void;
+  const outcome = new Promise<{ error: unknown } | { saved: true }>(resolve => { finish = resolve; });
+  const results = await Promise.allSettled(targets.map(async target => {
+    try {
+      await target.replaceFromSaveAs(async () => {
+        if (++ready === targets.length) {
+          try { await write(); finish({ saved: true }); }
+          catch (error) { finish({ error }); }
+        }
+        const result = await outcome;
+        if ('error' in result) throw result.error;
+      }, cancellation);
+    } catch (error) {
+      // A refused/dirty alias releases peers that already closed their handles.
+      // Post-write reopen failures must not make those peers retain old history.
+      finish({ error });
+      throw error;
+    }
+  }));
+  const errors = [...new Set(results.flatMap(result => result.status === 'rejected' ? [result.reason] : []))];
+  if (errors.length === 1) throw errors[0];
+  if (errors.length) throw new AggregateError(errors, 'Save As failed for one or more open destination documents.');
+}
 
 async function acquireDatabaseDocument(
   provider: DatabaseViewerProvider,
@@ -49,7 +110,7 @@ async function acquireDatabaseDocument(
 
   const pending = PendingDocumentOpens.get(documentKey);
   if (pending) {
-    const document = await pending;
+    const document = await pending.document;
     document.retainReference();
     return document;
   }
@@ -63,11 +124,11 @@ async function acquireDatabaseDocument(
     undefined,
     documentKey
   );
-  PendingDocumentOpens.set(documentKey, creation);
+  PendingDocumentOpens.set(documentKey, { uri, document: creation });
   try {
     return await creation;
   } finally {
-    if (PendingDocumentOpens.get(documentKey) === creation) {
+    if (PendingDocumentOpens.get(documentKey)?.document === creation) {
       PendingDocumentOpens.delete(documentKey);
     }
   }
@@ -510,13 +571,11 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
     if (destination.toString() !== document.uri.toString()
       && !(await confirmFileReplacement(destination))) throw new vsc.CancellationError();
     if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
-    const key = await generateDatabaseDocumentKey(destination);
-    const target = DocumentRegistry.get(key) ?? await PendingDocumentOpens.get(key);
-    if (target && target !== document) {
-      await target.replaceFromSaveAs(() => document.saveAs(destination, cancellation), cancellation);
-    } else {
-      await document.saveAs(destination, cancellation);
-    }
+    const { targets, writeUri } = await findSaveAsDestinations(destination);
+    if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+    await replaceSaveAsDestinations(
+      targets.filter(target => target !== document), () => document.saveAs(writeUri, cancellation), cancellation
+    );
   }
 
   /**

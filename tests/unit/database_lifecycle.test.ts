@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 import * as vscode from 'vscode';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
+import { createNativeDatabaseConnection } from '../../src/nativeWorker';
 import type { DatabaseOperations } from '../../src/core/types';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { mockVscode } from './mocks/vscode';
@@ -23,6 +24,8 @@ let documents: Set<Document>;
 let backup: Uint8Array;
 let events: Edit[];
 let failOpenFor: string | undefined;
+let nativeConnections: boolean;
+let deferOpen: ((uri: vscode.Uri) => Promise<void>) | undefined;
 let controllerModule: typeof import('../../src/editorController');
 const engines: Engine[] = [];
 
@@ -64,16 +67,19 @@ describe('database custom-editor lifecycle', () => {
     fs.mkdirSync(path.resolve('.tmp/unit-database-lifecycle'), { recursive: true });
     directory = fs.mkdtempSync(path.resolve('.tmp/unit-database-lifecycle/run-'));
     documents = new Set(); events = []; backup = new Uint8Array(); failOpenFor = undefined;
+    nativeConnections = false; deferOpen = undefined;
     const cache = require('node:module')._cache;
     for (const name of ['../../src/databaseModel', '../../src/editorController', '../../src/documentRegistry']) delete cache[require.resolve(name)];
     const factoryPath = require.resolve('../../src/workerFactory');
     cache[factoryPath] = { id: factoryPath, filename: factoryPath, loaded: true, exports: {
       createDatabaseConnection: async () => {
+        if (nativeConnections) return createNativeDatabaseConnection(vscode.Uri.file(process.cwd()));
         let active: Engine | undefined;
         return {
           establishConnection: async (uri: vscode.Uri) => {
             if (uri.fsPath === failOpenFor) throw new Error('Controlled replacement-open failure');
             active = await engineFor(fs.readFileSync(uri.fsPath));
+            await deferOpen?.(uri);
             return { databaseOps: active, isReadOnly: false, storage: 'memory' };
           },
           workerMethods: { [Symbol.dispose]: () => active?.shutdown?.() }
@@ -150,6 +156,163 @@ describe('database custom-editor lifecycle', () => {
     assert.equal(await value(target), 'unsaved target');
     await events.at(-1)!.undo();
     assert.equal(await value(target), 'original target');
+  });
+
+  for (const aliasSide of ['destination', 'open document'] as const) {
+    it(`Save As refreshes a destination reached through a symlink on the ${aliasSide}`, async () => {
+      const sourceUri = await fixture('source.db', 'copied value');
+      const targetUri = await fixture('target.db', 'original target');
+      const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
+      fs.symlinkSync(targetUri.fsPath, aliasUri.fsPath);
+      const source = await open(sourceUri);
+      const target = await open(aliasSide === 'destination' ? targetUri : aliasUri);
+      const oldOperations = target.databaseOperations;
+
+      await provider.saveCustomDocumentAs(source, aliasSide === 'destination' ? aliasUri : targetUri, token);
+
+      assert.equal(await value(target), 'copied value');
+      await assert.rejects(() => oldOperations.executeQuery(query), /closed/i);
+      assert.equal(fs.lstatSync(aliasUri.fsPath).isSymbolicLink(), true);
+      await target.hostBridge.updateCell('items', 1, 'name', 'target still owns edits');
+      await target.save();
+      assert.equal(await value(source), 'copied value');
+    });
+  }
+
+  it('Save As refuses a dirty alias even when the literal destination document is clean', async () => {
+    const sourceUri = await fixture('source.db', 'copied value');
+    const targetUri = await fixture('target.db', 'original target');
+    const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
+    fs.symlinkSync(targetUri.fsPath, aliasUri.fsPath);
+    const source = await open(sourceUri);
+    const target = await open(targetUri);
+    const alias = await open(aliasUri);
+    await alias.hostBridge.updateCell('items', 1, 'name', 'unsaved alias');
+    const bytes = fs.readFileSync(targetUri.fsPath);
+
+    await assert.rejects(() => provider.saveCustomDocumentAs(source, targetUri, token), /unsaved changes/i);
+
+    assert.deepEqual(fs.readFileSync(targetUri.fsPath), bytes);
+    assert.equal(await value(target), 'original target');
+    assert.equal(await value(alias), 'unsaved alias');
+    assert.equal(fs.lstatSync(aliasUri.fsPath).isSymbolicLink(), true);
+  });
+
+  it('Save As pins the writer to the canonical destination whose handles were retired', async () => {
+    const sourceUri = await fixture('source.db', 'copied value');
+    const targetUri = await fixture('target.db', 'original target');
+    const otherUri = await fixture('other.db', 'unrelated database');
+    const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
+    fs.symlinkSync(targetUri.fsPath, aliasUri.fsPath);
+    const source = await open(sourceUri);
+    const target = await open(targetUri);
+    const other = await open(otherUri);
+    const write = source.databaseOperations.writeToFile.bind(source.databaseOperations);
+    mock.method(source.databaseOperations, 'writeToFile', async (...args: Parameters<typeof write>) => {
+      fs.unlinkSync(aliasUri.fsPath);
+      fs.symlinkSync(otherUri.fsPath, aliasUri.fsPath);
+      return write(...args);
+    });
+
+    await provider.saveCustomDocumentAs(source, aliasUri, token);
+
+    assert.equal(await value(target), 'copied value');
+    assert.equal(await value(other), 'unrelated database');
+    const onDisk = await engineFor(fs.readFileSync(otherUri.fsPath));
+    assert.equal((await onDisk.executeQuery(query))[0].rows[0][0], 'unrelated database');
+  });
+
+  it('Save As refreshes every clean document for the same canonical destination', async () => {
+    const sourceUri = await fixture('source.db', 'copied value');
+    const targetUri = await fixture('target.db', 'original target');
+    const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
+    fs.symlinkSync(targetUri.fsPath, aliasUri.fsPath);
+    const source = await open(sourceUri);
+    const target = await open(targetUri);
+    const alias = await open(aliasUri);
+    const oldTarget = target.databaseOperations;
+    const oldAlias = alias.databaseOperations;
+    const write = source.databaseOperations.writeToFile.bind(source.databaseOperations);
+    mock.method(source.databaseOperations, 'writeToFile', async (...args: Parameters<typeof write>) => {
+      await assert.rejects(() => oldTarget.executeQuery(query), /closed/i);
+      await assert.rejects(() => oldAlias.executeQuery(query), /closed/i);
+      return write(...args);
+    });
+
+    await provider.saveCustomDocumentAs(source, targetUri, token);
+
+    assert.equal(await value(target), 'copied value');
+    assert.equal(await value(alias), 'copied value');
+  });
+
+  it('Save As waits for an alias that is still opening before replacing its bytes', async () => {
+    const sourceUri = await fixture('source.db', 'copied value');
+    const targetUri = await fixture('target.db', 'original target');
+    const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
+    fs.symlinkSync(targetUri.fsPath, aliasUri.fsPath);
+    const source = await open(sourceUri);
+    const opening = createDeferred<void>();
+    const release = createDeferred<void>();
+    deferOpen = async uri => {
+      if (uri.fsPath === aliasUri.fsPath) { opening.resolve(); await release.promise; }
+    };
+    const pending = open(aliasUri);
+    await opening.promise;
+    const copying = provider.saveCustomDocumentAs(source, targetUri, token);
+    // Yield through filesystem lookup without making the test depend on a timer.
+    await fs.promises.stat(targetUri.fsPath);
+    assert.equal(await value(source), 'copied value');
+    release.resolve();
+    const target = await pending;
+    await copying;
+    assert.equal(await value(target), 'copied value');
+  });
+
+  it('a failed alias reopen does not preserve another destination document\'s obsolete Undo', async () => {
+    const sourceUri = await fixture('source.db', 'copied value');
+    const targetUri = await fixture('target.db', 'original target');
+    const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
+    fs.symlinkSync(targetUri.fsPath, aliasUri.fsPath);
+    const source = await open(sourceUri);
+    const target = await open(targetUri);
+    await target.hostBridge.updateCell('items', 1, 'name', 'saved target edit');
+    const oldEdit = events.at(-1)!;
+    await target.save();
+    const alias = await open(aliasUri);
+    const write = source.databaseOperations.writeToFile.bind(source.databaseOperations);
+    mock.method(source.databaseOperations, 'writeToFile', async (...args: Parameters<typeof write>) => {
+      const result = await write(...args); failOpenFor = aliasUri.fsPath; return result;
+    });
+
+    await assert.rejects(() => provider.saveCustomDocumentAs(source, targetUri, token), /saved.*destination could not be reopened/i);
+
+    assert.equal(await value(target), 'copied value');
+    await oldEdit.undo();
+    assert.equal(await value(target), 'copied value');
+    assert.equal(alias.isReadOnlyMode, true);
+    failOpenFor = undefined;
+    await alias.reloadFromDisk();
+    assert.equal(await value(alias), 'copied value');
+  });
+
+  it('native Save As through a directory symlink reopens the existing destination handle', async () => {
+    const sourceUri = await fixture('source.db', 'copied value');
+    const targetUri = await fixture('target.db', 'original target');
+    const aliasDirectory = path.join(directory, 'linked');
+    fs.symlinkSync(directory, aliasDirectory, 'junction');
+    const aliasUri = vscode.Uri.file(path.join(aliasDirectory, 'target.db'));
+    nativeConnections = true;
+    const source = await open(sourceUri);
+    const target = await open(targetUri);
+    const sourceBytes = fs.readFileSync(sourceUri.fsPath);
+
+    await provider.saveCustomDocumentAs(source, aliasUri, token);
+
+    assert.equal(await value(target), 'copied value');
+    await target.hostBridge.updateCell('items', 1, 'name', 'native replacement edit');
+    assert.equal(await value(target), 'native replacement edit');
+    assert.deepEqual(fs.readFileSync(sourceUri.fsPath), sourceBytes);
+    assert.equal(fs.lstatSync(aliasDirectory).isSymbolicLink(), true);
   });
 
   it('Save As drains an admitted destination edit before deciding whether its overlay can be replaced', async () => {
