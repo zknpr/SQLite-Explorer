@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { it } from 'node:test';
 import { NativeWorkerProcess } from '../../src/nativeWorker';
+import { prepareReadQuery } from '../../src/core/sql-workspace';
 
 it('cancels dispatched native Explain on the primary connection and restores its state and limits', async context => {
     const target = process.platform === 'darwin' ? (process.arch === 'arm64' ? 'aarch64-macos' : 'x86_64-macos')
@@ -31,7 +32,8 @@ it('cancels dispatched native Explain on the primary connection and restores its
         assert.deepEqual(JSON.parse(await plan(sql)), await query(`EXPLAIN QUERY PLAN ${sql}`),
             'Explain sees TEMP and pending DDL without evaluating the overflowing SELECT');
 
-        const wideSql = 'SELECT ' + Array.from({ length: 1800 }, (_, index) => `(SELECT max(value) FROM plan_main) AS c${index}`).join(',');
+        const wideSql = 'SELECT ' + Array.from({ length: 1400 }, (_, index) => `(SELECT max(value) FROM plan_main) AS c${index}`).join(',');
+        assert.doesNotThrow(() => prepareReadQuery(wideSql), 'the cancellation fixture must fit the SQL workspace input policy');
         assert.equal(JSON.parse(await plan(wideSql)).length, 1001);
         let accepted = false;
         // A fast machine can finish before the cancellation reaches the worker.
