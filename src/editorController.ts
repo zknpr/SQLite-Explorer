@@ -27,6 +27,7 @@ import { WEBVIEW_TRANSPORT_SURFACES, assertWebviewTransportPayload } from './cor
 import { WebviewMessageHandler } from './webviewMessageHandler';
 import { HostBridge } from './hostBridge';
 import type { CellMaterializationService } from './cellMaterialization';
+import { confirmFileReplacement } from './fileReplacementConfirmation';
 
 /** Coalesce provider opens that race before their shared document is registered. */
 const PendingDocumentOpens = new Map<string, Promise<DatabaseDocument>>();
@@ -37,7 +38,9 @@ async function acquireDatabaseDocument(
   openContext: vsc.CustomDocumentOpenContext,
   token?: vsc.CancellationToken
 ): Promise<DatabaseDocument> {
+  if (token?.isCancellationRequested) throw new vsc.CancellationError();
   const documentKey = await generateDatabaseDocumentKey(uri);
+  if (token?.isCancellationRequested) throw new vsc.CancellationError();
   const existing = DocumentRegistry.get(documentKey);
   if (existing) {
     existing.retainReference();
@@ -55,7 +58,9 @@ async function acquireDatabaseDocument(
     provider,
     uri,
     openContext,
-    token,
+    // Cancellation belongs to each caller's retained reference. One cancelled
+    // panel must not abort another provider's coalesced database connection.
+    undefined,
     documentKey
   );
   PendingDocumentOpens.set(documentKey, creation);
@@ -74,7 +79,7 @@ interface WebviewBridgeFunctions {
   updateCellEditBehavior(value: string): Promise<void>;
   refreshContent(
     filename: string,
-    connection?: { connected: boolean; readOnly: boolean; connectionGeneration: number }
+    connection?: { connected: boolean; readOnly: boolean; connectionGeneration: number; reloadRequiredReason?: string }
   ): Promise<void>;
 }
 
@@ -147,6 +152,10 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
   ): Promise<DatabaseDocument> {
 
     const document = await acquireDatabaseDocument(this, uri, openContext, token);
+    if (token?.isCancellationRequested) {
+      await document.dispose();
+      throw new vsc.CancellationError();
+    }
 
     // A provider needs exactly one listener set for the shared document. The
     // other view type installs its own set so refreshes reach both collections.
@@ -282,17 +291,17 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
     );
     webviewPanel.webview.onDidReceiveMessage((message) => messageHandler.handleMessage(message));
 
-    // Keep the default file grant to the one extension asset directory the
-    // page loads. HostBridge temporarily adds exactly one Stage-B run
-    // directory while an oversized media URI lease is active.
+    // Grant this panel's private media directory before HTML loads. Updating
+    // localResourceRoots later reloads the webview and loses its pending RPC.
     const codiconsRoot = vsc.Uri.joinPath(
       this.context.extensionUri,
       'assets',
       'codicons'
     );
+    const mediaRoot = this.cellMaterializer?.createMediaPreviewRoot(webviewPanel);
     webviewPanel.webview.options = {
       enableScripts: true,
-      localResourceRoots: [codiconsRoot]
+      localResourceRoots: [codiconsRoot, ...(mediaRoot ? [mediaRoot] : [])]
     };
     webviewPanel.webview.html = await this.#generateWebviewHtml(webviewPanel, document, webviewId);
 
@@ -406,11 +415,36 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
  * Extends the read-only provider with edit, save, and revert capabilities.
  */
 export class DatabaseEditorProvider extends DatabaseViewerProvider implements vsc.CustomEditorProvider<DatabaseDocument> {
+  readonly #restoredDocuments = new WeakSet<DatabaseDocument>();
+  readonly #resolvedDocuments = new WeakSet<DatabaseDocument>();
+
   /**
    * Check if the provider is read-only.
    */
   get isReadOnly(): boolean {
     return false;
+  }
+
+  async resolveCustomEditor(
+    document: DatabaseDocument,
+    webviewPanel: vsc.WebviewPanel,
+    token: vsc.CancellationToken
+  ): Promise<void> {
+    await super.resolveCustomEditor(document, webviewPanel, token);
+    this.#resolvedDocuments.add(document);
+    this.#publishRestoredEdits(document);
+  }
+
+  #publishRestoredEdits(document: DatabaseDocument): void {
+    if (!document.isConnected || !this.#resolvedDocuments.has(document)) return;
+    if (this.#restoredDocuments.has(document)) return;
+    this.#restoredDocuments.add(document);
+    // openCustomDocument completes before VS Code registers its custom-document
+    // entry. At resolve time that entry exists and can accept restored edits.
+    // Publish only for this provider: another viewType has its own host stack.
+    for (const edit of document.getRestoredEditEvents()) {
+      this.#editEventEmitter.fire({ document, ...edit });
+    }
   }
 
   /**
@@ -429,17 +463,22 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
 
     // Update webviews when document content changes
     document.registerLifecycleDisposable(document.onDidChangeContent(change => {
+      this.#publishRestoredEdits(document);
       const { filename } = document.fileParts;
       const connection = change.invalidateAllViewDocuments
         ? {
-            connected: true,
+            connected: document.isConnected,
             readOnly: this.isReadOnly || document.isReadOnlyMode,
-            connectionGeneration: document.connectionGeneration
+            connectionGeneration: document.connectionGeneration,
+            ...(document.reloadRequiredReason ? { reloadRequiredReason: document.reloadRequiredReason } : {})
           }
         : undefined;
-      void (async () => {
-        for (const panel of this.webviews.get(document.uri)) {
-          const bridge = this.webviewBridges.get(panel);
+      for (const panel of this.webviews.get(document.uri)) {
+        const bridge = this.webviewBridges.get(panel);
+        // A suspended webview can hold an RPC open until its timeout. Dispatch
+        // each panel independently so one hidden sibling cannot block the
+        // visible editor from reflecting undo, redo, or an external change.
+        void (async () => {
           try {
             await bridge?.refreshContent(filename, connection);
           } catch (error) {
@@ -447,8 +486,8 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
             this.outputChannel?.appendLine(`[Webview refresh] ${message}`);
             console.error('SQLite Explorer webview refresh failed:', error);
           }
-        }
-      })();
+        })();
+      }
     }));
   }
 
@@ -466,8 +505,18 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
   /**
    * Save the document to a new location.
    */
-  saveCustomDocumentAs(document: DatabaseDocument, destination: vsc.Uri, cancellation: vsc.CancellationToken): Thenable<void> {
-    return document.saveAs(destination, cancellation);
+  async saveCustomDocumentAs(document: DatabaseDocument, destination: vsc.Uri, cancellation: vsc.CancellationToken): Promise<void> {
+    if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+    if (destination.toString() !== document.uri.toString()
+      && !(await confirmFileReplacement(destination))) throw new vsc.CancellationError();
+    if (cancellation?.isCancellationRequested) throw new vsc.CancellationError();
+    const key = await generateDatabaseDocumentKey(destination);
+    const target = DocumentRegistry.get(key) ?? await PendingDocumentOpens.get(key);
+    if (target && target !== document) {
+      await target.replaceFromSaveAs(() => document.saveAs(destination, cancellation), cancellation);
+    } else {
+      await document.saveAs(destination, cancellation);
+    }
   }
 
   /**

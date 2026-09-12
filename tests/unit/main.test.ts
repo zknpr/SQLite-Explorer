@@ -61,6 +61,8 @@ import { mockVscode } from './mocks/vscode';
 (mockVscode.commands as any).registerCommand = () => ({ dispose: () => {} });
 (mockVscode.commands as any).executeCommand = () => Promise.resolve();
 (mockVscode.workspace as any).registerFileSystemProvider = () => ({ dispose: () => {} });
+(mockVscode.workspace as any).registerTextDocumentContentProvider = () => ({ dispose: () => {} });
+(mockVscode as any).languages = { registerCompletionItemProvider: () => ({ dispose: () => {} }) };
 (mockVscode.window as any).createOutputChannel = () => ({ dispose: () => {} });
 (mockVscode.window as any).registerCustomEditorProvider = () => ({ dispose: () => {} });
 (mockVscode as any).ConfigurationTarget = { Global: 1 };
@@ -75,8 +77,10 @@ import { mockVscode } from './mocks/vscode';
 // Mock telemetry via _load
 import Module from 'module';
 const originalLoad = (Module as any)._load;
+let telemetryRuntimeLoads = 0;
 (Module as any)._load = function (request: string, parent: any, isMain: boolean) {
     if (request === '@vscode/extension-telemetry') {
+        telemetryRuntimeLoads++;
         return {
             TelemetryReporter: class {
                 constructor() {}
@@ -139,6 +143,11 @@ describe('main.ts', () => {
 
     it('should deactivate without throwing', () => {
         assert.doesNotThrow(() => main.deactivate());
+    });
+
+    it('loads and activates without importing the disabled telemetry runtime', async () => {
+        await main.activate(mockContext);
+        assert.strictEqual(telemetryRuntimeLoads, 0);
     });
 
     it('should run activation sequence successfully', async () => {
@@ -278,6 +287,11 @@ describe('main.ts', () => {
 
         assert.strictEqual(reloads, 1);
         assert.strictEqual(executeCmdSpy.mock.calls.length, 0);
+        document.reloadFromDisk = async () => { throw new vsc.CancellationError(); };
+        await assert.doesNotReject(() => refreshCall.arguments[1]());
+        const failure = new Error('controlled refresh failure');
+        document.reloadFromDisk = async () => { throw failure; };
+        await assert.rejects(() => refreshCall.arguments[1](), error => error === failure);
     });
 
     it('should activate providers successfully', async () => {

@@ -19,9 +19,6 @@ export const UriScheme = 'sqlite-explorer';
 // Configuration section in settings.json
 export const ConfigurationSection = 'sqliteExplorer';
 
-// Telemetry disabled for this extension
-export const TelemetryConnectionString = "";
-
 // File nesting patterns
 export const NestingPattern = "${capture}.${extname}-*";
 export const FileNestingPatternsAdded = 'fileNestingPatternsAdded';

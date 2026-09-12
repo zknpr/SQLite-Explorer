@@ -327,7 +327,61 @@ it('shares one document, engine, and edit history across both editor view types 
     }
 });
 
-it('tracks active panels on the shared document across view types and disposal', async () => {
+it('starts every panel refresh without waiting for a suspended sibling', async () => {
+    const provider = createProvider('sqlite-explorer.view');
+    const uri = fileUri('/workspace/independent-refresh.sqlite');
+    const document = await provider.openCustomDocument(uri, openContext);
+    const suspendedPanel = createPanel();
+    const activePanel = createPanel();
+    const refreshStarts = [0, 0];
+    let releaseSuspendedRefresh!: () => void;
+    const suspendedRefresh = new Promise<void>(resolve => {
+        releaseSuspendedRefresh = resolve;
+    });
+    const modification: LabeledModification = {
+        label: 'Refresh every sibling',
+        description: 'Exercise independent panel refresh dispatch',
+        modificationType: 'cell_update',
+        targetTable: 'items',
+        targetRowId: 1,
+        targetColumn: 'value',
+        priorValue: 'before',
+        newValue: 'after'
+    };
+
+    provider.webviews.add(uri, suspendedPanel, 'suspended');
+    provider.webviews.add(uri, activePanel, 'active');
+    provider.webviewBridges.set(suspendedPanel, {
+        updateColorScheme: async () => {},
+        updateCellEditBehavior: async () => {},
+        refreshContent: () => {
+            refreshStarts[0]++;
+            return suspendedRefresh;
+        }
+    });
+    provider.webviewBridges.set(activePanel, {
+        updateColorScheme: async () => {},
+        updateCellEditBehavior: async () => {},
+        refreshContent: async () => { refreshStarts[1]++; }
+    });
+
+    try {
+        document.recordExternalModification(modification);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepStrictEqual(
+            [...refreshStarts],
+            [1, 1],
+            'an unresponsive panel must not delay refresh dispatch to a visible sibling'
+        );
+    } finally {
+        releaseSuspendedRefresh();
+        await new Promise(resolve => setImmediate(resolve));
+        await document.dispose();
+        provider.dispose();
+    }
+});
+
+it('targets shared document saves across active, inactive, and closed viewer states', async () => {
     activeEngineKind = 'wasm';
     (mockVscode.workspace as any)._config.set('instantCommit', 'always');
     const defaultProvider = createProvider('sqlite-explorer.view');
@@ -335,10 +389,13 @@ it('tracks active panels on the shared document across view types and disposal',
     const uri = fileUri('/workspace/shared-active.sqlite');
     const document = await defaultProvider.openCustomDocument(uri, openContext);
     const optionalDocument = await optionalProvider.openCustomDocument(uri, openContext);
-    const originalExecuteCommand = mockVscode.commands.executeCommand;
+    const originalSave = mockVscode.workspace.save;
     let saveCount = 0;
-    mockVscode.commands.executeCommand = async (command: string) => {
-        if (command === 'workbench.action.files.save') saveCount++;
+    let saveResult: Uri | undefined = uri;
+    mockVscode.workspace.save = async (target: Uri) => {
+        assert.strictEqual(target, uri);
+        saveCount++;
+        return saveResult;
     };
 
     function createTrackedPanel(initiallyActive: boolean) {
@@ -418,12 +475,18 @@ it('tracks active panels on the shared document across view types and disposal',
         await recordAndFlush('disposing inactive sibling preserves active view');
         assert.strictEqual(saveCount, 3);
 
-        inactivePanel.dispose();
+        inactivePanel.setActive(false);
         await recordAndFlush('no active panels');
-        assert.strictEqual(saveCount, 3);
+        assert.strictEqual(saveCount, 4);
+        assert.strictEqual(document.hasPendingSave, false);
+
+        inactivePanel.dispose();
+        saveResult = undefined;
+        await recordAndFlush('no remaining editor');
+        assert.strictEqual(saveCount, 5);
         assert.strictEqual(document.hasPendingSave, true);
     } finally {
-        mockVscode.commands.executeCommand = originalExecuteCommand;
+        mockVscode.workspace.save = originalSave;
         (mockVscode.workspace as any)._config.set('instantCommit', 'never');
         await document.dispose();
         await optionalDocument.dispose();
@@ -514,6 +577,46 @@ it('keeps non-file documents with the same path but different queries distinct',
     }
 });
 
+it('allocates the panel media root before loading viewer HTML', async () => {
+    const mediaRoot = fileUri('/private/cells/panel');
+    const order: string[] = [];
+    const provider = new DatabaseEditorProvider('sqlite-explorer.view', context, undefined, null,
+        true, undefined, undefined, {
+            createMediaPreviewRoot(owner: unknown) {
+                assert.strictEqual(owner, panel);
+                order.push('root');
+                return mediaRoot;
+            }
+        } as any);
+    const document = await provider.openCustomDocument(fileUri('/workspace/media.sqlite'), openContext);
+    let assignedOptions: any;
+    const webview = {
+        cspSource: '',
+        set options(value: unknown) { order.push('options'); assignedOptions = value; },
+        set html(_value: string) {
+            order.push('html');
+            assert.deepStrictEqual(assignedOptions.localResourceRoots.map((uri: Uri) => uri.fsPath), [
+                '/extension/assets/codicons', mediaRoot.fsPath
+            ]);
+        },
+        postMessage: async () => true,
+        onDidReceiveMessage: () => noOpDisposable,
+        asWebviewUri: (value: unknown) => value
+    };
+    const panel = {
+        webview, active: true, visible: true,
+        onDidChangeViewState: () => noOpDisposable,
+        onDidDispose: () => noOpDisposable
+    } as any;
+    try {
+        await provider.resolveCustomEditor(document, panel, {} as any);
+        assert.deepStrictEqual(order, ['root', 'options', 'html']);
+    } finally {
+        await document.dispose();
+        provider.dispose();
+    }
+});
+
 it('binds optional-view RPC to the provider that owns its webview panel', async () => {
     const defaultProvider = createProvider('sqlite-explorer.view');
     const optionalProvider = createProvider('sqlite-explorer.option');
@@ -568,6 +671,7 @@ it('binds optional-view RPC to the provider that owns its webview panel', async 
                 connected: true,
                 filename: 'provider-bridge.sqlite',
                 readOnly: false,
+                cellEditBehavior: 'inline',
                 connectionGeneration: 0
             }
         });

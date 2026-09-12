@@ -43,6 +43,25 @@ const { registerEditorProvider, DatabaseViewerProvider, DatabaseEditorProvider }
 const editorControllerPath = path.resolve(__dirname, '../../src/editorController.ts');
 const editorControllerSource = fs.readFileSync(editorControllerPath, 'utf8');
 
+it('cancels Save As before touching an existing destination when replacement is declined', async () => {
+    const provider = Object.create(DatabaseEditorProvider.prototype);
+    const originalStat = mockVscode.workspace.fs.stat;
+    const originalWarning = mockVscode.window.showWarningMessage;
+    let writes = 0;
+    mockVscode.workspace.fs.stat = async () => ({ type: 1, size: 1, ctime: 0, mtime: 0 });
+    mockVscode.window.showWarningMessage = async () => undefined;
+    try {
+        await assert.rejects(() => provider.saveCustomDocumentAs({
+            uri: mockVscode.Uri.file('/workspace/source.db'),
+            saveAs: async () => { writes++; }
+        }, mockVscode.Uri.file('/workspace/existing.db'), {}), /Canceled/);
+        assert.strictEqual(writes, 0);
+    } finally {
+        mockVscode.workspace.fs.stat = originalStat;
+        mockVscode.window.showWarningMessage = originalWarning;
+    }
+});
+
 function loadBrowserEditorController(supportsWriteMode = true) {
     const jsCode = esbuild.transformSync(editorControllerSource, {
         loader: 'ts',
@@ -159,7 +178,7 @@ describe('registerEditorProvider', () => {
     });
 
     it('narrows webview resources and permits CSP-compatible temp media URIs', () => {
-        assert.match(editorControllerSource, /localResourceRoots:\s*\[codiconsRoot\]/);
+        assert.match(editorControllerSource, /localResourceRoots:\s*\[codiconsRoot, \.\.\.\(mediaRoot \? \[mediaRoot\] : \[\]\)\]/);
         assert.match(
             editorControllerSource,
             /\[cspUtil\.frameSrc\]:\s*\[webview\.cspSource\]/

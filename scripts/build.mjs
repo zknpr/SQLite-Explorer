@@ -467,6 +467,20 @@ const validateBuildOutputs = () => {
     throw new Error(`Build validation failed: missing files: ${missingFiles.join(', ')}`);
   }
 
+  // Keep the measured telemetry savings while allowing the SQL workspace to
+  // grow. These are shipped byte sizes; readable development builds are exempt.
+  if (!DEV) {
+    const entryBudgets = {
+      'out/extension.js': 450_000,
+      'out/extension-browser.js': 550_000,
+    };
+    for (const [file, budget] of Object.entries(entryBudgets)) {
+      const bytes = fs.statSync(resolve(file)).size;
+      if (bytes > budget) {
+        throw new Error(`Bundle size budget exceeded: ${file} is ${bytes} bytes (budget ${budget})`);
+      }
+    }
+  }
 };
 
 /**

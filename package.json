@@ -3,7 +3,7 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.7.2",
+  "version": "1.8.0-dev",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
@@ -185,11 +185,79 @@
     },
     "commands": [
       {
+        "command": "sqlite-explorer.importData",
+        "title": "Import CSV or JSON",
+        "category": "SQLite Explorer"
+      },
+      {
         "command": "sqlite-explorer.refresh",
         "title": "Refresh Database",
         "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.newQuery",
+        "title": "New SQL Query",
+        "icon": "$(code)",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.chooseQueryDatabase",
+        "title": "Choose Query Database",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.runQuery",
+        "title": "Run Query",
+        "icon": "$(play)",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.explainQuery",
+        "title": "Explain Query Plan",
+        "icon": "$(list-tree)",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.refreshQueryCompletions",
+        "title": "Refresh Query Completions",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.queryHistory",
+        "title": "Query History (Session)",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.clearQueryHistory",
+        "title": "Clear Query History",
+        "category": "SQLite Explorer"
+      },
+      {
+        "command": "sqlite-explorer.exportQueryResults",
+        "title": "Export Query Results",
+        "icon": "$(export)",
+        "category": "SQLite Explorer"
       }
-    ]
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "sqlite-explorer.runQuery",
+          "when": "editorLangId == sql || editorLangId == sqlite",
+          "group": "navigation"
+        },
+        {
+          "command": "sqlite-explorer.explainQuery",
+          "when": "editorLangId == sql || editorLangId == sqlite",
+          "group": "navigation"
+        },
+        {
+          "command": "sqlite-explorer.exportQueryResults",
+          "when": "resourceScheme == sqlite-query-result",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "clean": "rm -rf out && rm -rf assets",
