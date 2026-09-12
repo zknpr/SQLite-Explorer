@@ -3,30 +3,50 @@ import { DocumentRegistry } from './documentRegistry';
 import type { DatabaseDocument } from './databaseModel';
 import { ExtensionId } from './config';
 import { IMPORT_MAX_BYTES, IMPORT_LIMIT_DESCRIPTION, parseImport, mapImportRows, importRowsAtomically } from './core/bulk-import';
+import { runReadSnapshot } from './core/operation-serializer';
+import type { DatabaseOperations } from './core/types';
 
 /** Read no more than the accepted source size, including when a file grows during preview. */
 const readSource: (uri: vscode.Uri) => Promise<string> = import.meta.env?.VSCODE_BROWSER_EXT
     ? async () => { throw new Error('Import requires a desktop or remote extension host.'); }
     : async (uri) => {
+    // Remote extension-host RPC maps its workspace URIs to file:. vscode-local:
+    // denotes the client filesystem and must not be opened on the remote host.
     if (uri.scheme !== 'file') {
         throw new Error('Import requires a file on the desktop or remote extension host.');
     }
     const { open } = await import('node:fs/promises');
     const file = await open(uri.fsPath, 'r');
     try {
-        const stat = await file.stat();
-        if (!stat.isFile() || stat.size > IMPORT_MAX_BYTES) throw new Error('Choose a regular CSV/JSON file of at most 64 MiB.');
-        const buffer = new Uint8Array(stat.size + 1);
+        const stat = await file.stat({ bigint: true });
+        if (!stat.isFile() || stat.size > BigInt(IMPORT_MAX_BYTES)) throw new Error('Choose a regular CSV/JSON file of at most 64 MiB.');
+        const size = Number(stat.size);
+        const buffer = new Uint8Array(size + 1);
         let length = 0;
         while (length < buffer.length) {
             const { bytesRead } = await file.read(buffer, length, buffer.length - length, null);
             if (!bytesRead) break;
             length += bytesRead;
         }
-        if (length > stat.size) throw new Error('The source file changed while reading. Retry the import.');
+        const after = await file.stat({ bigint: true });
+        // Compare the held descriptor, including ctime when an overwrite restores
+        // mtime. Reopening the path could silently switch a symlink's target.
+        if (length !== size || after.size !== stat.size
+            || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs) {
+            throw new Error('The source file changed while reading. Retry the import.');
+        }
         return new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, length));
     } finally { await file.close(); }
 };
+
+async function readSchemaVersion(operations: DatabaseOperations): Promise<string> {
+    const [main, temporary] = await operations.executeQuery('PRAGMA main.schema_version; PRAGMA temp.schema_version');
+    const versions = [main?.rows[0]?.[0], temporary?.rows[0]?.[0]];
+    if (!versions.every(value => typeof value === 'number' && Number.isSafeInteger(value))) {
+        throw new Error('Unable to read the destination database schema version.');
+    }
+    return versions.join(':');
+}
 
 function assertCurrent(database: DatabaseDocument, generation: number): void {
     if (![...DocumentRegistry.values()].includes(database) || database.connectionGeneration !== generation) {
@@ -55,7 +75,10 @@ async function importData(): Promise<void> {
     const schema = await database.databaseOperations.fetchSchema();
     const table = await vscode.window.showQuickPick(schema.tables.map(item => item.identifier), { title: 'Import into existing table', ignoreFocusOut: true });
     if (!table) return;
-    const metadata = await database.databaseOperations.getTableInfo(table);
+    const { metadata, schemaVersion } = await runReadSnapshot(database.databaseOperations, async transaction => {
+        const schemaVersion = await readSchemaVersion(transaction);
+        return { metadata: await transaction.getTableInfo(table), schemaVersion };
+    });
     const columns = metadata.filter(column => !column.isGenerated);
     const files = await vscode.window.showOpenDialog({ canSelectMany: false, canSelectFiles: true, canSelectFolders: false, filters: { 'CSV or JSON': ['csv', 'json'] }, title: `Choose import source (${IMPORT_LIMIT_DESCRIPTION} maximum)` });
     if (!files?.[0]) return;
@@ -122,8 +145,17 @@ async function importData(): Promise<void> {
         try {
             await database.runTrackedMutation(async () => {
                 assertCurrent(database, generation);
-                const modification = await importRowsAtomically(database.databaseOperations, table, rows, database.undoMemoryLimitBytes, abort.signal,
-                    completed => { if (completed % 50 === 0 || completed === rows.length) progress.report({ message: `${completed} / ${rows.length} ${rowLabel}` }); });
+                const modification = await runReadSnapshot(database.databaseOperations, async transaction => {
+                    // Schema cookies cover defaults, constraints, indexes and
+                    // triggers, including an identical DROP/CREATE replacement.
+                    // Keep this snapshot through commit: an external WAL change
+                    // must fail the write upgrade instead of changing the import.
+                    if (await readSchemaVersion(transaction) !== schemaVersion) {
+                        throw new Error('The destination database schema changed after the preview was prepared. Start the import again.');
+                    }
+                    return importRowsAtomically(transaction, table, rows, database.undoMemoryLimitBytes, abort.signal,
+                        completed => { if (completed % 50 === 0 || completed === rows.length) progress.report({ message: `${completed} / ${rows.length} ${rowLabel}` }); });
+                });
                 // Recording belongs to the same document mutation gate as commit.
                 // Do not throw on cancellation after the transaction has committed.
                 database.recordExternalModification(modification);
