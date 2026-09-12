@@ -2283,6 +2283,68 @@ export async function createNativeDatabaseConnection(
             cells.map(cell => cell.columnName),
             identity.kind === 'rowid'
           );
+          // Stable, whole-value edits are independent rows. Keep the same
+          // byte/storage checks and guarded writes, but amortize IPC in bounded
+          // chunks. Identity moves and JSON merges still need ordered replay.
+          if (groups.length > 1 && cells.every(cell => cell.operation !== 'json_patch'
+            && (cell.newRowId === undefined || cell.newRowId === cell.rowId))) {
+            const chunkRows = 128;
+            for (let offset = 0; offset < groups.length; offset += chunkRows) {
+              const plans = groups.slice(offset, offset + chunkRows).map(([rowId, rowCells]) => {
+                const predicate = buildRecordIdentityPredicate(rowId, identity);
+                const expected = rowCells.map(cell => direction === 'undo' ? cell.postState : cell.priorState);
+                const target = rowCells.map(cell => direction === 'undo' ? cell.priorState : cell.postState);
+                return {
+                  rowCells, predicate, expected, target,
+                  query: {
+                    sql: `SELECT ${rowCells.map(cell => buildStoredCellStateProjection(cell.columnName)).join(', ')} `
+                      + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+                    params: predicate.params
+                  }
+                };
+              });
+              const assertStates = (result: NativeQueryBatchResult, target: boolean): void => {
+                if (result.results?.length !== plans.length) {
+                  throw new Error('Cell history batch returned incomplete results');
+                }
+                plans.forEach((plan, index) => {
+                  const rows = result.results[index].values;
+                  const states = target ? plan.target : plan.expected;
+                  if (rows?.length !== 1 || !states.every((state, column) => storedCellStatesEqual(
+                    state,
+                    parseStoredCellState(rows[0][column * 2], rows[0][column * 2 + 1],
+                      `${table}.${plan.rowCells[column].columnName}`, { textEncoding })
+                  ))) {
+                    throw new CellHistoryConflictError(table, plan.rowCells.map(cell => cell.columnName));
+                  }
+                });
+              };
+              const queries = plans.map(plan => plan.query);
+              assertStates(await worker.call<NativeQueryBatchResult>('queryBatch', [queries]), false);
+              const batch: { sql: string; paramsList: CellValue[][]; expectedChanges: number }[] = [];
+              for (const plan of plans) {
+                const writes = plan.target.map(state => buildStoredCellWrite(state));
+                const guards = plan.expected.map((state, index) => (
+                  buildStoredCellPredicate(plan.rowCells[index].columnName, state)
+                ));
+                const sql = `UPDATE ${escapeMainIdentifier(table)} SET `
+                  + plan.rowCells.map((cell, index) => `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`).join(', ')
+                  + ` WHERE ${plan.predicate.sql} AND ${guards.map(guard => `(${guard.sql})`).join(' AND ')}`;
+                const params = [
+                  ...writes.flatMap(write => write.params), ...plan.predicate.params,
+                  ...guards.flatMap(guard => guard.params)
+                ];
+                // Reuse only adjacent statement shapes so row order is unchanged.
+                const last = batch[batch.length - 1];
+                if (last?.sql === sql) last.paramsList.push(params);
+                else batch.push({ sql, paramsList: [params], expectedChanges: 1 });
+              }
+              await worker.call('execBatch', [batch, savepointName]);
+              assertStates(await worker.call<NativeQueryBatchResult>('queryBatch', [queries]), true);
+            }
+            await releaseNativeSavepoint(savepointName);
+            return;
+          }
           for (const [originalRowId, rowCells] of groups) {
             const recordedNewRowIds = new Set(
               rowCells.map(cell => cell.newRowId ?? cell.rowId)

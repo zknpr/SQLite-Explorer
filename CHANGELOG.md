@@ -13,6 +13,8 @@
 
 ### Fixes
 
+- Allow native database opens above the default 200 MB file-size limit without a configuration change. Keep the limit for WASM fallback and buffered database copies.
+- Batch native Undo/Redo reads and guarded writes while preserving conflict detection and rollback. Avoid repeated grid scans and duplicate in-flight table refreshes after batch updates, and retain refresh errors instead of reporting false completion.
 - Cancel an in-progress native Explain without closing its primary connection or losing TEMP objects and pending transactions. Expected Run/Explain cancellation no longer displays an error notification; SQL failures and deadlines remain visible.
 - Reject CSV/JSON sources changed during reading and destination schemas changed after preview. Schema validation and import commit share one snapshot, including changes made by another SQLite connection.
 - Refresh already-open Save As destinations, including file and directory symlinks. Close all destination handles before replacement, refuse dirty WASM aliases, and reopen each document with the replacement bytes and fresh history.

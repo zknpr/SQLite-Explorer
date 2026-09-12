@@ -16,9 +16,9 @@ import {
     getCellValueForDisplay,
     getBatchSelectionEligibility,
     getRowDataOffset,
+    getRowId,
     clearExactIntegerText,
-    clearOversizedCellMetadata,
-    resolveDisplayedCell
+    clearOversizedCellMetadata
 } from './data-utils.js';
 import { updateSelectionStates } from './grid-selection.js';
 import { openCreateTableModal } from './crud.js';
@@ -621,19 +621,17 @@ export async function applyBatchUpdate() {
         const hasPatch = updates.some(u => u.operation === 'json_patch');
 
         if (stillOnTargetTable && !hasPatch) {
+            // These lookups live only for this synchronous reconciliation;
+            // never reuse positional indices across a page reload or await.
+            const rowIndexes = new Map(state.gridData.map((row, index) => [getRowId(row, index), index]));
+            const columnIndexes = new Map(state.tableColumns.map((column, index) => [column.name, index]));
             for (const u of updates) {
-                const outcome = (outcomes ?? []).find(candidate => (
-                    candidate.rowId === u.rowId && candidate.columnName === u.column
-                ));
-                const currentCell = resolveDisplayedCell(
-                    targetTable,
-                    outcome?.newRowId ?? u.rowId,
-                    u.column
-                ) ?? resolveDisplayedCell(targetTable, u.rowId, u.column);
-                if (!currentCell) continue;
-                state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = u.value;
-                clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
-                clearOversizedCellMetadata(currentCell.rowIdx, currentCell.colIdx);
+                const rowIdx = rowIndexes.get(identityChanges.get(u.rowId) ?? u.rowId) ?? rowIndexes.get(u.rowId);
+                const colIdx = columnIndexes.get(u.column);
+                if (rowIdx === undefined || colIdx === undefined) continue;
+                state.gridData[rowIdx][colIdx + getRowDataOffset()] = u.value;
+                clearExactIntegerText(rowIdx, colIdx);
+                clearOversizedCellMetadata(rowIdx, colIdx);
             }
         }
 
@@ -649,8 +647,19 @@ export async function applyBatchUpdate() {
             updateToolbarButtons();
         }
 
-        // A PK edit can move the row in the table's default ordering.
-        if (stillOnTargetTable) await loadTableData(false);
+        // The VS Code host broadcasts this committed edit before replying.
+        // Reuse its pending schema/row refresh instead of fetching the wide
+        // page twice. The web demo has no echo and still needs its own reload.
+        if (stillOnTargetTable) {
+            if (state.contentRefreshPromise) {
+                let refreshResult;
+                while (state.contentRefreshPromise) refreshResult = await state.contentRefreshPromise;
+                if (refreshResult?.success === false) return;
+            } else {
+                // A PK edit can move the row in the table's default ordering.
+                if (await loadTableData(false) !== true) return;
+            }
+        }
 
         if (state.selectedTable === targetTable) {
             updateStatus(eligibility.readOnlyCount > 0

@@ -103,6 +103,45 @@ it('preserves NULL and BLOB parameters when reusing native batch statements', as
     assert.deepEqual(f.stored(), [...cases.map(([, , type, bytes]) => [type, bytes]), ['blob', '00FFA5']]);
 });
 
+it('rolls back a guarded native batch if any prepared execution misses its expected row count', async t => {
+    const f = await fixture(t); if (!f) return;
+    await f.worker.call('run', ['INSERT INTO entries VALUES (1), (2)']);
+    const before = f.stored();
+    await assert.rejects(f.worker.call('execBatch', [[{
+        sql: 'UPDATE entries SET value = ? WHERE rowid = ? AND value = ?',
+        paramsList: [[10, 1, 1], [20, 2, 999]],
+        expectedChanges: 1
+    }]]), /expected.*1.*row/i);
+    assert.deepEqual(f.stored(), before);
+    await assert.rejects(f.worker.call('execBatch', [[{
+        sql: 'UPDATE entries SET value = 30 WHERE rowid = 99', expectedChanges: 1
+    }]]), /expected.*1.*row/i);
+    assert.deepEqual(f.stored(), before);
+});
+
+it('reuses the history savepoint across chunks without committing it and rolls all chunks back on failure', async t => {
+    const f = await fixture(t); if (!f) return;
+    await f.worker.call('run', ['INSERT INTO entries VALUES (1), (2)']);
+    const before = f.stored();
+    const savepoint = '"sp_replay_cell_history_0123456789abcdef0123456789abcdef"';
+    await f.worker.call('run', [`SAVEPOINT ${savepoint}`]);
+    await f.worker.call('execBatch', [[{
+        sql: 'UPDATE entries SET value = ? WHERE rowid = ?', paramsList: [[10, 1]], expectedChanges: 1
+    }], savepoint]);
+    assert.deepEqual(f.stored(), before, 'a successful chunk must not commit the owning savepoint');
+    await assert.rejects(f.worker.call('execBatch', [[{
+        sql: 'UPDATE entries SET value = ? WHERE rowid = ?', paramsList: [[20, 2], [30, 99]], expectedChanges: 1
+    }], savepoint]), /expected.*1.*row/i);
+    const current = await f.worker.call<{ values: unknown[][] }>('query', ['SELECT value FROM entries ORDER BY rowid']);
+    assert.deepEqual(current.values, [[1], [2]], 'failure rolls back earlier chunks too');
+    await f.worker.call('run', [`RELEASE ${savepoint}`]);
+    assert.deepEqual(f.stored(), before);
+    await assert.rejects(f.worker.call('execBatch', [[{
+        sql: 'UPDATE entries SET value = 99', expectedChanges: 2
+    }], 'not-a-history-savepoint']), /savepoint/i);
+    assert.deepEqual(f.stored(), before);
+});
+
 it('preserves single-value bindings in the main-connection SQL workspace fallback', async t => {
     const f = await fixture(t); if (!f) return;
     await f.worker.call('run', ['CREATE TEMP TABLE use_main_connection(value)']);

@@ -2153,19 +2153,41 @@ async function handleRequest(request) {
       case "execBatch": {
         // SAVEPOINT composes with host-side atomic read/write boundaries; a raw
         // BEGIN here would fail when updateCellBatch is intentionally nested.
-        // args: [items: { sql: string, params?: any[], paramsList?: any[][] }[]]
-        const [items] = args;
+        // A chunked history replay supplies its owning host savepoint. Adding
+        // a nested savepoint per chunk forces redundant SQLite subjournal I/O.
+        // args: [items: { sql: string, params?: any[], paramsList?: any[][], expectedChanges?: number }[], historySavepoint?: string]
+        const [items, historySavepoint] = args;
         if (!db) throw new Error("Database not open");
-
-        const savepointName = `sqlite_explorer_exec_batch_${++savepointCounter}`;
-        db.exec(`SAVEPOINT "${savepointName}"`);
+        const ownsSavepoint = historySavepoint === undefined;
+        if (!ownsSavepoint) {
+          if (typeof historySavepoint !== 'string'
+            || !/^"sp_replay_cell_history_[0-9a-f]{32}"$/.test(historySavepoint)) {
+            throw new Error('Invalid enclosing cell history savepoint');
+          }
+          const active = typeof db.inTransaction === 'function' ? db.inTransaction() : db.inTransaction;
+          if (active !== true) throw new Error('Cell history savepoint requires an active transaction');
+        }
+        const savepointName = ownsSavepoint
+          ? `"sqlite_explorer_exec_batch_${++savepointCounter}"` : historySavepoint;
+        if (ownsSavepoint) db.exec(`SAVEPOINT ${savepointName}`);
         try {
           for (const item of items) {
+             if (item.expectedChanges !== undefined
+               && (!Number.isSafeInteger(item.expectedChanges) || item.expectedChanges < 0)) {
+                 throw new Error('Batch expected row count must be a non-negative safe integer');
+             }
+             const assertChanges = () => {
+                 if (item.expectedChanges !== undefined
+                   && readRunFallbackResult(db).changes !== item.expectedChanges) {
+                     throw new Error(`Guarded batch expected ${item.expectedChanges} changed row(s); cell history was not applied`);
+                 }
+             };
              if (item.paramsList && item.paramsList.length > 0) {
                  const stmt = db.prepare(item.sql);
                  try {
                      for (const params of item.paramsList) {
                          stmt.run(params ?? []);
+                         assertChanges();
                      }
                  } finally {
                      if (typeof stmt.free === 'function') stmt.free();
@@ -2173,14 +2195,15 @@ async function handleRequest(request) {
                  }
              } else {
                  executeStatement(db, item.sql, item.params);
+                 assertChanges();
              }
           }
-          db.exec(`RELEASE SAVEPOINT "${savepointName}"`);
+          if (ownsSavepoint) db.exec(`RELEASE SAVEPOINT ${savepointName}`);
           result = { success: true };
         } catch (err) {
           try {
-            db.exec(`ROLLBACK TO SAVEPOINT "${savepointName}"`);
-            db.exec(`RELEASE SAVEPOINT "${savepointName}"`);
+            db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+            if (ownsSavepoint) db.exec(`RELEASE SAVEPOINT ${savepointName}`);
           } catch (rollbackErr) {
             throw new Error(
               `Batch failed (${String(err)}); savepoint cleanup failed (${String(rollbackErr)})`

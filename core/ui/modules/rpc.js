@@ -113,9 +113,12 @@ async function refreshContentOnce(filename, connectionResult) {
             // Refresh columns to reflect added/removed columns
             if (await loadTableColumns()) {
                 // Refresh data to reflect row changes
-                await loadTableData(false);
-            } else if (connectionReplaced) {
-                showErrorState('Could not load table columns after reloading the database.');
+                if (await loadTableData(false) !== true) return { success: false };
+            } else {
+                if (connectionReplaced) {
+                    showErrorState('Could not load table columns after reloading the database.');
+                }
+                return { success: false };
             }
         }
       }
