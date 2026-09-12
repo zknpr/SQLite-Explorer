@@ -70,6 +70,9 @@ export function handleTextareaTab(event, indent = DEFAULT_INDENT) {
         return true;
     }
     if (event.key !== 'Tab') {
+        // A real Shift+Tab sends a Shift keydown first. It must not consume
+        // the one-shot escape before the browser receives the Tab key.
+        if (['Shift', 'Control', 'Alt', 'Meta'].includes(event.key)) return false;
         focusEscapeArmed.delete(textarea);
         return false;
     }

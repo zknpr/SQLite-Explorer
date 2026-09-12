@@ -14,6 +14,7 @@ import {
     rpcErrorFields
 } from './transport.js';
 import { getErrorMessage } from './utils.js';
+import { encodeBinaryBase64 } from './binary-encoding.js';
 
 export { RPC_TIMEOUT_MS, getRpcTimeoutMs };
 
@@ -41,63 +42,6 @@ export function saveVsCodeState(stateObj) {
 // Message ID tracking
 let rpcMessageId = 0;
 const pendingRpcCalls = new Map();
-
-// ============================================================================
-// Base64 Encoding Utilities
-// ============================================================================
-
-/**
- * Encode Uint8Array to Base64 string asynchronously.
- * Uses chunked processing with microtask yields to prevent UI blocking.
- *
- * For small arrays (< 64KB), uses synchronous encoding for speed.
- * For larger arrays, yields control between chunks to keep UI responsive.
- *
- * @param {Uint8Array} bytes - Binary data to encode
- * @returns {Promise<string>} Base64 encoded string
- */
-async function uint8ArrayToBase64Async(bytes) {
-    // For small arrays, synchronous encoding is fast enough and avoids async overhead
-    const SYNC_THRESHOLD = 65536; // 64KB
-    if (bytes.length <= SYNC_THRESHOLD) {
-        return uint8ArrayToBase64Sync(bytes);
-    }
-
-    // For larger arrays, use chunked async encoding to prevent UI freeze
-    // Process in chunks and yield to the event loop between chunks
-    const CHUNK_SIZE = 32768; // 32KB per chunk
-    const chunks = [];
-
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-        const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-        chunks.push(String.fromCharCode.apply(null, chunk));
-
-        // Yield to event loop every few chunks to allow UI updates
-        // Using a microtask (Promise.resolve) for minimal delay while still allowing repaints
-        if (i > 0 && (i / CHUNK_SIZE) % 4 === 0) {
-            await new Promise(resolve => setTimeout(resolve, 0));
-        }
-    }
-
-    return btoa(chunks.join(''));
-}
-
-/**
- * Synchronous Base64 encoding for small arrays.
- * Used when async overhead isn't worth it.
- *
- * @param {Uint8Array} bytes - Binary data to encode
- * @returns {string} Base64 encoded string
- */
-function uint8ArrayToBase64Sync(bytes) {
-    const CHUNK_SIZE = 32768;
-    const chunks = [];
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-        const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-        chunks.push(String.fromCharCode.apply(null, chunk));
-    }
-    return btoa(chunks.join(''));
-}
 
 /**
  * Decode Base64 string to Uint8Array.
@@ -129,25 +73,26 @@ function base64ToUint8Array(base64) {
  * @param {*} value - Value to serialize
  * @returns {Promise<*>} Serialized value
  */
-async function serializeValueAsync(value) {
+async function serializeValueAsync(value, signal) {
+    signal?.throwIfAborted();
     if (typeof value === 'number' && !Number.isFinite(value)) {
         return encodeJsonSafeNonFiniteNumber(value);
     }
     if (typeof value === 'string') return escapeJsonSafeNumberString(value);
     // Handle Uint8Array by converting to Base64 marker object
     if (value instanceof Uint8Array) {
-        const base64 = await uint8ArrayToBase64Async(value);
+        const base64 = await encodeBinaryBase64(value, signal);
         return { __type: 'Uint8Array', base64 };
     }
     // Handle other ArrayBuffer views (like DataView)
     if (ArrayBuffer.isView(value)) {
         const uint8 = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-        const base64 = await uint8ArrayToBase64Async(uint8);
+        const base64 = await encodeBinaryBase64(uint8, signal);
         return { __type: 'Uint8Array', base64 };
     }
     // Recursively serialize arrays
     if (Array.isArray(value)) {
-        return Promise.all(value.map(serializeValueAsync));
+        return Promise.all(value.map(item => serializeValueAsync(item, signal)));
     }
     // Recursively serialize plain object properties only
     // Using Object.prototype.toString for robust object detection (handles null prototype)
@@ -155,7 +100,7 @@ async function serializeValueAsync(value) {
         const result = {};
         for (const key of Object.keys(value)) {
             Object.defineProperty(result, key, {
-                value: await serializeValueAsync(value[key]),
+                value: await serializeValueAsync(value[key], signal),
                 enumerable: true,
                 configurable: true,
                 writable: true
@@ -171,11 +116,11 @@ async function serializeValueAsync(value) {
  * @param {Array} args - Arguments to serialize
  * @returns {Promise<Array>} Serialized arguments
  */
-async function serializeArgsAsync(args) {
+async function serializeArgsAsync(args, signal) {
     assertWebviewTransportPayload(args, {
         surface: WEBVIEW_TRANSPORT_SURFACES.webviewRequest
     });
-    return Promise.all(args.map(serializeValueAsync));
+    return Promise.all(args.map(value => serializeValueAsync(value, signal)));
 }
 
 /**
@@ -236,7 +181,8 @@ function deserializeValue(value) {
  * Send an RPC request to the extension host.
  * Uses async serialization to prevent UI blocking during large blob encoding.
  */
-export async function sendRpcRequest(method, args) {
+export async function sendRpcRequest(method, args, options = {}) {
+    options.signal?.throwIfAborted();
     const messageId = `rpc_${++rpcMessageId}_${Date.now()}`;
 
     // Measure the complete raw envelope before Base64 can allocate an expanded
@@ -249,8 +195,9 @@ export async function sendRpcRequest(method, args) {
     });
 
     // Serialize args asynchronously to handle Uint8Array without blocking UI
-    // This is done before setting up the timeout to ensure encoding time is included
-    const serializedArgs = await serializeArgsAsync(args);
+    // Cancellation is safe until posting; after posting, await the actual result.
+    const serializedArgs = await serializeArgsAsync(args, options.signal);
+    options.signal?.throwIfAborted();
     const outboundMessage = {
         channel: 'rpc',
         content: {
@@ -278,6 +225,7 @@ export async function sendRpcRequest(method, args) {
         try {
             if (!vscodeApi) throw new Error('VS Code API not available');
             vscodeApi.postMessage(outboundMessage);
+            options.onDidPost?.();
         } catch (error) {
             if (pendingRpcCalls.delete(messageId)) {
                 if (timeoutId !== undefined) clearTimeout(timeoutId);
@@ -359,14 +307,18 @@ export const backendApi = {
     exportTable: (dbParams, columns, dbOptions, tableStore, exportOptions, extras) => sendRpcRequest('exportTable', [dbParams, columns, dbOptions, tableStore, exportOptions, extras]),
 
     // New safe methods
-    updateCell: (table, rowId, column, value, originalValue) => sendRpcRequest('updateCell', [table, rowId, column, value, originalValue]),
+    updateCell: (table, rowId, column, value, originalValue, options) =>
+        sendRpcRequest('updateCell', [table, rowId, column, value, originalValue], options),
     insertRow: (table, data) => sendRpcRequest('insertRow', [table, data]),
     deleteRows: (table, rowIds) => sendRpcRequest('deleteRows', [table, rowIds]),
     deleteColumns: (table, columns) => sendRpcRequest('deleteColumns', [table, columns]),
-    createTable: (table, columns) => sendRpcRequest('createTable', [table, columns]),
+    // An absent array argument becomes null in VS Code's JSON transport.
+    createTable: (table, columns, options) => sendRpcRequest('createTable',
+        options === undefined ? [table, columns] : [table, columns, options]),
     getViewDefinition: (view) => sendRpcRequest('getViewDefinition', [view]),
     validateViewDefinition: (view, selectSql, intent) =>
         sendRpcRequest('validateViewDefinition', [view, selectSql, intent]),
+    openQueryEditor: () => sendRpcRequest('openQueryEditor', []),
     previewViewDefinition: (view, selectSql, limit, intent) =>
         sendRpcRequest('previewViewDefinition', [view, selectSql, limit, intent]),
     createView: (view, selectSql) => sendRpcRequest('createView', [view, selectSql]),
@@ -381,6 +333,7 @@ export const backendApi = {
     dropView: (view) => sendRpcRequest('dropView', [view]),
     confirmLargeSelection: (itemCount, unit) =>
         sendRpcRequest('confirmLargeSelection', [itemCount, unit]),
+    confirmLargeChanges: (itemCount, unit) => sendRpcRequest('confirmLargeChanges', [itemCount, unit]),
     updateCellBatch: (table, updates, label) => sendRpcRequest('updateCellBatch', [table, updates, label]),
     addColumn: (table, column, type, defaultValue) => sendRpcRequest('addColumn', [table, column, type, defaultValue]),
     fetchTableData: (table, options) => sendRpcRequest('fetchTableData', [table, options]),
@@ -405,7 +358,7 @@ export const backendApi = {
         sendRpcRequest('closeCellReadSession', [sessionId]),
     openCellEditor: (params, rowId, colName, colTypes, options) => sendRpcRequest('openCellEditor', [params, rowId, colName, colTypes, options]),
     openViewEditor: (view, webviewId) => sendRpcRequest('openViewEditor', [view, webviewId]),
-    readWorkspaceFileUri: (uri) => sendRpcRequest('readWorkspaceFileUri', [uri]),
+    readWorkspaceFileUri: (uri, options) => sendRpcRequest('readWorkspaceFileUri', [uri], options),
     saveFile: (filename, data) => sendRpcRequest('saveFile', [filename, data]),
     selectFile: () => sendRpcRequest('selectFile', [])
 };

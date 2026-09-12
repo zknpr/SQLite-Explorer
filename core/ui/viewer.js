@@ -42,7 +42,7 @@ import {
     initDragAndDrop
 } from './modules/dnd.js';
 import { initViews } from './modules/views.js';
-import { applyConnectionResult } from './modules/connection-state.js';
+import { applyConnectionResult, updateMutationControlCapabilities } from './modules/connection-state.js';
 import { setupGlobalShortcuts } from './modules/global-shortcuts.js';
 
 // Initialize RPC system
@@ -60,6 +60,7 @@ function initializeModules() {
     initSidebarResize();
     initDragAndDrop();
     initViews();
+    updateMutationControlCapabilities();
 }
 
 async function connectAndLoadSchema() {
@@ -67,7 +68,7 @@ async function connectAndLoadSchema() {
 
     const result = await backendApi.initialize();
     if (!applyConnectionResult(result)) {
-        throw new Error('Failed to connect to database');
+        throw new Error(state.reloadRequiredReason || 'Failed to connect to database');
     }
 
     // Test connection
@@ -115,6 +116,9 @@ async function restoreSavedState() {
     // inside the selected-table branch loses the user's filter on an empty or
     // newly opened database when the webview is reconstructed.
     state.sidebarFilter = savedState?.sidebarFilter || '';
+    state.collapsedSections = new Set(Array.isArray(savedState?.collapsedSections)
+        ? savedState.collapsedSections.filter(section => ['tables', 'views', 'indexes'].includes(section))
+        : ['views', 'indexes']);
     const sidebarFilterInput = document.getElementById('sidebarFilterInput');
     if (sidebarFilterInput) sidebarFilterInput.value = state.sidebarFilter;
 
@@ -202,13 +206,15 @@ function applyVsCodeSettings() {
 async function initializeApp() {
     try {
         initializeModules();
+        applyVsCodeSettings();
         await connectAndLoadSchema();
         await restoreSavedState();
-        applyVsCodeSettings();
-        setupGlobalShortcuts();
     } catch (err) {
         console.error('Init error:', err);
+        updateStatus(err.message);
         showErrorState(err.message);
+    } finally {
+        setupGlobalShortcuts();
     }
 }
 

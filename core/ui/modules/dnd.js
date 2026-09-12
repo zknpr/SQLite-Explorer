@@ -20,6 +20,7 @@ import { DEFAULT_MAX_CELL_EDIT_BYTES } from '../../../src/core/cell-edit-policy.
 
 // Track upload state to prevent concurrent uploads and allow proper cleanup
 let isUploading = false;
+let activeUpload = null;
 
 export function initDragAndDrop() {
     const container = document.getElementById('gridContainer');
@@ -32,6 +33,9 @@ export function initDragAndDrop() {
     document.addEventListener('dragover', e => e.preventDefault());
     document.addEventListener('drop', e => e.preventDefault());
     document.addEventListener('dragend', clearDragHighlight);
+    // VS Code forwards unhandled Undo keys to the custom document. While a
+    // dropped file is being prepared that history still ends at the prior edit.
+    document.addEventListener('keydown', onUploadUndo, true);
 
     // Highlight cell on dragover
     container.addEventListener('dragover', onDragOver);
@@ -40,6 +44,23 @@ export function initDragAndDrop() {
 }
 
 let lastHighlightedCell = null;
+
+function onUploadUndo(event) {
+    if (!activeUpload || event.isComposing || event.altKey || event.shiftKey
+        || !(event.ctrlKey || event.metaKey) || event.key?.toLowerCase() !== 'z') return;
+    const target = event.target;
+    if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (activeUpload.committing) {
+        // A posted mutation may already have committed. Do not claim it was
+        // cancelled, or issue a global Undo against an unrelated history entry.
+        updateStatus('Upload is finishing. Press Undo after it completes to revert it.');
+        return;
+    }
+    activeUpload.controller.abort();
+    updateStatus('Upload cancelled');
+}
 
 function clearDragHighlight() {
     if (!lastHighlightedCell) return;
@@ -101,7 +122,7 @@ async function onDrop(e) {
     let upload;
     if (e.dataTransfer.files.length > 0) {
         const file = e.dataTransfer.files[0];
-        upload = () => handleFileUpload(uploadTarget, file.name, file);
+        upload = context => handleFileUpload(uploadTarget, file.name, file, context);
     } else {
         // Check for VS Code internal URI list (dragging from Explorer)
         const uriList = e.dataTransfer.getData('text/uri-list');
@@ -121,7 +142,7 @@ async function onDrop(e) {
             } catch (err) {
                 console.warn('Failed to parse name from URI', err);
             }
-            upload = () => handleUriUpload(uploadTarget, name, uri);
+            upload = context => handleUriUpload(uploadTarget, name, uri, context);
         }
     }
     if (!upload) return;
@@ -134,9 +155,12 @@ async function onDrop(e) {
         return;
     }
     isUploading = true;
+    const context = { controller: new AbortController(), committing: false };
+    activeUpload = context;
     try {
-        await upload();
+        await upload(context);
     } finally {
+        if (activeUpload === context) activeUpload = null;
         isUploading = false;
     }
 }
@@ -176,7 +200,7 @@ function captureUploadTarget(cell) {
     };
 }
 
-async function handleFileUpload(uploadTarget, fileName, fileBlob) {
+async function handleFileUpload(uploadTarget, fileName, fileBlob, context) {
     // Early size check before reading file
     if (!Number.isSafeInteger(fileBlob?.size) || fileBlob.size < 0) {
         updateStatus('Unable to determine the dropped file size safely.');
@@ -191,24 +215,33 @@ async function handleFileUpload(uploadTarget, fileName, fileBlob) {
 
     try {
         updateStatus(`Reading ${fileName}...`);
-        const buffer = await readFileAsArrayBuffer(fileBlob);
+        const buffer = await readFileAsArrayBuffer(fileBlob, context.controller.signal);
         const uint8Array = new Uint8Array(buffer);
-        await uploadDataToCell(uploadTarget, fileName, uint8Array);
+        await uploadDataToCell(uploadTarget, fileName, uint8Array, context);
     } catch (err) {
+        if (context.controller.signal.aborted) {
+            updateStatus('Upload cancelled');
+            return;
+        }
         console.error('File read failed:', err);
         updateStatus(`File read failed: ${getErrorMessage(err)}`);
     }
 }
 
-async function handleUriUpload(uploadTarget, fileName, uri) {
+async function handleUriUpload(uploadTarget, fileName, uri, context) {
     try {
         updateStatus(`Fetching ${fileName}...`);
-        const result = await backendApi.readWorkspaceFileUri(uri);
+        const result = await backendApi.readWorkspaceFileUri(uri, { signal: context.controller.signal });
+        context.controller.signal.throwIfAborted();
 
         const uint8Array = normalizeUploadBytes(result);
 
-        await uploadDataToCell(uploadTarget, fileName, uint8Array);
+        await uploadDataToCell(uploadTarget, fileName, uint8Array, context);
     } catch (err) {
+        if (context.controller.signal.aborted) {
+            updateStatus('Upload cancelled');
+            return;
+        }
         console.error('URI upload failed:', err);
         updateStatus(`Upload failed: ${getErrorMessage(err)}`);
     }
@@ -225,7 +258,8 @@ function normalizeUploadBytes(result) {
     }
 }
 
-async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
+async function uploadDataToCell(uploadTarget, fileName, uint8Array, context) {
+    context.controller.signal.throwIfAborted();
     // URI reads cannot preflight a browser File, so enforce the same edit
     // ceiling again before serialization or database mutation.
     if (uint8Array.byteLength > DEFAULT_MAX_CELL_EDIT_BYTES) {
@@ -263,7 +297,11 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
             uploadTarget.rowId,
             uploadTarget.columnName,
             uint8Array,
-            uploadTarget.originalValue
+            uploadTarget.originalValue,
+            {
+                signal: context.controller.signal,
+                onDidPost: () => { context.committing = true; }
+            }
         );
         // The uploaded value may enter/leave an active filter's match set,
         // so the table's cached filtered counts can't be trusted.
@@ -321,6 +359,10 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
             updateStatus(`Uploaded ${fileName}`);
         }
     } catch (err) {
+        if (context.controller.signal.aborted) {
+            updateStatus('Upload cancelled');
+            return;
+        }
         console.error('Upload failed:', err);
         let errorMessage = getErrorMessage(err);
         if (errorMessage.includes('timeout')) {
@@ -332,18 +374,28 @@ async function uploadDataToCell(uploadTarget, fileName, uint8Array) {
     }
 }
 
-export function readFileAsArrayBuffer(file) {
+export function readFileAsArrayBuffer(file, signal) {
     return new Promise((resolve, reject) => {
+        signal?.throwIfAborted();
         const reader = new FileReader();
+        const cleanup = () => signal?.removeEventListener('abort', abort);
+        const abort = () => {
+            reader.abort();
+            cleanup();
+            reject(signal.reason);
+        };
         reader.onload = () => {
+            cleanup();
             if (reader.result instanceof ArrayBuffer) resolve(reader.result);
             else reject(new Error('FileReader returned a non-binary result'));
         };
-        reader.onerror = () => reject(reader.error ?? new Error('File read failed'));
-        reader.onabort = () => reject(new Error('File read was aborted'));
+        reader.onerror = () => { cleanup(); reject(reader.error ?? new Error('File read failed')); };
+        reader.onabort = () => { cleanup(); reject(signal?.reason ?? new Error('File read was aborted')); };
+        signal?.addEventListener('abort', abort, { once: true });
         try {
             reader.readAsArrayBuffer(file);
         } catch (error) {
+            cleanup();
             reject(error);
         }
     });

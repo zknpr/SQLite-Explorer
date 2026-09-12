@@ -218,6 +218,83 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     // gap the old load still owns the token, so a token-only check would let it
     // render the old table's rows under the new selection and clear the flag.
     const isSuperseded = () => loadToken !== activeLoadToken || requestedTable !== state.selectedTable;
+    let earlyDataResult;
+
+    // Both the early page and a count-aware retry use the same atomic row commit.
+    const commitRows = (dataResult, currentPageIndex, container) => {
+        state.gridData = dataResult.rows || [];
+        state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
+        state.gridOversizedCells = dataResult.oversizedCells || {};
+        state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};
+        const clearedOrdinalRowState = requestedTableType !== 'table'
+            && (state.selectedRowIds.size > 0 || state.pinnedRowIds.size > 0);
+        if (requestedTableType !== 'table') {
+            // Views have no stable row identity: getRowId() uses only a page
+            // ordinal. Any sort/filter/reload can bind that ordinal to another
+            // row, so selections and pins must not cross a committed load.
+            state.selectedRowIds.clear();
+            state.pinnedRowIds.clear();
+        }
+        // Anchors commit atomically with the rows they describe; a superseded
+        // load bailed above, so its anchors can never survive into state. On
+        // error paths the previous grid stays mounted together with the
+        // anchors that still describe it. Views/keyless objects store nulls.
+        state.keysetAnchors = {
+            table: requestedTable,
+            pageIndex: currentPageIndex,
+            first: dataResult.keysetAnchors?.first ?? null,
+            last: dataResult.keysetAnchors?.last ?? null
+        };
+        state.lastSuccessfulFilterState = {
+            table: requestedTable,
+            filterQuery: requestedFilterQuery,
+            columnFilters: requestedColumnFilters
+        };
+        state.lastGridLoadError = null;
+        // Shift-range anchors are indices into the rows/columns just replaced;
+        // a stale anchor would make the next shift-click select the wrong block
+        // of rows, or read past the new page's bounds.
+        state.lastSelectedCell = null;
+        state.lastSelectedColumnIndex = null;
+        state.lastSelectedRowIndex = null;
+        // The staged cell selection is index-bearing in the same way, so it
+        // must not survive the commit either. Flows that need a selection
+        // across a reload rebuild it by identity afterwards (applyBatchUpdate).
+        clearCellSelection();
+        if (clearedOrdinalRowState) persistState();
+        resetMatchNav();
+
+        // When preserving scroll, re-capture the latest position right before
+        // rendering. Covers the user scrolling during the fetch — including a
+        // flicker-free refetch where the spinner was suppressed and the grid stayed
+        // interactive — and edit operations that restored scroll while the fetch was
+        // pending. Gated on saveScrollPosition (not !showSpinner) so callers that
+        // intentionally reset scroll (page change, table switch) aren't clobbered.
+        // Re-check the DOM here (not the cached flag): this runs after the await,
+        // so the rendered state may differ from when the function started.
+        if (saveScrollPosition && container && container.querySelector('.data-grid')) {
+            state.scrollPosition.left = container.scrollLeft;
+            state.scrollPosition.top = container.scrollTop;
+        }
+
+        // Optimization: If editing, skip render to avoid destroying the active editor
+        if (!showSpinner && state.editingCellInfo) {
+            // We updated gridData, so the data is fresh.
+            // We skip the DOM update to keep the <textarea> alive.
+            // updateCellDom in edit.js handles the visual update of the modified cell.
+        } else {
+            renderDataGrid(state.scrollPosition.top, state.scrollPosition.left);
+            // The on-screen grid now reflects this table; remember it so the next
+            // load can distinguish a same-table refetch from a table switch.
+            state.renderedTable = requestedTable;
+        }
+
+        if (container) {
+            container.scrollLeft = state.scrollPosition.left;
+            container.scrollTop = state.scrollPosition.top;
+        }
+
+    };
 
     try {
         // The guard and every synchronous setup step it protects belong inside
@@ -348,7 +425,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         };
 
         // Resolve the count: cached when the identity is known, otherwise
-        // fetched in parallel with the data query wherever possible. A cached
+        // fetched after first-page rows or alongside deeper-page reads. A cached
         // count can drive pagination metadata, but cannot shorten a new data
         // query because another native connection may have changed the file.
         let countResult = getCachedCount(countIdentity);
@@ -399,9 +476,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
             if (isSuperseded()) return; // superseded (newer load or table switch) during the fetch
         } else {
-            // Cache miss: fetch count and data in parallel instead of serially,
-            // so the miss costs the slower of the two rather than their sum.
-            // The data query is speculative in one narrow way: it assumes the
+            // The count-blind data query is speculative in one narrow way: it assumes the
             // current page index needs no clamp. That only fails when the
             // count shrank below the current page through changes this webview
             // didn't make (its own deletes adjust the cache and take the
@@ -409,14 +484,41 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             // discarded and refetched at the clamped index.
             const storeCount = prepareCountStore(countIdentity);
             const speculativeOptions = buildDataQueryOptions(currentPageIndex, undefined, undefined);
-            // allSettled: a rejection on either leg must not surface as an
-            // unhandled rejection while the other is pending. Failures rethrow
-            // below in count-then-data order, matching the sequential flow
-            // this replaces.
-            const [countOutcome, dataOutcome] = await Promise.allSettled([
-                backendApi.fetchTableCount(requestedTable, countOptions),
-                backendApi.fetchTableData(requestedTable, speculativeOptions)
-            ]);
+            let countOutcome;
+            let dataOutcome;
+            if (currentPageIndex === 0) {
+                // A native connection serializes these requests. Put the useful
+                // rows ahead of counting, then let the webview paint them first.
+                const firstPage = await backendApi.fetchTableData(requestedTable, speculativeOptions);
+                if (isSuperseded()) return;
+                state.totalRecordCount = 0;
+                state.totalRecordCountIsExact = false;
+                state.totalPageCount = 1;
+                state.currentPageIndex = 0;
+                state.countStatus = 'pending';
+                commitRows(firstPage, 0, container);
+                earlyDataResult = firstPage;
+                state.isLoadingData = false;
+                // Keep the existing reload guard until metadata settles so
+                // queued filters and edits retain their ordering contract.
+                updatePagination();
+                updateToolbarButtons();
+                updateStatus(`${state.gridData.length} records loaded; counting…`);
+                if (typeof requestAnimationFrame === 'function' && document.visibilityState !== 'hidden') {
+                    await new Promise(resolve => {
+                        requestAnimationFrame(() => setTimeout(resolve, 0));
+                    });
+                }
+                if (isSuperseded()) return;
+                countOutcome = { status: 'fulfilled', value: await backendApi.fetchTableCount(requestedTable, countOptions) };
+                dataOutcome = { status: 'fulfilled', value: firstPage };
+            } else {
+                // Observe both outcomes even if one fails while the other is pending.
+                [countOutcome, dataOutcome] = await Promise.allSettled([
+                    backendApi.fetchTableCount(requestedTable, countOptions),
+                    backendApi.fetchTableData(requestedTable, speculativeOptions)
+                ]);
+            }
             if (isSuperseded()) return; // superseded during the parallel fetch
             if (countOutcome.status === 'rejected') throw countOutcome.reason;
             countResult = normalizeCountResult(countOutcome.value);
@@ -451,7 +553,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             }
         }
 
-        // A cold-cache load keeps count and data parallel, so its speculative
+        // A cold-cache load requests data without the count, so its speculative
         // query cannot know that this is a short exact page. Retry only when
         // that pessimistic row bound actually clipped a cell; ordinary pages
         // retain the one-query fast path. The second request is bounded by the
@@ -610,81 +712,12 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
 
         // Commit count, page, rows, and their filter identity together. A data
         // query failure therefore leaves the prior successful grid coherent.
+        state.countStatus = 'ready';
         state.totalRecordCount = totalRecordCount;
         state.totalRecordCountIsExact = totalRecordCountIsExact;
         state.totalPageCount = totalPageCount;
         state.currentPageIndex = currentPageIndex;
-        state.gridData = dataResult.rows || [];
-        state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
-        state.gridOversizedCells = dataResult.oversizedCells || {};
-        state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};
-        const clearedOrdinalRowState = requestedTableType !== 'table'
-            && (state.selectedRowIds.size > 0 || state.pinnedRowIds.size > 0);
-        if (requestedTableType !== 'table') {
-            // Views have no stable row identity: getRowId() uses only a page
-            // ordinal. Any sort/filter/reload can bind that ordinal to another
-            // row, so selections and pins must not cross a committed load.
-            state.selectedRowIds.clear();
-            state.pinnedRowIds.clear();
-        }
-        // Anchors commit atomically with the rows they describe; a superseded
-        // load bailed above, so its anchors can never survive into state. On
-        // error paths the previous grid stays mounted together with the
-        // anchors that still describe it. Views/keyless objects store nulls.
-        state.keysetAnchors = {
-            table: requestedTable,
-            pageIndex: currentPageIndex,
-            first: dataResult.keysetAnchors?.first ?? null,
-            last: dataResult.keysetAnchors?.last ?? null
-        };
-        state.lastSuccessfulFilterState = {
-            table: requestedTable,
-            filterQuery: requestedFilterQuery,
-            columnFilters: requestedColumnFilters
-        };
-        state.lastGridLoadError = null;
-        // Shift-range anchors are indices into the rows/columns just replaced;
-        // a stale anchor would make the next shift-click select the wrong block
-        // of rows, or read past the new page's bounds.
-        state.lastSelectedCell = null;
-        state.lastSelectedColumnIndex = null;
-        state.lastSelectedRowIndex = null;
-        // The staged cell selection is index-bearing in the same way, so it
-        // must not survive the commit either. Flows that need a selection
-        // across a reload rebuild it by identity afterwards (applyBatchUpdate).
-        clearCellSelection();
-        if (clearedOrdinalRowState) persistState();
-        resetMatchNav();
-
-        // When preserving scroll, re-capture the latest position right before
-        // rendering. Covers the user scrolling during the fetch — including a
-        // flicker-free refetch where the spinner was suppressed and the grid stayed
-        // interactive — and edit operations that restored scroll while the fetch was
-        // pending. Gated on saveScrollPosition (not !showSpinner) so callers that
-        // intentionally reset scroll (page change, table switch) aren't clobbered.
-        // Re-check the DOM here (not the cached flag): this runs after the await,
-        // so the rendered state may differ from when the function started.
-        if (saveScrollPosition && container && container.querySelector('.data-grid')) {
-            state.scrollPosition.left = container.scrollLeft;
-            state.scrollPosition.top = container.scrollTop;
-        }
-
-        // Optimization: If editing, skip render to avoid destroying the active editor
-        if (!showSpinner && state.editingCellInfo) {
-            // We updated gridData, so the data is fresh.
-            // We skip the DOM update to keep the <textarea> alive.
-            // updateCellDom in edit.js handles the visual update of the modified cell.
-        } else {
-            renderDataGrid(state.scrollPosition.top, state.scrollPosition.left);
-            // The on-screen grid now reflects this table; remember it so the next
-            // load can distinguish a same-table refetch from a table switch.
-            state.renderedTable = requestedTable;
-        }
-
-        if (container) {
-            container.scrollLeft = state.scrollPosition.left;
-            container.scrollTop = state.scrollPosition.top;
-        }
+        if (dataResult !== earlyDataResult) commitRows(dataResult, currentPageIndex, container);
 
         updatePagination();
         updateStatus(`${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`);
@@ -695,6 +728,14 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // Don't let a superseded load's error replace the current table's view.
         if (!isSuperseded()) {
             const message = getErrorMessage(err);
+            if (earlyDataResult) {
+                // Count/recovery failure does not undo a successful row load or
+                // its filter identity. Keep a usable grid and expose the error.
+                state.countStatus = 'unavailable';
+                updatePagination();
+                updateStatus(`${state.gridData.length} records loaded; count unavailable: ${message}`);
+                return true;
+            }
             state.lastGridLoadError = message;
             updateStatus(`Error: ${message}`);
             // Background filters retain the last successful grid so the UI can

@@ -143,6 +143,7 @@ it('restores a saved table identity before loading its columns or data', async (
                         './modules/dnd.js': 'export function initDragAndDrop() {}',
                         './modules/views.js': 'export function initViews() {}',
                         './modules/connection-state.js': `
+                            export function updateMutationControlCapabilities() {}
                             export function applyConnectionResult(result) {
                                 ${harness}.state.isDbConnected = !!result?.connected;
                                 return ${harness}.state.isDbConnected;

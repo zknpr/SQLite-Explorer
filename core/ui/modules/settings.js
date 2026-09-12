@@ -150,18 +150,21 @@ function renderPragmaForm(pragmas, settings) {
     appendSection('Extension Settings');
 
     // Auto Commit
+    const nativeWritesImmediately = settings.nativeWritesImmediately === true;
     const autoCommitInput = document.createElement('input');
     autoCommitInput.type = 'checkbox';
     autoCommitInput.className = 'setting-extension';
     autoCommitInput.dataset.key = 'autoCommit';
-    autoCommitInput.checked = !!settings.autoCommit;
-    autoCommitInput.disabled = settings.autoCommitSupported === false;
+    autoCommitInput.checked = nativeWritesImmediately || !!settings.autoCommit;
+    autoCommitInput.disabled = nativeWritesImmediately || settings.autoCommitSupported === false;
     appendField(
         'Auto-Commit Changes',
         autoCommitInput,
         settings.autoCommitSupported === false
             ? 'Auto-commit is unavailable in the web demo. Download the database to save changes.'
-            : 'Automatically save changes to disk immediately. If disabled, you must save manually (Ctrl+S).'
+            : nativeWritesImmediately
+                ? 'Native SQLite writes changes to the database immediately. Auto-commit is always enabled for this connection.'
+                : 'Automatically save changes to disk immediately. If disabled, you must save manually (Ctrl+S).'
     );
 
     // Double Click Behavior

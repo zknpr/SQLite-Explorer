@@ -7,7 +7,7 @@ import { refreshSchema } from './sidebar.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
 import { applyConnectionResult, updateMutationControlCapabilities } from './connection-state.js';
 import { invalidateAllCounts } from './count-cache.js';
-import { showErrorState, showLoading, updateStatus, updateToolbarButtons } from './ui.js';
+import { clearContentStatus, showErrorState, showLoading, updateStatus, updateToolbarButtons } from './ui.js';
 import { closeDatabaseTargetModals } from './modals.js';
 import { getErrorMessage } from './utils.js';
 
@@ -17,11 +17,25 @@ export { backendApi } from './api.js';
  * Methods called by the extension host.
  */
 export async function refreshContent(filename, connectionResult) {
+    const refresh = refreshContentOnce(filename, connectionResult);
+    state.contentRefreshPromise = refresh;
+    try {
+        return await refresh;
+    } finally {
+        if (state.contentRefreshPromise === refresh) state.contentRefreshPromise = null;
+    }
+}
+
+async function refreshContentOnce(filename, connectionResult) {
     // This broadcast means the document changed in a way this webview didn't
     // perform itself (undo/redo, another panel's edit, a VS Code cell-editor
     // write, revert — the host also echoes one after this webview's own
     // edits). None of the cached counts can be trusted across it.
     invalidateAllCounts();
+    // Undo can restore a dropped view while no object is selected, so no grid
+    // load will replace its old completion message. Expire only completed
+    // schema feedback, before awaits can admit newer status or operation replies.
+    clearContentStatus();
     const contentGeneration = ++state.contentGeneration;
     state.isRefreshingContent = true;
     updateMutationControlCapabilities();
@@ -41,6 +55,13 @@ export async function refreshContent(filename, connectionResult) {
     state.activeCellInput = null;
     updateToolbarButtons();
     try {
+      if (state.reloadRequiredReason) {
+        // The host has retired this connection. Fetching its schema can only
+        // fail again and hide the action needed to recover it.
+        showErrorState(state.reloadRequiredReason);
+        updateStatus('Reload Database to open the current file.');
+        return { success: false, reloadRequired: true };
+      }
       if (state.isDbConnected) {
         if (connectionReplaced) {
             clearSelection();

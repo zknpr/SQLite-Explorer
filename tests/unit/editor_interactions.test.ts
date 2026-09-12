@@ -20,6 +20,7 @@ const clipboardModulePath = '../../core/ui/modules/clipboard.js';
 const backendApiModulePath = '../../core/ui/modules/api.js';
 const gridActionsModulePath = '../../core/ui/modules/grid-actions.js';
 const connectionStateModulePath = '../../core/ui/modules/connection-state.js';
+const rpcModulePath = '../../core/ui/modules/rpc.js';
 
 interface CellReadSessionResult {
     sessionId: string;
@@ -195,6 +196,20 @@ describe('editor keyboard and grid selection interactions', () => {
         assert.strictEqual(textarea.value, 'SELECT 1    ');
     });
 
+    it('keeps Escape focus escape armed through the real Shift key before reverse Tab', async () => {
+        const { handleTextareaTab } = await import(textEditorModulePath);
+        const textarea = createTextarea('    SELECT 1', 12);
+        const event = (key: string, shiftKey = false) => ({
+            key, shiftKey, target: textarea, preventDefault() {}, stopPropagation() {}
+        });
+        assert.strictEqual(handleTextareaTab(event('Escape')), true);
+        assert.strictEqual(handleTextareaTab(event('Shift', true)), false);
+        assert.strictEqual(handleTextareaTab(event('Tab', true)), false);
+        assert.strictEqual(textarea.value, '    SELECT 1');
+        assert.strictEqual(handleTextareaTab(event('Tab', true)), true);
+        assert.strictEqual(textarea.value, 'SELECT 1');
+    });
+
     it('wires Tab indentation into the modal cell editor', async () => {
         const listeners = new Map<string, (event: any) => any>();
         const element = (id: string) => ({
@@ -305,6 +320,33 @@ describe('editor keyboard and grid selection interactions', () => {
         } finally {
             backendApi.updateCell = originalUpdateCell;
         }
+    });
+
+    it('downloads the stored TEXT cell without submitting or discarding the modal draft', async () => {
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { downloadCellPreview } = await import(editModulePath);
+        const status = { textContent: '' };
+        (globalThis as any).document = { getElementById(id: string) {
+            if (id === 'statusText') return status;
+            if (id === 'cellPreviewTextarea') throw new Error('download must not read the unsaved draft');
+            return null;
+        } };
+        const session = { table: 'items', tableType: 'table', rowId: 7, columnName: 'body', originalText: 'original', dirty: true };
+        state.cellPreviewInfo = session;
+        const open = backendApi.openCellEditor;
+        let requested: unknown[] = [];
+        backendApi.openCellEditor = async (...args: unknown[]) => { requested = args; return { success: true, mode: 'download' }; };
+        try {
+            assert.equal(typeof downloadCellPreview, 'function');
+            await downloadCellPreview();
+            assert.deepStrictEqual(requested.slice(0, 3), [{ table: 'items', name: '' }, 7, 'body']);
+            assert.strictEqual((requested[4] as { download: boolean }).download, true);
+            assert.strictEqual(state.cellPreviewInfo, session);
+            assert.strictEqual(session.dirty, true);
+            assert.match(status.textContent, /draft is unchanged/);
+        } finally { backendApi.openCellEditor = open; }
     });
 
     it('keeps the preview open and reports the host reason when external editing is unavailable', async () => {
@@ -1883,7 +1925,11 @@ describe('editor keyboard and grid selection interactions', () => {
             children: [] as any[],
             appendChild(child: any) { this.children.push(child); }
         };
-        const hex = { value: '' };
+        const hex = {
+            textContent: '',
+            addEventListener() {},
+            appendChild(child: { textContent: string }) { this.textContent += child.textContent; }
+        };
         const info = { textContent: '' };
         const genericElement = () => ({
             addEventListener() {},
@@ -2097,7 +2143,9 @@ describe('editor keyboard and grid selection interactions', () => {
         }
     });
 
-    it('keeps Tab advancement bound to the intended row when the edit changes sort order', async () => {
+    for (const pendingRefresh of [false, true]) it(
+      `keeps Tab advancement bound to the intended row when the edit changes sort order${pendingRefresh ? ' while the content refresh is pending' : ''}`,
+      async () => {
         const makeCell = (id: string) => ({
             id,
             innerHTML: '',
@@ -2164,9 +2212,31 @@ describe('editor keyboard and grid selection interactions', () => {
         const { backendApi } = await import(apiModulePath);
         const { state } = await import(stateModulePath);
         const { onCellInputKeydown } = await import(editModulePath);
+        const { refreshContent } = await import(rpcModulePath);
         const originalUpdateCell = backendApi.updateCell;
         const originalFetchCount = backendApi.fetchTableCount;
         const originalFetchData = backendApi.fetchTableData;
+        const originalFetchSchema = backendApi.fetchSchema;
+        const originalGetTableInfo = backendApi.getTableInfo;
+        let refresh: Promise<unknown> | undefined;
+        let columnsReady = createDeferred<void>();
+        const originalAnimationFrame = globalThis.requestAnimationFrame;
+        if (pendingRefresh) {
+            // The real grid yields for the first paint before fetching a cold
+            // count. That lets the slower host schema refresh supersede it.
+            globalThis.requestAnimationFrame = callback => {
+                setImmediate(() => callback(0));
+                return 1;
+            };
+        }
+        backendApi.fetchSchema = async () => ({ tables: [{ identifier: 'items' }], views: [], indexes: [] });
+        backendApi.getTableInfo = async () => {
+            await columnsReady.promise;
+            return ['rank', 'note'].map((identifier, ordinal) => ({
+                identifier, ordinal, declaredType: 'TEXT', isRequired: false,
+                defaultExpression: null, primaryKeyPosition: 0
+            }));
+        };
         const updateCalls: Array<{ rowId: number; column: string; value: unknown }> = [];
         const databaseRows: any[][] = [
             [1, 'a', 'first row note'],
@@ -2189,6 +2259,11 @@ describe('editor keyboard and grid selection interactions', () => {
             // Mirror the external refresh landing while the inline textarea keeps
             // the pre-refresh DOM mounted.
             state.gridData = sortedRows();
+            if (pendingRefresh) {
+                columnsReady = createDeferred<void>();
+                refresh = refreshContent('items.db');
+                setImmediate(() => columnsReady.resolve());
+            }
         };
         backendApi.fetchTableCount = async () => databaseRows.length;
         backendApi.fetchTableData = async () => {
@@ -2197,6 +2272,7 @@ describe('editor keyboard and grid selection interactions', () => {
             return { rows: sortedRows() };
         };
         state.selectedTable = 'items';
+        state.isDbConnected = pendingRefresh;
         state.selectedTableType = 'table';
         state.renderedTable = 'items';
         state.tableColumns = [
@@ -2230,6 +2306,7 @@ describe('editor keyboard and grid selection interactions', () => {
                 shiftKey: false,
                 preventDefault() {}
             });
+            await refresh;
 
             assert.strictEqual(state.editingCellInfo?.rowId, 1);
             assert.strictEqual(state.editingCellInfo?.rowIdx, 1);
@@ -2247,7 +2324,7 @@ describe('editor keyboard and grid selection interactions', () => {
                 shiftKey: false,
                 preventDefault() {}
             });
-
+            await refresh;
             assert.deepStrictEqual(updateCalls.slice(0, 2), [
                 { rowId: 1, column: 'rank', value: 'z' },
                 { rowId: 1, column: 'note', value: 'edited intended row' }
@@ -2256,9 +2333,15 @@ describe('editor keyboard and grid selection interactions', () => {
             backendApi.updateCell = originalUpdateCell;
             backendApi.fetchTableCount = originalFetchCount;
             backendApi.fetchTableData = originalFetchData;
+            backendApi.fetchSchema = originalFetchSchema;
+            backendApi.getTableInfo = originalGetTableInfo;
             state.sortedColumn = null;
             state.sortAscending = true;
             state.renderedTable = null;
+            state.isRefreshingContent = false;
+            state.contentRefreshPromise = null;
+            state.isDbConnected = false;
+            globalThis.requestAnimationFrame = originalAnimationFrame;
         }
     });
 

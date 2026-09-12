@@ -82,6 +82,7 @@ body {
 
 .main-panel {
     flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -278,6 +279,24 @@ button.section-title:focus-visible,
     flex: 1;
 }
 
+#indexesList .list-item {
+    padding: 4px 12px 4px 24px;
+    gap: 6px;
+}
+
+.item-content {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.item-detail {
+    font-size: 11px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .view-item-actions {
     display: flex;
     align-items: center;
@@ -318,19 +337,23 @@ button.section-title:focus-visible,
    TOOLBAR STYLES
    ================================================================ */
 .toolbar-panel {
-    height: var(--toolbar-height);
+    min-height: var(--toolbar-height);
+    flex-shrink: 0;
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border-color);
     display: flex;
     align-items: center;
-    padding: 0 8px;
+    padding: 4px 8px;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .toolbar-left {
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .toolbar-right {
@@ -338,6 +361,8 @@ button.section-title:focus-visible,
     display: flex;
     align-items: center;
     gap: 8px;
+    max-width: 100%;
+    flex-wrap: wrap;
 }
 
 .current-table {
@@ -345,6 +370,13 @@ button.section-title:focus-visible,
     align-items: center;
     gap: 6px;
     font-weight: 500;
+    min-width: 0;
+}
+
+#tableNameLabel {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .toolbar-button {
@@ -353,6 +385,7 @@ button.section-title:focus-visible,
     color: var(--text-primary);
     padding: 4px 10px;
     border-radius: 3px;
+    white-space: nowrap;
     cursor: pointer;
     font-size: 12px;
     display: flex;
@@ -866,8 +899,7 @@ button.section-title:focus-visible,
 }
 
 .data-cell.oversized-cell {
-    color: var(--vscode-editorWarning-foreground, #cca700);
-    cursor: not-allowed;
+    color: var(--text-primary);
 }
 
 .data-row.read-only-row .data-cell.row-number {
@@ -981,19 +1013,30 @@ button.section-title:focus-visible,
    FOOTER STYLES
    ================================================================ */
 .footer-panel {
-    height: var(--footer-height);
+    min-height: var(--footer-height);
+    flex-shrink: 0;
     background: var(--bg-secondary);
     border-top: 1px solid var(--border-color);
     display: flex;
     align-items: center;
-    padding: 0 12px;
+    padding: 4px 12px;
     font-size: 12px;
+    flex-wrap: wrap;
+    gap: 4px 12px;
 }
 
 .footer-left {
     display: flex;
     align-items: center;
     gap: 12px;
+    min-width: 0;
+    max-width: 100%;
+}
+
+#statusText {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .footer-right {
@@ -1001,12 +1044,15 @@ button.section-title:focus-visible,
     display: flex;
     align-items: center;
     gap: 12px;
+    max-width: 100%;
+    flex-wrap: wrap;
 }
 
 .page-selector {
     display: flex;
     align-items: center;
     gap: 4px;
+    white-space: nowrap;
 }
 
 .page-selector select {
@@ -1066,8 +1112,8 @@ button.section-title:focus-visible,
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 6px;
-    min-width: 400px;
-    max-width: 600px;
+    min-width: min(400px, calc(100vw - 24px));
+    max-width: min(600px, calc(100vw - 24px));
     max-height: 80vh;
     overflow: hidden;
     display: flex;
@@ -1085,9 +1131,12 @@ button.section-title:focus-visible,
 .modal-title {
     font-weight: 600;
     font-size: 14px;
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .modal-close {
+    flex-shrink: 0;
     background: none;
     border: none;
     color: var(--text-secondary);
@@ -1111,6 +1160,7 @@ button.section-title:focus-visible,
     display: flex;
     justify-content: flex-end;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .form-field {
@@ -1146,6 +1196,11 @@ button.section-title:focus-visible,
 .form-field select:focus {
     outline: none;
     border-color: var(--accent-color);
+}
+
+input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--vscode-focusBorder, var(--accent-color));
+    outline-offset: 2px;
 }
 
 .view-editor-dialog {
@@ -1242,7 +1297,7 @@ button.section-title:focus-visible,
     font-size: 13px;
 }
 
-.btn-primary:hover {
+.btn-primary:hover:not(:disabled) {
     /* Themed hover background replaces the previous opacity dim, which faded
        the button-foreground text and hurt contrast on some themes. */
     background: var(--vscode-button-hoverBackground, #1177bb);
@@ -1258,8 +1313,14 @@ button.section-title:focus-visible,
     font-size: 13px;
 }
 
-.btn-secondary:hover {
+.btn-secondary:hover:not(:disabled) {
     background: var(--vscode-button-secondaryHoverBackground, #2a2d2e);
+}
+
+.btn-primary:disabled,
+.btn-secondary:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
 }
 
 .btn-danger {
@@ -1578,7 +1639,7 @@ button.section-title:focus-visible,
 }
 
 .blob-inspector-dialog {
-    min-width: 600px;
+    min-width: min(600px, calc(100vw - 24px));
     height: 600px;
 }
 
@@ -1627,22 +1688,51 @@ button.section-title:focus-visible,
     background: var(--bg-primary);
 }
 
-.blob-hex-pane {
-    display: none;
-    flex: 1;
-    overflow: auto;
+.inspector-text-preview input {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    padding: 5px 6px;
+    font: inherit;
 }
 
-.hex-dump-textarea {
+.inspector-text-preview input:focus-visible,
+.inspector-text-preview pre:focus-visible,
+.hex-dump-content:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
+}
+
+.blob-hex-pane {
+    display: none;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.blob-hex-navigation {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+}
+
+.hex-dump-content {
     width: 100%;
-    height: 100%;
-    resize: none;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    white-space: pre;
+    user-select: text;
     border: none;
     padding: 12px;
     font-family: monospace;
     background: var(--bg-primary);
     color: var(--text-primary);
-    outline: none;
 }
 
 .blob-preview-placeholder {

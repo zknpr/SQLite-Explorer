@@ -11,6 +11,7 @@ import { getErrorMessage, parseGridInputValue } from './utils.js';
 import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
 import { assertUsableSqlIdentifier } from '../../../src/core/sql-utils.ts';
+import { confirmLargeChange, LARGE_CHANGE_WARNING_THRESHOLD } from './large-change-guard.js';
 
 let isSubmittingAddRow = false;
 let isSubmittingDelete = false;
@@ -436,6 +437,7 @@ async function submitDeleteRows(session, isCurrentSession) {
     }
 
     try {
+        if (rowIds.length > LARGE_CHANGE_WARNING_THRESHOLD && !(await confirmLargeChange(rowIds.length, 'rows'))) return;
         updateStatus('Deleting rows...');
         await backendApi.deleteRows(targetTable, rowIds);
         // VS Code retains this requested delta until its refreshContent echo.
@@ -547,6 +549,8 @@ export function openCreateTableModal() {
         contentGeneration: state.contentGeneration
     };
     document.getElementById('newTableName').value = '';
+    const withoutRowid = document.getElementById('newTableWithoutRowid');
+    if (withoutRowid) withoutRowid.checked = false;
     const container = document.getElementById('columnDefinitions');
     container.replaceChildren();
     columnDefCounter = 0;
@@ -605,6 +609,21 @@ export function addColumnDefinition(isFirst = false) {
     });
     rowDiv.appendChild(typeSelect);
 
+    const defaultInputId = `columnDefault_${colId}`;
+    const defaultLabel = document.createElement('label');
+    defaultLabel.className = 'visually-hidden';
+    defaultLabel.htmlFor = defaultInputId;
+    defaultLabel.textContent = `Column ${colId} default literal`;
+    rowDiv.appendChild(defaultLabel);
+    const defaultInput = document.createElement('input');
+    defaultInput.id = defaultInputId;
+    defaultInput.type = 'text';
+    defaultInput.className = 'col-default';
+    defaultInput.placeholder = 'Default literal';
+    defaultInput.title = 'Empty: no default. Numbers and NULL keep their SQL meaning; other values are literal text, not SQL expressions.';
+    defaultInput.style.flex = '1';
+    rowDiv.appendChild(defaultInput);
+
     // PK Checkbox
     const pkLabel = document.createElement('label');
     Object.assign(pkLabel.style, {
@@ -658,7 +677,13 @@ export function addColumnDefinition(isFirst = false) {
 
 export function removeColumnDefinition(colId) {
     const elem = document.getElementById(`colDef_${colId}`);
-    if (elem) elem.remove();
+    if (!elem) return;
+    const adjacentRow = elem.nextElementSibling ?? elem.previousElementSibling;
+    const focusTarget = adjacentRow?.querySelector('.col-name')
+        ?? document.getElementById('btnAddColumnDef');
+    // Removing the focused button otherwise leaves keyboard focus on BODY.
+    elem.remove();
+    focusTarget?.focus();
 }
 
 export async function submitCreateTable() {
@@ -673,9 +698,18 @@ export async function submitCreateTable() {
 
 async function submitCreateTableOnce() {
     const modalSession = createTableSession;
+    const targetConnectionGeneration = modalSession?.connectionGeneration
+        ?? state.connectionGeneration;
     const isCurrentSession = () => modalSession === null
         ? createTableSession === null
         : createTableSession === modalSession;
+    const operationStatus = 'Creating table...';
+    const canReportCompletion = () => {
+        const activeSession = createTableSession;
+        return targetConnectionGeneration === state.connectionGeneration
+            && (activeSession === null || activeSession === modalSession)
+            && document.getElementById('statusText')?.textContent === operationStatus;
+    };
     const tableName = document.getElementById('newTableName').value;
     if (modalSession
         && (modalSession.connectionGeneration !== state.connectionGeneration
@@ -698,6 +732,7 @@ async function submitCreateTableOnce() {
         const type = row.querySelector('.col-type').value;
         const isPK = row.querySelector('.col-pk').checked;
         const isNN = row.querySelector('.col-nn').checked;
+        const defaultValue = row.querySelector('.col-default')?.value ?? '';
 
         try {
             assertUsableSqlIdentifier(name, 'Column name');
@@ -710,7 +745,8 @@ async function submitCreateTableOnce() {
             name: name,
             type: type,
             primaryKey: isPK,
-            notNull: isNN
+            notNull: isNN,
+            ...(defaultValue === '' ? {} : { defaultValue })
         });
     }
 
@@ -718,15 +754,27 @@ async function submitCreateTableOnce() {
         updateStatus('Error: At least one column is required');
         return;
     }
+    const withoutRowid = document.getElementById('newTableWithoutRowid')?.checked === true;
+    if (withoutRowid && !colDefs.some(column => column.primaryKey)) {
+        updateStatus('Error: WITHOUT ROWID requires a primary key');
+        return;
+    }
 
     try {
-        updateStatus('Creating table...');
-        await backendApi.createTable(tableName, colDefs);
+        updateStatus(operationStatus);
+        if (withoutRowid) await backendApi.createTable(tableName, colDefs, { withoutRowid: true });
+        else await backendApi.createTable(tableName, colDefs);
 
         await refreshSchema();
         if (isCurrentSession()) {
             closeModal('createTableModal');
-            updateStatus(`Table "${tableName}" created - Ctrl+S to save`);
+        }
+        // The extension host echoes committed DDL before its RPC response and
+        // closes this modal as stale. Report success while this operation still
+        // owns the footer, but never close a reopened draft or replace newer
+        // feedback from another action.
+        if (canReportCompletion()) {
+            updateStatus(`Table "${tableName}" created - Ctrl+S to save`, { clearOnRefresh: true });
         }
 
     } catch (err) {
