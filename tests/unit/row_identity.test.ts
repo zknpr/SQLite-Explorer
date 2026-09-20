@@ -35,11 +35,11 @@ describe('FTS shadow table identity', () => {
 
     it('preserves composite primary keys with undeclared types in FTS index metadata', () => {
         const identities = buildTableIdentityMap([
-            ['history_fts_idx', 'shadow', 1, 0, 'segid', '', 1],
-            ['history_fts_idx', 'shadow', 1, 1, 'term', '', 2],
-            ['history_fts_idx', 'shadow', 1, 2, 'pgno', '', 0]
+            ['fts_fixture_idx', 'shadow', 1, 0, 'segid', '', 1],
+            ['fts_fixture_idx', 'shadow', 1, 1, 'term', '', 2],
+            ['fts_fixture_idx', 'shadow', 1, 2, 'pgno', '', 0]
         ]);
-        assert.deepStrictEqual(identities.get('history_fts_idx'), {
+        assert.deepStrictEqual(identities.get('fts_fixture_idx'), {
             kind: 'primaryKey',
             columns: [
                 { identifier: 'segid', declaredType: '', position: 1 },
