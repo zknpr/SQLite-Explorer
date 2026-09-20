@@ -79,6 +79,7 @@ describe('VSIX content gate', () => {
     'extension/package.json',
     'extension/out/extension.js',
     'extension/out/extension-browser.js',
+    'extension/core/ui/viewer.html',
     'extension/assets/sqlite3.wasm'
   ];
 
@@ -91,19 +92,21 @@ describe('VSIX content gate', () => {
     );
   });
 
-  it('allows only the selected native binary and shared native worker', async () => {
+  it('allows only the selected native binary, plan reader and shared native worker', async () => {
     const { NATIVE_VARIANTS } = await loadTargets();
     const { getNativeStageFiles, validatePackageEntries } = await loadPackager();
     const variant = NATIVE_VARIANTS.find((candidate: any) => candidate.target === 'darwin-arm64');
 
     assert.deepStrictEqual(getNativeStageFiles(variant), [
       'natives/native-worker.js',
-      'natives/aarch64-macos/tjs'
+      'natives/aarch64-macos/tjs',
+      'natives/aarch64-macos/query-plan.dylib'
     ]);
     assert.doesNotThrow(() => validatePackageEntries([
       ...commonEntries,
       'extension/natives/native-worker.js',
-      'extension/natives/aarch64-macos/tjs'
+      'extension/natives/aarch64-macos/tjs',
+      'extension/natives/aarch64-macos/query-plan.dylib'
     ], variant));
   });
 
@@ -117,6 +120,7 @@ describe('VSIX content gate', () => {
         ...commonEntries,
         'extension/natives/native-worker.js',
         'extension/natives/aarch64-macos/tjs',
+        'extension/natives/aarch64-macos/query-plan.dylib',
         'extension/natives/x86_64-linux-gnu/tjs'
       ], variant),
       /foreign or unexpected native/
@@ -147,6 +151,24 @@ describe('VSIX content gate', () => {
         UNIVERSAL_VARIANT
       ),
       /browser entry point/
+    );
+  });
+
+  it('requires the bundled viewer and excludes its redundant source modules', async () => {
+    const { UNIVERSAL_VARIANT } = await loadTargets();
+    const { validatePackageEntries } = await loadPackager();
+    assert.throws(
+      () => validatePackageEntries(
+        commonEntries.filter(entry => entry !== 'extension/core/ui/viewer.html'),
+        UNIVERSAL_VARIANT
+      ),
+      /bundled viewer/
+    );
+    assert.throws(
+      () => validatePackageEntries([
+        ...commonEntries, 'extension/core/ui/modules/grid-data.js'
+      ], UNIVERSAL_VARIANT),
+      /redundant core source/
     );
   });
 

@@ -13,6 +13,7 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
+import Link from 'next/link';
 import { Upload, Database, FileUp, ArrowLeft, Download, RefreshCw, AlertCircle } from 'lucide-react';
 import { isTrustedViewerMessage } from './messageGuard';
 import {
@@ -27,6 +28,8 @@ import {
   type PendingWorkerCall
 } from './lifecycle';
 import { DEMO_INLINE_CONTENT_MAX_BYTES } from '../../../src/core/paged-open';
+import type { QueryResultSet } from '../../../src/core/types';
+import DemoSqlEditor from './DemoSqlEditor';
 import {
   demoRpcErrorFields,
   demoRpcErrorFromResponse,
@@ -115,6 +118,7 @@ const SAMPLE_DATABASES = [
 
 const CANCELLATION_PARAMETER_INDEX: Readonly<Record<string, number>> = {
   runQuery: 2,
+  executeReadQuery: 2,
   previewViewDefinition: 4
 };
 
@@ -152,6 +156,8 @@ function createSharedCancellationFlag(signal?: AbortSignal) {
 // ============================================================================
 
 export default function DemoClient() {
+  const [queryEditorOpen, setQueryEditorOpen] = useState(false);
+  const [querySession, setQuerySession] = useState(0);
   // -------------------------------------------------------------------------
   // State
   // -------------------------------------------------------------------------
@@ -365,6 +371,18 @@ export default function DemoClient() {
       }
 
       // Special handling for extension-specific methods
+      if (targetMethod === 'openQueryEditor') {
+        const connected = workerRef.current !== null;
+        if (connected) setQueryEditorOpen(true);
+        postIframeRpcResponse(event.source, viewerOrigin, {
+          kind: 'response',
+          messageId,
+          success: connected,
+          ...(connected ? {} : { errorMessage: 'No database initialized' })
+        });
+        return;
+      }
+
       if (targetMethod === 'initialize') {
         // Already initialized, just return success. Read-only reflects how
         // the worker actually opened the database (stale-runtime paged
@@ -564,6 +582,8 @@ export default function DemoClient() {
    * File — the guard rejects larger inline Uint8Arrays.
    */
   const initializeWorker = useCallback(async (source: Uint8Array | File, filename: string) => {
+    setQueryEditorOpen(false);
+    setQuerySession(session => session + 1);
     // Terminate existing worker
     activePreviewController.current?.abort();
     activePreviewController.current = null;
@@ -578,7 +598,7 @@ export default function DemoClient() {
     }
 
     // Create new worker (classic worker, not module, to support importScripts)
-    const worker = new Worker('/sqlite-viewer/worker.js');
+    const worker = new Worker(`${process.env.NEXT_PUBLIC_SQLITE_VIEWER_BASE_PATH}/worker.js`);
     workerRef.current = worker;
 
     // Handle worker messages
@@ -669,11 +689,16 @@ export default function DemoClient() {
     }
   }, [callWorker]);
 
-  reloadDatabaseRef.current = () => reloadDemoDatabase(
-    databaseBinary.current ?? databaseFile.current,
-    databaseName,
-    initializeWorker
-  );
+  useEffect(() => {
+    reloadDatabaseRef.current = () => reloadDemoDatabase(
+      databaseBinary.current ?? databaseFile.current,
+      databaseName,
+      initializeWorker
+    );
+    return () => {
+      reloadDatabaseRef.current = null;
+    };
+  }, [databaseName, initializeWorker]);
 
   // -------------------------------------------------------------------------
   // File Handling
@@ -863,13 +888,13 @@ export default function DemoClient() {
       {/* Header */}
       <header className="border-b border-(--ui-edge) px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <a
+          <Link
             href="/"
             className="flex items-center gap-2 text-(--ui-subtle-fg) hover:text-(--ui-fg) transition-colors"
           >
             <ArrowLeft className="w-4 h-4" />
             <span className="text-sm">Back</span>
-          </a>
+          </Link>
           <div className="h-6 w-px bg-(--ui-edge)" />
           <div className="flex items-center gap-2">
             <Database className="w-5 h-5 text-(--ui-accent)" />
@@ -1041,9 +1066,17 @@ export default function DemoClient() {
             )}
             <iframe
               ref={iframeRef}
-              src="/sqlite-viewer/viewer.html"
+              src={`${process.env.NEXT_PUBLIC_SQLITE_VIEWER_BASE_PATH}/viewer.html`}
               className="flex-1 border-0"
               title="SQLite Viewer"
+            />
+            <DemoSqlEditor
+              key={querySession}
+              open={queryEditorOpen}
+              databaseName={databaseName ?? 'Database'}
+              onClose={() => setQueryEditorOpen(false)}
+              executeQuery={async (sql, parameters) =>
+                await callWorker('executeReadQuery', [sql, parameters]) as QueryResultSet}
             />
           </div>
         )}

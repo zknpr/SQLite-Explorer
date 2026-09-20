@@ -41,27 +41,60 @@ function deferred<T>() {
 }
 
 interface PreviewElement {
+    tagName: string;
     style: Record<string, string>;
     children: PreviewElement[];
     listeners: Map<string, (event: any) => void>;
+    attributes: Map<string, string>;
+    disabled: boolean;
+    value: string;
     textContent: string;
     appendChild(child: PreviewElement): void;
     addEventListener(name: string, listener: (event: any) => void): void;
+    setAttribute(name: string, value: string): void;
     contains(node: unknown): boolean;
 }
 
-function previewElement(): PreviewElement {
+function previewElement(tag = 'div'): PreviewElement {
     let value = '';
     const children: ReturnType<typeof previewElement>[] = [];
     const listeners = new Map<string, (event: any) => void>();
+    const attributes = new Map<string, string>();
     return {
-        style: {} as Record<string, string>, children, listeners,
+        tagName: tag.toUpperCase(), style: {} as Record<string, string>, children, listeners,
+        attributes, disabled: false, value: '',
         get textContent(): string { return value + children.map(child => child.textContent).join(''); },
         set textContent(text: string) { value = text; children.length = 0; },
         appendChild(child: ReturnType<typeof previewElement>) { children.push(child); },
         addEventListener(name: string, listener: (event: any) => void) { listeners.set(name, listener); },
-        contains(node: unknown) { return node === this || children.includes(node as ReturnType<typeof previewElement>); }
+        setAttribute(name: string, value: string) { attributes.set(name, value); },
+        contains(node: unknown) { return node === this || children.some(child => child.contains(node)); }
     };
+}
+
+function previewDescendants(element: PreviewElement): PreviewElement[] {
+    return [element, ...element.children.flatMap(previewDescendants)];
+}
+
+function previewText(element: PreviewElement): PreviewElement {
+    const pre = previewDescendants(element).find(child => child.tagName === 'PRE');
+    assert.ok(pre, 'The preview contains selectable text');
+    return pre;
+}
+
+function completePreviewText(element: PreviewElement): string {
+    const next = previewDescendants(element).find(child => child.tagName === 'BUTTON' && child.textContent === 'Next');
+    let text = '';
+    for (let page = 0; page < 10000; page++) {
+        const current = previewText(element).textContent;
+        assert.ok(current.length <= 65536);
+        assert.ok(current.split(/\r\n|[\r\n\v\f\u0085\u2028\u2029]/).length <= 1025);
+        assert.doesNotMatch(current, /^[\udc00-\udfff]|[\ud800-\udbff]$/);
+        text += current;
+        if (!next || next.disabled) return text;
+        next.listeners.get('click')!({});
+    }
+    assert.fail('Preview navigation did not reach its final page');
 }
 
 function inspectorHarness(BlobInspector: any) {
@@ -148,6 +181,8 @@ describe('BlobInspector oversized containment', () => {
         const { state } = await import(stateModulePath);
         state.selectedTable = null;
         state.selectedTableType = 'table';
+        state.isDesktop = false;
+        state.gridReadOnlyRowReasons = {};
     });
 
     it('caps BLOB and TEXT previews without splitting a UTF-8 code point', async () => {
@@ -166,7 +201,7 @@ describe('BlobInspector oversized containment', () => {
         assert.doesNotMatch(new TextDecoder().decode(cappedText), /�/);
     });
 
-    it('renders only admitted TEXT bytes in the DOM and expands them on Load more', async () => {
+    it('makes every admitted TEXT byte accessible through bounded pages after Load more', async () => {
         const { BlobInspector, MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES, OVERSIZED_INSPECTOR_LOAD_STEP_BYTES } =
             await import(inspectorModulePath);
         const { backendApi } = await import(apiModulePath);
@@ -219,8 +254,8 @@ describe('BlobInspector oversized containment', () => {
             const prefix = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
                 fullBytes.subarray(0, OVERSIZED_INSPECTOR_LOAD_STEP_BYTES), { stream: true }
             );
-            assert.strictEqual(previewContainer.children.at(-1)?.textContent, prefix);
-            const expandedPreview = previewContainer.children.at(-1);
+            assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), prefix);
+            const expandedPreview = previewText(previewContainer.children.at(-1));
             assert.strictEqual(expandedPreview.style.whiteSpace, 'pre-wrap');
             assert.ok(expandedPreview.children.length > 1);
             assert.ok(expandedPreview.children.every((block: { textContent: string }) =>
@@ -229,7 +264,7 @@ describe('BlobInspector oversized containment', () => {
             assert.doesNotMatch(prefix, /�/);
 
             assert.strictEqual(await inspector.loadMoreOversizedContent(), true);
-            assert.strictEqual(previewContainer.children.at(-1)?.textContent, fullText);
+            assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), fullText);
             assert.strictEqual(opened, 2);
             assert.strictEqual(closed, 2);
         } finally {
@@ -287,8 +322,8 @@ describe('BlobInspector oversized containment', () => {
 
         inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
 
-        const preview = previewContainer.children.at(-1);
-        assert.strictEqual(preview.textContent, text);
+        assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), text);
+        const preview = previewText(previewContainer.children.at(-1));
         assert.strictEqual(preview.style.whiteSpace, 'pre-wrap');
         assert.strictEqual(preview.style.wordBreak, 'break-all');
     });
@@ -301,13 +336,74 @@ describe('BlobInspector oversized containment', () => {
 
         inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
 
-        const preview = previewContainer.children.at(-1);
-        assert.strictEqual(preview.textContent, text);
+        const preview = previewText(previewContainer.children.at(-1));
         assert.ok(preview.children.length > 1);
-        assert.ok(preview.children.length <= 4100);
+        assert.ok(preview.children.length <= 33);
         assert.ok(preview.children.every((block: { textContent: string }) =>
             block.textContent.length <= 2048 && !/[\ud800-\udbff]$/.test(block.textContent)));
         assert.strictEqual(preview.style.whiteSpace, 'pre-wrap');
+        assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), text);
+    });
+
+    it('keeps only a bounded selectable page in the DOM after loading many Unicode lines', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        (globalThis as any).document = { createElement: previewElement };
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+        const text = 'é😀\n'.repeat(20_000);
+
+        inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
+
+        const preview = previewContainer.children.at(-1);
+        // CSS offscreen skipping is not a memory boundary: selection makes
+        // skipped text eligible for layout. Do not attach the whole value.
+        assert.ok(preview.textContent.length <= 65536 + 512,
+            `A selectable preview retained ${preview.textContent.length} code units`);
+        assert.ok(preview.textContent.split('\n').length <= 1026,
+            'A selectable page must also bound many-short-line layout');
+    });
+
+    for (const [name, text] of [
+        ['Unicode line', 'A'.repeat(65535) + '😀é東京'.repeat(20_000)],
+        ['LF-only lines below the byte cap', '\n'.repeat(4097)],
+        ['CRLF lines', 'é😀\r\n'.repeat(3073)],
+        ['CR-only lines', 'é😀\r'.repeat(3073)],
+        ['Unicode separator lines', 'é😀\u2028\u2029'.repeat(3073)],
+        ['control separator lines', 'é😀\v\f\u0085'.repeat(3073)]
+    ]) {
+        it(`navigates every bounded ${name} page without losing or duplicating text`, async () => {
+            const { BlobInspector } = await import(inspectorModulePath);
+            (globalThis as any).document = { createElement: previewElement };
+            const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+            inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
+
+            assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), text);
+        });
+    }
+
+    it('rejects invalid text page navigation and preserves the displayed page', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        (globalThis as any).document = { createElement: previewElement };
+        const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
+        inspector.renderPreview(new TextEncoder().encode('A'.repeat(131073)), { type: 'text' });
+        const preview = previewContainer.children.at(-1);
+        const elements = previewDescendants(preview);
+        const input = elements.find(element => element.tagName === 'INPUT');
+        const go = elements.find(element => element.tagName === 'BUTTON' && element.textContent === 'Go');
+        assert.ok(input && go, 'Large text must expose bounded page navigation');
+        const first = previewText(preview).textContent;
+        for (const invalid of ['0', '-1', '1.5', '4', 'NaN', 'Infinity', '']) {
+            input.value = invalid;
+            go.listeners.get('click')!({});
+            assert.strictEqual(previewText(preview).textContent, first);
+            assert.strictEqual(input.value, '1');
+        }
+        input.value = '3';
+        input.listeners.get('keydown')!({ key: 'Enter', preventDefault() {} });
+        assert.strictEqual(previewText(preview).textContent, 'A');
+        const previous = elements.find(element => element.tagName === 'BUTTON' && element.textContent === 'Previous')!;
+        previous.listeners.get('click')!({});
+        assert.strictEqual(input.value, '2');
+        assert.strictEqual(previewText(preview).textContent, 'A'.repeat(65536));
     });
 
     it('copies selected long-preview text without adding formatting-block newlines', async () => {
@@ -325,7 +421,7 @@ describe('BlobInspector oversized containment', () => {
         };
         const text = 'é東京😀'.repeat(20_000);
         inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
-        selectedPreview = previewContainer.children.at(-1);
+        selectedPreview = previewText(previewContainer.children.at(-1));
         const copied = new Map<string, string>();
         let prevented = false;
 
@@ -334,7 +430,7 @@ describe('BlobInspector oversized containment', () => {
             preventDefault() { prevented = true; }
         });
 
-        assert.strictEqual(selectedPreview.textContent, text);
+        assert.strictEqual(selectedPreview.textContent, text.slice(0, 65536));
         assert.ok(selectedPreview.children.every(block => !/[\ud800-\udbff]$/.test(block.textContent)));
         assert.strictEqual(copied.get('text/plain'), 'é東京😀original\nline break');
         assert.strictEqual(prevented, true);
@@ -348,9 +444,9 @@ describe('BlobInspector oversized containment', () => {
 
         inspector.renderPreview(new TextEncoder().encode(text), { type: 'text' }, { text });
 
-        const preview = previewContainer.children.at(-1);
-        assert.strictEqual(preview.textContent, text);
-        assert.ok(preview.children.length <= 4100);
+        assert.strictEqual(completePreviewText(previewContainer.children.at(-1)), text);
+        const preview = previewText(previewContainer.children.at(-1));
+        assert.ok(preview.children.length <= 33);
         assert.ok(preview.children.every((block: PreviewElement) => block.textContent.length <= 2048));
     });
 
@@ -403,17 +499,7 @@ describe('BlobInspector oversized containment', () => {
             calls.push({ method: 'close', args });
         };
         state.selectedTable = 'items';
-        (globalThis as any).document = {
-            createElement() {
-                return {
-                    style: {},
-                    className: '',
-                    textContent: '',
-                    appendChild() {},
-                    addEventListener() {}
-                };
-            }
-        };
+        (globalThis as any).document = { createElement: previewElement };
         const { inspector, previewContainer } = streamedInspectorHarness(BlobInspector);
 
         try {
@@ -439,7 +525,7 @@ describe('BlobInspector oversized containment', () => {
         }
     });
 
-    it('keeps full-content access separate from bounded TEXT load-more', async () => {
+    for (const storageClass of ['text', 'blob']) it(`keeps full-content access separate from bounded ${storageClass} load-more`, async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const listeners = new Map<string, () => void>();
         const loadButton = {
@@ -455,7 +541,7 @@ describe('BlobInspector oversized containment', () => {
         let loads = 0;
         Object.assign(inspector, {
             modal: { querySelectorAll() { return []; } },
-            currentOversizedMetadata: { storageClass: 'text', byteLength: 4 * 1024 * 1024 },
+            currentOversizedMetadata: { storageClass, byteLength: 4 * 1024 * 1024 },
             oversizedLoadedBytes: 1024 * 1024,
             isLoadingOversized: false,
             isUploading: false,
@@ -479,19 +565,67 @@ describe('BlobInspector oversized containment', () => {
         assert.strictEqual(loads, 1);
     });
 
-    it('pages through loaded BLOB Hex without rendering the entire loaded prefix', async () => {
+    it('preserves modal focus during pointer tab switches without blocking activation', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const listeners = new Map<string, (event: any) => void>();
+        const tabButton = {
+            dataset: { tab: 'hex' },
+            addEventListener(type: string, listener: (event: any) => void) {
+                listeners.set(type, listener);
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        const switched: string[] = [];
+        Object.assign(inspector, {
+            modal: {
+                querySelectorAll(selector: string) {
+                    return selector === '.tab-btn' ? [tabButton] : [];
+                }
+            },
+            switchTab(tab: string) { switched.push(tab); }
+        });
+        (globalThis as any).document = { getElementById() { return null; } };
+
+        inspector.setupEventListeners();
+
+        let pointerDefaultPrevented = false;
+        listeners.get('mousedown')?.({
+            preventDefault() { pointerDefaultPrevented = true; }
+        });
+        let activationDefaultPrevented = false;
+        listeners.get('click')?.({
+            target: tabButton,
+            preventDefault() { activationDefaultPrevented = true; }
+        });
+
+        assert.strictEqual(pointerDefaultPrevented, true);
+        assert.strictEqual(activationDefaultPrevented, false);
+        assert.deepStrictEqual(switched, ['hex']);
+    });
+
+    it('pages through loaded BLOB Hex with bounded text nodes and no form-control value', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const inspector = Object.create(BlobInspector.prototype);
-        inspector.hexContainer = { value: '' };
+        const hexContainer = previewElement('pre');
+        Object.defineProperty(hexContainer, 'value', {
+            set() { throw new Error('Hex data must not become one accessibility form-control value'); }
+        });
+        inspector.hexContainer = hexContainer;
         const data = new Uint8Array(1024 * 1024).fill(0xa5);
         data[16 * 1024] = 0x42;
-        (globalThis as any).document = { getElementById() { return null; } };
+        (globalThis as any).document = { getElementById() { return null; }, createElement: previewElement };
         inspector.renderHex(data, 1);
-        assert.match(inspector.hexContainer.value, /^00004000  42 a5/);
-        assert.ok(inspector.hexContainer.value.length < 100_000);
+        assert.match(hexContainer.textContent, /^00004000  42 a5/);
+        assert.ok(hexContainer.textContent.length < 100_000);
+        assert.ok(hexContainer.children.length > 1 && hexContainer.children.length <= 40);
+        assert.ok(hexContainer.children.every(block => block.textContent.length <= 2048));
         inspector.renderHex(data, 63);
-        assert.match(inspector.hexContainer.value, /^000fc000  a5 a5/);
-        assert.ok(inspector.hexContainer.value.includes('000ffff0'));
+        assert.match(hexContainer.textContent, /^000fc000  a5 a5/);
+        assert.ok(hexContainer.textContent.includes('000ffff0'));
+        assert.ok(hexContainer.children.every(block => block.textContent.length <= 2048));
+        inspector.renderHex(new Uint8Array());
+        assert.strictEqual(hexContainer.textContent, '');
+        assert.strictEqual(hexContainer.children.length, 0);
     });
 
     it('hides load-more after the current snapshot has been read completely', async () => {
@@ -953,6 +1087,59 @@ describe('BlobInspector oversized containment', () => {
         assert.strictEqual(loadMoreOversizedContent.mock.callCount(), 1);
         assert.deepStrictEqual(loadMoreOversizedContent.mock.calls[0].arguments, [1]);
     });
+
+    for (const tableType of ['table', 'view']) {
+        for (const storageClass of ['text', 'blob']) {
+            it(`keeps unaddressable oversized ${tableType} ${storageClass} results in preview-only mode`, async () => {
+                const { BlobInspector } = await import(inspectorModulePath);
+                const { backendApi } = await import(apiModulePath);
+                const { state } = await import(stateModulePath);
+                const original = backendApi.openCellReadSession;
+                const opened = mock.fn(async () => { throw new Error('No addressable stored cell'); });
+                backendApi.openCellReadSession = opened;
+                state.selectedTable = 'result';
+                state.selectedTableType = tableType;
+                state.gridReadOnlyRowReasons = tableType === 'table' ? { 0: 'Identity not transported' } : {};
+                const { inspector } = inspectorHarness(BlobInspector);
+                const buttons = new Map(['blob-download-btn', 'blob-save-full-btn', 'blob-load-more-btn', 'blob-replace-btn']
+                    .map(id => [id, { hidden: false, disabled: false, textContent: '', title: '' }]));
+                (globalThis as any).document = { getElementById: (id: string) => buttons.get(id) ?? null };
+                try {
+                    const value = storageClass === 'text' ? 'decoded prefix' : Uint8Array.of(1, 2, 3);
+                    await inspector.inspectOversized(value, { storageClass, byteLength: 100_000 }, 0, 'value', 0, 0);
+                    assert.strictEqual(opened.mock.callCount(), 0);
+                    assert.match(inspector.infoContainer.textContent, /No addressable stored cell/);
+                    if (storageClass === 'text') {
+                        assert.match(inspector.hexContainer.textContent, /Raw Hex is unavailable/);
+                    }
+                    // Later grid navigation must not turn a result-row ordinal
+                    // into an addressable table row for this open inspector.
+                    state.selectedTable = 'different_table';
+                    state.selectedTableType = 'table';
+                    state.gridReadOnlyRowReasons = {};
+                    BlobInspector.prototype.setUploadState.call(inspector, false);
+                    assert.strictEqual(buttons.get('blob-save-full-btn')!.hidden, true);
+                    assert.strictEqual(buttons.get('blob-load-more-btn')!.hidden, true);
+                    assert.strictEqual(buttons.get('blob-replace-btn')!.disabled, true);
+                    assert.strictEqual(buttons.get('blob-download-btn')!.textContent, 'Download Preview');
+                    assert.strictEqual(await inspector.loadMoreOversizedContent(), false);
+                    assert.strictEqual(await inspector.openFullContent(true), false);
+                    assert.strictEqual(inspector.beginReplacementOperation(), null);
+                    assert.strictEqual(opened.mock.callCount(), 0);
+                    const downloads: Uint8Array[] = [];
+                    inspector.runDownload = async (operation: { data: Uint8Array }) => {
+                        downloads.push(operation.data);
+                        return true;
+                    };
+                    assert.strictEqual(await inspector.download(), true);
+                    assert.deepStrictEqual(downloads, [storageClass === 'text'
+                        ? new TextEncoder().encode(value as string) : value]);
+                } finally {
+                    backendApi.openCellReadSession = original;
+                }
+            });
+        }
+    }
 
     it('rejects an over-edit-limit replacement before reading the file', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
@@ -1518,6 +1705,53 @@ describe('BlobInspector oversized containment', () => {
         }
     });
 
+    it('does not mutate tab UI when the active tab is selected again', async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        let styleWrites = 0;
+        let classWrites = 0;
+        let uploadStateCalls = 0;
+        const style = (initial: Record<string, string>) => new Proxy(initial, {
+            set(target, property, value) {
+                styleWrites++;
+                return Reflect.set(target, property, value);
+            }
+        });
+        const buttons = ['preview', 'hex'].map(tab => ({
+            dataset: { tab },
+            classList: {
+                add() { classWrites++; },
+                remove() { classWrites++; }
+            },
+            style: style(tab === 'preview'
+                ? { borderBottom: '2px solid var(--accent-color)', color: 'var(--text-primary)' }
+                : { borderBottom: 'none', color: 'var(--text-secondary)' })
+        }));
+        const preview = { style: style({ display: 'flex' }) };
+        const hex = { style: style({ display: 'none' }) };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'tab-preview') return preview;
+                if (id === 'tab-hex') return hex;
+                return null;
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, {
+            currentTab: 'preview',
+            currentHexNeedsSnapshot: false,
+            currentTableType: 'table',
+            isUploading: false,
+            modal: { querySelectorAll: () => buttons },
+            setUploadState() { uploadStateCalls++; }
+        });
+
+        inspector.switchTab('preview');
+
+        assert.strictEqual(styleWrites, 0);
+        assert.strictEqual(classWrites, 0);
+        assert.strictEqual(uploadStateCalls, 0);
+    });
+
     it('opens the selected full Hex view even when the content type is PDF', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const { backendApi } = await import(apiModulePath);
@@ -1581,6 +1815,93 @@ describe('BlobInspector oversized containment', () => {
         } finally {
             backendApi.openCellEditor = originalOpenCellEditor;
         }
+    });
+
+    for (const fixture of [
+        { name: 'PDF', data: new TextEncoder().encode('%PDF-1.7\n%%EOF'), type: { type: 'pdf', ext: 'pdf' } },
+        { name: 'empty BLOB', data: new Uint8Array(), type: { type: 'binary', ext: 'bin' } }
+    ]) it(`opens an inline ${fixture.name} as full Hex and still downloads raw bytes from Preview`, async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const originalApi = {
+            openCellEditor: backendApi.openCellEditor,
+            getExtensionSettings: backendApi.getExtensionSettings,
+            saveFile: backendApi.saveFile
+        };
+        const opened: unknown[][] = [];
+        const saved: Uint8Array[] = [];
+        backendApi.openCellEditor = async (...args: unknown[]) => {
+            opened.push(args);
+            return { success: true, mode: 'temporary-read-only' };
+        };
+        backendApi.getExtensionSettings = async () => ({ fileOperations: 'native' });
+        backendApi.saveFile = async (_name: string, data: Uint8Array) => {
+            saved.push(data);
+            return { success: true };
+        };
+        const downloadButton = { textContent: '', title: '', disabled: false };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'vscode-env') return { dataset: { webviewId: 'wv-inline', browserExt: 'false' } };
+                if (id === 'statusText') return { textContent: '' };
+                if (id === 'blob-download-btn') return downloadButton;
+                if (id === 'tab-preview' || id === 'tab-hex') return { style: {} };
+                return null;
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, {
+            currentTable: 'small_cells', currentTableType: 'table', currentStorageClass: 'blob',
+            currentData: fixture.data, currentType: fixture.type,
+            currentRowId: 0, currentColName: '', currentOversizedMetadata: null,
+            previewGeneration: 1, modal: { querySelectorAll: () => [] }
+        });
+        try {
+            inspector.switchTab('hex');
+            assert.strictEqual(downloadButton.textContent, 'Open Full Hex');
+            await inspector.download();
+            assert.deepStrictEqual(opened, [[
+                { table: 'small_cells', name: '' }, 0, '', {},
+                { type: fixture.type, webviewId: 'wv-inline', sourceByteLength: fixture.data.byteLength, view: 'hex' }
+            ]]);
+            assert.deepStrictEqual(saved, []);
+            inspector.switchTab('preview');
+            assert.strictEqual(downloadButton.textContent, 'Download');
+            await inspector.download();
+            assert.deepStrictEqual(saved, [fixture.data]);
+            assert.strictEqual(opened.length, 1);
+        } finally {
+            Object.assign(backendApi, originalApi);
+        }
+    });
+
+    for (const fixture of [
+        { name: 'web demo', env: null, tableType: 'table', storageClass: 'blob' },
+        { name: 'desktop app', env: { dataset: { browserExt: 'false' } }, tableType: 'table', storageClass: 'blob', isDesktop: true },
+        { name: 'browser extension', env: { dataset: { browserExt: 'true' } }, tableType: 'table', storageClass: 'blob' },
+        { name: 'view result', env: { dataset: { browserExt: 'false' } }, tableType: 'view', storageClass: 'blob' },
+        { name: 'decoded TEXT without a stored-byte snapshot', env: { dataset: { browserExt: 'false' } }, tableType: 'table', storageClass: 'text' }
+    ]) it(`keeps the ordinary inline download for a ${fixture.name}`, async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { state } = await import(stateModulePath);
+        state.isDesktop = fixture.isDesktop ?? false;
+        const button = { textContent: '', title: '', disabled: false };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'vscode-env') return fixture.env;
+                if (id === 'blob-download-btn') return button;
+                if (id === 'tab-preview' || id === 'tab-hex') return { style: {} };
+                return null;
+            }
+        };
+        const inspector = Object.create(BlobInspector.prototype);
+        Object.assign(inspector, {
+            currentTable: 'items', currentTableType: fixture.tableType, currentStorageClass: fixture.storageClass,
+            currentData: Uint8Array.of(1), currentOversizedMetadata: null,
+            currentRowId: 1, currentColName: 'payload', modal: { querySelectorAll: () => [] }
+        });
+        inspector.switchTab('hex');
+        assert.strictEqual(button.textContent, 'Download');
     });
 
     it('coalesces duplicate full-content opens and suppresses stale completion status', async () => {
@@ -2142,17 +2463,13 @@ describe('BlobInspector oversized containment', () => {
         }
     });
 
-    // -----------------------------------------------------------------------
-    // Desktop lane. The desktop has no VS Code editor tab to open an oversized
-    // value in and no host media file to render it from: the chunked read
-    // (Load more) is the only way a >64 KiB cell becomes inspectable there,
-    // so it streams BLOBs as well as TEXT, and the Download button saves the
-    // loaded bytes once they are the whole value — never "Open Full Content".
-    // -----------------------------------------------------------------------
+    // Desktop Download saves an already loaded snapshot. Save Full exports
+    // stored bytes through the host independently of the bounded preview.
 
     function desktopButtonHarness(BlobInspector: any, fields: Record<string, unknown>) {
         const downloadButton = { hidden: false, disabled: false, textContent: '', title: '' };
         const loadButton = { hidden: true, disabled: false, textContent: '', title: '' };
+        const saveFullButton = { hidden: true, disabled: false, textContent: '', title: '' };
         const inspector = Object.create(BlobInspector.prototype);
         Object.assign(inspector, {
             isUploading: false,
@@ -2162,6 +2479,7 @@ describe('BlobInspector oversized containment', () => {
             currentCellInfo: null,
             currentInlineRawTextBytes: false,
             currentRawTextCanStream: false,
+            pendingTextSnapshot: false,
             oversizedLoadedBytes: 0,
             ...fields
         });
@@ -2169,10 +2487,11 @@ describe('BlobInspector oversized containment', () => {
             getElementById(id: string) {
                 if (id === 'blob-download-btn') return downloadButton;
                 if (id === 'blob-load-more-btn') return loadButton;
+                if (id === 'blob-save-full-btn') return saveFullButton;
                 return null;
             }
         };
-        return { inspector, downloadButton, loadButton };
+        return { inspector, downloadButton, loadButton, saveFullButton };
     }
 
     it('desktop: Download waits for the chunked read to hold the whole value, then saves it', async () => {
@@ -2194,6 +2513,7 @@ describe('BlobInspector oversized containment', () => {
 
             const complete = desktopButtonHarness(BlobInspector, {
                 currentOversizedMetadata: { storageClass: 'blob', byteLength: 3 * 1024 * 1024 },
+                currentData: new Uint8Array(3 * 1024 * 1024),
                 oversizedLoadedBytes: 3 * 1024 * 1024
             });
             complete.inspector.setUploadState(false);
@@ -2211,6 +2531,9 @@ describe('BlobInspector oversized containment', () => {
             huge.inspector.setUploadState(false);
             assert.strictEqual(huge.downloadButton.disabled, true);
             assert.match(huge.downloadButton.title, /cannot be shown/);
+            assert.match(huge.downloadButton.title, /Save Full/);
+            assert.strictEqual(huge.saveFullButton.hidden, false);
+            assert.strictEqual(huge.saveFullButton.disabled, false);
             assert.strictEqual(huge.inspector.isOversizedFullyLoaded(), false);
             assert.strictEqual(huge.loadButton.hidden, true);
         } finally {
@@ -2256,7 +2579,114 @@ describe('BlobInspector oversized containment', () => {
         assert.deepStrictEqual(runs, ['save', 'editor']);
     });
 
-    it('keeps BLOB load-more off the lanes that have another route', async () => {
+    for (const fixture of [
+        { name: 'UTF-16LE', text: '\ufeffA東京😀', encoding: 'utf-16le' },
+        { name: 'UTF-16BE', text: '\ufeffA東京😀', encoding: 'utf-16be' },
+        { name: 'empty TEXT', text: '', encoding: 'utf-16le' }
+    ]) it(`desktop: reads and downloads exact stored ${fixture.name} bytes`, async () => {
+        const { BlobInspector } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const bytes = Buffer.from(fixture.text, 'utf16le');
+        if (fixture.encoding === 'utf-16be') bytes.swap16();
+        const originalApi = {
+            openCellReadSession: backendApi.openCellReadSession,
+            readCellChunk: backendApi.readCellChunk,
+            closeCellReadSession: backendApi.closeCellReadSession,
+            getExtensionSettings: backendApi.getExtensionSettings,
+            saveFile: backendApi.saveFile
+        };
+        const calls: unknown[] = [];
+        const session = deferred<any>();
+        backendApi.openCellReadSession = async (target: unknown) => {
+            calls.push(target);
+            return session.promise;
+        };
+        backendApi.readCellChunk = async (_id: string, offset: number, count: number) => ({
+            bytes: new Uint8Array(bytes.subarray(offset, offset + count)),
+            byteOffset: offset, done: offset + count >= bytes.byteLength
+        });
+        backendApi.closeCellReadSession = async (id: string) => { calls.push(id); };
+        backendApi.getExtensionSettings = async () => ({ fileOperations: 'native' });
+        backendApi.saveFile = async (_name: string, saved: Uint8Array) => {
+            calls.push(saved);
+            return { success: true, savedAs: 'stored-text.bin' };
+        };
+        state.isDesktop = true;
+        state.selectedTable = 'stored_text';
+        state.selectedTableType = 'table';
+        const { inspector } = inspectorHarness(BlobInspector);
+        const button = { disabled: false, textContent: '', title: '' };
+        const status = { textContent: '' };
+        (globalThis as any).document = {
+            getElementById(id: string) {
+                if (id === 'blob-download-btn') return button;
+                if (id === 'statusText') return status;
+                return null;
+            }
+        };
+        try {
+            const reading = inspector.inspectStoredText(0, '', 0, 0);
+            BlobInspector.prototype.setUploadState.call(inspector, false);
+            assert.strictEqual(button.disabled, true);
+            assert.strictEqual(await inspector.download(), false);
+            session.resolve({ sessionId: 'stored', metadata: {
+                storageClass: 'text', byteLength: bytes.byteLength, textEncoding: fixture.encoding
+            } });
+            assert.strictEqual(await reading, true);
+            BlobInspector.prototype.setUploadState.call(inspector, false);
+            assert.strictEqual(button.disabled, false);
+            assert.strictEqual(inspector.isOversizedFullyLoaded(), true);
+            assert.strictEqual(await inspector.download(), true);
+            assert.deepStrictEqual(calls, [
+                { table: 'stored_text', rowId: 0, column: '' }, 'stored', new Uint8Array(bytes)
+            ]);
+            assert.strictEqual(status.textContent, 'Saved stored-text.bin');
+        } finally {
+            Object.assign(backendApi, originalApi);
+        }
+    });
+
+    it('desktop: Save Full exports stored bytes beyond the inspector cap using the captured cell identity', async () => {
+        const { BlobInspector, MAX_OVERSIZED_INSPECTOR_LOAD_BYTES } = await import(inspectorModulePath);
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const opened: unknown[][] = [];
+        const original = backendApi.openCellEditor;
+        backendApi.openCellEditor = async (...args: unknown[]) => {
+            opened.push(args);
+            return { success: true, mode: 'download' };
+        };
+        state.isDesktop = true;
+        state.selectedTable = 'newly_selected_table';
+        const { inspector, saveFullButton } = desktopButtonHarness(BlobInspector, {
+            currentTable: 'original_table', currentTableType: 'table',
+            currentTab: 'hex', currentRowId: 0, currentColName: '',
+            currentType: { type: 'text', mime: 'text/plain', ext: 'txt' },
+            currentData: new Uint8Array(2), previewGeneration: 1,
+            currentOversizedMetadata: {
+                storageClass: 'text', byteLength: MAX_OVERSIZED_INSPECTOR_LOAD_BYTES + 2
+            }
+        });
+        try {
+            inspector.setUploadState(false);
+            assert.strictEqual(saveFullButton.hidden, false);
+            assert.strictEqual(saveFullButton.disabled, false);
+            assert.strictEqual(await inspector.openFullContent(true), true);
+            assert.deepStrictEqual(opened, [[
+                { table: 'original_table', name: '' }, 0, '', {}, {
+                    type: inspector.currentType, webviewId: 'default',
+                    sourceByteLength: MAX_OVERSIZED_INSPECTOR_LOAD_BYTES + 2,
+                    download: true
+                }
+            ]]);
+            assert.strictEqual(inspector.currentData.byteLength, 2);
+        } finally {
+            backendApi.openCellEditor = original;
+        }
+    });
+
+    it('keeps bounded BLOB load-more available alongside the VS Code full-content route', async () => {
         const { BlobInspector } = await import(inspectorModulePath);
         const { state } = await import(stateModulePath);
         state.isDesktop = false;
@@ -2266,6 +2696,6 @@ describe('BlobInspector oversized containment', () => {
         inspector.setUploadState(false);
         assert.strictEqual(downloadButton.textContent, 'Open Full Content');
         assert.strictEqual(downloadButton.disabled, false);
-        assert.strictEqual(loadButton.hidden, true);
+        assert.strictEqual(loadButton.hidden, false);
     });
 });

@@ -1564,6 +1564,55 @@ export function createDesktopHost({ bridge, createWorker }) {
             const bytes = await callWorker(entry, 'exportDatabase', [entry.currentName]);
             return dialogOutcome(await bridge.saveFileAs(filename || entry.currentName, bytes));
         },
+        async openCellEditor(entry, params, rowId, column, _columnTypes, options = {}) {
+            if (options.download !== true) {
+                return { success: false, message: 'Use the cell inspector to view this value, or Save Full to download its stored bytes.' };
+            }
+            // Bind the complete read to this entry, even if the active tab changes.
+            const session = await callWorker(entry, 'openCellReadSession', [{ table: params?.table, rowId, column }]);
+            entry.cellReadSessionOpen = true;
+            let bytes;
+            let readError;
+            try {
+                const size = session.metadata?.byteLength;
+                if (!Number.isSafeInteger(size) || size < 0 || size > DESKTOP_EXPORT_MAX_BYTES) {
+                    throw new Error('Cell download exceeds the 512 MiB limit or has an invalid byte length.');
+                }
+                bytes = new Uint8Array(size);
+                let offset = 0;
+                while (offset < size) {
+                    const wanted = Math.min(64 * 1024, size - offset);
+                    const chunk = await callWorker(entry, 'readCellChunk', [session.sessionId, offset, wanted]);
+                    if (chunk.byteOffset !== offset || !(chunk.bytes instanceof Uint8Array)
+                        || chunk.bytes.byteLength === 0 || chunk.bytes.byteLength > wanted
+                        || (chunk.done && offset + chunk.bytes.byteLength !== size)) {
+                        throw new Error('Cell download returned an incomplete or invalid byte window.');
+                    }
+                    bytes.set(chunk.bytes, offset);
+                    offset += chunk.bytes.byteLength;
+                    if (offset === size && chunk.done !== true) {
+                        throw new Error('Cell download returned an incomplete snapshot.');
+                    }
+                }
+            } catch (error) {
+                readError = error;
+            }
+            // Release the snapshot before the OS dialog. Failed cleanup stays
+            // visible and keeps the native export guard armed.
+            try {
+                await callWorker(entry, 'closeCellReadSession', [session.sessionId]);
+                entry.cellReadSessionOpen = false;
+            } catch (error) {
+                if (readError) throw new AggregateError([readError, error], `${readError.message}; snapshot close failed: ${error.message}`);
+                throw error;
+            }
+            if (readError) throw readError;
+            const extension = /^[a-z0-9]{1,8}$/i.test(options.type?.ext ?? '') ? options.type.ext
+                : session.metadata.storageClass === 'text' ? 'txt' : 'bin';
+            const basename = `${params.table}_${column}`.replace(/[\\/:\x00-\x1f]/g, '_');
+            const result = dialogOutcome(await bridge.saveFileAs(`${basename}.${extension}`, bytes));
+            return result.success ? { ...result, mode: 'download' } : result;
+        },
         async exportTable(entry, ...args) {
             // Host policy overrides anything UI-passed (nothing passes one today):
             // raise the worker's default web-demo cap to the desktop ceiling.

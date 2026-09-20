@@ -20,6 +20,7 @@
  */
 
 import { Database } from 'tjs:sqlite';
+import path from 'tjs:path';
 import { createShimDatabase } from './sqljs-shim.js';
 import { createStdioTransport } from './stdio-transport.js';
 import { frameErrorResponse, toFrameErrorData } from './frame-codec.js';
@@ -77,6 +78,24 @@ const shimDeps = {
  */
 let activeDb = null;
 
+/** The shell installs the pinned reader beside the executable, never at a page-supplied path. */
+async function loadQueryPlanReader(db) {
+  const directory = path.dirname(tjs.exePath);
+  for (const name of ['query-plan.dylib', 'query-plan.so', 'query-plan.dll']) {
+    const library = path.join(directory, name);
+    try { await tjs.stat(library); }
+    catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    // A present but incompatible library is a broken installation. Never
+    // continue with the unbounded native EXPLAIN implementation after failure.
+    db.backingDatabase.loadExtension(library, 'sqlite3_sqliteexplorer_init');
+    return;
+  }
+  throw new Error('Missing bundled query-plan reader beside the native runtime.');
+}
+
 /**
  * Engine factory called by worker.js's engine seam with the raw
  * `initializeDatabase` config. Returns `{ SQL, db }`: `db` is the sql.js-shaped
@@ -116,6 +135,11 @@ export async function createNativeEngine(config) {
   }
 
   const db = createShimDatabase({ path: boundPath, readOnly }, shimDeps);
+  try { await loadQueryPlanReader(db); }
+  catch (error) {
+    db.close();
+    throw new Error(`Unable to initialize the bounded query-plan reader: ${error?.message ?? error}`, { cause: error });
+  }
 
   // Query-timeout wiring. worker.js arms `db.progress_handler(interval, cb)`
   // immediately before every bounded synchronous operation and disarms it in
@@ -143,7 +167,7 @@ export async function createNativeEngine(config) {
   };
 
   activeDb = db;
-  return { SQL: Object.freeze({ engine: 'tjs-native' }), db };
+  return { SQL: Object.freeze({ engine: 'tjs-native', queryPlanReaderActive: true }), db };
 }
 
 // ---------------------------------------------------------------------------

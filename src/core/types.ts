@@ -476,6 +476,9 @@ export interface DatabaseOperations {
     operation: (snapshotOperations: DatabaseOperations) => Promise<T>
   ): Promise<T>;
 
+  /** Execute one bounded SELECT or its query plan; never a write/script. */
+  executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, signal?: AbortSignal): Promise<QueryResultSet>;
+
   /** Execute SQL query */
   executeQuery(
     sql: string,

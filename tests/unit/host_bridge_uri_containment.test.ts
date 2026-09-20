@@ -133,6 +133,7 @@ const FILE_PAYLOAD = new Uint8Array([0xDB, 0x01]);
 
 describe('HostBridge.readWorkspaceFileUri containment', () => {
     const original = {
+        platform: process.platform,
         parse: uriApi.parse,
         getWorkspaceFolder: workspaceApi.getWorkspaceFolder,
         stat: workspaceApi.fs.stat,
@@ -152,6 +153,7 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
     });
 
     afterEach(() => {
+        Object.defineProperty(process, 'platform', { value: original.platform });
         uriApi.parse = original.parse;
         workspaceApi.getWorkspaceFolder = original.getWorkspaceFolder;
         workspaceApi.fs.stat = original.stat;
@@ -168,6 +170,56 @@ describe('HostBridge.readWorkspaceFileUri containment', () => {
         assert.strictEqual(result, FILE_PAYLOAD);
         assert.deepStrictEqual(readUris, ['file:///home/user/elsewhere/blob.bin']);
     });
+
+    for (const [documentDrive, droppedDrive] of [['C', 'c'], ['c', 'C']]) {
+        it(`allows a same-directory file when drive case changes from ${documentDrive} to ${droppedDrive}`, async () => {
+            Object.defineProperty(process, 'platform', { value: 'win32' });
+            // VS Code serializes a drive letter in lowercase even when the
+            // original Uri.file().path retains its uppercase spelling.
+            const bridge = createBridge(`file:///${documentDrive}:/SQLiteQA/workspace/main.db`);
+            const dropped = `file:///${droppedDrive}:/SQLiteQA/workspace/drop.bin`;
+            const result = await bridge.readWorkspaceFileUri(dropped);
+            assert.deepStrictEqual(result, FILE_PAYLOAD);
+            assert.deepStrictEqual(readUris, [dropped]);
+        });
+    }
+
+    it('normalizes file drive case after the workspace membership lookup', async () => {
+        Object.defineProperty(process, 'platform', { value: 'win32' });
+        const folder = { uri: parseUriForTest('file:///C:/SQLiteQA/assets'), name: 'assets', index: 0 };
+        workspaceApi.getWorkspaceFolder = () => folder;
+        const bridge = createBridge('file:///D:/databases/main.db');
+        const dropped = 'file:///c:/SQLiteQA/assets/drop.bin';
+        const result = await bridge.readWorkspaceFileUri(dropped);
+        assert.deepStrictEqual(result, FILE_PAYLOAD);
+        assert.deepStrictEqual(readUris, [dropped]);
+    });
+
+    for (const [document, dropped] of [
+        ['file:///C:/SQLiteQA/workspace/main.db', 'file:///D:/SQLiteQA/workspace/drop.bin'],
+        ['file:///C:/SQLiteQA/Workspace/main.db', 'file:///c:/SQLiteQA/workspace/drop.bin'],
+        ['file://example/C:/workspace/main.db', 'file://example/c:/workspace/drop.bin'],
+        ['vscode-vfs://example/C:/workspace/main.db', 'vscode-vfs://example/c:/workspace/drop.bin']
+    ]) {
+        it(`does not broaden file-drive normalization to ${dropped}`, async () => {
+            Object.defineProperty(process, 'platform', { value: 'win32' });
+            const bridge = createBridge(document);
+            await assert.rejects(bridge.readWorkspaceFileUri(dropped), /Access denied/);
+            assert.deepStrictEqual(readUris, []);
+        });
+    }
+
+    for (const platform of ['linux', 'darwin']) {
+        it(`preserves distinct local colon-directory case on ${platform}`, async () => {
+            Object.defineProperty(process, 'platform', { value: platform });
+            const bridge = createBridge('file:///C:/SQLiteQA/workspace/main.db');
+            await assert.rejects(
+                bridge.readWorkspaceFileUri('file:///c:/SQLiteQA/workspace/drop.bin'),
+                /Access denied/
+            );
+            assert.deepStrictEqual(readUris, []);
+        });
+    }
 
     it('rejects an oversized authorized URI from stat without reading the file', async () => {
         installWorkspaceFolders(['file:///home/user/elsewhere']);

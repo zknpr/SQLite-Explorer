@@ -134,6 +134,17 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.strictEqual(version, BUNDLED_TXIKI_SQLITE_VERSION);
         });
 
+        await testContext.test('loads the packaged bounded plan reader through the native dispatcher', async () => {
+            const suffix = process.platform === 'darwin' ? 'dylib' : process.platform === 'win32' ? 'dll' : 'so';
+            const library = path.join(path.dirname(binary), `query-plan.${suffix}`);
+            const result = await activeRawWorker.call<string>('workspaceQueryPlan', [
+                'SELECT sqlite_explorer_query_plan(?) AS plan', ['SELECT 42 AS value'], library, 1000
+            ]);
+            const rows = JSON.parse(result);
+            assert.strictEqual(rows.length, 1);
+            assert.strictEqual(rows[0][3], 'SCAN CONSTANT ROW');
+        });
+
         await testContext.test('honors an explicit read-only native worker open', async () => {
             await activeRawWorker.call('open', [databasePath, true]);
             await assert.rejects(

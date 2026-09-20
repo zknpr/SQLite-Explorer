@@ -900,6 +900,53 @@ describe('view modal concurrency', () => {
         }
     });
 
+    it('keeps a stale WASM draft and offers an explicit database reload without hiding cancellation', async () => {
+        const { elements, listener } = installViewDocument();
+        const apiModulePath = '../../core/ui/modules/api.js';
+        const stateModulePath = '../../core/ui/modules/state.js';
+        const viewsModulePath = '../../core/ui/modules/views.js';
+        const { backendApi } = await import(apiModulePath);
+        const { state } = await import(stateModulePath);
+        const { initViews, openEditViewModal } = await import(viewsModulePath);
+        const { VIEW_SOURCE_CHANGED_MESSAGE } = await import('../../src/core/view-utils');
+        const originals = { get: backendApi.getViewDefinition, validate: backendApi.validateViewDefinition,
+            edit: backendApi.editView, refresh: backendApi.refreshFile, readOnly: state.isReadOnly };
+        let stale = false;
+        let mutations = 0;
+        let reloads = 0;
+        backendApi.getViewDefinition = async () => {
+            if (stale) throw new Error(VIEW_SOURCE_CHANGED_MESSAGE);
+            return { sql: 'CREATE VIEW v AS SELECT 1', selectSql: 'SELECT 1', triggers: [] };
+        };
+        backendApi.validateViewDefinition = async () => undefined;
+        backendApi.editView = async () => { mutations++; };
+        backendApi.refreshFile = async () => { reloads++; throw new Error('Canceled'); };
+        state.isReadOnly = false;
+        try {
+            initViews();
+            await openEditViewModal('v');
+            elements.viewSelectSql.value = 'SELECT 2';
+            stale = true;
+            await listener('btnSaveView', 'click')();
+            assert.strictEqual(mutations, 0);
+            assert.strictEqual(elements.viewSelectSql.value, 'SELECT 2');
+            assert.strictEqual(elements.btnReloadViewDefinition.hidden, false);
+            assert.strictEqual(elements.btnReloadViewDefinition.textContent, 'Reload Database');
+            assert.match(elements.viewValidationStatus.textContent, /file changed on disk/);
+            await listener('btnReloadViewDefinition', 'click')();
+            assert.strictEqual(reloads, 1);
+            assert.strictEqual(elements.viewSelectSql.value, 'SELECT 2');
+            assert.strictEqual(elements.viewModal.classList.contains('hidden'), false);
+            assert.match(elements.viewValidationStatus.textContent, /Reload cancelled.*draft/i);
+        } finally {
+            backendApi.getViewDefinition = originals.get;
+            backendApi.validateViewDefinition = originals.validate;
+            backendApi.editView = originals.edit;
+            backendApi.refreshFile = originals.refresh;
+            state.isReadOnly = originals.readOnly;
+        }
+    });
+
     it('shows the friendly reload conflict when the engine-side snapshot check wins a race', async () => {
         const { elements, listener } = installViewDocument();
         const apiModulePath = '../../core/ui/modules/api.js';

@@ -317,12 +317,14 @@ describe('very large single-cell behavior (opt-in)', () => {
       assert.ok(Number(result.transportedCellBytes) <= MAX_INLINE_CELL_BYTES);
       assert.ok(Number(result.inspectorPreviewBytes) <= MAX_INSPECTOR_PREVIEW_BYTES);
       assert.ok(Number(result.largestDomTextChars) <= MAX_INSPECTOR_PREVIEW_BYTES);
+      assert.ok(Number(result.previewRenderedChars) <= MAX_INSPECTOR_PREVIEW_BYTES);
+      assert.ok(Number(result.hexRenderedChars) <= 96 * 1024);
       assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_B_SURFACE_RSS_BYTES);
     }
   );
 
   test(
-    'VFS editor open avoids returning an oversized cell from readFile',
+    'oversized editor open sends bounded snapshot pages without a whole-value VFS read',
     {
       skip: !RUN_LARGE_CELL_TESTS
         && `set SQLITE_EXPLORER_RUN_LARGE_CELL_TESTS=1 to run the ${SIZE_MIB} MiB probes`,
@@ -333,10 +335,22 @@ describe('very large single-cell behavior (opt-in)', () => {
       diagnose(t, result);
       assert.equal(result.failureStage, undefined);
       assert.equal(result.openedScheme, 'file');
+      assert.equal(result.openedMode, 'paged-read-only');
+      assert.deepEqual(result.openedCommandUris, []);
       assert.equal(result.vfsReadFileCalled, false);
-      assert.equal(result.markedReadOnly, true);
       assert.equal(result.materializedBytes, EXPECTED_CELL_BYTES);
-      assert.ok(Number(result.sampledBytes) <= 64 * 1024);
+      assert.equal(result.reportedCellBytes, EXPECTED_CELL_BYTES);
+      assert.equal(result.firstPageStart, 0);
+      assert.equal(result.firstPageEnd, 64 * 1024);
+      assert.equal(result.lastPageStart, EXPECTED_CELL_BYTES - 64 * 1024);
+      assert.equal(result.lastPageEnd, EXPECTED_CELL_BYTES);
+      assert.equal(result.textPagesMatchExpected, true);
+      assert.ok(Number(result.largestTextPageBytes) <= 64 * 1024);
+      assert.ok(Number(result.largestTextPageChars) <= 64 * 1024);
+      assert.equal(result.hexPageBytes, 16 * 1024);
+      assert.ok(Number(result.hexPageChars) <= 96 * 1024);
+      assert.equal(result.hexPrefixMatches, true);
+      assert.equal(result.snapshotReleased, true);
       assert.ok(Number(result.maxRssBytes) <= MAX_STAGE_B_SURFACE_RSS_BYTES);
     }
   );

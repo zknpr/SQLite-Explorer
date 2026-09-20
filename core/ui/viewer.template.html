@@ -26,6 +26,12 @@
                 <input type="text" class="sidebar-filter-input" id="sidebarFilterInput" placeholder="Filter..." aria-label="Filter tables, views, and indexes">
             </div>
 
+            <button type="button" class="section-title hidden" id="btnOpenQuery"
+                title="Open a SQL editor for this database" aria-label="New SQL query">
+                <span class="codicon codicon-code mr-6" aria-hidden="true"></span>
+                <span>SQL Query</span>
+            </button>
+
             <div class="sidebar-scroll-area">
                 <!-- Open Databases Section (desktop only). The shell holds N
                      databases at once; this is the overview half of that, the
@@ -497,8 +503,8 @@
                         <span id="blob-hex-position" role="status"></span>
                         <button type="button" class="btn-secondary" id="blob-hex-next">Next Hex page</button>
                     </div>
-                    <textarea readonly class="hex-dump hex-dump-textarea"
-                        aria-label="BLOB hexadecimal data"></textarea>
+                    <pre class="hex-dump hex-dump-content" tabindex="0" role="region"
+                        aria-label="BLOB hexadecimal data"></pre>
                 </div>
             </div>
             <div class="modal-footer">

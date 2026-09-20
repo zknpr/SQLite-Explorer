@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
+import { assertRuntimeVersion } from './vscode-runtime.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const extensionDevelopmentPath = path.resolve(scriptDirectory, '..');
@@ -32,13 +33,19 @@ if (!fs.existsSync(extensionTestsPath)) {
   throw new Error('Desktop tests are not compiled; run npm run compile:desktop-tests first');
 }
 
+// Cached apps can update in place while their directory keeps the old version.
+// Validate the selected application before launching or allocating test state.
+const vscodeExecutablePath = process.env.VSCODE_TEST_EXECUTABLE_PATH
+  ?? await downloadAndUnzipVSCode(vscodeVersion);
+const actualVersion = assertRuntimeVersion(vscodeExecutablePath, vscodeVersion);
+console.log(`[Desktop tests] Verified VS Code ${actualVersion} at ${vscodeExecutablePath}`);
+
 const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-explorer-desktop-'));
 
 try {
-  // One cache-aware download and one Extension Development Host launch for the
-  // complete matrix. Do not add --disable-extensions: it disables the extension
+  // One Extension Development Host launch for the complete matrix.
+  // Do not add --disable-extensions: it disables the extension
   // under development and can make fallback-editor tests pass falsely.
-  const vscodeExecutablePath = await downloadAndUnzipVSCode(vscodeVersion);
   await runTests({
     vscodeExecutablePath,
     extensionDevelopmentPath,

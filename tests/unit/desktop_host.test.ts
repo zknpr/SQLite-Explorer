@@ -4228,3 +4228,63 @@ test('the reload-required reason is per-database UI state', () => {
   assert.equal(GLOBAL_STATE_FIELDS.includes('reloadRequiredReason'), false);
   assert.equal(TRANSIENT_STATE_FIELDS.includes('reloadRequiredReason'), false);
 });
+
+test('stored-cell download preserves UTF-16 bytes and closes its snapshot before the save dialog', async () => {
+  const bytes = new Uint8Array([0x41, 0, 0xa9, 3, 0, 0]);
+  let closed = false;
+  let downloaded: Uint8Array | undefined;
+  const { host } = makeHost({
+    openCellReadSession: ([target]) => {
+      assert.deepEqual(target, { table: 't', rowId: 0, column: 'generated' });
+      return { sessionId: 'raw', metadata: { storageClass: 'text', textEncoding: 'utf-16le', byteLength: bytes.length } };
+    },
+    readCellChunk: ([id, offset]) => {
+      assert.equal(id, 'raw');
+      assert.equal(offset, 0);
+      return { byteOffset: 0, bytes, done: true };
+    },
+    closeCellReadSession: ([id]) => { assert.equal(id, 'raw'); closed = true; }
+  }, {
+    saveFileAs: async (name: string, data: Uint8Array) => {
+      assert.equal(closed, true, 'the dialog must not hold a SQLite read lock');
+      assert.equal(name, 't_generated.txt');
+      downloaded = data;
+      return '/tmp/exact.txt';
+    }
+  });
+  await host.start();
+  const result = await host.invoke('openCellEditor', [{ table: 't' }, 0, 'generated', {}, { download: true, type: { ext: 'txt' } }]);
+  assert.deepEqual(result, { success: true, savedAs: 'exact.txt', mode: 'download' });
+  assert.deepEqual(downloaded, bytes);
+});
+
+for (const failure of ['oversized', 'truncated', 'offset', 'read', 'close']) {
+  test(`stored-cell download refuses ${failure} reads without opening a save dialog`, async () => {
+    let closes = 0, dialogs = 0;
+    const { host } = makeHost({
+      openCellReadSession: () => ({ sessionId: 'raw', metadata: { storageClass: 'blob', byteLength: failure === 'oversized' ? 512 * 1024 * 1024 + 1 : 4 } }),
+      readCellChunk: () => {
+        if (failure === 'read') throw new Error('snapshot expired');
+        return { byteOffset: failure === 'offset' ? 1 : 0, bytes: new Uint8Array(failure === 'truncated' ? 2 : 4), done: true };
+      },
+      closeCellReadSession: () => { closes++; if (failure === 'close') throw new Error('snapshot close failed'); }
+    }, { saveFileAs: async () => { dialogs++; return '/tmp/wrong.bin'; } });
+    await host.start();
+    await assert.rejects(host.invoke('openCellEditor', [{ table: 't' }, 1, 'value', {}, { download: true }]), /limit|incomplete|invalid|expired|close failed/i);
+    assert.equal(closes, 1);
+    assert.equal(dialogs, 0);
+  });
+}
+
+test('empty stored-cell download and cancelled dialog produce an honest cancellation', async () => {
+  let reads = 0, closes = 0;
+  const { host } = makeHost({
+    openCellReadSession: () => ({ sessionId: 'empty', metadata: { storageClass: 'blob', byteLength: 0 } }),
+    readCellChunk: () => { reads++; throw new Error('empty values need no reads'); },
+    closeCellReadSession: () => { closes++; }
+  }, { saveFileAs: async (_name: string, data: Uint8Array) => { assert.equal(data.byteLength, 0); return null; } });
+  await host.start();
+  assert.deepEqual(await host.invoke('openCellEditor', [{ table: 't' }, 1, 'value', {}, { download: true }]), { success: false, cancelled: true });
+  assert.equal(reads, 0);
+  assert.equal(closes, 1);
+});

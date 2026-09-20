@@ -162,10 +162,25 @@ export function describeOmittedColumns(targetColumns, targets) {
  */
 export function previewRows(rows, columns, {
     limit = IMPORT_PREVIEW_ROWS,
-    maxChars = IMPORT_PREVIEW_MAX_CHARS
+    maxChars = IMPORT_PREVIEW_MAX_CHARS,
+    columnMetadata = []
 } = {}) {
+    const metadata = new Map(columnMetadata.map(column => [column.identifier, column]));
     return rows.slice(0, limit).map(row => columns.map(column => {
-        if (!Object.hasOwn(row, column)) return { text: 'DEFAULT', kind: 'default' };
+        if (!Object.hasOwn(row, column)) {
+            const target = metadata.get(column);
+            if (!target) return { text: 'DEFAULT', kind: 'default' };
+            if (target.defaultExpression != null) {
+                const expression = String(target.defaultExpression);
+                return {
+                    text: `DEFAULT ${expression.length > maxChars
+                        ? expression.slice(0, maxChars) + '… [default preview shortened]' : expression}`,
+                    kind: 'default'
+                };
+            }
+            if (target.isRowidAlias === true) return { text: 'AUTO', kind: 'default' };
+            return { text: 'NULL', kind: 'null' };
+        }
         const value = row[column];
         if (value === null) return { text: 'NULL', kind: 'null' };
         const text = String(value);
@@ -316,7 +331,8 @@ function renderTableSelect() {
 }
 
 function renderMapping() {
-    const { parsed, columns, targets } = session;
+    const current = session;
+    const { parsed, columns, targets, tableRequest } = current;
     const container = dialog.mapping;
     container.replaceChildren();
     parsed.columns.forEach((sourceColumn, index) => {
@@ -338,7 +354,9 @@ function renderMapping() {
         }
         select.value = targets[index] ?? '';
         select.addEventListener('change', () => {
-            session.targets[index] = select.value === '' ? undefined : select.value;
+            if (session !== current || current.tableRequest !== tableRequest
+                || current.loadingTarget || current.submitting) return;
+            current.targets[index] = select.value === '' ? undefined : select.value;
             renderPreviewAndNotice();
         });
         container.append(name, arrow, select);
@@ -348,14 +366,18 @@ function renderMapping() {
 function renderPreviewAndNotice() {
     const { parsed, columns, targets } = session;
     const problem = describeMappingProblem(targets);
-    const mappedColumns = targets.filter(target => target !== undefined);
+    const previewColumns = columns.map(column => column.identifier);
     const table = dialog.preview;
     table.replaceChildren();
     if (!problem) {
-        const rows = previewRows(mapImportRows(parsed, targets), mappedColumns);
+        const rows = previewRows(mapImportRows(parsed, targets), previewColumns, { columnMetadata: columns });
         const head = el('thead');
         const headRow = el('tr');
-        for (const column of mappedColumns) headRow.appendChild(el('th', undefined, column));
+        for (const column of columns) {
+            const heading = el('th', undefined, column.identifier);
+            heading.title = column.declaredType || 'No declared type';
+            headRow.appendChild(heading);
+        }
         head.appendChild(headRow);
         const bodyNode = el('tbody');
         for (const row of rows) {
@@ -390,36 +412,75 @@ function renderPreviewAndNotice() {
     if (defaulted.length > 0) {
         lines.push(`Table columns without a source (their defaults apply): ${defaulted.join(', ')}.`);
     }
+    lines.push('Defaults apply to omitted values, not explicit NULL or empty strings. SQLite evaluates SQL default expressions when inserting each row.');
     lines.push(`The import is one undoable edit; ${saveHint()} afterwards.`);
     dialog.notice.textContent = lines.join('\n');
     dialog.notice.classList.toggle('import-notice-error', isError);
-    dialog.submit.disabled = problem !== null || session.submitting;
+    dialog.submit.disabled = problem !== null || session.submitting || session.loadingTarget || !session.schemaVersion;
     dialog.submit.textContent = `Import ${parsed.rows.length.toLocaleString('en-US')} row${parsed.rows.length === 1 ? '' : 's'}`;
 }
 
 function setBusy(busy) {
-    dialog.submit.disabled = busy || describeMappingProblem(session.targets) !== null;
+    dialog.submit.disabled = busy || session.loadingTarget || !session.schemaVersion
+        || describeMappingProblem(session.targets) !== null;
     dialog.tableSelect.disabled = busy;
-    for (const select of dialog.mapping.querySelectorAll('select')) select.disabled = busy;
+    for (const select of dialog.mapping.querySelectorAll('select')) select.disabled = busy || session.loadingTarget;
 }
 
 let tableRequestSequence = 0;
+let openRequestSequence = 0;
+
+function isCurrentConnection(current) {
+    return state.isDbConnected && !state.isReadOnly && !state.isRefreshingContent
+        && state.dbId === current.dbId && state.connectionGeneration === current.connectionGeneration;
+}
 
 async function selectTargetTable(name) {
     const current = session;
-    if (!current) return;
+    if (!current || current.submitting) return;
     // Two quick select changes race their metadata fetches; only the latest
     // request may render, or a slow earlier answer would describe the wrong table.
     const request = ++tableRequestSequence;
     current.tableRequest = request;
-    const info = await backendApi.getTableInfo(name);
-    if (session !== current || current.tableRequest !== request) return;
-    session.table = name;
-    // Generated columns cannot be inserted into; SQLite computes them.
-    session.columns = (Array.isArray(info) ? info : []).filter(column => column.isGenerated !== true);
-    session.targets = autoMapColumns(session.parsed.columns, session.columns.map(column => column.identifier));
+    current.table = name;
+    // Retire the reviewed schema before awaiting metadata. A queued submit or
+    // failed target change must never reuse the previous table's preview.
+    current.schemaVersion = null;
+    current.loadingTarget = true;
+    current.columns = [];
+    current.targets = current.parsed.columns.map(() => undefined);
     renderMapping();
     renderPreviewAndNotice();
+    dialog.notice.textContent = 'Loading destination columns…';
+    setBusy(false);
+    try {
+        const info = await backendApi.getImportTarget(name);
+        if (session !== current || current.tableRequest !== request) return;
+        if (!isCurrentConnection(current)) {
+            closeModal(IMPORT_MODAL_ID, dialog.overlay);
+            session = null;
+            return;
+        }
+        if (!Array.isArray(info?.columns) || typeof info.schemaVersion !== 'string' || !info.schemaVersion) {
+            throw new Error('Unable to read the destination database schema.');
+        }
+        // Generated columns cannot be inserted into; SQLite computes them.
+        current.columns = info.columns.filter(column => column.isGenerated !== true);
+        current.schemaVersion = info.schemaVersion;
+        current.targets = autoMapColumns(current.parsed.columns, current.columns.map(column => column.identifier));
+        renderMapping();
+        renderPreviewAndNotice();
+    } catch (error) {
+        if (session !== current || current.tableRequest !== request || !isCurrentConnection(current)) return;
+        dialog.notice.textContent = `Unable to load import target: ${getErrorMessage(error)}`;
+        dialog.notice.classList.add('import-notice-error');
+        throw error;
+    } finally {
+        if (session === current && current.tableRequest === request) {
+            current.loadingTarget = false;
+            setBusy(false);
+        }
+    }
 }
 
 /** Small yield so a status line paints before a long synchronous parse. */
@@ -458,7 +519,14 @@ export async function openImportDialog() {
         updateStatus('Import unavailable: this database has no tables to import into');
         return false;
     }
+    const request = ++openRequestSequence;
+    const targetConnection = { dbId: state.dbId, connectionGeneration: state.connectionGeneration };
+    const ownsOpen = () => request === openRequestSequence && isCurrentConnection(targetConnection);
+    const preferred = state.selectedTableType === 'table' && tables.includes(state.selectedTable)
+        ? state.selectedTable
+        : tables[0];
     const picked = await backendApi.pickImportSource();
+    if (!ownsOpen()) return false;
     if (!picked) {
         updateStatus('Import cancelled');
         return false;
@@ -466,18 +534,17 @@ export async function openImportDialog() {
     const format = importFormatOf(picked.name);
     updateStatus(`Reading ${picked.name}…`);
     const text = await backendApi.readImportSource(picked.path);
+    if (!ownsOpen()) return false;
     updateStatus(`Parsing ${picked.name}…`);
     await nextFrame();
+    if (!ownsOpen()) return false;
     let parsed;
     try {
         parsed = parseImport(text, format);
     } catch (error) {
         throw new Error(`${picked.name}: ${getErrorMessage(error)} (limits: ${IMPORT_LIMIT_DESCRIPTION})`);
     }
-    const preferred = state.selectedTableType === 'table' && tables.includes(state.selectedTable)
-        ? state.selectedTable
-        : tables[0];
-    session = {
+    const current = session = {
         source: { name: picked.name, size: picked.size },
         format,
         parsed,
@@ -486,15 +553,16 @@ export async function openImportDialog() {
         columns: [],
         targets: parsed.columns.map(() => undefined),
         // The connection this import is for; a switch or reload cancels it.
-        dbId: state.dbId,
-        connectionGeneration: state.connectionGeneration,
+        ...targetConnection,
+        schemaVersion: null,
+        loadingTarget: false,
         submitting: false
     };
     ensureDialog();
     renderSourceLine();
     renderTableSelect();
     await selectTargetTable(preferred);
-    if (!session) return false;   // dismissed while the table metadata loaded
+    if (session !== current || !ownsOpen()) return false;
     updateStatus(`${picked.name}: ${parsed.rows.length.toLocaleString('en-US')} rows ready to import`);
     openModal(IMPORT_MODAL_ID, dialog.overlay);
     return true;
@@ -502,8 +570,8 @@ export async function openImportDialog() {
 
 async function submitImport() {
     const current = session;
-    if (!current || current.submitting) return;
-    if (state.dbId !== current.dbId || state.connectionGeneration !== current.connectionGeneration) {
+    if (!current || current.submitting || current.loadingTarget || !current.schemaVersion) return;
+    if (!isCurrentConnection(current)) {
         closeModal(IMPORT_MODAL_ID, dialog.overlay);
         session = null;
         updateStatus('Import cancelled because the database changed');
@@ -521,21 +589,20 @@ async function submitImport() {
     setBusy(true);
     updateStatus(`Importing ${count.toLocaleString('en-US')} rows into ${table}…`);
     try {
-        const result = await backendApi.importRows(table, rows);
+        const result = await backendApi.importRows(table, rows, { expectedSchemaVersion: current.schemaVersion });
         const imported = Number.isSafeInteger(result?.rowCount) ? result.rowCount : count;
         // Same optimistic count discipline as Add Row: the delta is known, and
         // the demo-mode cache drops it again if triggers make it unreliable.
-        noteRowCountChanged(table, imported);
+        if (isCurrentConnection(current)) noteRowCountChanged(table, imported);
         if (session === current) {
             closeModal(IMPORT_MODAL_ID, dialog.overlay);
             session = null;
         }
-        const targetIsCurrent = state.dbId === current.dbId
-            && state.connectionGeneration === current.connectionGeneration
+        const targetIsCurrent = isCurrentConnection(current)
             && state.selectedTable === table
             && state.selectedTableType === 'table';
         if (targetIsCurrent) await loadTableData();
-        updateStatus(
+        if (isCurrentConnection(current)) updateStatus(
             `Imported ${imported.toLocaleString('en-US')} row${imported === 1 ? '' : 's'} into ${table} `
             + `— one undoable edit, ${saveHint()}`
         );
@@ -543,7 +610,14 @@ async function submitImport() {
         console.error('Import failed:', error);
         // Nothing changed (the worker rolled every row back), so the modal
         // stays open for the user to adjust the mapping or pick another table.
-        updateStatus(`Import failed: ${describeImportFailure(error)}`);
+        if (session === current && isCurrentConnection(current)) {
+            updateStatus(`Import failed: ${describeImportFailure(error)}`);
+            if (/schema changed.*preview/i.test(getErrorMessage(error))) {
+                current.schemaVersion = null;
+                dialog.notice.textContent = describeImportFailure(error);
+                dialog.notice.classList.add('import-notice-error');
+            }
+        }
     } finally {
         current.submitting = false;
         if (session === current && dialog) setBusy(false);

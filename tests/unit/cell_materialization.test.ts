@@ -73,6 +73,161 @@ describe('CellMaterializationService', () => {
         fs.rmSync(testDir, { recursive: true, force: true });
     });
 
+    it('streams complete hexadecimal rows across unaligned source chunks', async () => {
+        const source = Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 72, 105, 33, 255]);
+        const operations = makeChunkedOperations(source, { storageClass: 'blob', byteLength: 20 });
+        service = new CellMaterializationService(vscode.Uri.file(testDir), { maxBytes: 200, chunkBytes: 7 });
+        const result = await service.materialize(operations, target, { format: 'hex' });
+        const output = fs.readFileSync(result.uri.fsPath, 'utf8');
+        const lines = output.trimEnd().split('\n');
+        assert.strictEqual(path.extname(result.uri.fsPath), '.hex');
+        assert.strictEqual(result.contentEncoding, 'hex');
+        assert.strictEqual(lines.length, 2);
+        assert.strictEqual(lines[0], '00000000  00 01 02 03 04 05 06 07  08 09 0a 0b 0c 0d 0e 0f  |................|');
+        assert.match(lines[1], /^00000010  48 69 21 ff\s+\|Hi!\.\|$/);
+        const restored = lines.flatMap(line => line.slice(10, 58).trim().split(/\s+/).map(value => Number.parseInt(value, 16)));
+        assert.deepStrictEqual(restored, Array.from(source));
+        assert.strictEqual(result.byteLength, Buffer.byteLength(output));
+        assert.deepStrictEqual(result.sourcePrefix, source);
+        assert.strictEqual(operations.closeCount, 1);
+    });
+
+    it('shows database TEXT bytes in Hex without transcoding UTF-16', async () => {
+        const source = Uint8Array.from([65, 0, 66, 0]);
+        const operations = makeChunkedOperations(source, { storageClass: 'text', byteLength: 4, textEncoding: 'utf-16le' });
+        service = new CellMaterializationService(vscode.Uri.file(testDir), { maxBytes: 100, chunkBytes: 3 });
+        const result = await service.materialize(operations, target, { format: 'hex' });
+        assert.match(fs.readFileSync(result.uri.fsPath, 'utf8'), /^00000000  41 00 42 00\s+\|A\.B\.\|\n$/);
+    });
+
+    it('accounts for Hex expansion before reading and releases a refused reservation', async () => {
+        const source = new Uint8Array(20);
+        const operations = makeChunkedOperations(source, { storageClass: 'blob', byteLength: 20 });
+        service = new CellMaterializationService(vscode.Uri.file(testDir), { maxBytes: 100, chunkBytes: 7 });
+        await assert.rejects(service.materialize(operations, target, { format: 'hex' }), /quota/i);
+        assert.strictEqual(operations.readSizes.length, 0);
+        const result = await service.materialize(operations, target);
+        assert.deepStrictEqual(fs.readFileSync(result.uri.fsPath), Buffer.from(source));
+    });
+
+    it('keeps a private media directory stable across releases and separate for each panel', async () => {
+        service = new CellMaterializationService(vscode.Uri.file(testDir), { maxBytes: 16 });
+        const firstDispose = new vscode.EventEmitter<void>();
+        const firstOwner: CellMaterializationOwner = { onDidDispose: firstDispose.event };
+        const secondOwner: CellMaterializationOwner = {
+            onDidDispose: new vscode.EventEmitter<void>().event
+        };
+        const firstRoot = service.createMediaPreviewRoot(firstOwner);
+        const secondRoot = service.createMediaPreviewRoot(secondOwner);
+        assert.strictEqual(service.createMediaPreviewRoot(firstOwner), firstRoot);
+        assert.notStrictEqual(firstRoot.fsPath, secondRoot.fsPath);
+        if (process.platform !== 'win32') {
+            assert.strictEqual(fs.statSync(firstRoot.fsPath).mode & 0o777, 0o700);
+        }
+
+        const source = Uint8Array.from([1, 2, 3, 4]);
+        const operations = makeChunkedOperations(source, {
+            storageClass: 'blob', byteLength: source.byteLength
+        });
+        const first = await service.materialize(operations, target, {
+            owner: firstOwner, mediaPreview: true, fileExtension: 'png'
+        });
+        assert.strictEqual(path.dirname(first.uri.fsPath), firstRoot.fsPath);
+        assert.deepStrictEqual(fs.readFileSync(first.uri.fsPath), Buffer.from(source));
+        service.release(first.uri);
+        assert.strictEqual(fs.existsSync(first.uri.fsPath), false);
+        assert.strictEqual(fs.existsSync(firstRoot.fsPath), true);
+        assert.strictEqual(service.createMediaPreviewRoot(firstOwner), firstRoot);
+
+        const second = await service.materialize(operations, target, {
+            owner: firstOwner, mediaPreview: true
+        });
+        firstDispose.fire();
+        assert.strictEqual(fs.existsSync(second.uri.fsPath), false);
+        await assert.rejects(
+            service.materialize(operations, target, { owner: firstOwner, mediaPreview: true }),
+            /media preview owner is closed/
+        );
+        assert.throws(() => service!.createMediaPreviewRoot(firstOwner), /media preview owner is closed/);
+        service.dispose();
+        assert.strictEqual(fs.existsSync(firstRoot.fsPath), false);
+        assert.strictEqual(fs.existsSync(secondRoot.fsPath), false);
+    });
+
+    it('requires an allocated media root before opening a database read session', async () => {
+        service = new CellMaterializationService(vscode.Uri.file(testDir));
+        let opened = false;
+        const operations = {
+            openCellReadSession: async () => { opened = true; throw new Error('unexpected read'); }
+        } as unknown as DatabaseOperations;
+        const owner: CellMaterializationOwner = {
+            onDidDispose: new vscode.EventEmitter<void>().event
+        };
+        await assert.rejects(service.materialize(operations, target, { mediaPreview: true }), /allocated media preview root/);
+        await assert.rejects(service.materialize(operations, target, { owner, mediaPreview: true }), /allocated media preview root/);
+        assert.strictEqual(opened, false);
+    });
+
+    it('rejects a replaced media directory before opening a database read session', async () => {
+        service = new CellMaterializationService(vscode.Uri.file(testDir));
+        const owner: CellMaterializationOwner = {
+            onDidDispose: new vscode.EventEmitter<void>().event
+        };
+        const root = service.createMediaPreviewRoot(owner);
+        const outside = path.join(testDir, 'outside');
+        fs.mkdirSync(outside);
+        fs.rmdirSync(root.fsPath);
+        fs.symlinkSync(outside, root.fsPath, process.platform === 'win32' ? 'junction' : 'dir');
+        let opened = false;
+        const operations = {
+            openCellReadSession: async () => { opened = true; throw new Error('unexpected read'); }
+        } as unknown as DatabaseOperations;
+        await assert.rejects(
+            service.materialize(operations, target, { owner, mediaPreview: true }),
+            /media preview directory changed/
+        );
+        assert.strictEqual(opened, false);
+        assert.deepStrictEqual(fs.readdirSync(outside), []);
+    });
+
+    it('cancels in-flight media on panel close and returns its quota', async () => {
+        service = new CellMaterializationService(vscode.Uri.file(testDir), { maxBytes: 8, chunkBytes: 4 });
+        const dispose = new vscode.EventEmitter<void>();
+        const owner: CellMaterializationOwner = { onDidDispose: dispose.event };
+        const root = service.createMediaPreviewRoot(owner);
+        const source = Uint8Array.from({ length: 8 }, () => 0x5a);
+        const operations = makeChunkedOperations(source, {
+            storageClass: 'blob', byteLength: source.byteLength
+        }, { onRead: () => dispose.fire() });
+        await assert.rejects(
+            service.materialize(operations, target, { owner, mediaPreview: true }),
+            { name: 'AbortError' }
+        );
+        assert.strictEqual(operations.closeCount, 1);
+        assert.deepStrictEqual(fs.readdirSync(root.fsPath), []);
+        const nextOwner: CellMaterializationOwner = {
+            onDidDispose: new vscode.EventEmitter<void>().event
+        };
+        service.createMediaPreviewRoot(nextOwner);
+        const next = await service.materialize(makeChunkedOperations(source, {
+            storageClass: 'blob', byteLength: source.byteLength
+        }), target, { owner: nextOwner, mediaPreview: true });
+        assert.deepStrictEqual(fs.readFileSync(next.uri.fsPath), Buffer.from(source));
+    });
+
+    it('preserves exact UTF-16 database bytes when an explicit raw download is requested', async () => {
+        const source = Buffer.from('\uFEFFA😀Bé𝄞Z', 'utf16le');
+        const operations = makeChunkedOperations(source, {
+            storageClass: 'text', byteLength: source.byteLength, textEncoding: 'utf-16le'
+        });
+        service = new CellMaterializationService(vscode.Uri.file(testDir), { maxBytes: 1024, chunkBytes: 3 });
+        const materialized = await service.materialize(operations, target, { format: 'raw' });
+        assert.deepStrictEqual(fs.readFileSync(materialized.uri.fsPath), source);
+        assert.strictEqual(materialized.contentEncoding, 'raw-database-bytes');
+        assert.strictEqual(materialized.byteLength, source.byteLength);
+        assert.strictEqual(operations.closeCount, 1);
+    });
+
     it('streams split UTF-16 boundaries to a private UTF-8 file and verifies its checksum', async () => {
         const sourceText = 'A😀Bé𝄞Z';
         const source = Buffer.from(sourceText, 'utf16le');
@@ -316,6 +471,24 @@ describe('CellMaterializationService', () => {
         });
 
         assert.strictEqual(fs.existsSync(materialized.uri.fsPath), false);
+    });
+
+    it('ignores fileless tabs and still releases later binary tabs in the same close event', async () => {
+        const source = Uint8Array.from([1, 2, 3, 4]);
+        service = new CellMaterializationService(vscode.Uri.file(testDir), { maxBytes: 4 });
+        const materialized = await service.materialize(makeChunkedOperations(source, {
+            storageClass: 'blob', byteLength: source.byteLength
+        }), target);
+        assert.doesNotThrow(() => (vscode.window.tabGroups as any).__fireDidChangeTabs({
+            opened: [],
+            changed: [],
+            closed: [{ input: undefined }, { input: {} }, { input: { uri: materialized.uri } }]
+        }));
+        assert.strictEqual(fs.existsSync(materialized.uri.fsPath), false);
+        const replacement = await service.materialize(makeChunkedOperations(source, {
+            storageClass: 'blob', byteLength: source.byteLength
+        }), target);
+        assert.deepStrictEqual(fs.readFileSync(replacement.uri.fsPath), Buffer.from(source));
     });
 
     it('reserves aggregate quota across concurrent materializations', async () => {

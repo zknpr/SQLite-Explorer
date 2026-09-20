@@ -32,9 +32,6 @@ This distribution includes software licensed under the following terms:
 **@vscode/codicons** : [MIT]
 > Copyright (c) Microsoft Corporation.
 
-**@vscode/extension-telemetry** : [MIT]
-> Copyright (c) Microsoft Corporation.
-
 **@vscode/vscode-languagedetection** : [MIT]
 > Copyright (c) Microsoft Corporation.
 

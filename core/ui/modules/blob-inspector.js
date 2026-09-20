@@ -4,6 +4,7 @@ import {
     clearExactIntegerText,
     clearOversizedCellMetadata,
     getCellMutationBlockReason,
+    getReadOnlyRowReason,
     getRowDataOffset,
     remapDisplayedRowIdentity,
     resolveDisplayedCell
@@ -45,37 +46,31 @@ export const OVERSIZED_INSPECTOR_LOAD_STEP_BYTES = MAX_CELL_READ_CHUNK_BYTES;
 export const MAX_OVERSIZED_INSPECTOR_LOAD_BYTES = 8 * 1024 * 1024;
 
 const CELL_TEXT_ENCODINGS = new Set(['utf-8', 'utf-16le', 'utf-16be']);
-const MAX_SINGLE_INSPECTOR_TEXT_CODE_UNITS = 64 * 1024;
+const MAX_INSPECTOR_TEXT_PAGE_CODE_UNITS = 64 * 1024;
+const MAX_INSPECTOR_TEXT_PAGE_BREAKS = 1024;
 const INSPECTOR_TEXT_BLOCK_CODE_UNITS = 2048;
-const MAX_INSPECTOR_TEXT_BLOCKS = 4100;
 let mediaPreviewRequestCounter = 0;
 
-function renderBoundedInspectorTextBlocks(pre, text) {
+function renderInspectorTextPage(pre, text) {
     pre.textContent = '';
-    // Formatting JSON may enlarge the displayed string beyond the source bytes.
-    // Leave one code unit for a surrogate boundary without exceeding the node cap.
-    const blockSize = Math.max(
-        INSPECTOR_TEXT_BLOCK_CODE_UNITS,
-        Math.ceil(text.length / MAX_INSPECTOR_TEXT_BLOCKS) + 1
-    );
     for (let start = 0; start < text.length;) {
-        let end = Math.min(start + blockSize, text.length);
+        let end = Math.min(start + INSPECTOR_TEXT_BLOCK_CODE_UNITS, text.length);
         const last = text.charCodeAt(end - 1);
         const next = text.charCodeAt(end);
         if (end < text.length && last >= 0xD800 && last <= 0xDBFF
             && next >= 0xDC00 && next <= 0xDFFF) end--;
         const block = document.createElement('span');
         block.className = 'inspector-text-block';
-        block.style.display = 'block';
-        // Keep off-screen text searchable and copyable without laying out every
-        // Unicode line when a large preview is expanded.
-        block.style.contentVisibility = 'auto';
-        block.style.containIntrinsicBlockSize = 'auto 1000px';
+        // Inline chunks preserve source line breaks in both display and copy.
         block.textContent = text.slice(start, end);
         pre.appendChild(block);
         start = end;
     }
-    // CSS block boundaries must not become newlines in copied database text.
+    pre.scrollTop = 0;
+    pre.scrollLeft = 0;
+}
+
+function setupInspectorTextSelection(pre) {
     pre.addEventListener('copy', event => {
         const selection = document.getSelection();
         if (!event.clipboardData || selection?.rangeCount !== 1
@@ -84,6 +79,112 @@ function renderBoundedInspectorTextBlocks(pre, text) {
         event.clipboardData.setData('text/plain', selectedText);
         event.preventDefault();
     });
+    pre.addEventListener('keydown', event => {
+        if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== 'a') return;
+        const selection = document.getSelection();
+        if (!selection) return;
+        // A focused page owns Select All, just as the former read-only textarea did.
+        const range = document.createRange();
+        range.selectNodeContents(pre);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        event.preventDefault();
+        event.stopPropagation();
+    });
+}
+
+function createInspectorTextPreview(pre, text) {
+    const boundaries = [0];
+    for (let start = 0; start < text.length;) {
+        let end = Math.min(start + MAX_INSPECTOR_TEXT_PAGE_CODE_UNITS, text.length);
+        const last = text.charCodeAt(end - 1), next = text.charCodeAt(end);
+        if ((last >= 0xD800 && last <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF)
+            || (last === 13 && next === 10)) end--;
+        let breaks = 0;
+        for (let position = start; position < end; position++) {
+            const unit = text.charCodeAt(position);
+            if ((unit < 10 || unit > 13) && unit !== 0x85 && unit !== 0x2028 && unit !== 0x2029) continue;
+            if (unit === 13 && text.charCodeAt(position + 1) === 10) position++;
+            if (++breaks === MAX_INSPECTOR_TEXT_PAGE_BREAKS) {
+                end = position + 1;
+                break;
+            }
+        }
+        boundaries.push(end);
+        start = end;
+    }
+    // content-visibility:auto is not a bound: a selection makes offscreen
+    // blocks eligible for layout. Retain only one bounded page in the DOM.
+    // Bound line count too, including small newline-only values.
+    renderInspectorTextPage(pre, text.slice(0, boundaries[1] ?? 0));
+    setupInspectorTextSelection(pre);
+    const pages = boundaries.length - 1;
+    if (pages <= 1) return pre;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'inspector-text-preview';
+    Object.assign(wrapper.style, {
+        display: 'flex', flexDirection: 'column', width: '100%', height: '100%', minHeight: '0'
+    });
+    Object.assign(pre.style, { flex: '1 1 0', height: 'auto', minHeight: '0', margin: '0' });
+    pre.tabIndex = 0;
+    pre.setAttribute('aria-label', 'Read-only text preview page');
+    const navigation = document.createElement('nav');
+    navigation.setAttribute('aria-label', 'Loaded text pages');
+    Object.assign(navigation.style, { display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center', flex: '0 0 auto' });
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '1';
+    input.max = String(pages);
+    input.step = '1';
+    input.value = '1';
+    input.style.width = '64px';
+    input.setAttribute('aria-label', 'Text preview page');
+    const note = document.createElement('p');
+    Object.assign(note.style, { margin: '6px 0', color: 'var(--text-secondary)', flex: '0 0 auto' });
+    note.setAttribute('role', 'status');
+    const pageNote = 'Each page holds at most 65,536 UTF-16 code units or 1,024 line breaks. Selection and copy cover this page.';
+    note.textContent = pageNote;
+    let currentPage = 0;
+    const showPage = page => {
+        input.value = String(currentPage + 1);
+        if (!Number.isSafeInteger(page) || page < 0 || page >= pages) {
+            note.textContent = `Choose a text page from 1 to ${pages}.`;
+            return;
+        }
+        currentPage = page;
+        renderInspectorTextPage(pre, text.slice(boundaries[page], boundaries[page + 1]));
+        input.value = String(page + 1);
+        previous.disabled = page === 0;
+        next.disabled = last.disabled = page === pages - 1;
+        note.textContent = pageNote;
+    };
+    const button = (label, action) => {
+        const element = document.createElement('button');
+        element.type = 'button';
+        element.className = 'btn-secondary';
+        element.textContent = label;
+        element.addEventListener('click', action);
+        return element;
+    };
+    const previous = button('Previous', () => showPage(currentPage - 1));
+    const go = button('Go', () => showPage(Number(input.value) - 1));
+    const next = button('Next', () => showPage(currentPage + 1));
+    const last = button('Last', () => showPage(pages - 1));
+    const label = document.createElement('span');
+    label.textContent = 'Page';
+    const count = document.createElement('span');
+    count.textContent = `of ${pages}`;
+    input.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        event.stopPropagation?.();
+        showPage(Number(input.value) - 1);
+    });
+    for (const element of [previous, label, input, count, go, next, last]) navigation.appendChild(element);
+    for (const element of [navigation, note, pre]) wrapper.appendChild(element);
+    previous.disabled = true;
+    return wrapper;
 }
 
 function createMediaPreviewRequestId() {
@@ -184,10 +285,13 @@ export class BlobInspector {
         this.currentColName = null;
         this.currentCellInfo = null;
         this.currentOversizedMetadata = null;
+        this.pendingTextSnapshot = false;
         this.currentStorageClass = null;
         this.currentInlineRawTextBytes = false;
         this.currentRawTextCanStream = false;
         this.currentTable = null;
+        this.currentTableType = null;
+        this.currentSnapshotUnavailable = false;
         this.oversizedLoadedBytes = 0;
         this.isLoadingOversized = false;
         this.oversizedLoadOperation = null;
@@ -199,6 +303,7 @@ export class BlobInspector {
         this.activeDownload = null;
 
         this.setupEventListeners();
+        if (this.hexContainer) setupInspectorTextSelection(this.hexContainer);
         registerModalCloseHandler('blob-inspector-modal', () => this.cleanup());
     }
 
@@ -210,6 +315,9 @@ export class BlobInspector {
 
         // Tabs
         this.modal.querySelectorAll('.tab-btn').forEach(btn => {
+            // Keep pointer focus stable while replacing the preview subtree.
+            // Keyboard activation retains normal focus on the tab button.
+            btn.addEventListener('mousedown', event => event.preventDefault());
             btn.addEventListener('click', (e) => {
                 const tab = e.target.dataset.tab;
                 this.switchTab(tab);
@@ -269,14 +377,10 @@ export class BlobInspector {
         const loadMoreBtn = document.getElementById('blob-load-more-btn');
         const saveFullBtn = document.getElementById('blob-save-full-btn');
         if (saveFullBtn) {
-            // The desktop has no host cell-editor to stream the full value into
-            // a file; its Download button already saves the loaded bytes through
-            // the same saveFileAs seam, so this VS Code/web-only affordance stays
-            // hidden on the desktop to avoid a second, redundant download button.
-            saveFullBtn.hidden = state.isDesktop
-                || !this.currentOversizedMetadata
+            saveFullBtn.hidden = !this.currentOversizedMetadata
+                || this.currentSnapshotUnavailable
                 || (this.currentInlineRawTextBytes && !this.currentRawTextCanStream);
-            saveFullBtn.disabled = uploading || !!this.activeFullContent;
+            saveFullBtn.disabled = uploading || !!this.activeFullContent || this.pendingTextSnapshot;
         }
         const mutationBlockReason = this.currentCellInfo
             ? getCellMutationBlockReason(
@@ -288,6 +392,9 @@ export class BlobInspector {
 
         if (replaceBtn) {
             replaceBtn.disabled = state.isReadOnly
+                || this.currentTableType === 'view'
+                || this.currentSnapshotUnavailable
+                || this.pendingTextSnapshot
                 || uploading
                 || !!this.activeReplacement
                 || !!mutationBlockReason;
@@ -303,7 +410,7 @@ export class BlobInspector {
                 && !this.currentRawTextCanStream;
             const rawTextBytesComplete = inlineRawTextOnly
                 && this.currentData?.byteLength === this.currentOversizedMetadata?.byteLength;
-            downloadBtn.disabled = uploading || !!this.activeFullContent;
+            downloadBtn.disabled = uploading || !!this.activeFullContent || this.pendingTextSnapshot;
             if (this.activeFullContent) {
                 downloadBtn.textContent = 'Opening...';
                 downloadBtn.title = '';
@@ -312,12 +419,14 @@ export class BlobInspector {
                     ? 'Download Raw Bytes'
                     : 'Download Raw Prefix';
                 downloadBtn.title = 'Download the byte-exact data retained from this result row';
+            } else if (this.currentSnapshotUnavailable && this.currentOversizedMetadata) {
+                downloadBtn.textContent = 'Download Preview';
+                downloadBtn.title = this.currentHexNeedsSnapshot
+                    ? 'Download the displayed TEXT prefix encoded as UTF-8; stored bytes are unavailable'
+                    : 'Download only the raw prefix retained from this result row';
             } else if (this.currentOversizedMetadata && state.isDesktop) {
-                // DESKTOP LANE. There is no VS Code editor tab to open the value
-                // in, so "Open Full Content" would be a dead button here. The
-                // chunked read (Load more) is what brings the value in; once it
-                // holds the whole value, Download saves those bytes, and until
-                // then it says why it cannot — and where the ceiling is.
+                // Download preserves the loaded snapshot. Save Full asks the
+                // desktop host to export one fresh snapshot beyond this cap.
                 const totalBytes = this.currentOversizedMetadata.byteLength;
                 downloadBtn.textContent = 'Download';
                 if (this.isOversizedFullyLoaded()) {
@@ -327,12 +436,12 @@ export class BlobInspector {
                     downloadBtn.title =
                         `The inspector holds at most ${this.formatSize(MAX_OVERSIZED_INSPECTOR_LOAD_BYTES)}; `
                         + `${this.formatSize(totalBytes - Math.min(this.oversizedLoadedBytes, MAX_OVERSIZED_INSPECTOR_LOAD_BYTES))} `
-                        + 'of this value cannot be shown. Export the table to get the whole value out.';
+                        + 'of this value cannot be shown. Use Save Full to export the stored bytes.';
                 } else {
                     downloadBtn.disabled = true;
                     downloadBtn.title = 'Load the whole value first (Load more), then download it';
                 }
-            } else if (this.currentOversizedMetadata) {
+            } else if (this.currentOversizedMetadata || this.canOpenInlineHex()) {
                 downloadBtn.textContent = this.currentTab === 'hex' ? 'Open Full Hex' : 'Open Full Content';
                 downloadBtn.title =
                     'Desktop opens the complete value in VS Code; the web demo is preview-only';
@@ -344,14 +453,9 @@ export class BlobInspector {
         if (loadMoreBtn) {
             const totalBytes = this.currentOversizedMetadata?.byteLength ?? 0;
             const loadLimit = Math.min(totalBytes, MAX_OVERSIZED_INSPECTOR_LOAD_BYTES);
-            // TEXT streams everywhere. BLOBs stream on the desktop too: VS Code
-            // renders an oversized BLOB through the host's media file, and the
-            // web demo cannot stream at all, but the desktop has neither route
-            // — the chunked read is what makes a >64 KiB BLOB inspectable there.
-            const storageClass = this.currentOversizedMetadata?.storageClass;
-            const canLoadMore = (!this.currentInlineRawTextBytes || this.currentRawTextCanStream)
-                && (storageClass === 'text' || (state.isDesktop && storageClass === 'blob'))
-                && this.oversizedLoadedBytes < loadLimit;
+            const canLoadMore = !this.currentSnapshotUnavailable && (this.pendingTextSnapshot || ((!this.currentInlineRawTextBytes || this.currentRawTextCanStream)
+                && ['text', 'blob'].includes(this.currentOversizedMetadata?.storageClass)
+                && this.oversizedLoadedBytes < loadLimit));
             const nextBytes = Math.min(
                 OVERSIZED_INSPECTOR_LOAD_STEP_BYTES,
                 Math.max(0, loadLimit - this.oversizedLoadedBytes)
@@ -360,27 +464,27 @@ export class BlobInspector {
             loadMoreBtn.disabled = uploading || this.isLoadingOversized || !canLoadMore;
             loadMoreBtn.textContent = this.isLoadingOversized ? 'Loading...' : 'Load more';
             loadMoreBtn.title = canLoadMore
-                ? `Load the next ${this.formatSize(nextBytes)} from one fresh cell snapshot`
+                ? this.pendingTextSnapshot
+                    ? 'Read a bounded snapshot of the stored TEXT bytes'
+                    : `Load the next ${this.formatSize(nextBytes)} from one fresh cell snapshot`
                 : '';
         }
     }
 
-    /**
-     * True once a chunked read has pulled the WHOLE oversized value into
-     * `currentData`. Only the desktop acts on it: VS Code keeps routing the
-     * Download button to the host's temporary-file editor whatever is loaded,
-     * and the web demo never streams.
-     */
+    /** Desktop Download requires all bytes from the current cell snapshot. */
     isOversizedFullyLoaded() {
         const metadata = this.currentOversizedMetadata;
         return !!metadata
-            && this.oversizedLoadedBytes > 0
+            && this.currentData?.byteLength === metadata.byteLength
             && this.oversizedLoadedBytes >= metadata.byteLength;
     }
 
     beginReplacementOperation() {
         if (
             this.activeReplacement
+            || this.pendingTextSnapshot
+            || this.currentTableType === 'view'
+            || this.currentSnapshotUnavailable
             || this.currentRowId === null
             || this.currentRowId === undefined
             || this.currentColName === null
@@ -668,10 +772,13 @@ export class BlobInspector {
         this.activeDownload = null;
         this.isUploading = false;
         this.currentOversizedMetadata = null;
+        this.pendingTextSnapshot = false;
         this.currentStorageClass = null;
         this.currentInlineRawTextBytes = false;
         this.currentRawTextCanStream = false;
         this.currentTable = null;
+        this.currentTableType = null;
+        this.currentSnapshotUnavailable = false;
         this.oversizedLoadedBytes = 0;
         this.oversizedLoadOperation = null;
         this.isLoadingOversized = false;
@@ -682,7 +789,7 @@ export class BlobInspector {
             this.currentObjectUrl = null;
         }
         this.previewContainer.innerHTML = '';
-        this.hexContainer.value = '';
+        this.hexContainer.textContent = '';
         this.infoContainer.textContent = '';
         this.currentData = null;
         this.currentType = null;
@@ -692,6 +799,9 @@ export class BlobInspector {
     }
 
     switchTab(tabId) {
+        // Reapplying tab styles can force a large preview through layout while
+        // assistive technology is traversing it. An active tab is a no-op.
+        if (this.currentTab === tabId) return;
         this.currentTab = tabId;
         // Update tab buttons
         this.modal.querySelectorAll('.tab-btn').forEach(btn => {
@@ -718,15 +828,28 @@ export class BlobInspector {
             hexTab.style.display = 'flex';
         }
         this.setUploadState(this.isUploading);
-        if (tabId === 'hex' && this.currentHexNeedsSnapshot && this.currentTableType === 'table') {
+        if (tabId === 'hex' && this.currentHexNeedsSnapshot && !this.currentSnapshotUnavailable && this.currentTableType === 'table') {
             return this.loadMoreOversizedContent(MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES);
         }
     }
 
+    canOpenInlineHex() {
+        // Inline BLOB bytes are authoritative. Decoded TEXT and view results
+        // must not be treated as a stored table-cell snapshot.
+        return !state.isDesktop
+            && !this.currentSnapshotUnavailable
+            && this.currentTab === 'hex'
+            && this.currentStorageClass === 'blob'
+            && this.currentTableType === 'table'
+            && document.getElementById('vscode-env')?.dataset.browserExt === 'false';
+    }
+
     async download() {
+        if (this.pendingTextSnapshot) return false;
         if (!this.currentData) return;
         if (
-            this.currentOversizedMetadata
+            (this.currentOversizedMetadata || this.canOpenInlineHex())
+            && !this.currentSnapshotUnavailable
             && (!this.currentInlineRawTextBytes || this.currentRawTextCanStream)
         ) {
             // The desktop has no host editor to open the value in; its Download
@@ -801,10 +924,11 @@ export class BlobInspector {
     }
 
     async openFullContent(download = false) {
+        if (this.currentSnapshotUnavailable) return false;
         if (this.activeFullContent?.promise) return this.activeFullContent.promise;
         const targetTable = this.currentTable ?? state.selectedTable;
         if (
-            !this.currentOversizedMetadata
+            (!this.currentOversizedMetadata && !this.canOpenInlineHex())
             || !targetTable
             || this.currentRowId === null
             || this.currentRowId === undefined
@@ -819,8 +943,9 @@ export class BlobInspector {
             rowId: this.currentRowId,
             column: this.currentColName,
             type: this.currentType,
-            sourceByteLength: this.currentOversizedMetadata.byteLength,
-            view: this.currentTab === 'hex' ? 'hex' : 'content',
+            sourceByteLength: this.currentOversizedMetadata?.byteLength ?? this.currentData?.byteLength,
+            view: this.currentTab === 'hex' ? 'hex'
+                : this.currentOversizedMetadata?.storageClass === 'text' ? 'snapshot' : 'content',
             download,
             webviewId,
             promise: null
@@ -849,7 +974,7 @@ export class BlobInspector {
                     type: operation.type,
                     webviewId: operation.webviewId,
                     sourceByteLength: operation.sourceByteLength,
-                    ...(operation.view === 'hex' && !operation.download ? { view: 'hex' } : {}),
+                    ...(operation.view !== 'content' && !operation.download ? { view: operation.view } : {}),
                     ...(operation.download ? { download: true } : {})
                 }
             );
@@ -914,6 +1039,8 @@ export class BlobInspector {
 
         // Store metadata
         this.currentTable = state.selectedTable;
+        this.currentTableType = state.selectedTableType;
+        this.currentSnapshotUnavailable = this.currentTableType !== 'table' || !!getReadOnlyRowReason(rowIdx);
         this.currentRowId = rowId;
         this.currentColName = colName;
         this.currentCellInfo = { rowIdx, colIdx };
@@ -945,13 +1072,37 @@ export class BlobInspector {
         const size = this.formatSize(data.length);
 
         this.infoContainer.textContent =
-            `${colName} (Row ${rowId}) | ${isText ? 'TEXT' : (type.mime || 'Unknown Type')} | ${size}`;
+            `${colName} (Row ${rowId}) | ${isText ? 'TEXT' : (type.mime || 'Unknown Type')} | ${size}` +
+            (isText ? ' | Displayed UTF-8, not stored database bytes' : '');
 
         // Render Preview
         this.renderPreview(data, type, { text: isText ? blobData : undefined });
 
         // Render Hex
         this.renderHex(data);
+    }
+
+    inspectStoredText(rowId, colName, rowIdx, colIdx) {
+        if (state.selectedTableType !== 'table' || getReadOnlyRowReason(rowIdx)) return false;
+        this.cleanup();
+        this.currentHexPage = 0;
+        this.setInspectorTitle('TEXT Inspector');
+        this.currentTable = state.selectedTable;
+        this.currentTableType = state.selectedTableType;
+        this.currentSnapshotUnavailable = false;
+        this.currentRowId = rowId;
+        this.currentColName = colName;
+        this.currentCellInfo = { rowIdx, colIdx };
+        this.currentStorageClass = 'text';
+        this.currentHexNeedsSnapshot = false;
+        // The decoded grid string has no authoritative byte length or encoding.
+        // Keep mutation/download disabled until the reader supplies both.
+        this.pendingTextSnapshot = true;
+        this.setUploadState(false);
+        openModal('blob-inspector-modal', this.modal);
+        this.switchTab('preview');
+        this.infoContainer.textContent = `${colName} (Row ${rowId}) | Reading bounded TEXT snapshot...`;
+        return this.loadMoreOversizedContent(MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES);
     }
 
     inspectOversized(previewValue, metadata, rowId, colName, rowIdx, colIdx) {
@@ -966,11 +1117,14 @@ export class BlobInspector {
         this.currentOversizedMetadata = metadata;
         this.currentStorageClass = metadata.storageClass;
         this.currentTableType = state.selectedTableType;
+        // View row numbers and identity-fallback tokens cannot address a
+        // stored table cell. Keep this decision bound to the inspected row.
+        this.currentSnapshotUnavailable = this.currentTableType !== 'table' || !!getReadOnlyRowReason(rowIdx);
         this.currentHexNeedsSnapshot = metadata.storageClass === 'text' && typeof previewValue === 'string';
         this.currentInlineRawTextBytes =
             metadata.storageClass === 'text' && previewValue instanceof Uint8Array;
         this.currentRawTextCanStream = this.currentInlineRawTextBytes
-            && state.selectedTableType === 'table';
+            && !this.currentSnapshotUnavailable;
         this.oversizedLoadedBytes = 0;
         this.setUploadState(false);
         openModal('blob-inspector-modal', this.modal);
@@ -1001,16 +1155,33 @@ export class BlobInspector {
         this.infoContainer.textContent =
             `${colName} (Row ${rowId}) | ${metadata.storageClass.toUpperCase()} | ` +
             `Preview ${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +
-            'Full content opens from a desktop temporary file; web is preview-only';
+            (state.isDesktop
+                ? 'Load more to inspect; Save Full exports the stored bytes'
+                : 'Full content opens from a desktop temporary file; web is preview-only');
 
         if (this.currentHexNeedsSnapshot) {
             // The page's decoded string has no database encoding metadata.
             // Re-encoding it as UTF-8 would mislabel UTF-16 bytes as raw Hex.
-            if (this.hexContainer) this.hexContainer.value = this.currentTableType === 'table'
+            if (this.hexContainer) this.hexContainer.textContent = !this.currentSnapshotUnavailable
                 ? 'Select Hex to read a bounded snapshot of the stored TEXT bytes.'
-                : 'Raw Hex is unavailable for this decoded view preview.';
+                : 'Raw Hex is unavailable for this decoded result preview.';
         } else {
             this.renderHex(data);
+        }
+        if (this.currentSnapshotUnavailable) {
+            this.infoContainer.textContent =
+                `${colName} | ${metadata.storageClass.toUpperCase()} | ` +
+                `Result preview ${this.formatSize(data.byteLength)} of ${this.formatSize(metadata.byteLength)} | ` +
+                'No addressable stored cell; only this result prefix is available';
+            if (isOversizedMediaType(type)) {
+                this.renderOversizedMediaStatus('Only the bounded result prefix is available for this media value.');
+            } else {
+                this.renderPreview(data, type, {
+                    text: metadata.storageClass === 'text' ? decodeCellTextPrefix(data, 'utf-8', true) : undefined
+                });
+            }
+            this.setUploadState(false);
+            return Promise.resolve(false);
         }
         if (metadata.byteLength <= OVERSIZED_INSPECTOR_LOAD_STEP_BYTES) {
             // Aggregate page pressure can truncate a modest value to a few
@@ -1035,12 +1206,13 @@ export class BlobInspector {
 
     /** Reread one complete prefix from offset zero inside a single snapshot. */
     async loadMoreOversizedContent(requestedPrefixBytes) {
+        if (this.currentSnapshotUnavailable) return false;
         const metadata = this.currentOversizedMetadata;
         const table = this.currentTable;
         const rowId = this.currentRowId;
         const colName = this.currentColName;
         if (
-            !metadata
+            (!metadata && !this.pendingTextSnapshot)
             || !table
             || rowId === null
             || rowId === undefined
@@ -1052,7 +1224,7 @@ export class BlobInspector {
         }
         if (this.oversizedLoadOperation) return false;
 
-        const defaultTarget = Math.max(
+        const defaultTarget = this.pendingTextSnapshot ? MAX_OVERSIZED_INSPECTOR_PREVIEW_BYTES : Math.max(
             OVERSIZED_INSPECTOR_LOAD_STEP_BYTES,
             this.oversizedLoadedBytes + OVERSIZED_INSPECTOR_LOAD_STEP_BYTES
         );
@@ -1133,6 +1305,8 @@ export class BlobInspector {
         this.currentData = loaded.bytes;
         this.currentHexNeedsSnapshot = false;
         this.currentOversizedMetadata = loaded.metadata;
+        this.currentStorageClass = loaded.metadata.storageClass;
+        this.pendingTextSnapshot = false;
         this.oversizedLoadedBytes = loaded.bytes.byteLength;
         let renderedText;
         if (loaded.metadata.storageClass === 'text') {
@@ -1505,12 +1679,6 @@ export class BlobInspector {
             } else {
                 pre.textContent = text;
             }
-            // Both long paragraphs and many short Unicode lines can stall a
-            // single rendering block. Bound each block and defer off-screen
-            // layout while keeping the DOM below 4100 blocks.
-            if (pre.textContent.length > MAX_SINGLE_INSPECTOR_TEXT_CODE_UNITS) {
-                renderBoundedInspectorTextBlocks(pre, pre.textContent);
-            }
             pre.style.whiteSpace = 'pre-wrap';
             pre.style.wordBreak = 'break-all';
             pre.style.fontFamily = 'var(--vscode-editor-font-family, monospace)';
@@ -1519,7 +1687,7 @@ export class BlobInspector {
             pre.style.width = '100%';
             pre.style.height = '100%';
             pre.style.overflow = 'auto';
-            this.previewContainer.appendChild(pre);
+            this.previewContainer.appendChild(createInspectorTextPreview(pre, pre.textContent));
         } else if (type.type === 'pdf') {
              // VS Code webview sandbox does not support inline PDF rendering.
              // Show file info and a download button that uses the VS Code save dialog.
@@ -1606,7 +1774,9 @@ export class BlobInspector {
             output += `${offset}  ${hexPart1}  ${hexPart2}  |${asciiPart}|\n`;
         }
 
-        this.hexContainer.value = output;
+        // A byte page expands to about 80 KiB of formatted text. Expose bounded
+        // static text nodes instead of one large native accessibility text-field value.
+        renderInspectorTextPage(this.hexContainer, output);
         const previous = document.getElementById('blob-hex-previous');
         const next = document.getElementById('blob-hex-next');
         const position = document.getElementById('blob-hex-position');

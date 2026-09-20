@@ -599,7 +599,6 @@ export function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock
  */
 function assertReplacementReadySync(
   fs: NodeFs,
-  sourceFd: number,
   activeBasePath: string,
   expectedBase: PagedFileIdentity,
   temporaryPath: string,
@@ -609,18 +608,13 @@ function assertReplacementReadySync(
   assertTemporaryGenerationSync(fs, temporaryPath, expectedTemporary);
   assertTargetGenerationSync(fs, target);
 
-  let descriptor: PagedFileIdentity;
   let activePath: PagedFileIdentity;
   try {
-    descriptor = identityFromStats(fs.fstatSync(sourceFd, { bigint: true }));
     activePath = identityFromStats(fs.statSync(activeBasePath, { bigint: true }));
   } catch (error) {
     throw new Error(PAGED_FILE_CHANGED_MESSAGE, { cause: error });
   }
-  if (
-    !sameBaseGeneration(expectedBase, descriptor)
-    || !sameBaseGeneration(expectedBase, activePath)
-  ) {
+  if (!sameBaseGeneration(expectedBase, activePath)) {
     throw new Error(PAGED_FILE_CHANGED_MESSAGE);
   }
   assertNoSiblingWalFramesSync(fs, activeBasePath);
@@ -819,6 +813,12 @@ export async function writePagedWritableOverlayToFile(
     completedTemporaryFingerprint = fingerprintFromStats(
       fs.fstatSync(temporary.fd, { bigint: true })
     );
+    // The copy descriptor also prevents Windows from replacing the base.
+    // Verify its completed read before closing, then use the frozen identity
+    // in the synchronous, writer-locked path gates immediately before rename.
+    await assertBaseGeneration(fs, source, activeBasePath, snapshot.baseIdentity);
+    await source.close();
+    source = undefined;
     await temporary.close();
     temporary = undefined;
     // This is the last cooperative cancellation point. Once rename commits,
@@ -841,7 +841,6 @@ export async function writePagedWritableOverlayToFile(
       }
       assertReplacementReadySync(
         fs,
-        source.fd,
         activeBasePath,
         snapshot.baseIdentity,
         temporaryPath,
@@ -860,7 +859,6 @@ export async function writePagedWritableOverlayToFile(
         lockToRelease.release();
         assertReplacementReadySync(
           fs,
-          source.fd,
           activeBasePath,
           snapshot.baseIdentity,
           temporaryPath,
@@ -942,16 +940,6 @@ export async function writePagedWritableOverlayToFile(
       );
     }
 
-    try {
-      await source.close();
-    } catch (closeError) {
-      warnAfterSuccessfulRename(
-        logger,
-        'Paged save succeeded, but the frozen source descriptor could not be closed:',
-        closeError
-      );
-    }
-    source = undefined;
     return { requiresReopen: target.requiresReopen };
   } catch (error) {
     const cleanupErrors: unknown[] = [];

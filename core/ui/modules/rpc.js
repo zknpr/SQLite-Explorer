@@ -7,7 +7,7 @@ import { refreshSchema } from './sidebar.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
 import { applyConnectionResult, updateMutationControlCapabilities } from './connection-state.js';
 import { invalidateAllCounts } from './count-cache.js';
-import { showErrorState, showLoading, updateStatus, updateToolbarButtons } from './ui.js';
+import { clearContentStatus, showErrorState, showLoading, updateStatus, updateToolbarButtons } from './ui.js';
 import { closeDatabaseTargetModals } from './modals.js';
 import { getErrorMessage } from './utils.js';
 
@@ -32,6 +32,10 @@ async function refreshContentOnce(filename, connectionResult) {
     // write, revert — the host also echoes one after this webview's own
     // edits). None of the cached counts can be trusted across it.
     invalidateAllCounts();
+    // Undo can restore a dropped view while no object is selected, so no grid
+    // load will replace its old completion message. Expire only completed
+    // schema feedback, before awaits can admit newer status or operation replies.
+    clearContentStatus();
     const contentGeneration = ++state.contentGeneration;
     state.isRefreshingContent = true;
     updateMutationControlCapabilities();
@@ -109,9 +113,12 @@ async function refreshContentOnce(filename, connectionResult) {
             // Refresh columns to reflect added/removed columns
             if (await loadTableColumns()) {
                 // Refresh data to reflect row changes
-                await loadTableData(false);
-            } else if (connectionReplaced) {
-                showErrorState('Could not load table columns after reloading the database.');
+                if (await loadTableData(false) !== true) return { success: false };
+            } else {
+                if (connectionReplaced) {
+                    showErrorState('Could not load table columns after reloading the database.');
+                }
+                return { success: false };
             }
         }
       }

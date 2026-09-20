@@ -77,7 +77,8 @@ export function getNativeStageFiles(variant) {
   }
   return [
     'natives/native-worker.js',
-    `natives/${variant.triple}/${variant.binary}`
+    `natives/${variant.triple}/${variant.binary}`,
+    `natives/${variant.triple}/query-plan.${variant.target.startsWith('darwin-') ? 'dylib' : variant.target.startsWith('win32-') ? 'dll' : 'so'}`
   ];
 }
 
@@ -85,6 +86,16 @@ export function validatePackageEntries(entries, variant) {
   const browserEntry = `${archivePrefix}out/extension-browser.js`;
   if (entries.filter((entry) => entry === browserEntry).length !== 1) {
     throw new Error(`VSIX gate failed: expected exactly one browser entry point (${browserEntry})`);
+  }
+
+  const viewerEntry = `${archivePrefix}core/ui/viewer.html`;
+  if (entries.filter(entry => entry === viewerEntry).length !== 1) {
+    throw new Error(`VSIX gate failed: expected exactly one bundled viewer (${viewerEntry})`);
+  }
+  const redundantCore = entries.find(entry => entry.startsWith(`${archivePrefix}core/`)
+    && entry !== viewerEntry);
+  if (redundantCore) {
+    throw new Error(`VSIX gate failed: redundant core source ${redundantCore}`);
   }
 
   const nativeEntries = entries.filter((entry) => entry.startsWith(`${archivePrefix}natives/`));

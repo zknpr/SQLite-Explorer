@@ -338,6 +338,7 @@ export const backendApi = {
     // `{}` keeps the worker's own maxRows clamp in charge of the row cap.
     runConsole: (sql, options) => sendRpcRequest('runConsole', [sql, options ?? {}]),
     getTableInfo: (table) => sendRpcRequest('getTableInfo', [table]),
+    getImportTarget: (table) => sendRpcRequest('getImportTarget', [table]),
     // Desktop-only CSV/JSON import (modules/import-data.js). The pick and the
     // read are shell dialog/file I/O answered by the host's global methods;
     // `importRows` is the worker mutation — one call for the whole batch,
@@ -345,9 +346,12 @@ export const backendApi = {
     // adds the undo and transport budgets itself (policy the page cannot lift).
     pickImportSource: () => sendRpcRequest('pickImportSource', []),
     readImportSource: (path) => sendRpcRequest('readImportSource', [path]),
-    importRows: (table, rows) => sendRpcRequest(
+    importRows: (table, rows, options = {}) => sendRpcRequest(
         'importRows',
-        [table, rows, { maxEditValueBytes: DEFAULT_MAX_CELL_EDIT_BYTES }]
+        [table, rows, {
+            ...(options.expectedSchemaVersion === undefined ? {} : { expectedSchemaVersion: options.expectedSchemaVersion }),
+            maxEditValueBytes: DEFAULT_MAX_CELL_EDIT_BYTES
+        }]
     ),
     getPragmas: () => sendRpcRequest('getPragmas', []),
     setPragma: (pragma, value) => sendRpcRequest('setPragma', [pragma, value]),
@@ -400,13 +404,10 @@ export const backendApi = {
             + 'Do you want to continue?',
         confirmLabel: 'Continue'
     }),
-    openCellEditor: (_params, _rowId, _colName, _colTypes, options = {}) => Promise.resolve({
-        success: false,
-        message:
-            `Opening ${options.sourceByteLength ?? 'this'} bytes in an external editor is a VS Code ` +
-            'feature; on the desktop use Load More in the cell inspector, which reads the value ' +
-            'through a consistent snapshot in bounded chunks.'
-    }),
+    openCellEditor: (params, rowId, colName, colTypes, options = {}) =>
+        options.download === true
+            ? sendRpcRequest('openCellEditor', [params, rowId, colName, colTypes, options])
+            : Promise.resolve({ success: false, message: 'Use Load More in the cell inspector to view this value, or Save Full to download its stored bytes.' }),
     openViewEditor: () => Promise.resolve({ success: false, message: 'Not available in web mode' }),
     readWorkspaceFileUri: () => Promise.resolve(null),
     triggerUndo: () => sendRpcRequest('triggerUndo', []),

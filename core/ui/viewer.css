@@ -300,14 +300,13 @@ button.section-title:focus-visible,
     flex: 1;
 }
 
-/*
- * Index rows pair two identifiers — the index name and the table it is on
- * (`renderIndexesList` in modules/sidebar.js). Both were unstyled inline
- * spans, so they rendered flush against each other and the sidebar showed
- * `idx_people_agepeople`: a name that does not exist, in the one section with
- * no other place to read the index's name. `min-width: 0` on both is what lets
- * the ellipsis actually engage inside a flex row.
- */
+#indexesList .list-item {
+    padding: 4px 12px 4px 24px;
+    gap: 6px;
+}
+
+/* Keep an index and its table distinct on one row. Both flex items must
+   shrink so long identifiers truncate within the sidebar. */
 .list-item .item-content {
     display: flex;
     align-items: baseline;
@@ -318,8 +317,8 @@ button.section-title:focus-visible,
 }
 
 .list-item .item-detail {
-    color: var(--text-secondary);
     font-size: 11px;
+    color: var(--text-secondary);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -935,8 +934,7 @@ button.section-title:focus-visible,
 }
 
 .data-cell.oversized-cell {
-    color: var(--vscode-editorWarning-foreground, #cca700);
-    cursor: not-allowed;
+    color: var(--text-primary);
 }
 
 .data-row.read-only-row .data-cell.row-number {
@@ -1758,6 +1756,22 @@ input[type="checkbox"]:focus-visible {
     background: var(--bg-primary);
 }
 
+.inspector-text-preview input {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    padding: 5px 6px;
+    font: inherit;
+}
+
+.inspector-text-preview input:focus-visible,
+.inspector-text-preview pre:focus-visible,
+.hex-dump-content:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
+}
+
 .blob-hex-pane {
     display: none;
     flex-direction: column;
@@ -1775,17 +1789,18 @@ input[type="checkbox"]:focus-visible {
     padding: 8px 12px;
 }
 
-.hex-dump-textarea {
+.hex-dump-content {
     width: 100%;
     flex: 1;
     min-height: 0;
-    resize: none;
+    overflow: auto;
+    white-space: pre;
+    user-select: text;
     border: none;
     padding: 12px;
     font-family: monospace;
     background: var(--bg-primary);
     color: var(--text-primary);
-    outline: none;
 }
 
 .blob-preview-placeholder {

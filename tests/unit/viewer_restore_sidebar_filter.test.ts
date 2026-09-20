@@ -6,7 +6,7 @@ import { it } from 'node:test';
 import esbuild from 'esbuild';
 import { createDeferred } from './helpers/deferred';
 
-it('restores and renders a saved sidebar filter without a selected table', async () => {
+it('restores and renders a saved sidebar filter without a selected table', { timeout: 10_000 }, async () => {
     const completed = createDeferred<void>();
     const state: Record<string, any> = {
         isDbConnected: false,

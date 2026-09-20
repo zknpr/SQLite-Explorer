@@ -229,6 +229,43 @@ const SWEEP = [
             'sweep/runQuery/error-names-the-missing-table', detail(bad));
     }],
 
+    ['executeReadQuery', async ({ s, check, dbPath }) => {
+        const exact = await s.invoke('executeReadQuery', [
+            "SELECT ? AS label, CAST(? AS INTEGER) AS exact, NULL AS empty, x'0102' AS bytes",
+            '["hello", "9223372036854775807"]'
+        ]);
+        const data = body(exact).data;
+        check(body(exact).success === true
+            && data?.rows?.[0]?.[0] === 'hello'
+            && data?.exactIntegerTexts?.[0]?.[1] === '9223372036854775807'
+            && data?.rows?.[0]?.[2] === null
+            && equalBytes(data?.rows?.[0]?.[3] ?? [], [1, 2]),
+            'sweep/executeReadQuery/happy-exact-bound-values', detail(exact));
+        const invalid = await s.invoke('executeReadQuery', ['SELECT ?', '[]']);
+        check(failed(invalid, /Expected 1 positional parameters/),
+            'sweep/executeReadQuery/error-binding-count', detail(invalid));
+
+        const clipped = await s.invoke('executeReadQuery', ['SELECT zeroblob(70000) AS payload']);
+        check(body(clipped).success === true
+            && body(clipped).data?.oversizedCells?.[0]?.[0]?.byteLength === 70000
+            && body(clipped).data?.rows?.[0]?.[0]?.byteLength <= 65536,
+            'sweep/executeReadQuery/bounds-cell-before-transport');
+
+        await s.invoke('runQuery', ["BEGIN; UPDATE people SET name = 'pending' WHERE id = 1"]);
+        try {
+            const pending = await s.invoke('executeReadQuery', ['SELECT name FROM people WHERE id = 1']);
+            const independent = new DatabaseSync(dbPath, { readOnly: true });
+            try {
+                check(body(pending).data?.rows?.[0]?.[0] === 'pending'
+                    && independent.prepare('SELECT name FROM people WHERE id = 1').get()?.name === 'alpha',
+                    'sweep/executeReadQuery/sees-pending-values-without-committing', detail(pending));
+            } finally { independent.close(); }
+        } finally { await s.invoke('runQuery', ['ROLLBACK']); }
+        const restored = await s.invoke('executeReadQuery', ['SELECT name FROM people WHERE id = 1']);
+        check(body(restored).data?.rows?.[0]?.[0] === 'alpha',
+            'sweep/executeReadQuery/pending-read-preserves-rollback', detail(restored));
+    }],
+
     ['runConsole', async ({ s, check }) => {
         const ok = await s.invoke('runConsole', ['SELECT name FROM people ORDER BY id']);
         check(body(ok).success === true
@@ -270,9 +307,14 @@ const SWEEP = [
             detail(overBound));
 
         // ---- EXPLAIN (the plan of ONE statement, nothing executed) -------
-        // The native engine has no bounded reader (its fork disables loadable
-        // extensions), so this is SQLite's own EXPLAIN QUERY PLAN through the
-        // shim, with the parameters bound so the planner sees real values.
+        // The pinned reader runs on this same native connection and sees bound
+        // parameters, TEMP objects and uncommitted schema changes.
+        const reader = await s.invoke('runQuery', [
+            "SELECT sqlite_explorer_query_plan('SELECT 1') AS plan"
+        ]);
+        check(body(reader).success === true
+            && JSON.parse(body(reader).data?.[0]?.rows?.[0]?.[0] ?? '[]').length > 0,
+            'sweep/runConsole/bounded-reader-is-registered', detail(reader));
         const plan = await s.invoke('runConsole', [
             'SELECT name FROM people WHERE id = ?', { explain: true, params: [2] }
         ]);
@@ -286,7 +328,42 @@ const SWEEP = [
             && planRows.length >= 1
             && planRows.every((row) => row.length === 4 && typeof row[3] === 'string')
             && /SEARCH people USING INTEGER PRIMARY KEY/.test(planRows.map((row) => row[3]).join('\n')),
-            'sweep/runConsole/explain-happy-native-builtin-plan', detail(plan));
+            'sweep/runConsole/explain-happy-native-bounded-plan', detail(plan));
+
+        await s.invoke('runQuery', [
+            'BEGIN; CREATE TEMP TABLE plan_temp(value); CREATE TABLE plan_pending(value); '
+            + 'INSERT INTO plan_temp VALUES (1); INSERT INTO plan_pending VALUES (1)'
+        ]);
+        try {
+            const pending = await s.invoke('runConsole', [
+                'WITH chosen(value) AS (SELECT value FROM plan_temp WHERE value = ?) '
+                + 'SELECT * FROM chosen JOIN plan_pending USING(value)',
+                { explain: true, params: [1] }
+            ]);
+            check(body(pending).success === true && body(pending).data?.error === undefined
+                && body(pending).data?.mutated === false
+                && body(pending).data?.results?.[0]?.rows?.length > 0,
+                'sweep/runConsole/explain-sees-temp-and-pending-schema', detail(pending));
+            const mismatch = await s.invoke('runConsole', ['SELECT ?', { explain: true }]);
+            check(body(mismatch).success === true && typeof body(mismatch).data?.error === 'string'
+                && body(mismatch).data?.mutated === false,
+                'sweep/runConsole/explain-refuses-mismatched-bindings', detail(mismatch));
+        } finally { await s.invoke('runQuery', ['ROLLBACK']); }
+        const pendingGone = await s.invoke('runQuery', [
+            "SELECT count(*) AS n FROM sqlite_schema WHERE name = 'plan_pending'"
+        ]);
+        check(body(pendingGone).data?.[0]?.rows?.[0]?.[0] === 0,
+            'sweep/runConsole/explain-preserves-pending-ddl-rollback', detail(pendingGone));
+
+        const manyColumns = Array.from({ length: 510 }, () => '(SELECT 1)').join(', ');
+        const capped = await s.invoke('runConsole', [`SELECT ${manyColumns}`, { explain: true }]);
+        check(body(capped).success === true && body(capped).data?.error === undefined
+            && body(capped).data?.results?.[0]?.rows?.length === 1000
+            && body(capped).data?.results?.[0]?.truncated === true,
+            'sweep/runConsole/explain-bounds-rows-in-reader');
+        const limitsRestored = await s.invoke('runQuery', ['SELECT length(zeroblob(2097152)) AS size']);
+        check(body(limitsRestored).data?.[0]?.rows?.[0]?.[0] === 2097152,
+            'sweep/runConsole/explain-restores-connection-limits', detail(limitsRestored));
 
         // A DML plan is listed, not executed: the row is untouched afterwards.
         const dmlPlan = await s.invoke('runConsole', [
@@ -639,6 +716,18 @@ const SWEEP = [
             detail(tooBig));
     }],
 
+    ['getImportTarget', async ({ s, check }) => {
+        const target = await s.invoke('getImportTarget', ['people']);
+        check(body(target).success === true
+            && body(target).data?.columns?.some(column => column.identifier === 'name')
+            && typeof body(target).data?.schemaVersion === 'string'
+            && body(target).data.schemaVersion.length > 0,
+            'sweep/getImportTarget/happy-columns-and-schema-cookie', detail(target));
+        const missing = await s.invoke('getImportTarget', ['missing_import_table']);
+        check(body(missing).success === false && String(body(missing).errorMessage ?? '').length > 0,
+            'sweep/getImportTarget/error-missing-target-refused', detail(missing));
+    }],
+
     ['importRows', async ({ s, check }) => {
         // The desktop's CSV/JSON import: every row inside ONE savepoint, ONE
         // compact post-image set back ({rowCount, snapshots}) that the host
@@ -648,11 +737,19 @@ const SWEEP = [
         const count = async () => body(await s.invoke('runQuery', ['SELECT count(*) AS c FROM people']))
             .data?.[0]?.rows?.[0]?.[0];
         const before = await count();
+        const preview = await s.invoke('getImportTarget', ['people']);
+        // Native column-name probes create and remove TEMP views. An ordinary
+        // intervening read must not invalidate an otherwise unchanged preview.
+        await s.invoke('runQuery', ['SELECT name FROM people ORDER BY id']);
         const imported = await s.invoke('importRows', ['people', [
             { id: 20, name: 'import-a', r: 1.25 },
             { id: 21, name: 'import-b' },              // ragged: no `r` → its default
             { id: 22, name: 'import-c', big: '9007199254740993' }   // exact int64 as text
-        ], { maxEditValueBytes: 1024 * 1024, maxUndoSnapshotBytes: 1024 * 1024 }]);
+        ], {
+            maxEditValueBytes: 1024 * 1024,
+            maxUndoSnapshotBytes: 1024 * 1024,
+            expectedSchemaVersion: body(preview).data?.schemaVersion
+        }]);
         const answer = body(imported).data;
         const readBack = await s.invoke('runQuery', [
             'SELECT name, CAST(big AS TEXT), typeof(big) FROM people WHERE id IN (20, 21, 22) ORDER BY id'
@@ -668,6 +765,22 @@ const SWEEP = [
             && await count() === before + 3,
             'sweep/importRows/happy-one-call-inserts-every-row-and-returns-compact-post-images',
             detail(imported));
+
+        for (const [scope, create] of [
+            ['main', 'CREATE TABLE main.import_schema_change(value)'],
+            ['temp', 'CREATE TEMP TABLE import_schema_change(value)']
+        ]) {
+            const stalePreview = await s.invoke('getImportTarget', ['people']);
+            await s.invoke('runQuery', [create]);
+            const refused = await s.invoke('importRows', ['people', [{ id: 40, name: 'stale-preview' }], {
+                expectedSchemaVersion: body(stalePreview).data?.schemaVersion
+            }]);
+            const absent = await s.invoke('runQuery', ['SELECT count(*) AS c FROM people WHERE id = 40']);
+            check(failed(refused, /schema changed after the preview was prepared/)
+                && body(absent).data?.[0]?.rows?.[0]?.[0] === 0,
+                `sweep/importRows/error-${scope}-schema-change-refuses-before-inserting`, detail(refused));
+            await s.invoke('runQuery', [`DROP TABLE ${scope}.import_schema_change`]);
+        }
 
         // Undo/redo of the SAME entry the host would record: importedRows on a
         // row_insert entry, through the real replay methods.

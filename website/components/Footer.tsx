@@ -42,17 +42,6 @@ export default function Footer() {
 
         <div className="mt-8 pt-6 border-t border-(--ui-edge) flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-(--ui-subtle-fg)">
           <p>&copy; {currentYear} zknpr</p>
-          <p>
-            Built with{" "}
-            <a
-              href="https://claude.com/product/claude-code"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-(--ui-accent) hover:underline"
-            >
-              Claude Code
-            </a>
-          </p>
         </div>
       </div>
     </footer>

@@ -310,7 +310,7 @@ async function submitAddRowOnce() {
         // the committed insert against the still-selected database target.
         if (targetIsCurrent()) await loadTableData();
         if (ownsModal && addRowSession === null && targetIsCurrent()) {
-            updateStatus('Row inserted - ${saveHint()}');
+            updateStatus(`Row inserted - ${saveHint()}`, { clearOnRefresh: true });
         }
 
     } catch (err) {
@@ -699,9 +699,18 @@ export async function submitCreateTable() {
 
 async function submitCreateTableOnce() {
     const modalSession = createTableSession;
+    const targetConnectionGeneration = modalSession?.connectionGeneration
+        ?? state.connectionGeneration;
     const isCurrentSession = () => modalSession === null
         ? createTableSession === null
         : createTableSession === modalSession;
+    const operationStatus = 'Creating table...';
+    const canReportCompletion = () => {
+        const activeSession = createTableSession;
+        return targetConnectionGeneration === state.connectionGeneration
+            && (activeSession === null || activeSession === modalSession)
+            && document.getElementById('statusText')?.textContent === operationStatus;
+    };
     const tableName = document.getElementById('newTableName').value;
     if (modalSession
         && (modalSession.connectionGeneration !== state.connectionGeneration
@@ -753,14 +762,20 @@ async function submitCreateTableOnce() {
     }
 
     try {
-        updateStatus('Creating table...');
+        updateStatus(operationStatus);
         if (withoutRowid) await backendApi.createTable(tableName, colDefs, { withoutRowid: true });
         else await backendApi.createTable(tableName, colDefs);
 
         await refreshSchema();
         if (isCurrentSession()) {
             closeModal('createTableModal');
-            updateStatus(`Table "${tableName}" created - ${saveHint()}`);
+        }
+        // The extension host echoes committed DDL before its RPC response and
+        // closes this modal as stale. Report success while this operation still
+        // owns the footer, but never close a reopened draft or replace newer
+        // feedback from another action.
+        if (canReportCompletion()) {
+            updateStatus(`Table "${tableName}" created - ${saveHint()}`, { clearOnRefresh: true });
         }
 
     } catch (err) {

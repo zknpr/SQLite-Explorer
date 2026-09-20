@@ -30,6 +30,7 @@ export interface NativeDatabase {
     interrupt?(): void;
     setQueryDeadline?(ms: number): void;
     clearQueryDeadline?(): void;
+    loadExtension?(path: string, entryPoint: string): void;
 }
 
 /**

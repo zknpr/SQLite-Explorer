@@ -660,6 +660,51 @@ describe('desktop paged fallback routing (engine layer)', () => {
     assert.strictEqual(openFdCount(), before);
   });
 
+  it('releases the frozen base for replacement without discarding edits after a failed save', async () => {
+    const basePath = path.join(fixtureDir, 'save-retry.db');
+    fs.writeFileSync(basePath, Buffer.from(dbBytes));
+    const before = openFdCount();
+    const opened = await createDatabaseEngine(overGateConfig(basePath));
+    const engine = opened.operations as WasmDatabaseEngine;
+    try {
+      await engine.updateCell('fixtures', 1, 'label', 'retained edit');
+      const snapshot = engine.exportPagedWritableOverlay();
+      if (before !== undefined) {
+        assert.strictEqual(openFdCount(), before, 'overlay extraction must release its base handle');
+      }
+      const refusingFs = new Proxy(fs, {
+        get(target, property) {
+          if (property === 'renameSync') return () => {
+            throw Object.assign(new Error('injected replacement failure'), { code: 'EPERM' });
+          };
+          return Reflect.get(target, property);
+        }
+      });
+      await assert.rejects(
+        writePagedWritableOverlayToFile(refusingFs, basePath, basePath, snapshot),
+        /injected replacement failure/
+      );
+      assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from(dbBytes));
+      const rows = await engine.executeQuery(
+        'SELECT label FROM fixtures WHERE id IN (1, 2000) ORDER BY id'
+      );
+      assert.deepStrictEqual(rows[0].rows, [['retained edit'], ['row-2000']]);
+      const retried = await writePagedWritableOverlayToFile(
+        fs, basePath, basePath, engine.exportPagedWritableOverlay()
+      );
+      assert.strictEqual(retried.requiresReopen, true);
+      const persisted = new (SqlJsModule.Database as any)(fs.readFileSync(basePath));
+      try {
+        assert.deepStrictEqual(persisted.exec('SELECT label FROM fixtures WHERE id = 1')[0].values,
+          [['retained edit']]);
+      } finally {
+        persisted.close();
+      }
+    } finally {
+      engine.shutdown();
+    }
+  });
+
   it('opens garbage above-threshold bytes paged and fails queries honestly', async () => {
     // sql.js defers validation to the first statement on the buffer path
     // too; paged garbage behaves the same way instead of regressing to a

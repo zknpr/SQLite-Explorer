@@ -7,6 +7,7 @@ import { createDeferred } from './helpers/deferred';
 function createOperations(overrides: Partial<DatabaseOperations> = {}): DatabaseOperations {
     const operations: DatabaseOperations = {
         engineKind: Promise.resolve('wasm'),
+        executeReadQuery: async () => ({ headers: [], rows: [] }),
         executeQuery: async (): Promise<QueryResultSet[]> => [],
         getCellMetadata: async () => ({ storageClass: 'blob', byteLength: 0 }),
         openCellReadSession: async () => ({

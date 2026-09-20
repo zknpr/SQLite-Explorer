@@ -25,6 +25,7 @@ import {
 import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
 import { ensureGridRowMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
+import { revealGridCell } from './grid-reveal.js';
 import { validateRowId } from './utils.js';
 import { getOrderedColumnIndices, getOrderedRowIndices } from './data-utils.js';
 
@@ -183,7 +184,7 @@ function setGridTabstop(cell, focus = true) {
     }
     cell.tabIndex = 0;
     cell.dataset.gridTabstop = 'true';
-    if (focus) cell.focus?.();
+    if (focus) cell.focus?.({ preventScroll: true });
 }
 
 function moveGridCellFocus(event, rowIdx, colIdx) {
@@ -210,6 +211,7 @@ function moveGridCellFocus(event, rowIdx, colIdx) {
     const target = document.getElementById(`cell-${targetRowIdx}-${targetColIdx}`);
     if (!target) return false;
     setGridTabstop(target);
+    revealGridCell(target);
     return true;
 }
 

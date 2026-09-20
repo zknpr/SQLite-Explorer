@@ -3,6 +3,8 @@ import './vscode_mock_setup';
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
 import { createDeferred } from './helpers/deferred';
+import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+import { encodeReadOnlyPrimaryKeyRecordId } from '../../src/core/row-identity';
 
 (globalThis as any).acquireVsCodeApi = () => ({
     getState: () => undefined,
@@ -92,6 +94,24 @@ function createTextarea(value: string, selectionStart: number, selectionEnd = se
     };
 }
 
+function installCellPreviewDocument() {
+    const elements: Record<string, any> = {};
+    for (const id of [
+        'cellPreviewModal', 'cellPreviewColumnName', 'cellPreviewTypeBadge', 'cellPreviewTextarea',
+        'cellPreviewReadonlyBadge', 'cellPreviewSaveBtn', 'cellPreviewDownloadBtn', 'openInVsCodeBtn',
+        'cellPreviewEmptyBtn', 'cellPreviewNullBtn', 'wrapTextBtn', 'cellPreviewCharCount', 'statusText'
+    ]) {
+        elements[id] = {
+            value: '', textContent: '', title: '', disabled: false, readOnly: false,
+            style: {}, classList: createClassList(), focus() {}
+        };
+    }
+    (globalThis as any).document = {
+        getElementById(id: string) { return elements[id] ?? null; }
+    };
+    return elements;
+}
+
 describe('editor keyboard and grid selection interactions', () => {
     afterEach(async () => {
         delete (globalThis as any).document;
@@ -120,6 +140,7 @@ describe('editor keyboard and grid selection interactions', () => {
         state.selectedTableType = 'table';
         state.selectedTableIdentity = null;
         state.isReadOnly = false;
+        state.isDesktop = false;
         state.cellEditBehavior = 'inline';
         state.cellPreviewInfo = null;
         state.isLoadingData = false;
@@ -333,7 +354,7 @@ describe('editor keyboard and grid selection interactions', () => {
             if (id === 'cellPreviewTextarea') throw new Error('download must not read the unsaved draft');
             return null;
         } };
-        const session = { table: 'items', tableType: 'table', rowId: 7, columnName: 'body', originalText: 'original', dirty: true };
+        const session = { table: 'items', tableType: 'table', rowId: 7, columnName: 'body', canReadStoredCell: true, originalText: 'original', dirty: true };
         state.cellPreviewInfo = session;
         const open = backendApi.openCellEditor;
         let requested: unknown[] = [];
@@ -347,6 +368,173 @@ describe('editor keyboard and grid selection interactions', () => {
             assert.strictEqual(session.dirty, true);
             assert.match(status.textContent, /draft is unchanged/);
         } finally { backendApi.openCellEditor = open; }
+    });
+
+    for (const { kind, isDesktop } of [
+        { kind: 'STORED', isDesktop: false },
+        { kind: 'VIRTUAL', isDesktop: false },
+        { kind: 'STORED', isDesktop: true },
+        { kind: 'VIRTUAL', isDesktop: true }
+    ]) {
+        it(`downloads byte-exact UTF-16 TEXT from a readable ${kind} generated column on ${isDesktop ? 'desktop' : 'VS Code'}`, async () => {
+            const { backendApi } = await import(backendApiModulePath);
+            const { state } = await import(stateModulePath);
+            const { openCellPreview, downloadCellPreview } = await import(editModulePath);
+            const elements = installCellPreviewDocument();
+            const initialized = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+            const engine = initialized.operations! as WasmDatabaseEngine;
+            const originals = { openCellEditor: backendApi.openCellEditor, saveFile: backendApi.saveFile };
+            let downloaded: Uint8Array | undefined;
+            backendApi.openCellEditor = async (target: { table: string }, rowId: number, column: string, _types: unknown, options: any) => {
+                assert.strictEqual(options.download, true);
+                assert.strictEqual(Object.hasOwn(options, 'value'), false);
+                const read = await engine.openCellReadSession({ table: target.table, rowId, column });
+                try {
+                    downloaded = (await engine.readCellChunk(read.sessionId, 0, 128)).bytes;
+                } finally {
+                    await engine.closeCellReadSession(read.sessionId);
+                }
+                return { success: true, mode: 'download' };
+            };
+            backendApi.saveFile = async (_name: string, bytes: Uint8Array) => {
+                downloaded = bytes;
+                return { success: true };
+            };
+            try {
+                await engine.executeQuery(
+                    `PRAGMA encoding = 'UTF-16le'; CREATE TABLE items (base TEXT, body TEXT GENERATED ALWAYS AS (base || '!') ${kind})`
+                );
+                await engine.executeQuery('INSERT INTO items(base) VALUES (?)', ['Aé😀']);
+                state.selectedTable = 'items';
+                state.isDesktop = isDesktop;
+                state.selectedTableType = 'table';
+                state.tableColumns = [{ name: 'body', type: 'TEXT', isGenerated: true }];
+                state.gridData = (await engine.fetchTableData('items', { columns: ['rowid', 'body'], limit: 20 })).rows;
+                openCellPreview(0, 0, 1);
+                assert.strictEqual(elements.cellPreviewTextarea.readOnly, true);
+                assert.strictEqual(elements.cellPreviewSaveBtn.style.display, 'none');
+                await downloadCellPreview();
+
+                assert.deepStrictEqual(Buffer.from(downloaded ?? []), Buffer.from('Aé😀!', 'utf16le'));
+                assert.strictEqual(elements.cellPreviewDownloadBtn.textContent, 'Download stored cell');
+                assert.ok(state.cellPreviewInfo);
+            } finally {
+                Object.assign(backendApi, originals);
+                engine.shutdown();
+            }
+        });
+    }
+
+    for (const tableType of ['view', 'table']) {
+        it(`downloads original displayed UTF-8 text when a ${tableType} cell has no readable row identity`, async () => {
+            const { backendApi } = await import(backendApiModulePath);
+            const { state } = await import(stateModulePath);
+            const { openCellPreview, downloadCellPreview } = await import(editModulePath);
+            const elements = installCellPreviewDocument();
+            const originals = { openCellEditor: backendApi.openCellEditor, saveFile: backendApi.saveFile };
+            const reason = 'Primary-key identity exceeds the safe transport limit.';
+            const rowId = tableType === 'table' ? encodeReadOnlyPrimaryKeyRecordId(reason, 0) : 0;
+            const text = 'Displayed café😀';
+            let downloaded: Uint8Array | undefined;
+            backendApi.openCellEditor = async () => {
+                throw new Error('Unaddressable cell reached a target-based download');
+            };
+            backendApi.saveFile = async (_name: string, bytes: Uint8Array) => {
+                downloaded = bytes;
+                return { success: true };
+            };
+            state.selectedTable = 'items';
+            state.selectedTableType = tableType;
+            state.tableColumns = [{ name: 'body', type: 'TEXT', isGenerated: true }];
+            state.gridData = [tableType === 'table' ? [rowId, text] : [text]];
+            state.gridReadOnlyRowReasons = tableType === 'table' ? { 0: reason } : {};
+            try {
+                openCellPreview(0, 0, rowId);
+                elements.cellPreviewTextarea.value = 'unsaved replacement';
+                await downloadCellPreview();
+                assert.deepStrictEqual(Buffer.from(downloaded ?? []), Buffer.from(text, 'utf8'));
+                assert.strictEqual(elements.cellPreviewDownloadBtn.textContent, 'Download displayed text');
+                assert.strictEqual(elements.cellPreviewTextarea.value, 'unsaved replacement');
+            } finally {
+                Object.assign(backendApi, originals);
+            }
+        });
+    }
+
+    for (const generation of ['connectionGeneration', 'contentGeneration']) {
+        it(`refuses a generated-cell download after its ${generation} changes`, async () => {
+            const { backendApi } = await import(backendApiModulePath);
+            const { state } = await import(stateModulePath);
+            const { openCellPreview, downloadCellPreview } = await import(editModulePath);
+            const elements = installCellPreviewDocument();
+            const originals = { openCellEditor: backendApi.openCellEditor, saveFile: backendApi.saveFile };
+            const priorGeneration = state[generation];
+            let downloads = 0;
+            backendApi.openCellEditor = backendApi.saveFile = async () => { downloads++; return { success: true }; };
+            state.selectedTable = 'items';
+            state.selectedTableType = 'table';
+            state.tableColumns = [{ name: 'body', type: 'TEXT', isGenerated: true }];
+            state.gridData = [[1, 'first']];
+            try {
+                openCellPreview(0, 0, 1);
+                state[generation]++;
+                await downloadCellPreview();
+                assert.strictEqual(downloads, 0);
+                assert.match(elements.statusText.textContent, /Reopen this cell before downloading/);
+            } finally {
+                state[generation] = priorGeneration;
+                Object.assign(backendApi, originals);
+            }
+        });
+    }
+
+    it('keeps generated-cell downloads tied to their modal sessions across a table switch', async () => {
+        const { backendApi } = await import(backendApiModulePath);
+        const { state } = await import(stateModulePath);
+        const { openCellPreview, downloadCellPreview, closeCellPreview } = await import(editModulePath);
+        const elements = installCellPreviewDocument();
+        const originals = { openCellEditor: backendApi.openCellEditor, saveFile: backendApi.saveFile };
+        const first = createDeferred<{ success: boolean }>();
+        const second = createDeferred<{ success: boolean }>();
+        const targets: unknown[][] = [];
+        backendApi.openCellEditor = async (...args: unknown[]) => {
+            targets.push(args.slice(0, 3));
+            return targets.length === 1 ? first.promise : second.promise;
+        };
+        backendApi.saveFile = async () => { throw new Error('Readable generated cell lost its stored target'); };
+        state.selectedTable = 'items';
+        state.selectedTableType = 'table';
+        state.tableColumns = [{ name: 'body', type: 'TEXT', isGenerated: true }];
+        state.gridData = [[1, 'first']];
+        try {
+            openCellPreview(0, 0, 1);
+            const firstDownload = downloadCellPreview();
+            await downloadCellPreview();
+            assert.strictEqual(targets.length, 1, 'a pending session must reject duplicate downloads');
+            closeCellPreview();
+            state.selectedTable = 'other_items';
+            state.gridData = [[2, 'second']];
+            openCellPreview(0, 0, 2);
+            const secondSession = state.cellPreviewInfo;
+            const secondDownload = downloadCellPreview();
+            elements.statusText.textContent = 'Second download pending';
+            first.resolve({ success: true });
+            await firstDownload;
+            assert.strictEqual(state.cellPreviewInfo, secondSession);
+            assert.strictEqual(elements.cellPreviewDownloadBtn.disabled, true);
+            assert.strictEqual(elements.statusText.textContent, 'Second download pending');
+            second.resolve({ success: true });
+            await secondDownload;
+            assert.strictEqual(elements.cellPreviewDownloadBtn.disabled, false);
+            assert.deepStrictEqual(targets, [
+                [{ table: 'items', name: '' }, 1, 'body'],
+                [{ table: 'other_items', name: '' }, 2, 'body']
+            ]);
+        } finally {
+            first.resolve({ success: true });
+            second.resolve({ success: true });
+            Object.assign(backendApi, originals);
+        }
     });
 
     it('keeps the preview open and reports the host reason when external editing is unavailable', async () => {
@@ -1925,7 +2113,11 @@ describe('editor keyboard and grid selection interactions', () => {
             children: [] as any[],
             appendChild(child: any) { this.children.push(child); }
         };
-        const hex = { value: '' };
+        const hex = {
+            textContent: '',
+            addEventListener() {},
+            appendChild(child: { textContent: string }) { this.textContent += child.textContent; }
+        };
         const info = { textContent: '' };
         const genericElement = () => ({
             addEventListener() {},

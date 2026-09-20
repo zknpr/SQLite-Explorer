@@ -32,6 +32,8 @@ import { closeModal, openModal } from './modals.js';
 
 let blobInspector;
 let isSavingCellPreview = false;
+// Engine transport limits do not bound browser editable-text layout work.
+const MAX_EMBEDDED_TEXT_CODE_UNITS = 64 * 1024;
 
 export function initEdit() {
     blobInspector = new BlobInspector();
@@ -99,6 +101,10 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     if (value instanceof Uint8Array) {
         openCellPreview(rowIdx, colIdx, rowId);
         return;
+    }
+
+    if (typeof value === 'string' && value.length > MAX_EMBEDDED_TEXT_CODE_UNITS) {
+        return openCellPreview(rowIdx, colIdx, rowId);
     }
 
     // Auto-open JSON in modal
@@ -422,27 +428,14 @@ export async function downloadCellPreview() {
     session.downloading = true;
     const button = document.getElementById('cellPreviewDownloadBtn');
     if (button) button.disabled = true;
-    const storedCell = session.tableType === 'table' && !session.readOnlyReason;
+    const storedCell = session.canReadStoredCell === true;
     try {
-        let result;
-        if (state.isDesktop) {
-            // The desktop shell has no VS Code cell-editor to hand the stored
-            // value to, so it saves through the same saveFileAs seam every other
-            // desktop download uses. The modal only ever holds an in-memory,
-            // non-oversized value (BLOBs and oversized cells route to the blob
-            // inspector), so its displayed text is the byte-exact stored value.
-            const text = storedCell
-                ? (session.originalText ?? (session.originalValue == null ? '' : String(session.originalValue)))
-                : (session.originalText ?? '');
-            result = await backendApi.saveFile('cell.txt', new TextEncoder().encode(text));
-        } else {
-            result = storedCell
-                ? await backendApi.openCellEditor(
-                    { table: session.table, name: '' }, validateRowId(session.rowId), session.columnName, {},
-                    { download: true, type: { type: 'text', ext: 'txt', mime: 'text/plain' } }
-                )
-                : await backendApi.saveFile('cell.txt', new TextEncoder().encode(session.originalText ?? ''));
-        }
+        const result = storedCell
+            ? await backendApi.openCellEditor(
+                { table: session.table, name: '' }, validateRowId(session.rowId), session.columnName, {},
+                { download: true, type: { type: 'text', ext: 'txt', mime: 'text/plain' } }
+            )
+            : await backendApi.saveFile('cell.txt', new TextEncoder().encode(session.originalText ?? ''));
         if (state.cellPreviewInfo !== session) return;
         updateStatus(result?.success === false
             ? (result.cancelled ? 'Save cancelled. Your draft is unchanged.' : result.message || 'Download failed')
@@ -551,6 +544,19 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         return;
     }
 
+    if (typeof value === 'string' && value.length > MAX_EMBEDDED_TEXT_CODE_UNITS) {
+        if (!blobInspector) {
+            updateStatus('Large TEXT preview is unavailable. Reopen the database editor.');
+            return;
+        }
+        if (state.selectedTableType === 'table' && !getReadOnlyRowReason(rowIdx)) {
+            return blobInspector.inspectStoredText(rowId, column.name, rowIdx, colIdx);
+        }
+        // Views and rows without a stable identity cannot supply stored bytes.
+        // Their complete displayed value remains copyable in bounded text blocks.
+        return blobInspector.inspect(value, rowId, column.name, rowIdx, colIdx);
+    }
+
     const originalText = String(getCellValueForDisplay(row, rowIdx, colIdx) ?? '');
     state.cellPreviewInfo = {
         rowIdx,
@@ -567,6 +573,9 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
         connectionGeneration: state.connectionGeneration,
         contentGeneration: state.contentGeneration,
         readOnlyReason: readOnlyRowReason,
+        // Generated columns cannot be edited, but a stable row identity can
+        // still read their stored bytes. Snapshot that capability separately.
+        canReadStoredCell: state.selectedTableType === 'table' && !getReadOnlyRowReason(rowIdx),
         valueMode: 'value',
         dirty: false
     };
@@ -581,7 +590,7 @@ export function openCellPreview(rowIdx, colIdx, rowId) {
     const saveBtnEl = document.getElementById('cellPreviewSaveBtn');
     const downloadBtnEl = document.getElementById('cellPreviewDownloadBtn');
     if (downloadBtnEl) {
-        const storedCell = previewSession.tableType === 'table' && !readOnlyRowReason;
+        const storedCell = previewSession.canReadStoredCell;
         downloadBtnEl.disabled = false;
         downloadBtnEl.textContent = storedCell ? 'Download stored cell' : 'Download displayed text';
         downloadBtnEl.title = storedCell

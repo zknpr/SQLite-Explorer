@@ -31,6 +31,11 @@ export function updateMutationControlCapabilities() {
 export function applyConnectionResult(result) {
     const connected = result?.connected === true;
     state.isDbConnected = connected;
+    // Hidden webviews can be reconstructed from HTML created before a global
+    // setting change. Their initialization reply is newer than that HTML.
+    if (['inline', 'modal', 'vscode'].includes(result?.cellEditBehavior)) {
+        state.cellEditBehavior = result.cellEditBehavior;
+    }
     state.reloadRequiredReason = typeof result?.reloadRequiredReason === 'string'
         ? result.reloadRequiredReason : null;
     // `readOnly` is the host bridge contract. Keep the older demo envelope key

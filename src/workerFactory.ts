@@ -35,6 +35,7 @@ import type {
   CellUpdate,
   CellUpdateResult,
   ColumnDefinition,
+  CreateTableOptions,
   TableQueryOptions,
   TableCountOptions,
   TableCountResult,
@@ -64,6 +65,8 @@ import { getNodeFs } from './core/platform/fs';
 import { WAL_HEADER_SIZE_BYTES } from './core/paged-open';
 import { createSharedCancellationFlag } from './core/cancellation-utils';
 import { writePagedWritableOverlayToFile } from './pagedWritableSave';
+import { canPersistLocalDatabase } from './fileWritability';
+import { DatabaseFileSizeLimitError } from './databaseFileSizeLimit';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
@@ -190,13 +193,14 @@ interface WorkerMethods {
     expectedCurrentState?: ColumnDropTableState
   ): Promise<ColumnDropTableState>;
   findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
-  createTable(table: string, columns: ColumnDefinition[]): Promise<ColumnDropTableState>;
+  createTable(table: string, columns: ColumnDefinition[], options?: CreateTableOptions): Promise<ColumnDropTableState>;
   getViewDefinition(view: string): Promise<ViewDefinition>;
   validateViewDefinition(
     view: string,
     selectSql: string,
     intent?: ViewDefinitionIntent
   ): Promise<void>;
+  executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, cancellationFlag?: Int32Array): Promise<QueryResultSet>;
   previewViewDefinition(
     view: string,
     selectSql: string,
@@ -271,6 +275,7 @@ const WORKER_METHOD_NAMES = [
   'getViewDefinition',
   'validateViewDefinition',
   'previewViewDefinition',
+  'executeReadQuery',
   'createView',
   'editView',
   'dropView',
@@ -348,6 +353,7 @@ function getModificationWorkUnits(modification: ModificationEntry | undefined): 
   const scaledPayloads = [
     modification?.affectedCells,
     modification?.deletedRows,
+    modification?.insertedRows,
     modification?.affectedRowIds,
     modification?.deletedColumns,
     modification?.droppedIndexes,
@@ -497,7 +503,8 @@ export async function createDatabaseConnection(
           async establishConnection(fileUri, displayName, forceReadOnly, autoCommit) {
             if (wrapperDisposed) throw new Error('Database connection bundle has been disposed');
             try {
-              // Try native first
+              // Native opens do not buffer the database. WASM fallback keeps
+              // its own configured size checks if the native open fails.
               return await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             } catch (nativeErr) {
               disposeNative();
@@ -719,8 +726,8 @@ async function createInProcessWasmDatabaseConnection(
         ),
         findDependentIndexes: (table: string, columns: string[]) =>
           endpoint.findDependentIndexes(table, columns),
-        createTable: (table: string, columns: ColumnDefinition[]) =>
-          endpoint.createTable(table, columns),
+        createTable: (table: string, columns: ColumnDefinition[], options?: CreateTableOptions) =>
+          endpoint.createTable(table, columns, options),
         getViewDefinition: (view: string) =>
           endpoint.getViewDefinition(view),
         validateViewDefinition: (
@@ -728,6 +735,7 @@ async function createInProcessWasmDatabaseConnection(
           selectSql: string,
           intent?: ViewDefinitionIntent
         ) => endpoint.validateViewDefinition(view, selectSql, intent),
+        executeReadQuery: (sql, params, explain, signal) => endpoint.executeReadQuery(sql, params, explain, signal),
         previewViewDefinition: (
           view: string,
           selectSql: string,
@@ -807,6 +815,7 @@ async function createWorkerBackedWasmDatabaseConnection(
   // Node.js environment: use file path directly
   const workerScriptPath = path.resolve(__dirname, './worker.cjs');
   const workerThread: InstanceType<typeof Worker> = new Worker(workerScriptPath);
+  let terminationError: Error | undefined;
 
   // Create IPC proxy for Node.js worker communication
   // Route worker log messages to the VS Code output channel for visibility.
@@ -814,6 +823,9 @@ async function createWorkerBackedWasmDatabaseConnection(
   const workerProxy = connectWorkerPort<WorkerMethods>(
     {
       postMessage: (data: unknown, transfer?: Transferable[]) => {
+        // Node accepts postMessage after termination but can never reply. Reject
+        // cleanup calls started after disposal instead of waiting for each timer.
+        if (terminationError) throw terminationError;
         if (transfer) {
           // worker_threads.Worker postMessage needs TransferListItem[], but we can pass it via any if necessary or let it be inferred if we cast it. Transferable in DOM is ArrayBuffer | MessagePort | ImageBitmap, which intersects with node's TransferListItem (ArrayBuffer | MessagePort | FileHandle | X509Certificate | Blob) at ArrayBuffer and MessagePort.
           workerThread.postMessage(data, transfer as any);
@@ -834,15 +846,15 @@ async function createWorkerBackedWasmDatabaseConnection(
 
   // Termination handler
   const terminateWorker = () => {
+    if (terminationError) return;
+    terminationError = new Error('Database worker terminated before its RPC completed');
     const pending = (workerProxy as Partial<ProxyWithPendingInvocations<WorkerMethods>>)
       .__pendingInvocations;
-    if (pending) {
-      rejectPendingInvocations(
-        pending,
-        new Error('Database worker terminated before its RPC completed')
-      );
+    try {
+      if (pending) rejectPendingInvocations(pending, terminationError);
+    } finally {
+      workerThread.terminate();
     }
-    workerThread.terminate();
   };
 
   return {
@@ -867,9 +879,9 @@ async function createWorkerBackedWasmDatabaseConnection(
       autoCommit?: boolean
     ) {
       // Keep the configured refusal message ready for local files above
-      // maxFileSize. The worker owns the authoritative backend-agnostic gate;
+      // maxFileSize. The WASM worker owns the authoritative size gate;
       // the host substitutes the existing user-facing units when it refuses.
-      let oversizedFileMessage: string | undefined;
+      let oversizedFileError: DatabaseFileSizeLimitError | undefined;
       try {
         // Read database file
         // Optimization: If running in Node and file is local, pass path to worker instead of reading content here
@@ -879,15 +891,17 @@ async function createWorkerBackedWasmDatabaseConnection(
 
         let dbContent: Uint8Array | null = null;
         let filePath: string | undefined;
+        let localFileReadOnly = false;
 
         if (isNode && isLocal) {
             // Check size limit first
             const maxSize = getMaximumFileSizeBytes();
             const fileStat = await vsc.workspace.fs.stat(fileUri);
             if (maxSize !== 0 && fileStat.size > maxSize) {
-               oversizedFileMessage = `File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`;
+               oversizedFileError = new DatabaseFileSizeLimitError(fileStat.size, maxSize);
             }
             filePath = fileUri.fsPath;
+            localFileReadOnly = !(await canPersistLocalDatabase(filePath));
         } else {
             dbContent = await loadDatabaseFile(fileUri);
         }
@@ -900,7 +914,7 @@ async function createWorkerBackedWasmDatabaseConnection(
         // checkpoint leftovers — see WAL_HEADER_SIZE_BYTES).
         const walSize = await statWalSize(fileUri);
         const hasUncheckpointedWal = walSize > WAL_HEADER_SIZE_BYTES;
-        if (oversizedFileMessage !== undefined && hasUncheckpointedWal) {
+        if (oversizedFileError !== undefined && hasUncheckpointedWal) {
           // Over the in-memory gate AND carrying (or possibly carrying) WAL
           // frames: the file can neither buffer (over the gate) nor open
           // page-on-demand (the snapshot reads only the main file and would
@@ -915,7 +929,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           //
           // Deliberate final rejection: clear the size-error substitution so
           // the catch below surfaces the checkpoint instruction itself.
-          oversizedFileMessage = undefined;
+          oversizedFileError = undefined;
           throw new Error(
             `${displayName} has uncheckpointed WAL data and exceeds the in-memory size limit for the `
             + 'WebAssembly backend, so it cannot be opened: a page-on-demand snapshot reads only the '
@@ -939,7 +953,7 @@ async function createWorkerBackedWasmDatabaseConnection(
           maxSize: getMaximumFileSizeBytes(),
           resourceMap: {},
           wasmBinary: wasmContent,
-          readOnlyMode: (forceReadOnly ?? false) || hasUncheckpointedWal,
+          readOnlyMode: (forceReadOnly ?? false) || localFileReadOnly || hasUncheckpointedWal,
           queryTimeout: getQueryTimeout(),
           // Desktop local files may use page-on-demand storage above the
           // worker's dedicated paging threshold (writable first, then
@@ -1159,8 +1173,8 @@ async function createWorkerBackedWasmDatabaseConnection(
           ),
           findDependentIndexes: (table: string, columns: string[]) =>
             workerProxy.findDependentIndexes(table, columns),
-          createTable: (table: string, columns: ColumnDefinition[]) =>
-            workerProxy.createTable(table, columns),
+          createTable: (table: string, columns: ColumnDefinition[], options?: CreateTableOptions) =>
+            workerProxy.createTable(table, columns, options),
           getViewDefinition: (view: string) =>
             workerProxy.getViewDefinition(view),
           validateViewDefinition: (
@@ -1168,6 +1182,9 @@ async function createWorkerBackedWasmDatabaseConnection(
             selectSql: string,
             intent?: ViewDefinitionIntent
           ) => workerProxy.validateViewDefinition(view, selectSql, intent),
+          executeReadQuery: (sql, params, explain, signal) => signal
+            ? callWorkerWithCancellation(signal, flag => workerProxy.executeReadQuery(sql, params, explain, flag))
+            : workerProxy.executeReadQuery(sql, params, explain),
           previewViewDefinition: (
             view: string,
             selectSql: string,
@@ -1253,7 +1270,7 @@ async function createWorkerBackedWasmDatabaseConnection(
       } catch (err) {
         // Terminate worker on connection failure to prevent leak
         terminateWorker();
-        if (oversizedFileMessage !== undefined) {
+        if (oversizedFileError !== undefined) {
           // Preserve the configured refusal surface while retaining the
           // worker's authoritative byte-level reason on the cause chain.
           const reason = err instanceof Error ? err.message : String(err);
@@ -1261,7 +1278,11 @@ async function createWorkerBackedWasmDatabaseConnection(
             `[SQLite Explorer] ${displayName}: WebAssembly open failed (${reason}); `
             + 'reporting the configured maxFileSize refusal.'
           );
-          throw new Error(oversizedFileMessage, { cause: err });
+          throw new DatabaseFileSizeLimitError(
+            oversizedFileError.byteLength,
+            oversizedFileError.maximumBytes,
+            { cause: err }
+          );
         }
         throw err;
       }
@@ -1304,7 +1325,7 @@ async function loadDatabaseFile(uri: vsc.Uri): Promise<Uint8Array> {
     throw new Error(`Cannot verify database file size for ${uri.toString()}: invalid provider size`);
   }
   if (maxSize !== 0 && fileStat.size > maxSize) {
-    throw new Error(`File size (${(fileStat.size / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
+    throw new DatabaseFileSizeLimitError(fileStat.size, maxSize);
   }
 
   const bytes = await vsc.workspace.fs.readFile(uri);
@@ -1312,7 +1333,7 @@ async function loadDatabaseFile(uri: vsc.Uri): Promise<Uint8Array> {
   // required to give those two calls one snapshot. Enforce the bound again on
   // the allocation that will actually cross into sql.js.
   if (maxSize !== 0 && bytes.byteLength > maxSize) {
-    throw new Error(`File size (${(bytes.byteLength / (1024 * 1024)).toFixed(2)} MB) exceeds the maximum allowed size (${(maxSize / (1024 * 1024)).toFixed(2)} MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.`);
+    throw new DatabaseFileSizeLimitError(bytes.byteLength, maxSize);
   }
   return bytes;
 }

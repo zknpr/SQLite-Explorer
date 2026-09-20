@@ -15,11 +15,12 @@ after(() => {
     if (originalDocument === undefined) delete (globalThis as any).document;
     else (globalThis as any).document = originalDocument;
     delete (globalThis as any).__webViewerRefreshHarness;
+    delete (globalThis as any).__countInvalidations;
 });
 
-it('clears and persists a displayed view selection before the demo refresh reloads it', async () => {
+it('clears and persists a displayed view selection before the demo refresh reloads it', { timeout: 10_000 }, async () => {
     const response = createDeferred<unknown>();
-    const initialSchemaRefresh = createDeferred<void>();
+    const initialized = createDeferred<void>();
     const state = {
         isDbConnected: true,
         selectedTable: 'shared_view',
@@ -45,6 +46,8 @@ it('clears and persists a displayed view selection before the demo refresh reloa
     (globalThis as any).__webViewerRefreshHarness = {
         state,
         refreshOrder,
+        initialized,
+        showErrorState(error: unknown) { initialized.reject(new Error(String(error))); },
         backendApi: {
             initialize: async () => ({ connected: true, readOnly: false }),
             ping: async () => true
@@ -55,7 +58,6 @@ it('clears and persists a displayed view selection before the demo refresh reloa
         refreshSchema: async () => {
             refreshOrder.push('schema');
             refreshSchemaCalls++;
-            if (refreshSchemaCalls === 1) initialSchemaRefresh.resolve();
             selectionWasClearedBeforeSchemaReload = state.selectedCells.length === 0
                 && state.selectedRowIds.size === 0
                 && state.selectedColumns.size === 0
@@ -75,9 +77,12 @@ it('clears and persists a displayed view selection before the demo refresh reloa
             if (type === 'message') messageHandler = handler;
         }
     };
+    const queryButtonClasses = new Set(['hidden']);
     (globalThis as any).document = {
         documentElement: { style: {} },
-        getElementById: () => ({ textContent: '', style: {}, dataset: {} }),
+        getElementById: (id: string) => id === 'btnOpenQuery'
+            ? { classList: { remove: (name: string) => queryButtonClasses.delete(name) } }
+            : { textContent: '', style: {}, dataset: {} },
         querySelectorAll: () => []
     };
 
@@ -118,7 +123,7 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                         './modules/ui.js': `
                             export function updateStatus() {}
                             export function showEmptyState() {}
-                            export function showErrorState() {}
+                            export function showErrorState(error) { ${harness}.showErrorState(error); }
                             export function showLoading() {}
                             export function updateToolbarButtons() {}
                             export function initSidebarResize() {}
@@ -158,7 +163,9 @@ it('clears and persists a displayed view selection before the demo refresh reloa
                             }
                             export function updateMutationControlCapabilities() {}
                         `,
-                        './modules/global-shortcuts.js': 'export function setupGlobalShortcuts() {}',
+                        './modules/global-shortcuts.js': `
+                            export function setupGlobalShortcuts() { ${harness}.initialized.resolve(); }
+                        `,
                         './modules/count-cache.js': `
                             export function setCountCacheDemoMode() {}
                             export function invalidateAllCounts() {
@@ -176,7 +183,10 @@ it('clears and persists a displayed view selection before the demo refresh reloa
     const compiled = bundle.outputFiles[0].text;
     const evaluatedModule = { exports: {} };
     new Function('module', 'exports', compiled)(evaluatedModule, evaluatedModule.exports);
-    await initialSchemaRefresh.promise;
+    // Wait for completed startup. A surfaced initialization failure rejects
+    // this promise immediately instead of silently hanging before schema load.
+    await initialized.promise;
+    assert.strictEqual(queryButtonClasses.has('hidden'), false);
     assert.ok(messageHandler, 'web demo RPC listener should be installed');
     refreshOrder.length = 0;
 
@@ -188,8 +198,9 @@ it('clears and persists a displayed view selection before the demo refresh reloa
             parameters: ['shared.db']
         }
     });
-    await response.promise;
+    assert.deepStrictEqual(await response.promise, { success: true });
 
+    assert.strictEqual(refreshSchemaCalls, 2, 'startup and the parent refresh must each reload schema once');
     assert.strictEqual(selectionWasClearedBeforeSchemaReload, true);
     assert.strictEqual(persistCalls, 1);
     assert.deepStrictEqual(refreshOrder, ['schema', 'columns', 'data']);

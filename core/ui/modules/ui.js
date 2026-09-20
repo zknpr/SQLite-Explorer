@@ -7,9 +7,21 @@ import { escapeHtml, getErrorMessage } from './utils.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
 import { reloadFromDisk } from './sidebar.js';
 
-export function updateStatus(message) {
+let contentStatus = null;
+
+export function updateStatus(message, { clearOnRefresh = false } = {}) {
     const el = document.getElementById('statusText');
     if (el) el.textContent = message;
+    contentStatus = clearOnRefresh && el ? { element: el, message } : null;
+}
+
+export function clearContentStatus() {
+    const previous = contentStatus;
+    contentStatus = null;
+    if (previous && previous.element === document.getElementById('statusText')
+        && previous.element.textContent === previous.message) {
+        updateStatus('Ready');
+    }
 }
 
 export function showLoading() {

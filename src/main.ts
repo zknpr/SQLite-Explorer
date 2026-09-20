@@ -1,8 +1,10 @@
 import "./shims"
+import { registerSqlWorkspace } from './sqlWorkspace';
+import { registerBulkImport } from './bulkImport';
 import * as vsc from 'vscode';
-import { TelemetryReporter } from '@vscode/extension-telemetry';
+import type { TelemetryReporter } from '@vscode/extension-telemetry';
 import { exportTableCommand } from './tableExporter';
-import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FirstInstallMs, NestingPattern, SyncedKeys, TelemetryConnectionString, Title, UriScheme } from './config';
+import { ExtensionId, FullExtensionId, FileNestingPatternsAdded, FirstInstallMs, NestingPattern, SyncedKeys, Title, UriScheme } from './config';
 import type { DbParams, ExportOptions } from './core/types';
 import { registerEditorProvider } from './editorController';
 import { SQLiteFileSystemProvider } from './virtualFileSystem';
@@ -28,15 +30,13 @@ export function deactivate(): void {
 export async function activate(
   context: vsc.ExtensionContext
 ): Promise<{ desktopTest: DesktopTestApi } | undefined> {
-  // Only create TelemetryReporter if connection string is provided.
-  // An empty string causes the reporter to throw errors on every event.
-  let reporter: TelemetryReporter | undefined;
-  if (TelemetryConnectionString) {
-    reporter = new TelemetryReporter(TelemetryConnectionString);
-    context.subscriptions.push(reporter);
-  }
+  // Telemetry is disabled. A runtime import still retains the entire SDK in
+  // the entry bundle even when reporter construction is unreachable.
+  const reporter: TelemetryReporter | undefined = undefined;
 
   await activateProviders(context, reporter);
+  context.subscriptions.push(registerSqlWorkspace(context));
+  context.subscriptions.push(registerBulkImport());
 
   // Register refresh command
   context.subscriptions.push(
@@ -94,7 +94,13 @@ export async function refreshActiveDatabase(): Promise<void> {
   if (!document) {
     throw new Error(vsc.l10n.t('The active SQLite document is no longer available.'));
   }
-  await document.reloadFromDisk();
+  try {
+    await document.reloadFromDisk();
+  } catch (error) {
+    // Cancelling the discard prompt is a completed user choice, not a failed
+    // command. Keep real reload errors visible to VS Code.
+    if (!(error instanceof vsc.CancellationError)) throw error;
+  }
 }
 
 /**

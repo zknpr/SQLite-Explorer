@@ -415,7 +415,7 @@ async function saveDraft() {
         if (ownsModal
             && activeViewModalSession === closedSession
             && targetConnectionIsCurrent()) {
-            updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - ${saveHint()}`);
+            updateStatus(`View "${changedView}" ${targetView ? 'updated' : 'created'} - ${saveHint()}`, { clearOnRefresh: true });
         }
     } catch (err) {
         if (isCurrentModalSession(modalSession)) {
@@ -540,7 +540,7 @@ export async function dropViewFromSidebar(view) {
             persistState();
         }
         await refreshSchema();
-        updateStatus(`View "${view}" dropped - ${saveHint()}`);
+        updateStatus(`View "${view}" dropped - ${saveHint()}`, { clearOnRefresh: true });
     } catch (err) {
         updateStatus(`Error: ${getErrorMessage(err)}`);
     } finally {

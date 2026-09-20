@@ -182,6 +182,26 @@ export async function runSidecarLane({ binary, scratch, note }) {
     const dbPath = path.join(scratch, 'sidecar-fixture.sqlite');
     createFixture(dbPath);
 
+    // The executable's directory is the sole native-library authority. An
+    // incomplete installation must refuse open rather than weaken plan limits.
+    const missingReaderDirectory = path.join(scratch, 'missing-plan-reader');
+    fs.mkdirSync(missingReaderDirectory);
+    const isolatedBinary = path.join(missingReaderDirectory, path.basename(binary));
+    fs.copyFileSync(binary, isolatedBinary);
+    const missingReader = startSidecar(isolatedBinary, dbPath, 'rw');
+    try {
+        const refused = await missingReader.invoke('initializeDatabase', ['sidecar-fixture.sqlite', {
+            path: dbPath, readOnlyMode: false
+        }]);
+        check(refused.content?.success === false
+            && /Missing bundled query-plan reader/.test(refused.content?.errorMessage ?? ''),
+            'sidecar/missing-bundled-reader-refuses-open', JSON.stringify(refused.content));
+        missingReader.endStdin();
+        await missingReader.untilExit();
+    } finally {
+        if (missingReader.exitCode === null) missingReader.child.kill('SIGKILL');
+    }
+
     // ---- writable session -------------------------------------------------
     const rw = startSidecar(binary, dbPath, 'rw');
     try {
@@ -583,6 +603,19 @@ export async function runSidecarLane({ binary, scratch, note }) {
         }]);
         check(init.content?.success === true && init.content?.data?.isReadOnly === true,
             'sidecar/ro-session-opens-read-only', JSON.stringify(init.content));
+
+        const boundedRead = await ro.invoke('executeReadQuery', ['SELECT 1 AS value']);
+        const badRead = await ro.invoke('executeReadQuery', ['SELECT * FROM absent_read_table']);
+        const enforced = await ro.invoke('executeReadQuery', ['SELECT query_only FROM pragma_query_only']);
+        const noMetadataViews = await ro.invoke('executeReadQuery', [
+            "SELECT count(*) FROM sqlite_temp_schema WHERE name LIKE 'query_columns_%'"
+        ]);
+        check(boundedRead.content?.success === true && boundedRead.content?.data?.rows?.[0]?.[0] === 1
+            && badRead.content?.success === false
+            && enforced.content?.data?.rows?.[0]?.[0] === 1
+            && noMetadataViews.content?.data?.rows?.[0]?.[0] === 0,
+            'sidecar/ro-bounded-reads-preserve-enforcement-and-clean-up',
+            JSON.stringify({ read: boundedRead.content, guard: enforced.content, views: noMetadataViews.content }));
 
         const write = await ro.invoke('runConsole', ["INSERT INTO t VALUES (9, 'x', NULL, 9, 9.0)"]);
         check(write.content?.success === false

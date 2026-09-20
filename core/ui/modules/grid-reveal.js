@@ -16,6 +16,18 @@ function measuredRect(element) {
     return rect;
 }
 
+function measuredScrollport(container) {
+    const bounds = measuredRect(container);
+    if (!bounds || !Number.isFinite(container.clientWidth) || !Number.isFinite(container.clientHeight)) {
+        return bounds;
+    }
+    // Native scrollbars and borders are inside the border box, but cover cells.
+    // The client box is the actual visible area available for keyboard reveal.
+    const left = bounds.left + (container.clientLeft || 0);
+    const top = bounds.top + (container.clientTop || 0);
+    return { left, top, right: left + container.clientWidth, bottom: top + container.clientHeight };
+}
+
 function queryOne(container, selector) {
     if (typeof container.querySelector !== 'function') return null;
     return container.querySelector(selector);
@@ -64,8 +76,10 @@ function getVisibleLeft(container, containerRect, targetIsPinned) {
 function getVisibleTop(container, containerRect, targetIsPinned) {
     if (targetIsPinned) return containerRect.top;
     let visibleTop = containerRect.top;
-    const headerRow = queryOne(container, '.grid-header tr') ||
-        queryOne(container, '.grid-header .header-cell');
+    // The cells are sticky, but their thead/tr ancestors scroll out of view.
+    // Measuring the row first loses the header's occlusion after scrolling.
+    const headerRow = queryOne(container, '.grid-header .header-cell') ||
+        queryOne(container, '.grid-header tr');
     // Pinned rows also render contiguously below the header; measuring the final
     // row captures the whole sticky stack without forcing layout for every cell.
     const lastPinnedRow = queryLast(container, '.data-row.pinned');
@@ -96,7 +110,7 @@ function nearestScrollDelta(start, end, visibleStart, visibleEnd) {
 export function revealGridCell(cellElement) {
     if (!cellElement) return false;
     const container = document.getElementById('gridContainer');
-    const containerRect = measuredRect(container);
+    const containerRect = measuredScrollport(container);
     const cellRect = measuredRect(cellElement);
 
     if (!container || !containerRect || !cellRect) {

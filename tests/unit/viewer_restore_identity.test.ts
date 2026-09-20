@@ -14,7 +14,7 @@ after(() => {
     delete (globalThis as any).__viewerRestoreIdentityHarness;
 });
 
-it('restores a saved table identity before loading its columns or data', async () => {
+it('restores a saved table identity before loading its columns or data', { timeout: 10_000 }, async () => {
     const restored = createDeferred<void>();
     const primaryKeyIdentity = {
         kind: 'primaryKey',

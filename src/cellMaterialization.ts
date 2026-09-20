@@ -37,7 +37,7 @@ export interface MaterializedCell {
     /** Authoritative source bytes captured from the same read snapshot. */
     sourcePrefix: Uint8Array;
     /** Invalidly encoded SQLite TEXT is exposed honestly as raw database bytes. */
-    contentEncoding: 'utf-8' | 'raw-database-bytes';
+    contentEncoding: 'utf-8' | 'raw-database-bytes' | 'hex';
 }
 
 export interface CellMaterializationServiceOptions {
@@ -55,6 +55,15 @@ export interface MaterializeCellOptions {
     signal?: AbortSignal;
     fileExtension?: string;
     owner?: CellMaterializationOwner;
+    format?: 'content' | 'raw' | 'hex';
+    /** Use the owner's directory granted before its webview HTML was loaded. */
+    mediaPreview?: boolean;
+}
+
+interface CellMediaPreviewRoot {
+    uri: vsc.Uri;
+    controller: AbortController;
+    subscription: vsc.Disposable;
 }
 
 function requireNodeModules(): { fs: NodeFs; crypto: NodeCrypto } {
@@ -96,6 +105,51 @@ function decodeCellText(
     } catch (error) {
         throw new InvalidCellTextEncodingError(error);
     }
+}
+
+/** Keep incomplete rows between source chunks; Hex always describes stored bytes. */
+class HexDumpEncoder {
+    private readonly pending = new Uint8Array(16);
+    private pendingLength = 0;
+    private offset = 0;
+    private readonly encoder = new TextEncoder();
+
+    encode(bytes: Uint8Array, final = false): Uint8Array {
+        const lines: string[] = [];
+        const emitRow = () => {
+            const row = this.pending.subarray(0, this.pendingLength);
+            const hex = Array.from(row, byte => byte.toString(16).padStart(2, '0'));
+            const ascii = Array.from(row, byte => byte >= 32 && byte <= 126
+                ? String.fromCharCode(byte) : '.').join('');
+            lines.push(
+                `${this.offset.toString(16).padStart(8, '0')}  ` +
+                `${hex.slice(0, 8).join(' ').padEnd(23)}  ` +
+                `${hex.slice(8).join(' ').padEnd(23)}  |${ascii}|\n`
+            );
+            this.offset += this.pendingLength;
+            this.pendingLength = 0;
+        };
+        for (let position = 0; position < bytes.byteLength;) {
+            const length = Math.min(16 - this.pendingLength, bytes.byteLength - position);
+            this.pending.set(bytes.subarray(position, position + length), this.pendingLength);
+            this.pendingLength += length;
+            position += length;
+            if (this.pendingLength === 16) emitRow();
+        }
+        if (final && this.pendingLength > 0) emitRow();
+        return this.encoder.encode(lines.join(''));
+    }
+}
+
+function hexDumpByteLength(byteLength: number): number {
+    const remainder = byteLength % 16;
+    let result = Math.floor(byteLength / 16) * 79 + (remainder ? 63 + remainder : 0);
+    // Eight-digit offsets cover the default quota. Account for wider offsets
+    // too if a caller explicitly configures a larger materialization service.
+    for (let boundary = 0x100000000; boundary < byteLength; boundary *= 16) {
+        result += Math.ceil((byteLength - boundary) / 16);
+    }
+    return result;
 }
 
 function checkedPositiveInteger(value: number | undefined, fallback: number, label: string): number {
@@ -152,6 +206,8 @@ export class CellMaterializationService implements vsc.Disposable {
     private readonly trackedFiles = new Map<string, MaterializedCell>();
     private readonly ownerFiles = new Map<CellMaterializationOwner, Set<string>>();
     private readonly ownerSubscriptions = new Map<CellMaterializationOwner, vsc.Disposable>();
+    private readonly mediaPreviewRoots = new Map<CellMaterializationOwner, CellMediaPreviewRoot>();
+    private readonly closedMediaOwners = new WeakSet<CellMaterializationOwner>();
     private readonly closeDocumentSubscription: vsc.Disposable | undefined;
     private readonly closeTabSubscription: vsc.Disposable | undefined;
     /** Disk bytes held by live files plus reservations for in-progress writes. */
@@ -202,11 +258,44 @@ export class CellMaterializationService implements vsc.Disposable {
         this.closeTabSubscription = typeof onDidChangeTabs === 'function'
             ? onDidChangeTabs(event => {
                 for (const tab of event.closed) {
-                    const uri = (tab.input as { uri?: vsc.Uri }).uri;
+                    // Workbench tabs such as Settings have no file input.
+                    const uri = (tab.input as { uri?: vsc.Uri } | undefined)?.uri;
                     if (uri) this.release(uri);
                 }
             })
             : undefined;
+    }
+
+    /** Allocate once before HTML loads: changing webview resource roots reloads the viewer. */
+    createMediaPreviewRoot(owner: CellMaterializationOwner): vsc.Uri {
+        this.assertActive(undefined);
+        if (this.closedMediaOwners.has(owner)) throw new Error('Cell media preview owner is closed');
+        const existing = this.mediaPreviewRoots.get(owner);
+        if (existing) return existing.uri;
+
+        const { fs } = requireNodeModules();
+        const path = require('path') as typeof import('node:path');
+        const directory = path.join(this.ensureRunDirectory(fs), `media-${webCrypto.randomUUID()}`);
+        fs.mkdirSync(directory, { mode: 0o700 });
+        try {
+            fs.chmodSync(directory, 0o700);
+            const uri = vsc.Uri.file(fs.realpathSync(directory));
+            const controller = new AbortController();
+            const subscription = owner.onDidDispose(() => {
+                this.closedMediaOwners.add(owner);
+                controller.abort();
+                this.mediaPreviewRoots.get(owner)?.subscription.dispose();
+                this.mediaPreviewRoots.delete(owner);
+                // Files retain their existing owner cleanup. Leave the empty
+                // directory until run cleanup so pending resource loads cannot
+                // cause this grant to be replaced by another panel's directory.
+            });
+            this.mediaPreviewRoots.set(owner, { uri, controller, subscription });
+            return uri;
+        } catch (error) {
+            fs.rmSync(directory, { recursive: true, force: true });
+            throw error;
+        }
     }
 
     async materialize(
@@ -215,13 +304,30 @@ export class CellMaterializationService implements vsc.Disposable {
         options: MaterializeCellOptions = {}
     ): Promise<MaterializedCell> {
         this.assertActive(options.signal);
+        let mediaDirectory: string | undefined;
+        if (options.mediaPreview) {
+            if (options.owner && this.closedMediaOwners.has(options.owner)) {
+                throw new Error('Cell media preview owner is closed');
+            }
+            const root = options.owner && this.mediaPreviewRoots.get(options.owner);
+            if (!root) throw new Error('Cell materialization requires an allocated media preview root');
+            mediaDirectory = root.uri.fsPath;
+            this.assertMediaPreviewDirectory(requireNodeModules().fs, mediaDirectory);
+            options = {
+                ...options,
+                signal: options.signal
+                    ? AbortSignal.any([options.signal, root.controller.signal])
+                    : root.controller.signal
+            };
+        }
         let completed: MaterializedCell | undefined;
         try {
             return await runReadSnapshot(operations, async leasedOperations => {
                 completed = await this.materializeWithinLease(
                     leasedOperations,
                     target,
-                    options
+                    options,
+                    mediaDirectory
                 );
                 return completed;
             });
@@ -243,7 +349,8 @@ export class CellMaterializationService implements vsc.Disposable {
     private async materializeWithinLease(
         operations: DatabaseOperations,
         target: CellReadTarget,
-        options: MaterializeCellOptions
+        options: MaterializeCellOptions,
+        mediaDirectory: string | undefined
     ): Promise<MaterializedCell> {
         this.assertActive(options.signal);
 
@@ -257,29 +364,34 @@ export class CellMaterializationService implements vsc.Disposable {
             session = await operations.openCellReadSession(target);
             this.assertActive(options.signal);
             const { metadata } = session;
-            if (metadata.byteLength > this.maxBytes) {
+            const plannedBytes = options.format === 'hex'
+                ? hexDumpByteLength(metadata.byteLength)
+                : metadata.byteLength;
+            if (!Number.isSafeInteger(plannedBytes) || plannedBytes > this.maxBytes) {
                 throw new Error(
-                    `${metadata.byteLength} bytes exceeds the ${this.maxBytes}-byte ` +
+                    `${plannedBytes} bytes exceeds the ${this.maxBytes}-byte ` +
                     'temporary-file quota; export the cell with an explicit destination instead'
                 );
             }
-            this.reserveBytes(metadata.byteLength);
-            reservedBytes = metadata.byteLength;
+            this.reserveBytes(plannedBytes);
+            reservedBytes = plannedBytes;
 
             this.assertActive(options.signal);
             const { fs, crypto } = requireNodeModules();
-            const runDirectory = this.ensureRunDirectory(fs);
-            const extension = safeExtension(options.fileExtension, metadata);
+            const runDirectory = mediaDirectory ?? this.ensureRunDirectory(fs);
+            const extension = options.format === 'hex' ? 'hex' : safeExtension(options.fileExtension, metadata);
             filePath = (require('path') as typeof import('node:path')).join(
                 runDirectory,
                 `${webCrypto.randomUUID()}.${extension}`
             );
+            if (mediaDirectory) this.assertMediaPreviewDirectory(fs, mediaDirectory);
             fileHandle = await fs.promises.open(filePath, 'wx', 0o600);
             this.assertActive(options.signal);
             await fileHandle.chmod(0o600);
             this.assertActive(options.signal);
 
             const streamCell = async (decodeText: boolean) => {
+                const hexEncoder = options.format === 'hex' ? new HexDumpEncoder() : undefined;
                 const decoder = decodeText
                     // U+FEFF may be real cell content. Decoding is a transport
                     // conversion, so a leading BOM must survive the UTF-8 rewrite.
@@ -318,9 +430,11 @@ export class CellMaterializationService implements vsc.Disposable {
                         sourcePrefix.set(chunk.bytes.subarray(0, prefixBytes), sourceOffset);
                     }
 
-                    const output = decoder && encoder
-                        ? encoder.encode(decodeCellText(decoder, chunk.bytes, true))
-                        : chunk.bytes;
+                    const output = hexEncoder
+                        ? hexEncoder.encode(chunk.bytes)
+                        : decoder && encoder
+                            ? encoder.encode(decodeCellText(decoder, chunk.bytes, true))
+                            : chunk.bytes;
                     const outputPosition = outputBytes;
                     outputBytes = this.checkedOutputSize(outputBytes, output.byteLength);
                     reservedBytes = this.ensureOutputReservation(reservedBytes, outputBytes);
@@ -329,8 +443,10 @@ export class CellMaterializationService implements vsc.Disposable {
                     sourceOffset += chunk.bytes.byteLength;
                 }
 
-                if (decoder && encoder) {
-                    const finalBytes = encoder.encode(decodeCellText(decoder));
+                if (hexEncoder || (decoder && encoder)) {
+                    const finalBytes = hexEncoder
+                        ? hexEncoder.encode(new Uint8Array(0), true)
+                        : encoder!.encode(decodeCellText(decoder!));
                     const outputPosition = outputBytes;
                     outputBytes = this.checkedOutputSize(outputBytes, finalBytes.byteLength);
                     reservedBytes = this.ensureOutputReservation(reservedBytes, outputBytes);
@@ -343,7 +459,9 @@ export class CellMaterializationService implements vsc.Disposable {
             let rawDatabaseBytes = false;
             let streamed: Awaited<ReturnType<typeof streamCell>>;
             try {
-                streamed = await streamCell(metadata.storageClass === 'text');
+                streamed = await streamCell(
+                    options.format !== 'hex' && options.format !== 'raw' && metadata.storageClass === 'text'
+                );
             } catch (error) {
                 if (!(error instanceof InvalidCellTextEncodingError)) throw error;
                 // The still-open snapshot supports absolute-offset rereads. Reset
@@ -373,6 +491,13 @@ export class CellMaterializationService implements vsc.Disposable {
             }
 
             const assembledChecksum = outputHash.digest('hex');
+            if (mediaDirectory) {
+                this.assertMediaPreviewDirectory(fs, mediaDirectory);
+                const path = require('path') as typeof import('node:path');
+                if (path.dirname(filePath) !== mediaDirectory || path.relative(filePath, fs.realpathSync(filePath)) !== '') {
+                    throw new Error('Materialized media file is outside its owner directory');
+                }
+            }
             const verified = await this.verifyFile(fs, crypto, filePath, options.signal);
             if (verified.byteLength !== outputBytes || verified.checksum !== assembledChecksum) {
                 throw new Error('Materialized cell checksum verification failed');
@@ -387,9 +512,11 @@ export class CellMaterializationService implements vsc.Disposable {
                 byteLength: outputBytes,
                 checksumSha256: assembledChecksum,
                 sourcePrefix,
-                contentEncoding: metadata.storageClass === 'text' && !rawDatabaseBytes
-                    ? 'utf-8'
-                    : 'raw-database-bytes'
+                contentEncoding: options.format === 'hex'
+                    ? 'hex'
+                    : metadata.storageClass === 'text' && !rawDatabaseBytes && options.format !== 'raw'
+                        ? 'utf-8'
+                        : 'raw-database-bytes'
             };
             this.releaseReservedBytes(reservedBytes - outputBytes);
             reservedBytes = outputBytes;
@@ -466,6 +593,11 @@ export class CellMaterializationService implements vsc.Disposable {
         for (const subscription of this.ownerSubscriptions.values()) subscription.dispose();
         this.ownerSubscriptions.clear();
         this.ownerFiles.clear();
+        for (const root of this.mediaPreviewRoots.values()) {
+            root.controller.abort();
+            root.subscription.dispose();
+        }
+        this.mediaPreviewRoots.clear();
 
         let trackedBytes = 0;
         for (const materialized of this.trackedFiles.values()) {
@@ -486,6 +618,13 @@ export class CellMaterializationService implements vsc.Disposable {
     private assertActive(signal: AbortSignal | undefined): void {
         if (this.disposed) throw new Error('Cell materialization service is disposed');
         assertNotCancelled(signal);
+    }
+
+    private assertMediaPreviewDirectory(fs: NodeFs, directory: string): void {
+        const path = require('path') as typeof import('node:path');
+        if (!fs.lstatSync(directory).isDirectory() || path.relative(directory, fs.realpathSync(directory)) !== '') {
+            throw new Error('Cell media preview directory changed after its webview grant');
+        }
     }
 
     private ensureRunDirectory(fs: NodeFs): string {

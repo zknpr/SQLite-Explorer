@@ -5,7 +5,8 @@
  * Abstracts over worker creation and communication.
  */
 
-import type { Uri } from 'vscode';
+import type { Event, Uri } from 'vscode';
+import type { DatabaseConnectionInvalidatedError } from './core/database-connection-invalidated';
 import type { DatabaseOperations, CellValue, QueryResultSet, DatabaseInitConfig, DatabaseInitResult } from './core/types';
 
 // ============================================================================
@@ -23,6 +24,8 @@ export interface EstablishedDatabaseConnection {
   databaseOps: DatabaseOperations;
   isReadOnly?: boolean;
   storage?: DatabaseInitResult['storage'];
+  /** Terminal loss of native connection state; recovery requires an explicit reload. */
+  onDidInvalidate?: Event<DatabaseConnectionInvalidatedError>;
 }
 
 export interface DatabaseConnectionBundle {

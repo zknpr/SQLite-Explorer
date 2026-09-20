@@ -143,6 +143,12 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         this.outputChannel.appendLine(`${timestamp} ${type} [${this.filename}] ${safeMessage}`);
     }
 
+    async executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, signal?: AbortSignal): Promise<QueryResultSet> {
+        // Query literals and bindings may contain credentials; do not log either.
+        this.log(explain ? 'Explaining SQL workspace query' : 'Running SQL workspace query');
+        return this.wrapped.executeReadQuery(sql, params, explain, signal);
+    }
+
     async executeQuery(
         sql: string,
         params?: CellValue[],
@@ -361,12 +367,13 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
 
     async createTable(
         table: string,
-        columns: ColumnDefinition[]
+        columns: ColumnDefinition[],
+        options?: import('./core/types').CreateTableOptions
     ): Promise<ColumnDropTableState> {
         const columnDefs = columns.map(c => `${c.name} ${c.type}`).join(', ');
-        const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columnDefs})`;
+        const sql = `CREATE TABLE ${escapeIdentifier(table)} (${columnDefs})${options?.withoutRowid ? ' WITHOUT ROWID' : ''}`;
         this.log(sql, true);
-        return this.wrapped.createTable(table, columns);
+        return options === undefined ? this.wrapped.createTable(table, columns) : this.wrapped.createTable(table, columns, options);
     }
 
     async getViewDefinition(view: string): Promise<ViewDefinition> {

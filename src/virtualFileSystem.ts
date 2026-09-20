@@ -136,7 +136,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             };
         }
 
-        const { document, table, rowId } = this.parseUri(uri);
+        const { document, table, rowId, column } = this.parseUri(uri);
 
         if (rowId === '__view__.sql') {
             const metadata = this.getViewDocumentMetadata(document, uri, table);
@@ -168,12 +168,27 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
             };
         }
 
+        let size: number;
+        if (rowId === '__create__.sql') {
+            size = (await this.readFile(uri)).byteLength;
+        } else {
+            const targetRowId = this.getCellDocumentTarget(document, uri, table, rowId, column);
+            const metadata = await document.databaseOperations.getCellMetadata({
+                table, rowId: targetRowId, column
+            });
+            // Media loaders use this length for their resource/range response.
+            // BLOB length is exact without loading it. TEXT and numbers are
+            // served as UTF-8, which can differ from SQLite's stored byte count.
+            size = metadata.storageClass === 'blob'
+                ? metadata.byteLength
+                : (await this.readFile(uri)).byteLength;
+        }
         const now = Date.now();
         return {
             type: vsc.FileType.File,
             ctime: now,
             mtime: now,
-            size: 0,
+            size,
             permissions: rowId === '__create__.sql' || document.isReadOnlyMode
                 ? vsc.FilePermission.Readonly
                 : undefined

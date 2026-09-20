@@ -54,7 +54,12 @@ import {
 import {
   decodeQueryPlan,
   queryPlanRequest,
-  SQL_RESULT_ROWS
+  prepareReadQuery,
+  parseQueryParameters,
+  buildReadTransport,
+  decodeReadTransport,
+  SQL_RESULT_ROWS,
+  SQL_MAX_COLUMNS
 } from '../../../src/core/sql-workspace.ts';
 import {
   COLUMN_DROP_DEPENDENT_OBJECT_SQL,
@@ -943,6 +948,7 @@ async function initializeDatabase(filename, config) {
   // produced.
   if (import.meta.env.DESKTOP_NATIVE_ENGINE) {
     ({ SQL, db } = await __desktopNativeCreateEngine(config));
+    queryPlanReaderActive = SQL.queryPlanReaderActive === true;
   } else {
     // Initialize sql.js with WASM
     if (!SQL) {
@@ -1231,6 +1237,72 @@ async function runQuery(sql, params = [], cancellationFlag) {
   }
 }
 
+/** Browser SQL workspace: one read query, with the extension's transport limits. */
+async function executeReadQuery(sql, parameterText = '[]', cancellationFlag) {
+  if (!db) throw new Error('No database initialized');
+  if (typeof sql !== 'string' || typeof parameterText !== 'string') {
+    throw new TypeError('SQL and parameter JSON must be strings');
+  }
+  const prepared = prepareReadQuery(sql);
+  const params = parseQueryParameters(parameterText);
+  if (params.length !== prepared.parameterCount) {
+    throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
+  }
+  const metadataView = `query_columns_${crypto.randomUUID().replace(/-/g, '')}`;
+  const queryOnly = Number(db.exec('PRAGMA query_only')[0]?.values[0]?.[0]) === 1;
+  let createdMetadataView = false;
+  let headers;
+  try {
+    // Match the WASM engine: TEMP metadata DDL needs query_only lifted, but no
+    // user query is stepped and no await occurs before the guard is restored.
+    if (queryOnly) runSingleStatement('PRAGMA query_only = OFF');
+    headers = executeWithProgressHandler(() => {
+      runSingleStatement(`CREATE TEMP VIEW "${metadataView}" AS ${prepared.metadataSql}`);
+      createdMetadataView = true;
+      // Bound database-controlled labels before extracting them into JavaScript.
+      const names = (db.exec(
+        "SELECT substr(name, 1, 4097) FROM pragma.pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?",
+        [metadataView, SQL_MAX_COLUMNS + 1]
+      )[0]?.values ?? []).map(row => String(row[0]));
+      if (!names.length || names.length > SQL_MAX_COLUMNS) throw new Error('Queries support 1 to 128 result columns.');
+      if (names.some(header => header.length > 4096)) throw new Error('Result column labels must be at most 4096 characters.');
+      return names;
+    }, cancellationFlag);
+  } finally {
+    try {
+      if (createdMetadataView) {
+        // The native shim restores query_only after its own column-name
+        // probe. Lift it again for this worker-owned TEMP view's cleanup.
+        if (queryOnly) runSingleStatement('PRAGMA query_only = OFF');
+        runSingleStatement(`DROP VIEW temp."${metadataView}"`);
+      }
+    }
+    finally {
+      if (queryOnly) {
+        try { runSingleStatement('PRAGMA query_only = ON'); }
+        catch (error) {
+          const failedDatabase = db;
+          db = null;
+          failedDatabase.close();
+          throw error;
+        }
+      }
+    }
+  }
+  return executeWithProgressHandler(() => {
+    const transport = buildReadTransport(prepared.sql, headers.length);
+    const statement = prepareSingleStatement(transport.sql);
+    try {
+      statement.bind(params);
+      const rows = [];
+      while (rows.length <= SQL_RESULT_ROWS && statement.step()) {
+        rows.push(statement.get(null, { useBigInt: true }));
+      }
+      return decodeReadTransport(headers, rows, transport.valueColumnCount);
+    } finally { statement.free(); }
+  }, cancellationFlag);
+}
+
 /**
  * Clamp a caller-supplied console row cap into [1, 50000], defaulting to
  * 5000 when omitted (or non-finite). Exported inline rather than as a
@@ -1381,20 +1453,39 @@ function stripLeadingSqlTrivia(text) {
 }
 
 /**
- * Does `sql` compile as a single read query? The probe is the bounded reader's
- * own admission test (query-plan.c compiles `SELECT * FROM (sql)` before it
- * touches the original text): a DML/DDL statement, a PRAGMA, a second
- * statement after a `;` -- none of them parse inside a subquery. Compile only,
- * never stepped; the statement is freed at once.
+ * Route read-shaped SQL without compiling it outside the C reader's limits.
+ * For WITH, skip each parenthesized CTE body and inspect the following
+ * statement keyword. Quoted names and comments stay opaque. Ambiguous or
+ * malformed WITH text goes to the reader, where SQLite rejects it safely.
  */
-function compilesAsReadQuery(sql) {
-  let statement;
-  try {
-    statement = db.prepare(`SELECT * FROM (\n${sql}\n)`);
-  } catch {
-    return false;
+const QUERY_PLAN_SQL_TOKENS = /--[^\r\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[A-Za-z_\u0080-\uffff][A-Za-z_0-9$\u0080-\uffff]*|[^\s]/g;
+
+function isQueryPlanRead(sql) {
+  const body = stripLeadingSqlTrivia(sql);
+  const first = /^[A-Za-z]+/.exec(body)?.[0]?.toUpperCase();
+  if (first !== 'WITH') return first === 'SELECT' || first === 'VALUES';
+  let depth = 0;
+  let awaitingBody = false;
+  let inBody = false;
+  let bodyEnded = false;
+  for (const match of body.matchAll(QUERY_PLAN_SQL_TOKENS)) {
+    const token = match[0];
+    if (token.startsWith('--') || token.startsWith('/*')) continue;
+    if (bodyEnded) {
+      if (token === ',') { bodyEnded = false; continue; }
+      return !/^(?:INSERT|UPDATE|DELETE|REPLACE)$/i.test(token);
+    }
+    if (token === '(') {
+      if (depth === 0 && awaitingBody) { inBody = true; awaitingBody = false; }
+      depth++;
+    } else if (token === ')') {
+      depth--;
+      if (depth < 0) return true;
+      if (depth === 0 && inBody) { bodyEnded = true; inBody = false; }
+    } else if (depth === 0 && /^AS$/i.test(token)) {
+      awaitingBody = true;
+    }
   }
-  statement.free();
   return true;
 }
 
@@ -1428,10 +1519,9 @@ function readQueryPlanBounded(sql, params) {
 }
 
 /**
- * The plan through SQLite's own `EXPLAIN QUERY PLAN <sql>`: the native engine
- * has no reader (its fork disables loadable extensions), and on WASM this is
- * the route for a statement the reader will not admit -- a DML statement has a
- * plan worth reading too.
+ * SQLite's own `EXPLAIN QUERY PLAN <sql>` preserves desktop support for DML
+ * plans, which the bounded read-query reader does not admit. Its display
+ * limits are checked in JavaScript; read plans use the C reader on both engines.
  *
  * What the reader guaranteed structurally is re-established here piece by
  * piece: prepareSingleStatement's boundary marker refuses a second statement
@@ -1485,13 +1575,9 @@ function readQueryPlanBuiltin(sql, params) {
  * EXPLAIN QUERY PLAN for exactly one statement, by whichever mechanism this
  * engine offers:
  *
- *   - WASM, read query: the bounded reader (readQueryPlanBounded), admitted by
- *     the same compile probe the reader applies internally so its admission
- *     refusal -- a syntax error naming the first non-SELECT token -- is never
- *     what the user sees for a perfectly good UPDATE.
- *   - WASM, anything else, and the native engine always: SQLite's own EXPLAIN
- *     QUERY PLAN statement (readQueryPlanBuiltin), bounded here in JavaScript
- *     to the reader's limits.
+ *   - Read query on either engine: the bounded reader (readQueryPlanBounded).
+ *   - Other statements: SQLite's own EXPLAIN QUERY PLAN statement
+ *     (readQueryPlanBuiltin), with display limits checked in JavaScript.
  *
  * Both answer the same four columns, so the console cannot tell them apart --
  * which is the point: query plans work on both desktop engines.
@@ -1513,7 +1599,10 @@ function readQueryPlan(sql, params) {
     throw new Error('Query plan SQL exceeds 262,144 UTF-8 bytes.');
   }
   const body = normalizeViewSelectSql(sql);
-  if (queryPlanReaderActive && compilesAsReadQuery(body)) return readQueryPlanBounded(body, params);
+  for (const token of body.matchAll(QUERY_PLAN_SQL_TOKENS)) {
+    if (token[0] === ';') throw new Error('Exactly one SQL statement is required');
+  }
+  if (queryPlanReaderActive && isQueryPlanRead(body)) return readQueryPlanBounded(body, params);
   return readQueryPlanBuiltin(body, params);
 }
 
@@ -3224,6 +3313,42 @@ async function getTableInfo(table) {
     }));
 }
 
+function readImportSchemaVersion() {
+  // Read positional values without getColumnNames: the native shim probes
+  // column names with transient TEMP views, which advance temp.schema_version.
+  const read = (sql) => {
+    const statement = db.prepare(sql);
+    const rows = [];
+    try {
+      while (statement.step()) rows.push(statement.get());
+      return rows;
+    } finally { statement.free(); }
+  };
+  const main = read('PRAGMA main.schema_version')[0]?.[0];
+  if (!Number.isSafeInteger(main)) throw new Error('Unable to read the destination database schema version.');
+  // Persistent schema cookies also catch identical DROP/CREATE replacements.
+  // TEMP definitions detect user schema changes without counting the shim's
+  // short-lived metadata views as changes to the import destination.
+  return JSON.stringify([main, read('SELECT type, name, tbl_name, sql FROM temp.sqlite_schema ORDER BY type, name')]);
+}
+
+async function getImportTarget(table) {
+  if (!db) throw new Error('No database initialized');
+  assertUsableSqlIdentifier(table, 'Table name');
+  const savepoint = createViewSavepointName('sp_import_preview');
+  runSingleStatement(`SAVEPOINT ${savepoint}`);
+  try {
+    const columns = await getTableInfo(table);
+    if (!columns.length) throw new Error(`Table not found: ${table}`);
+    const schemaVersion = readImportSchemaVersion();
+    runSingleStatement(`RELEASE SAVEPOINT ${savepoint}`);
+    return { columns, schemaVersion };
+  } catch (error) {
+    safeRollbackSavepoint(savepoint, 'getImportTarget');
+    throw error;
+  }
+}
+
 function getInsertableColumnNames(table) {
   // hidden: 0 ordinary, 1 virtual-table HIDDEN, 2 GENERATED VIRTUAL,
   // 3 GENERATED STORED. Only 0 is insertable.
@@ -3735,6 +3860,9 @@ function resolveImportOptions(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) {
     throw new Error('Import options must be an object');
   }
+  if (options.expectedSchemaVersion !== undefined && typeof options.expectedSchemaVersion !== 'string') {
+    throw new Error('Import expectedSchemaVersion must be a string');
+  }
   const budget = (name) => {
     const value = options[name];
     if (value === undefined) return undefined;
@@ -4001,12 +4129,15 @@ async function importRows(table, rows, options = {}) {
   assertUsableSqlIdentifier(table, 'Table name');
   const limits = resolveImportOptions(options ?? {});
   const rowColumns = validateImportRows(rows, limits.maxEditValueBytes);
-  const identity = await resolveTableIdentity(table);
-  const textEncoding = getCellTextEncoding();
 
   const savepointName = createViewSavepointName('sp_import_rows');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
+    if (options?.expectedSchemaVersion !== undefined && readImportSchemaVersion() !== options.expectedSchemaVersion) {
+      throw new Error('The destination database schema changed after the preview was prepared. Start the import again.');
+    }
+    const identity = await resolveTableIdentity(table);
+    const textEncoding = getCellTextEncoding();
     const rowIds = new Array(rows.length);
     const statements = new Map();
     let identityStatement = null;
@@ -5832,6 +5963,7 @@ const methods = {
   initializeDatabase,
   runQuery,
   runConsole,
+  executeReadQuery,
   getCellMetadata,
   openCellReadSession,
   readCellChunk,
@@ -5842,6 +5974,7 @@ const methods = {
   fetchTableCount,
   fetchSchema,
   getTableInfo,
+  getImportTarget,
   getPragmas,
   setPragma,
   updateCell,

@@ -19,9 +19,6 @@ export const UriScheme = 'sqlite-explorer';
 // Configuration section in settings.json
 export const ConfigurationSection = 'sqliteExplorer';
 
-// Telemetry disabled for this extension
-export const TelemetryConnectionString = "";
-
 // File nesting patterns
 export const NestingPattern = "${capture}.${extname}-*";
 export const FileNestingPatternsAdded = 'fileNestingPatternsAdded';
@@ -60,7 +57,8 @@ const MAX_UNDO_MEMORY_BYTES = 512 * 1024 * 1024;
 // ============================================================================
 
 /**
- * Retrieve maximum file size from user configuration.
+ * Retrieve the size limit for WASM opens and buffered database copies.
+ * Native file opens do not materialize the database and do not use this cap.
  *
  * @returns Maximum size in bytes (0 = unlimited)
  */

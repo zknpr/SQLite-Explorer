@@ -64,6 +64,55 @@ function assertLimitError(
 }
 
 describe('WebviewMessageHandler', () => {
+    for (const legacy of [false, true]) {
+        it(`reports rejected ${legacy ? 'legacy' : 'modern'} response delivery to the pending caller`, async () => {
+            const delivered: unknown[] = [];
+            let attempts = 0;
+            const postMessage = (message: unknown): PromiseLike<boolean> => {
+                attempts++;
+                if (attempts === 1) {
+                    // A lazy thenable makes ignoring the asynchronous rejection
+                    // a deterministic missing-reply failure, not an unhandled rejection.
+                    return {
+                        then(onfulfilled, onrejected) {
+                            return Promise.reject(new TypeError('Response is not JSON-serializable'))
+                                .then(onfulfilled, onrejected);
+                        }
+                    };
+                }
+                delivered.push(message);
+                return Promise.resolve(true);
+            };
+            const handler = new WebviewMessageHandler(postMessage, {
+                ping: () => 'committed result'
+            } as unknown as import('../../src/hostBridge').HostBridge);
+            handler.handleMessage(legacy ? {
+                type: 'rpc-request', method: 'ping', id: 'delivery-failure', args: []
+            } : {
+                channel: 'rpc',
+                content: {
+                    kind: 'invoke', targetMethod: 'ping', messageId: 'delivery-failure', payload: []
+                }
+            });
+            await new Promise(resolve => setTimeout(resolve, 20));
+            assert.strictEqual(attempts, 2, 'a rejected success reply must produce an explicit RPC failure');
+            assert.strictEqual(delivered.length, 1);
+            const failure = delivered[0] as {
+                id?: string;
+                error?: string;
+                content?: { messageId: string; success: boolean; errorMessage: string };
+            };
+            if (legacy) {
+                assert.strictEqual(failure.id, 'delivery-failure');
+                assert.match(failure.error!, /not JSON-serializable/);
+            } else {
+                assert.strictEqual(failure.content?.messageId, 'delivery-failure');
+                assert.strictEqual(failure.content?.success, false);
+                assert.match(failure.content!.errorMessage, /not JSON-serializable/);
+            }
+        });
+    }
+
     it('preserves own __proto__ keys on webview-to-host arguments', async () => {
         let captured: unknown;
         const posted = nextPostedMessage();

@@ -1,6 +1,6 @@
 
 import './vscode_mock_setup'; // Must be first
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
@@ -1967,6 +1967,48 @@ describe('streamTableExport cell boundaries', () => {
 });
 
 describe('exportTableCommand atomic streaming', () => {
+    beforeEach(() => {
+        mock.method(mockVscode.window, 'showWarningMessage', async () => 'Replace');
+    });
+    afterEach(() => mock.restoreAll());
+
+    it('requires replacement approval and retains the generation captured before that prompt', async () => {
+        const database = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+        const operations = database.operations!;
+        await operations.executeQuery("CREATE TABLE prompt_export(value TEXT); INSERT INTO prompt_export VALUES('new')");
+        const root = path.join(process.cwd(), '.tmp/unit-export-confirmation');
+        await fsPromises.mkdir(root, { recursive: true });
+        const scratch = await fsPromises.mkdtemp(path.join(root, 'run-'));
+        const destination = path.join(scratch, 'existing.csv');
+        const uri = mockVscode.Uri.file(path.join(scratch, 'source.db'));
+        DocumentRegistry.set('prompt-export', { uri, databaseOperations: operations } as any);
+        mock.method(mockVscode.window, 'showSaveDialog', async () => mockVscode.Uri.file(destination));
+        const warning = mock.method(mockVscode.window, 'showWarningMessage', async (): Promise<string | undefined> => undefined);
+        const run = () => exportTableCommand({} as any, undefined,
+            { table: 'prompt_export', uri: uri.toString() }, ['value'], undefined, undefined, { format: 'csv' });
+        try {
+            await fsPromises.writeFile(destination, 'original');
+            assert.deepStrictEqual(await run(), { success: false, cancelled: true });
+            assert.strictEqual(await fsPromises.readFile(destination, 'utf8'), 'original');
+            warning.mock.mockImplementation(async () => {
+                await fsPromises.writeFile(destination, 'changed while confirming');
+                return 'Replace';
+            });
+            const conflict = await run();
+            assert.strictEqual(conflict.success, false);
+            assert.match('message' in conflict ? conflict.message : '', /destination changed/);
+            assert.strictEqual(await fsPromises.readFile(destination, 'utf8'), 'changed while confirming');
+            warning.mock.mockImplementation(async () => 'Replace');
+            assert.strictEqual((await run()).success, true);
+            assert.strictEqual(await fsPromises.readFile(destination, 'utf8'), 'value\nnew');
+            assert.deepStrictEqual(await fsPromises.readdir(scratch), ['existing.csv']);
+        } finally {
+            DocumentRegistry.delete('prompt-export');
+            (operations as WasmDatabaseEngine).shutdown();
+            await fsPromises.rm(scratch, { recursive: true, force: true });
+        }
+    });
+
     it('coalesces tiny workspace emissions before the final buffer copy', async () => {
         const sink = new CappedWorkspaceSink();
         for (let index = 0; index < 100_000; index++) {

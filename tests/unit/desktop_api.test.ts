@@ -360,12 +360,23 @@ test('the import methods route through host.invoke: pick/read are bare, importRo
   assert.deepEqual(host.calls.at(-1), { method: 'pickImportSource', args: [] });
   await backendApi.readImportSource('/tmp/rows.csv');
   assert.deepEqual(host.calls.at(-1), { method: 'readImportSource', args: ['/tmp/rows.csv'] });
+  await backendApi.getImportTarget('users');
+  assert.deepEqual(host.calls.at(-1), { method: 'getImportTarget', args: ['users'] });
   await backendApi.importRows('users', [{ id: 1 }]);
   // The same per-value cap the single-row insert carries; the host adds the
   // undo and transport budgets itself.
   assert.deepEqual(host.calls.at(-1), {
     method: 'importRows',
     args: ['users', [{ id: 1 }], { maxEditValueBytes: DEFAULT_MAX_CELL_EDIT_BYTES }]
+  });
+  const schemaVersion = '[7,[["trigger","fill_defaults"]]]';
+  await backendApi.importRows('users', [{ id: 1 }], {
+    expectedSchemaVersion: schemaVersion,
+    maxEditValueBytes: Number.MAX_SAFE_INTEGER
+  } as any);
+  assert.deepEqual(host.calls.at(-1), {
+    method: 'importRows',
+    args: ['users', [{ id: 1 }], { expectedSchemaVersion: schemaVersion, maxEditValueBytes: DEFAULT_MAX_CELL_EDIT_BYTES }]
   });
   // A client deadline on importRows that rejected while the worker went on to
   // release the import would leave rows with no history entry; the pick is a

@@ -22,8 +22,26 @@ import { DEFAULT_MAX_INLINE_CELL_BYTES } from '../../src/core/cell-containment';
 import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
 import { MAX_TABLE_PAGE_ROWS } from '../../src/core/query-builder';
 import { VIEW_DEFINITION_CONFLICT_MESSAGE } from '../../src/core/view-utils';
+import fs from 'node:fs';
+import path from 'node:path';
 
 describe('HostBridge', () => {
+    it('initializes a recreated webview with the current editing preference', async () => {
+        const uri = vscode.Uri.file('/workspace/settings.db');
+        let behavior = 'vscode';
+        const bridge = new HostBridge({
+            webviews: new Map([[uri, true]]), context: {}, isReadOnly: false
+        } as any, {
+            uri, isConnected: true, fileParts: { filename: 'settings.db' },
+            isReadOnlyMode: false, connectionGeneration: 4,
+            get cellEditBehavior() { return behavior; }
+        } as any);
+
+        assert.strictEqual((await bridge.initialize()).cellEditBehavior, 'vscode');
+        behavior = 'inline';
+        assert.strictEqual((await bridge.initialize()).cellEditBehavior, 'inline');
+    });
+
     it('rejects malformed table-page bounds before calling the database engine', async () => {
         const fetchTableData = mock.fn(async (_table: string, _options: any) => ({ headers: [], rows: [] }));
         const bridge = new HostBridge(
@@ -616,7 +634,8 @@ describe('HostBridge', () => {
         const mockProvider = { webviews: new Map(), context: {} };
         const bridge = new HostBridge(mockProvider as any, mockDocument as any);
 
-        const targetUri = vscode.Uri.file('/dbDir/safe.txt');
+        const targetUri = { ...vscode.Uri.from({ scheme: 'mem', path: '/dbDir/safe.txt' }), fsPath: '/dbDir/safe.txt' };
+        mock.method(vscode.workspace.fs, 'stat', async () => { throw vscode.FileSystemError.FileNotFound(targetUri.toString()); });
         const showSaveDialogMock = mock.method(vscode.window, 'showSaveDialog', async () => targetUri);
         const writeFileMock = mock.method(vscode.workspace.fs, 'writeFile', async () => {});
         const renameMock = mock.method(vscode.workspace.fs, 'rename', async () => {});
@@ -640,7 +659,8 @@ describe('HostBridge', () => {
             { webviews: new Map(), context: {} } as any,
             { uri: vscode.Uri.file('/dbDir/test.db') } as any
         );
-        const targetUri = vscode.Uri.file('/dbDir/payload.bin');
+        const targetUri = { ...vscode.Uri.from({ scheme: 'mem', path: '/dbDir/payload.bin' }), fsPath: '/dbDir/payload.bin' };
+        mock.method(vscode.window, 'showWarningMessage', async () => 'Replace');
         const sentinel = Uint8Array.of(9, 8, 7);
         let targetBytes = sentinel;
         let temporaryUri: any;
@@ -798,8 +818,9 @@ describe('HostBridge', () => {
         assert.ok(uri.path.endsWith('.txt'), `Path should end with .txt, got ${uri.path}`);
     });
 
-    it('opens an oversized cell from a temp materialization and marks the editor read-only', async () => {
+    it('opens an oversized cell in a bounded read-only viewer without invoking the text editor', async () => {
         const executeCommandMock = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const createPanel = mock.method(vscode.window, 'createWebviewPanel');
         const tempUri = vscode.Uri.file('/private/materialized/random.bin');
         const materializer = {
             materialize: mock.fn(async (_operations: any, _target: any, _options: any) => ({
@@ -851,20 +872,210 @@ describe('HostBridge', () => {
             materializer.materialize.mock.calls[0].arguments[2].fileExtension,
             'png'
         );
-        assert.strictEqual(executeCommandMock.mock.callCount(), 2);
-        assert.deepStrictEqual(executeCommandMock.mock.calls[0].arguments, [
-            'vscode.open',
-            tempUri,
-            vscode.ViewColumn.Two
-        ]);
-        assert.strictEqual(
-            executeCommandMock.mock.calls[1].arguments[0],
-            'workbench.action.files.setActiveEditorReadonlyInSession'
-        );
+        assert.strictEqual(executeCommandMock.mock.callCount(), 0);
+        assert.strictEqual(createPanel.mock.callCount(), 1);
+        assert.deepStrictEqual(createPanel.mock.calls[0].arguments[3]!.localResourceRoots, []);
         assert.deepStrictEqual(openResult, {
             success: true,
-            mode: 'temporary-read-only'
+            mode: 'paged-read-only'
         });
+    });
+
+    it('opens an explicitly requested snapshot in the paged viewer below the inline byte limit', async () => {
+        const execute = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const createPanel = mock.method(vscode.window, 'createWebviewPanel');
+        let format: unknown;
+        const metadata = { storageClass: 'text', byteLength: 6000, textEncoding: 'utf-16le' };
+        const materializer = {
+            async materialize(_operations: unknown, _target: unknown, options: { format?: string }) {
+                format = options.format;
+                return { uri: vscode.Uri.file('/private/materialized/text.txt'), metadata, byteLength: 6000 };
+            },
+            release() {}
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {}, cellMaterializer: materializer } as any, {
+            uri: vscode.Uri.file('/test.db'), documentKey: Promise.resolve('test-key'),
+            databaseOperations: { getCellMetadata: async () => metadata },
+            onDidDispose: () => ({ dispose() {} })
+        } as any);
+
+        const result = await bridge.openCellEditor({ table: 'cells' }, 1, 'body', {}, {
+            type: { type: 'text', mime: 'text/plain', ext: 'txt' }, view: 'snapshot'
+        });
+
+        assert.strictEqual(format, 'raw');
+        assert.strictEqual(execute.mock.callCount(), 0);
+        assert.strictEqual(createPanel.mock.callCount(), 1);
+        assert.deepStrictEqual(result, { success: true, mode: 'paged-read-only' });
+    });
+
+    for (const video of [
+        { name: 'MP4', mime: 'video/mp4', ext: 'mp4', prefix: Buffer.from('000000206674797069736f6d', 'hex') },
+        { name: 'WebM', mime: 'video/webm', ext: 'webm', prefix: Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3]) }
+    ]) it(`opens an oversized ${video.name} snapshot in the built-in video viewer`, async () => {
+        const opened: unknown[][] = [];
+        mock.method(vscode.commands, 'executeCommand', async (...args: unknown[]) => { opened.push(args); });
+        const createPanel = mock.method(vscode.window, 'createWebviewPanel');
+        const tempUri = vscode.Uri.file(`/private/materialized/video.${video.ext}`);
+        const metadata = { storageClass: 'blob', byteLength: 2 * 1024 * 1024 };
+        const materializer = {
+            materialize: mock.fn(async (_operations: unknown, _target: unknown, _options: unknown) => ({
+                uri: tempUri, metadata, byteLength: metadata.byteLength, checksumSha256: '0'.repeat(64),
+                sourcePrefix: video.prefix, contentEncoding: 'raw-database-bytes'
+            })),
+            release: mock.fn()
+        };
+        const document = {
+            uri: vscode.Uri.file('/test.db'), onDidDispose: () => ({ dispose() {} }),
+            databaseOperations: { getCellMetadata: async () => metadata }
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {}, cellMaterializer: materializer } as any, document as any);
+
+        const result = await bridge.openCellEditor({ table: 'cells' }, 1, 'video', {}, {
+            type: { type: 'video', mime: video.mime, ext: video.ext }
+        });
+
+        assert.deepStrictEqual(opened, [
+            ['vscode.openWith', tempUri, 'vscode.videoPreview', vscode.ViewColumn.Two],
+            ['workbench.action.files.setActiveEditorReadonlyInSession']
+        ]);
+        assert.strictEqual(createPanel.mock.callCount(), 0, 'a video must not open the raw Hex pager');
+        assert.strictEqual(materializer.materialize.mock.callCount(), 1);
+        assert.deepStrictEqual(materializer.materialize.mock.calls[0].arguments[1], { table: 'cells', rowId: 1, column: 'video' });
+        assert.strictEqual((materializer.materialize.mock.calls[0].arguments[2] as { format: string }).format, 'raw');
+        assert.strictEqual(materializer.release.mock.callCount(), 0, 'the existing tab/document lifecycle owns the snapshot');
+        assert.deepStrictEqual(result, { success: true, mode: 'temporary-read-only' });
+    });
+
+    for (const scenario of ['explicit raw snapshot', 'SQLite TEXT', 'changed signature', 'noncanonical extension', 'unsupported video container'] as const) {
+        it(`keeps oversized ${scenario} in the bounded content viewer`, async () => {
+            const opened = mock.method(vscode.commands, 'executeCommand', async () => {});
+            const createPanel = mock.method(vscode.window, 'createWebviewPanel');
+            const metadata = { storageClass: scenario === 'SQLite TEXT' ? 'text' : 'blob', byteLength: 2 * 1024 * 1024 };
+            const ext = scenario === 'noncanonical extension' ? 'txt' : scenario === 'unsupported video container' ? 'mov' : 'mp4';
+            const materializer = {
+                async materialize() {
+                    return {
+                        uri: vscode.Uri.file(`/private/materialized/content.${ext}`), metadata,
+                        byteLength: metadata.byteLength, checksumSha256: '0'.repeat(64),
+                        sourcePrefix: scenario === 'changed signature' ? new TextEncoder().encode('ordinary text')
+                            : Buffer.from('000000206674797069736f6d', 'hex'),
+                        contentEncoding: 'raw-database-bytes'
+                    };
+                },
+                release() {}
+            };
+            const bridge = new HostBridge({ webviews: new Map(), context: {}, cellMaterializer: materializer } as any, {
+                uri: vscode.Uri.file('/test.db'), onDidDispose: () => ({ dispose() {} }),
+                databaseOperations: { getCellMetadata: async () => metadata }
+            } as any);
+
+            const result = await bridge.openCellEditor({ table: 'cells' }, 1, 'value', {}, {
+                type: { type: 'video', mime: scenario === 'unsupported video container' ? 'video/quicktime' : 'video/mp4', ext },
+                view: scenario === 'explicit raw snapshot' ? 'snapshot' : 'content'
+            });
+
+            assert.strictEqual(opened.mock.callCount(), 0);
+            assert.strictEqual(createPanel.mock.callCount(), 1);
+            assert.deepStrictEqual(result, { success: true, mode: 'paged-read-only' });
+        });
+    }
+
+    it('releases an oversized video snapshot when its viewer cannot open', async () => {
+        const failure = new Error('Video preview unavailable');
+        mock.method(vscode.commands, 'executeCommand', async () => { throw failure; });
+        const tempUri = vscode.Uri.file('/private/materialized/video.mp4');
+        const metadata = { storageClass: 'blob', byteLength: 2 * 1024 * 1024 };
+        const materializer = {
+            async materialize() {
+                return {
+                    uri: tempUri, metadata, byteLength: metadata.byteLength, checksumSha256: '0'.repeat(64),
+                    sourcePrefix: Buffer.from('000000206674797069736f6d', 'hex'), contentEncoding: 'raw-database-bytes'
+                };
+            },
+            release: mock.fn()
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {}, cellMaterializer: materializer } as any, {
+            uri: vscode.Uri.file('/test.db'), onDidDispose: () => ({ dispose() {} }),
+            databaseOperations: { getCellMetadata: async () => metadata }
+        } as any);
+
+        await assert.rejects(bridge.openCellEditor({ table: 'cells' }, 1, 'video', {}, {
+            type: { type: 'video', mime: 'video/mp4', ext: 'mp4' }
+        }), failure);
+        assert.strictEqual(materializer.release.mock.callCount(), 1);
+        assert.strictEqual(materializer.release.mock.calls[0].arguments[0], tempUri);
+    });
+
+    it('opens a selected Hex view as read-only text even below the inline byte limit', async () => {
+        const opened: unknown[][] = [];
+        mock.method(vscode.commands, 'executeCommand', async (...args: unknown[]) => { opened.push(args); });
+        const tempUri = vscode.Uri.file('/private/materialized/video.hex');
+        let format: unknown;
+        const materializer = {
+            async materialize(_operations: unknown, _target: unknown, options: { format?: string }) {
+                format = options.format;
+                return { uri: tempUri, metadata: { storageClass: 'blob', byteLength: 20 }, byteLength: 146 };
+            },
+            release() {}
+        };
+        const bridge = new HostBridge({ webviews: new Map(), context: {}, cellMaterializer: materializer } as any, {
+            uri: vscode.Uri.file('/test.db'),
+            documentKey: Promise.resolve('test-key'),
+            databaseOperations: { getCellMetadata: async () => ({ storageClass: 'blob', byteLength: 20 }) },
+            onDidDispose: () => ({ dispose() {} })
+        } as any);
+
+        const result = await bridge.openCellEditor({ table: 'cells' }, 1, 'payload', {}, {
+            type: { type: 'video', mime: 'video/mp4', ext: 'mp4' }, view: 'hex'
+        });
+
+        assert.strictEqual(format, 'hex');
+        assert.deepStrictEqual(opened, [
+            ['vscode.openWith', tempUri, 'default', vscode.ViewColumn.Two],
+            ['workbench.action.files.setActiveEditorReadonlyInSession']
+        ]);
+        assert.deepStrictEqual(result, { success: true, mode: 'temporary-read-only' });
+    });
+
+    for (const outcome of ['saved', 'cancelled', 'failed'] as const) it(`downloads a complete oversized PDF with ${outcome} cleanup`, async () => {
+        fs.mkdirSync('.tmp', { recursive: true });
+        const directory = fs.mkdtempSync(path.resolve('.tmp/cell-download-'));
+        const source = vscode.Uri.file(path.join(directory, 'source.pdf'));
+        const destination = vscode.Uri.file(path.join(directory, 'full.pdf'));
+        const bytes = Buffer.concat([Buffer.from('%PDF'), Buffer.alloc(2 * 1024 * 1024, 0xa5)]);
+        fs.writeFileSync(source.fsPath, bytes);
+        const materializer = {
+            materialize: mock.fn(async () => ({ uri: source })),
+            release: mock.fn()
+        };
+        const execute = mock.method(vscode.commands, 'executeCommand', async () => {});
+        const dialog = mock.method(vscode.window, 'showSaveDialog', async () => outcome === 'cancelled' ? undefined : destination);
+        const failure = new Error('destination rename failed');
+        const rename = fs.promises.rename;
+        if (outcome === 'failed') mock.method(fs.promises, 'rename', async () => { throw failure; });
+        const bridge = new HostBridge({ webviews: new Map(), context: {}, cellMaterializer: materializer } as any, {
+            uri: vscode.Uri.file('/data/source.db'), onDidDispose: () => ({ dispose() {} }),
+            databaseOperations: { getCellMetadata: async () => ({ storageClass: 'blob', byteLength: 32 * 1024 * 1024 }) }
+        } as any);
+        try {
+            const operation = bridge.openCellEditor({ table: 'items' }, 1, 'payload', {}, {
+                type: { mime: 'application/pdf', type: 'pdf', ext: 'pdf' }, download: true
+            } as any);
+            if (outcome === 'failed') await assert.rejects(operation, failure);
+            else assert.deepStrictEqual(await operation, outcome === 'saved'
+                ? { success: true, mode: 'download' }
+                : { success: false, cancelled: true, message: 'Save cancelled' });
+            assert.strictEqual(dialog.mock.callCount(), 1);
+            assert.strictEqual(materializer.materialize.mock.callCount(), outcome === 'cancelled' ? 0 : 1);
+            assert.strictEqual(materializer.release.mock.callCount(), outcome === 'cancelled' ? 0 : 1);
+            if (outcome === 'saved') assert.deepStrictEqual(fs.readFileSync(destination.fsPath), bytes);
+            else assert.strictEqual(fs.existsSync(destination.fsPath), false);
+            assert.strictEqual(execute.mock.callCount(), 0, 'a download does not open an unsupported PDF editor');
+        } finally {
+            fs.promises.rename = rename;
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
     });
 
     it('materializes an oversized cell whose legal SQLite column name is empty', async () => {
@@ -915,16 +1126,26 @@ describe('HostBridge', () => {
             rowId: 1,
             column: ''
         });
-        assert.deepStrictEqual(result, { success: true, mode: 'temporary-read-only' });
-        assert.strictEqual(executeCommand.mock.callCount(), 2);
+        assert.deepStrictEqual(result, { success: true, mode: 'paged-read-only' });
+        assert.strictEqual(executeCommand.mock.callCount(), 0);
     });
 
-    it('serves oversized media from a panel-owned temp URI within narrowed roots', async () => {
+    it('serves and releases oversized media without reconfiguring the loaded webview', async () => {
         const tempUri = vscode.Uri.file(
-            '/private/materialized/sqlite-explorer-cell-materializations-run/random.png'
+            '/private/materialized/sqlite-explorer-cell-materializations-run/panel/random.png'
         );
+        const initialOptions = {
+            enableScripts: true,
+            localResourceRoots: [
+                vscode.Uri.file('/extension/assets/codicons'),
+                vscode.Uri.file('/private/materialized/sqlite-explorer-cell-materializations-run/panel')
+            ]
+        };
         const webview = {
-            options: { enableScripts: true, localResourceRoots: [] as vscode.Uri[] },
+            get options() { return initialOptions; },
+            set options(_value: typeof initialOptions) {
+                throw new Error('Changing options after HTML loads reloads the webview');
+            },
             asWebviewUri: mock.fn((uri: vscode.Uri) => ({
                 toString: () => `https://wv-resource.test${uri.path}`
             }))
@@ -981,7 +1202,7 @@ describe('HostBridge', () => {
         assert.strictEqual(result.success, true);
         assert.strictEqual(
             result.uri,
-            'https://wv-resource.test/private/materialized/sqlite-explorer-cell-materializations-run/random.png'
+            'https://wv-resource.test/private/materialized/sqlite-explorer-cell-materializations-run/panel/random.png'
         );
         assert.strictEqual(result.byteLength, 32 * 1024 * 1024);
         assert.strictEqual('bytes' in result, false);
@@ -994,21 +1215,13 @@ describe('HostBridge', () => {
         });
         assert.strictEqual(materializer.materialize.mock.calls[0].arguments[2].owner, panel);
         assert.strictEqual(materializer.materialize.mock.calls[0].arguments[2].fileExtension, 'png');
-        assert.deepStrictEqual(
-            webview.options.localResourceRoots.map(uri => uri.fsPath),
-            [
-                '/extension/assets/codicons',
-                '/private/materialized/sqlite-explorer-cell-materializations-run'
-            ]
-        );
+        assert.strictEqual(materializer.materialize.mock.calls[0].arguments[2].mediaPreview, true);
+        assert.strictEqual(webview.options, initialOptions);
 
         await (bridge as any).releaseCellMediaPreview('wv-media', result.previewId);
         assert.strictEqual(materializer.release.mock.callCount(), 1);
         assert.strictEqual(materializer.release.mock.calls[0].arguments[0], tempUri);
-        assert.deepStrictEqual(
-            webview.options.localResourceRoots.map(uri => uri.fsPath),
-            ['/extension/assets/codicons']
-        );
+        assert.strictEqual(webview.options, initialOptions);
     });
 
     it('rejects media whose same-snapshot storage class or signature changed', async () => {
@@ -2026,6 +2239,61 @@ describe('HostBridge', () => {
                 operation: 'set'
             }
         ]);
+    });
+
+    it('keeps exact batch history host-side and returns only JSON-safe row identities', async () => {
+        const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+        const dbOps = result.operations!;
+        const recordExternalModification = mock.fn();
+        try {
+            await dbOps.executeQuery(
+                'CREATE TABLE batch_wire (id INTEGER PRIMARY KEY, amount INTEGER, label TEXT, payload BLOB); ' +
+                "INSERT INTO batch_wire VALUES (1, 5, 'before', X'0001FF'), " +
+                "(2, 9223372036854775807, 'second', X'');"
+            );
+            const bridge = new HostBridge(
+                { webviews: new Map(), context: {} } as any,
+                {
+                    uri: vscode.Uri.parse('file:///test.db'),
+                    documentKey: Promise.resolve('test-key'),
+                    databaseOperations: dbOps,
+                    isReadOnlyMode: false,
+                    connectionGeneration: 1,
+                    recordExternalModification
+                } as any
+            );
+            const outcomes = await bridge.updateCellBatch('batch_wire', [
+                { rowId: 1, column: 'amount', value: 17 },
+                { rowId: 1, column: 'label', value: 'after' },
+                { rowId: 1, column: 'payload', value: new Uint8Array([2, 3]) },
+                { rowId: 2, column: 'amount', value: null }
+            ], 'Mixed batch');
+
+            assert.doesNotThrow(() => JSON.stringify(serializeValue(outcomes)));
+            assert.deepStrictEqual(outcomes, [
+                { rowId: 1, columnName: 'amount' },
+                { rowId: 1, columnName: 'label' },
+                { rowId: 1, columnName: 'payload' },
+                { rowId: 2, columnName: 'amount' }
+            ]);
+            const modification = recordExternalModification.mock.calls[0].arguments[0];
+            assert.strictEqual(modification.affectedCells[0].priorValue, 5n);
+            assert.strictEqual(modification.affectedCells[3].priorValue, 9223372036854775807n);
+            assert.deepStrictEqual(
+                modification.affectedCells[2].priorValue,
+                new Uint8Array([0, 1, 255])
+            );
+            await dbOps.undoModification(modification);
+            assert.deepStrictEqual((await dbOps.executeQuery(
+                'SELECT id, CAST(amount AS TEXT), label, hex(payload) FROM batch_wire ORDER BY id'
+            ))[0].rows, [[1, '5', 'before', '0001FF'], [2, '9223372036854775807', 'second', '']]);
+            await dbOps.redoModification(modification);
+            assert.deepStrictEqual((await dbOps.executeQuery(
+                'SELECT id, amount, label, hex(payload) FROM batch_wire ORDER BY id'
+            ))[0].rows, [[1, 17, 'after', '0203'], [2, null, 'second', '']]);
+        } finally {
+            (dbOps as WasmDatabaseEngine).shutdown();
+        }
     });
 
     it('passes only the residual undo-entry budget into an atomic batch', async () => {
@@ -3131,6 +3399,52 @@ describe('HostBridge', () => {
             /Reload is unavailable for untitled databases/
         );
         assert.strictEqual(reloadFromDisk.mock.callCount(), 0);
+    });
+
+    it('reports native immediate persistence independently from the saved auto-commit and file-operation settings', async () => {
+        let fileOperations = 'web';
+        mock.method(vscode.workspace, 'getConfiguration', () => ({
+            get: (key: string, fallback: unknown) => key === 'fileOperations' ? fileOperations : fallback,
+            update: async () => { throw new Error('Reading persistence settings must not change configuration'); }
+        }) as any);
+        for (const engineKind of ['native', 'wasm'] as const) {
+            fileOperations = engineKind === 'native' ? 'web' : 'native';
+            for (const autoCommitEnabled of [false, true]) {
+                const document = {
+                    databaseOperations: { engineKind: Promise.resolve(engineKind) },
+                    autoCommitEnabled,
+                    cellEditBehavior: 'inline'
+                };
+                const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, document as any);
+                const settings = await bridge.getExtensionSettings();
+                assert.strictEqual(settings.nativeWritesImmediately, engineKind === 'native');
+                assert.strictEqual(settings.autoCommit, autoCommitEnabled);
+                assert.strictEqual(settings.fileOperations, fileOperations);
+                assert.strictEqual(document.autoCommitEnabled, autoCommitEnabled);
+            }
+        }
+    });
+
+    it('keeps WASM auto-commit changes persistent and reflects them in extension settings', async () => {
+        const writes: unknown[][] = [];
+        const document = {
+            databaseOperations: { engineKind: Promise.resolve('wasm') },
+            autoCommitEnabled: false,
+            cellEditBehavior: 'inline'
+        };
+        mock.method(vscode.workspace, 'getConfiguration', () => ({
+            get: (_key: string, fallback: unknown) => fallback,
+            update: async (...args: unknown[]) => { writes.push(args); }
+        }) as any);
+        const bridge = new HostBridge({ webviews: new Map(), context: {} } as any, document as any);
+        await bridge.updateExtensionSetting('autoCommit', true);
+        assert.strictEqual((await bridge.getExtensionSettings()).autoCommit, true);
+        await bridge.updateExtensionSetting('autoCommit', false);
+        assert.strictEqual((await bridge.getExtensionSettings()).autoCommit, false);
+        assert.deepStrictEqual(writes, [
+            ['instantCommit', 'always', vscode.ConfigurationTarget.Global],
+            ['instantCommit', 'never', vscode.ConfigurationTarget.Global]
+        ]);
     });
 
     it('does not change live auto-commit behavior when configuration persistence fails', async () => {

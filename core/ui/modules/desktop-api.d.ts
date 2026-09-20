@@ -9,7 +9,7 @@
  * are left unknown for callers to narrow, matching host.invoke's own
  * contract.
  */
-import type { RecordId, CellValue } from '../../../src/core/types';
+import type { RecordId, CellValue, ColumnMetadata } from '../../../src/core/types';
 
 /** Minimal host surface desktop-api.js depends on (see DesktopHost in desktop-host.d.ts). */
 export interface DesktopApiHost {
@@ -102,6 +102,7 @@ export interface DesktopBackendApi {
         }
     ): Promise<unknown>;
     getTableInfo(table: string): Promise<unknown>;
+    getImportTarget(table: string): Promise<{ columns: ColumnMetadata[]; schemaVersion: string }>;
     /**
      * Desktop-only CSV/JSON import. `pickImportSource` shows the shell's open
      * dialog (null when cancelled); `readImportSource` returns the picked
@@ -112,7 +113,11 @@ export interface DesktopBackendApi {
      */
     pickImportSource(): Promise<{ path: string; name: string; size: number } | null>;
     readImportSource(path: string): Promise<string>;
-    importRows(table: string, rows: Array<Record<string, CellValue>>): Promise<unknown>;
+    importRows(
+        table: string,
+        rows: Array<Record<string, CellValue>>,
+        options?: { expectedSchemaVersion?: string }
+    ): Promise<unknown>;
     getPragmas(): Promise<unknown>;
     setPragma(pragma: string, value: unknown): Promise<unknown>;
     getExtensionSettings(): Promise<unknown>;
@@ -132,8 +137,8 @@ export interface DesktopBackendApi {
         rowId: RecordId,
         colName: string,
         colTypes: unknown,
-        options?: { sourceByteLength?: number }
-    ): Promise<{ success: boolean; message?: string }>;
+        options?: { sourceByteLength?: number; download?: boolean; type?: { ext?: string } }
+    ): Promise<{ success: boolean; message?: string; savedAs?: string }>;
     openViewEditor(): Promise<{ success: boolean; message?: string }>;
     confirmLargeSelection(itemCount: number, unit: 'rows' | 'cells'): Promise<boolean>;
     confirmLargeChanges(itemCount: number, unit: 'rows' | 'cells'): Promise<boolean>;

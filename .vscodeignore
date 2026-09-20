@@ -5,15 +5,8 @@
 !out/
 !out/**
 
-# Include core UI and utilities.
-#
-# Scoped to core/ui/ rather than core/**: vsce applies every `!` negation AFTER
-# all ignore patterns, so a broad `!core/**` re-includes any subtree a later
-# rule tries to drop (the same engine quirk documented for codicons below). The
-# only other subtree is core/native/, which belongs to the desktop sidecar and
-# must not ship — see the exclusion further down.
-!core/ui/
-!core/ui/**
+# The viewer already bundles its JavaScript and CSS; ship only that artifact.
+!core/ui/viewer.html
 
 # Include WASM binary
 !assets/
@@ -53,24 +46,6 @@ src/
 scripts/
 tsconfig.json
 CLAUDE.md
-
-# Exclude the desktop (Tauri shell) build target. desktop/ artifacts are
-# consumed by the separate SQLite-Explorer-App repo's sync script, not by the
-# VS Code extension — already caught by the default-deny above, but called
-# out explicitly (repo convention) so the .vsix never ships it even if the
-# default-deny rules above it change.
-desktop/**
-
-# Exclude the desktop native-sidecar modules. core/native/ is bundled into the
-# tjs sidecar for the SQLite-Explorer-App repo; the extension has its own native
-# path (src/nativeWorker.ts + natives/native-worker.js) and never loads these.
-#
-# The exclusion that actually does the work is the scoping of the include above
-# to core/ui/ -- this rule alone would NOT be enough, because vsce applies every
-# `!` negation after all ignore patterns. Kept as belt-and-braces so that
-# widening the include back to core/** cannot silently ship the sidecar, and as
-# the place a reader looks for the intent.
-core/native/**
 
 # Exclude development files
 .git/
