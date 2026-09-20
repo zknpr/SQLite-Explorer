@@ -77,7 +77,7 @@ it('clears and persists a displayed view selection before the demo refresh reloa
     };
     (globalThis as any).document = {
         documentElement: { style: {} },
-        getElementById: () => ({ textContent: '', style: {}, dataset: {} }),
+        getElementById: () => ({ textContent: '', style: {}, dataset: {}, classList: { remove() {} } }),
         querySelectorAll: () => []
     };
 
