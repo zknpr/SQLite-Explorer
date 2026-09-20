@@ -29,7 +29,7 @@ SELECT
   ti."pk" AS primary_key_position
 FROM pragma.pragma_table_list AS tl
 LEFT JOIN pragma.pragma_table_info(tl."name", tl."schema") AS ti
-  ON tl."type" = 'table' AND tl."wr" = 1
+  ON tl."type" IN ('table', 'shadow') AND tl."wr" = 1
 WHERE tl."schema" = 'main' AND tl."name" NOT LIKE 'sqlite_%'
 ORDER BY tl."name", ti."cid"`;
 
@@ -820,8 +820,9 @@ export function classifyTableIdentity(
   objectType: unknown,
   withoutRowId: unknown
 ): TableIdentity['kind'] | undefined {
-  if (objectType === 'virtual' || objectType === 'shadow') return 'rowid';
-  if (objectType !== 'table') return undefined;
+  if (objectType === 'virtual') return 'rowid';
+  // FTS5's _idx and _config shadow tables use WITHOUT ROWID storage.
+  if (objectType !== 'table' && objectType !== 'shadow') return undefined;
   return Number(withoutRowId) === 1 ? 'primaryKey' : 'rowid';
 }
 

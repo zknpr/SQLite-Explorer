@@ -4,8 +4,10 @@ import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
+    buildTableIdentityMap,
     buildRecordIdentityPredicate,
     buildRecordIdentitiesPredicate,
+    classifyTableIdentity,
     decodePrimaryKeyRecordId,
     encodePrimaryKeyRecordId,
     encodePrimaryKeyValue
@@ -22,6 +24,30 @@ function rawIntegerIdentity(text: string): string {
         c: [['id', ['integer', text]]]
     }));
 }
+
+describe('FTS shadow table identity', () => {
+    it('uses the storage layout to distinguish rowid and WITHOUT ROWID shadow tables', () => {
+        assert.strictEqual(classifyTableIdentity('shadow', 1), 'primaryKey');
+        assert.strictEqual(classifyTableIdentity('shadow', 0), 'rowid');
+        assert.strictEqual(classifyTableIdentity('virtual', 0), 'rowid');
+        assert.strictEqual(classifyTableIdentity('view', 0), undefined);
+    });
+
+    it('preserves composite primary keys with undeclared types in FTS index metadata', () => {
+        const identities = buildTableIdentityMap([
+            ['fts_fixture_idx', 'shadow', 1, 0, 'segid', '', 1],
+            ['fts_fixture_idx', 'shadow', 1, 1, 'term', '', 2],
+            ['fts_fixture_idx', 'shadow', 1, 2, 'pgno', '', 0]
+        ]);
+        assert.deepStrictEqual(identities.get('fts_fixture_idx'), {
+            kind: 'primaryKey',
+            columns: [
+                { identifier: 'segid', declaredType: '', position: 1 },
+                { identifier: 'term', declaredType: '', position: 2 }
+            ]
+        });
+    });
+});
 
 describe('primary-key RecordId canonicalization', () => {
     it('rejects noncanonical INTEGER spellings while accepting normalized decimal text', () => {
