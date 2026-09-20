@@ -126,10 +126,11 @@ const consoleTheme = EditorView.theme({
  *   runSql: (sqlText: string) => unknown,
  *   loadHistory: () => string[],
  *   saveHistory: (list: string[]) => void,
- *   getSchema: () => Record<string, string[]>
+ *   getSchema: () => Record<string, string[]>,
+ *   onClose: () => void
  * }} deps
  */
-export function createConsole({ container, runSql, loadHistory, saveHistory, getSchema }) {
+export function createConsole({ container, runSql, loadHistory, saveHistory, getSchema, onClose }) {
     const schemaCompartment = new Compartment();
     const sqlExtension = () => sql({ dialect: SQLite, schema: getSchema() });
 
@@ -346,6 +347,9 @@ export function createConsole({ container, runSql, loadHistory, saveHistory, get
 
     const runKeymap = keymap.of([
         { key: 'Mod-Enter', run: () => { void runCurrent(); return true; } },
+        // The app's console shortcut overlaps CodeMirror's deleteLine. Handle
+        // it here while the editor has focus so toggling preserves the draft.
+        { key: 'Mod-Shift-k', run: () => { onClose(); return true; } },
         ...historyKeymap,
         ...defaultKeymap
     ]);

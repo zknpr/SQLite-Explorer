@@ -303,7 +303,8 @@ async function openConsole() {
         runSql: runConsoleSql,
         loadHistory: loadConsoleHistory,
         saveHistory: saveConsoleHistory,
-        getSchema: getConsoleSchema
+        getSchema: getConsoleSchema,
+        onClose: closeConsole
     });
     // Every open captures current state. The refreshContent hook alone is not
     // enough: picking a table in the sidebar goes straight to selectTableItem,

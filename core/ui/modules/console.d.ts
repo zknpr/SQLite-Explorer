@@ -82,6 +82,8 @@ export interface CreateConsoleOptions {
     saveHistory(list: string[]): void;
     /** Returns the current schema for SQL autocompletion. */
     getSchema(): ConsoleSchema;
+    /** Closes the surrounding console layout for Mod-Shift-K without clearing the draft. */
+    onClose(): void;
 }
 
 /** Public surface returned by {@link createConsole}. */
