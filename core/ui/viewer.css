@@ -200,7 +200,9 @@ button.section-title:hover {
    The `display: flex` above is an AUTHOR rule and outranks the UA
    `[hidden] { display: none }`, so without this companion a "hidden" section
    header stays on screen — the same load-bearing pairing the SQL console
-   documents. Pinned by tests/unit/db_tabs.test.ts. */
+   documents. The shared SQL Query action uses the `hidden` class until a
+   target enables it; desktop keeps its existing SQL console instead. */
+.section-title.hidden,
 .section-title[hidden] {
     display: none;
 }
