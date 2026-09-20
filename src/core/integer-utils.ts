@@ -28,7 +28,7 @@ export const SQLITE_MAX_VARIABLE_NUMBER = 32766;
 export const ROWID_TABLE_AUTHORITY_SQL =
   `SELECT 1 FROM pragma.pragma_table_list AS target ` +
   `WHERE "schema" = 'main' AND "name" = ? AND (` +
-  `("type" = 'table' AND "wr" = 0) OR "type" IN ('virtual', 'shadow')) ` +
+  `("type" IN ('table', 'shadow') AND "wr" = 0) OR "type" = 'virtual') ` +
   `AND (NOT EXISTS (SELECT 1 FROM pragma.pragma_table_info(?, 'main') ` +
   `WHERE lower("name") = 'rowid') OR (` +
   `"type" = 'table' AND ` +

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.8.1
+
+### Fixes
+
+- Open FTS5 shadow tables such as `history_fts_idx` and `history_fts_config` using their declared primary keys when they have no rowid. Apply the same storage check to pagination and row counts.
+- Make the web demo's SQL Query button open a browser SQL editor with bounded read queries, positional parameters, and exact integer results. Support read-only databases and clear results when the database reloads.
+- Version the web demo's viewer, worker, and SQLite runtime together so cached assets from an older deployment cannot break database opens. Apply immutable caching only to matching asset revisions.
+
+### Maintenance
+
+- Add FTS5 shadow-table identity, pagination, and row-count regressions. Update the demo-refresh test's DOM stub so viewer initialization completes.
+
 ## 1.8.0
 
 ### Features

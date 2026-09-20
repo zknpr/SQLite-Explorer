@@ -511,6 +511,8 @@ describe('web demo worker File opens', () => {
         await harness.invoke('updateCell', 'fixtures', 1, 'label', 'updated');
         await harness.invoke('insertRow', 'fixtures', { id: 65, label: 'inserted' });
         await harness.invoke('deleteRows', 'fixtures', [2]);
+        const queryResult = await harness.invoke('executeReadQuery', 'SELECT label FROM fixtures WHERE id = ?', '[1]') as { rows: string[][] };
+        assert.strictEqual(queryResult.rows[0][0], 'updated', 'the SQL editor must read the current editable connection');
         assert.deepStrictEqual(plainDbBytes, originalBase, 'the uploaded File base must stay immutable');
 
         const exported = await harness.invoke('exportDatabase', 'main') as Uint8Array;
@@ -611,6 +613,11 @@ describe('web demo worker File opens', () => {
         // The existing read-only machinery engaged on the paged handle.
         assert.ok(harness.pagedSql.includes('PRAGMA query_only = ON'));
         await expectRows(harness);
+        const queryResult = await harness.invoke('executeReadQuery', 'SELECT label FROM fixtures WHERE id = ?', '[1]') as { rows: string[][] };
+        assert.strictEqual(queryResult.rows[0][0], 'row-1');
+        await assert.rejects(harness.invoke('executeReadQuery', 'SELECT * FROM missing_table'), /missing_table/);
+        const queryOnly = await harness.invoke('executeReadQuery', 'SELECT query_only FROM pragma_query_only') as { rows: number[][] };
+        assert.strictEqual(queryOnly.rows[0][0], 1, 'metadata errors must not relax read-only paging');
         await assert.rejects(
             harness.invoke('updateCell', 'fixtures', 1, 'label', 'nope'),
             /read-only/
