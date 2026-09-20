@@ -43,7 +43,7 @@ export const PAGED_COUNT_PROBE_MAX_ROWS = 10_000;
 /** Cheap main-schema classification used only after the large-paged gate. */
 export const WITHOUT_ROWID_TABLE_SQL =
   `SELECT 1 FROM pragma.pragma_table_list ` +
-  `WHERE "schema" = 'main' AND "name" = ? AND "type" = 'table' AND "wr" = 1 LIMIT 1`;
+  `WHERE "schema" = 'main' AND "name" = ? AND "type" IN ('table', 'shadow') AND "wr" = 1 LIMIT 1`;
 
 /**
  * Normalize the internal/test override for the exact-count gate. Any

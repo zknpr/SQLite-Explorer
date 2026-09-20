@@ -704,9 +704,114 @@ export async function runSidecarLane({ binary, scratch, note }) {
     // ---- journal_mode WAL round trip --------------------------------------
     checks += await runJournalModeCase(binary, scratch, note);
 
+    checks += await runFtsShadowReadCase(binary, scratch, note);
+
     // ---- ppid watchdog ----------------------------------------------------
     checks += await runWatchdogCase(binary, dbPath, note);
 
+    return checks;
+}
+
+/** Read FTS5's WITHOUT ROWID shadow tables through the shipping desktop worker. */
+export async function runFtsShadowReadCase(binary, scratch, note) {
+    let checks = 0;
+    const check = (ok, label, detail) => { note(ok, label, detail); checks++; };
+    const dbPath = path.join(scratch, 'fts-shadow-read.sqlite');
+    const seed = new DatabaseSync(dbPath);
+    seed.close();
+    const writer = startSidecar(binary, dbPath, 'rw');
+    try {
+        const init = await writer.invoke('initializeDatabase', ['fts-shadow-read.sqlite', {
+            path: dbPath, readOnlyMode: false
+        }]);
+        if (init.content?.success !== true) throw new Error(init.content?.errorMessage ?? 'FTS fixture open failed');
+        const created = await writer.invoke('runQuery', ['CREATE VIRTUAL TABLE desktop_fts USING fts5(body)']);
+        if (created.content?.success !== true) throw new Error(created.content?.errorMessage ?? 'FTS fixture create failed');
+        // Separate autocommit inserts produce multiple index segments. Only
+        // the virtual table is written; shadow tables are inspected read-only.
+        for (const text of ['alpha', 'beta', 'gamma']) {
+            const inserted = await writer.invoke('runQuery', ['INSERT INTO desktop_fts(body) VALUES (?)', [text]]);
+            if (inserted.content?.success !== true) throw new Error(inserted.content?.errorMessage ?? 'FTS fixture insert failed');
+        }
+        writer.endStdin();
+        check(await writer.untilExit() === 0, 'sidecar/fts-shadow/fixture-seeded-through-native-worker');
+    } finally {
+        if (writer.exitCode === null) writer.child.kill('SIGKILL');
+    }
+
+    const digest = () => createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+    const before = digest();
+    const reader = startSidecar(binary, dbPath, 'ro');
+    const reference = new DatabaseSync(dbPath, { readOnly: true });
+    const image = rows => JSON.stringify((rows ?? []).map(row => row.map(value =>
+        value instanceof Uint8Array ? Array.from(value) : value
+    )));
+    try {
+        const init = await reader.invoke('initializeDatabase', ['fts-shadow-read.sqlite', {
+            path: dbPath, readOnlyMode: true
+        }]);
+        check(init.content?.success === true && init.content?.data?.isReadOnly === true,
+            'sidecar/fts-shadow/inspection-opens-read-only', JSON.stringify(init.content));
+        const schema = await reader.invoke('fetchSchema', []);
+        for (const fixture of [
+            { table: 'desktop_fts_idx', columns: ['segid', 'term', 'pgno'], keys: ['segid', 'term'] },
+            { table: 'desktop_fts_config', columns: ['k', 'v'], keys: ['k'] }
+        ]) {
+            const label = `sidecar/fts-shadow/${fixture.table}`;
+            const identity = schema.content?.data?.tables?.find(table => table.identifier === fixture.table)?.identity;
+            check(schema.content?.success === true && identity?.kind === 'primaryKey'
+                && JSON.stringify(identity.columns.map(column => column.identifier)) === JSON.stringify(fixture.keys),
+                `${label}/schema-primary-key`, JSON.stringify(identity));
+            const expected = reference.prepare(
+                `SELECT ${fixture.columns.join(', ')} FROM ${fixture.table} ORDER BY ${fixture.keys.join(', ')}`
+            ).all().map(row => fixture.columns.map(column => row[column]));
+            check(expected.length >= (fixture.table.endsWith('_idx') ? 2 : 1),
+                `${label}/fixture-has-rows-to-page`, `rows=${expected.length}`);
+            const count = await reader.invoke('fetchTableCount', [fixture.table, {}]);
+            check(count.content?.success === true && count.content?.data?.count === expected.length
+                && count.content?.data?.isExact === true,
+                `${label}/exact-count`, JSON.stringify(count.content));
+            const options = {
+                columns: ['rowid', ...fixture.columns], orderBy: 'rowid', orderDir: 'ASC', limit: 1, offset: 0
+            };
+            const first = await reader.invoke('fetchTableData', [fixture.table, {
+                ...options, keyset: { mode: 'first' }
+            }]);
+            let page = first.content?.data;
+            const firstId = page?.rows?.[0]?.[0];
+            check(first.content?.success === true && typeof firstId === 'string' && firstId.startsWith('pk:')
+                && image(page.rows.map(row => row.slice(1))) === image(expected.slice(0, 1)),
+                `${label}/first-page-primary-key`, JSON.stringify(first.content));
+            const recordIds = [firstId];
+            if (first.content?.success === true) {
+                for (let offset = 1; offset < expected.length; offset++) {
+                    const next = await reader.invoke('fetchTableData', [fixture.table, {
+                        ...options, offset, keyset: { mode: 'after', anchor: page?.keysetAnchors?.last }
+                    }]);
+                    const current = next.content?.data;
+                    const rowId = current?.rows?.[0]?.[0];
+                    check(Boolean(page?.keysetAnchors?.last) && next.content?.success === true
+                        && typeof rowId === 'string' && rowId.startsWith('pk:')
+                        && !recordIds.includes(rowId)
+                        && image(current.rows.map(row => row.slice(1))) === image([expected[offset]]),
+                        `${label}/keyset-page-${offset + 1}`, JSON.stringify(next.content));
+                    recordIds.push(rowId);
+                    page = current;
+                }
+            }
+            const offsetPage = await reader.invoke('fetchTableData', [fixture.table, { ...options, limit: 10 }]);
+            check(offsetPage.content?.success === true
+                && image(offsetPage.content?.data?.rows?.map(row => row.slice(1))) === image(expected)
+                && offsetPage.content?.data?.rows?.[0]?.[0] === firstId,
+                `${label}/offset-page-matches-reference`, JSON.stringify(offsetPage.content));
+        }
+        reader.endStdin();
+        check(await reader.untilExit() === 0, 'sidecar/fts-shadow/inspection-exits-clean');
+    } finally {
+        reference.close();
+        if (reader.exitCode === null) reader.child.kill('SIGKILL');
+    }
+    check(digest() === before, 'sidecar/fts-shadow/inspection-keeps-file-byte-identical');
     return checks;
 }
 
