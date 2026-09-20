@@ -16,7 +16,9 @@ import {
     CellEditPolicyError,
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
-import { isReadOnlyPrimaryKeyRecordId } from '../../src/core/row-identity';
+import { decodePrimaryKeyRecordId, isReadOnlyPrimaryKeyRecordId } from '../../src/core/row-identity';
+import { ROWID_TABLE_AUTHORITY_SQL } from '../../src/core/integer-utils';
+import { WITHOUT_ROWID_TABLE_SQL } from '../../src/core/paged-count';
 import { streamTableExport } from '../../src/tableExporter';
 import { ModificationTracker } from '../../src/core/undo-history';
 import {
@@ -3506,6 +3508,73 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ))[0].rows[0][0],
                 'shadow-after'
             );
+        });
+
+        await testContext.test('opens WITHOUT ROWID FTS5 shadow tables with primary-key pagination', async () => {
+            await engine.executeQuery('CREATE VIRTUAL TABLE native_fts_shadow USING fts5(body)');
+            // Separate commits give the index multiple segments to paginate.
+            for (const body of ['alpha', 'beta', 'gamma']) {
+                await engine.executeQuery('INSERT INTO native_fts_shadow(body) VALUES (?)', [body]);
+            }
+
+            for (const fixture of [
+                { table: 'native_fts_shadow_idx', columns: ['segid', 'term', 'pgno'], keys: ['segid', 'term'] },
+                { table: 'native_fts_shadow_config', columns: ['k', 'v'], keys: ['k'] }
+            ]) {
+                const options: TableQueryOptions = {
+                    columns: ['rowid', ...fixture.columns],
+                    orderBy: 'rowid',
+                    orderDir: 'ASC',
+                    limit: 1,
+                    offset: 0
+                };
+                const first = await engine.fetchTableData(fixture.table, {
+                    ...options,
+                    keyset: { mode: 'first' }
+                });
+                assert.strictEqual(first.rows.length, 1);
+                assert.deepStrictEqual(
+                    decodePrimaryKeyRecordId(first.rows[0][0] as string).columns,
+                    fixture.keys
+                );
+
+                const schema = await engine.fetchSchema();
+                const identity = schema.tables.find(table => table.identifier === fixture.table)?.identity;
+                assert.strictEqual(identity?.kind, 'primaryKey');
+                assert.deepStrictEqual(
+                    identity?.kind === 'primaryKey' ? identity.columns.map(column => column.identifier) : [],
+                    fixture.keys
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [fixture.table, fixture.table]))[0].rows,
+                    []
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(WITHOUT_ROWID_TABLE_SQL, [fixture.table]))[0].rows,
+                    [[1]]
+                );
+
+                const expected = (await engine.executeQuery(
+                    `SELECT * FROM ${fixture.table} ORDER BY ${fixture.keys.join(', ')}`
+                ))[0].rows;
+                assert.deepStrictEqual(await engine.fetchTableCount(fixture.table, {}), {
+                    count: expected.length,
+                    isExact: true
+                });
+                assert.deepStrictEqual(first.rows[0].slice(1), expected[0]);
+                let page = first;
+                for (let offset = 1; offset < expected.length; offset++) {
+                    assert.ok(page.keysetAnchors?.last);
+                    page = await engine.fetchTableData(fixture.table, {
+                        ...options,
+                        offset,
+                        keyset: { mode: 'after', anchor: page.keysetAnchors.last }
+                    });
+                    assert.deepStrictEqual(page.rows.map(row => row.slice(1)), [expected[offset]]);
+                }
+                const offsetPage = await engine.fetchTableData(fixture.table, { ...options, limit: 10 });
+                assert.deepStrictEqual(offsetPage.rows.map(row => row.slice(1)), expected);
+            }
         });
 
         await testContext.test('surfaces native generated columns as read-only metadata', async () => {
