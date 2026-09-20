@@ -705,10 +705,50 @@ export async function runSidecarLane({ binary, scratch, note }) {
     checks += await runJournalModeCase(binary, scratch, note);
 
     checks += await runFtsShadowReadCase(binary, scratch, note);
+    checks += await runUtf16ReadCase(binary, scratch, note);
 
     // ---- ppid watchdog ----------------------------------------------------
     checks += await runWatchdogCase(binary, dbPath, note);
 
+    return checks;
+}
+
+/** UTF-16 grid reads must work in txiki, whose TextDecoder only supports UTF-8. */
+export async function runUtf16ReadCase(binary, scratch, note) {
+    let checks = 0;
+    const check = (ok, label, detail) => { note(ok, label, detail); checks++; };
+    for (const encoding of ['UTF-16le', 'UTF-16be']) {
+        const dbPath = path.join(scratch, `${encoding}.sqlite`);
+        const reference = new DatabaseSync(dbPath);
+        reference.exec(`PRAGMA encoding='${encoding}';
+            CREATE TABLE ordinary(id INTEGER PRIMARY KEY, value TEXT);
+            CREATE TABLE keyed(value TEXT PRIMARY KEY) WITHOUT ROWID;`);
+        const value = '東京😀\uFEFF';
+        reference.prepare('INSERT INTO ordinary VALUES(1,?)').run(value);
+        reference.prepare('INSERT INTO keyed VALUES(?)').run(value);
+        reference.close();
+        const before = createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
+        const session = startSidecar(binary, dbPath, 'ro');
+        try {
+            const init = await session.invoke('initializeDatabase', [path.basename(dbPath), {
+                path: dbPath, readOnlyMode: true
+            }]);
+            check(init.content?.success === true, `sidecar/${encoding}/opens`, JSON.stringify(init.content));
+            for (const table of ['ordinary', 'keyed']) {
+                const page = await session.invoke('fetchTableData', [table, { limit: 10 }]);
+                check(page.content?.success === true
+                    && page.content?.data?.rows?.length === 1
+                    && page.content.data.rows[0].includes(value),
+                    `sidecar/${encoding}/${table}-grid-preserves-text`, JSON.stringify(page.content));
+            }
+            session.endStdin();
+            check(await session.untilExit() === 0, `sidecar/${encoding}/clean-shutdown`);
+        } finally {
+            if (session.exitCode === null) session.child.kill('SIGKILL');
+        }
+        check(createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex') === before,
+            `sidecar/${encoding}/inspection-keeps-file-byte-identical`);
+    }
     return checks;
 }
 

@@ -5,6 +5,7 @@ import type {
   StoredCellState
 } from './types';
 import { escapeIdentifier } from './sql-utils';
+import { createCellTextDecoder } from './cell-text-decoder';
 
 const CELL_STORAGE_CLASSES = new Set<CellStorageClass>([
   'null',
@@ -69,7 +70,7 @@ function decodeProjectedText(
   }
   try {
     return {
-      value: new TextDecoder(encoding, { fatal: true, ignoreBOM: true }).decode(bytes)
+      value: createCellTextDecoder(encoding).decode(bytes)
     };
   } catch {
     // A replacement-character string is neither authoritative nor useful for

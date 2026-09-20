@@ -11,6 +11,7 @@
  * - All SQL execution happens in this worker
  */
 
+import { createCellTextDecoder } from '../../../src/core/cell-text-decoder.ts';
 import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
@@ -2259,7 +2260,7 @@ function parseWebDemoExportCell(
   try {
     return {
       storageClass,
-      value: new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true }).decode(bytes)
+      value: createCellTextDecoder(textEncoding).decode(bytes)
     };
   } catch {
     return {

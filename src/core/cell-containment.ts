@@ -1,4 +1,5 @@
 import { escapeIdentifier } from './sql-utils';
+import { createCellTextDecoder } from './cell-text-decoder';
 import type {
   CellValue,
   CellTextEncoding,
@@ -442,7 +443,7 @@ export function findUnrepresentableTextRows(input: {
   // The default decoder strips a leading BOM, which would collapse BOM+A and
   // plain A into the same identity. Retain it so byte-distinct valid TEXT is
   // rejected whenever the ordinary engine string cannot represent it.
-  const decoder = new TextDecoder(input.textEncoding, { fatal: true, ignoreBOM: true });
+  const decoder = createCellTextDecoder(input.textEncoding);
   let unrepresentableRows: Set<number> | undefined;
   input.sourceRows.forEach((row, rowIndex) => {
     const rawRow = input.rawTextRows[rowIndex];
@@ -510,7 +511,7 @@ export function containUnrepresentableTextCells(input: {
   let aggregateBytes = estimateRowsWireBytes(rows)
     + estimateOversizedCellsWireBytes(oversizedCells)
     + estimateExactIntegerTextsWireBytes(exactIntegerTexts);
-  const decoder = new TextDecoder(input.textEncoding, { fatal: true, ignoreBOM: true });
+  const decoder = createCellTextDecoder(input.textEncoding);
   input.sourceRows.forEach((sourceRow, rowIndex) => {
     const rawRow = input.rawTextRows[rowIndex];
     if (!rawRow || rawRow.length !== input.rawTextColumnIndices.length) {
@@ -1071,7 +1072,7 @@ export function encodeByteFaithfulPrimaryKeyRecordId(
     throw new Error(`${context}: SQLite returned an invalid primary-key validation row`);
   }
   const values = projectedRow.slice(0, keyCount) as Array<CellValue | bigint>;
-  const decoder = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true });
+  const decoder = createCellTextDecoder(textEncoding);
   for (let index = 0; index < keyCount; index++) {
     const value = values[index];
     if (typeof value !== 'string') continue;
@@ -1137,7 +1138,7 @@ export function remapPrimaryKeyContainment(
   let readOnlyRowReasons: ReadOnlyRowReasonMap | undefined;
   let unrepresentableTextKeyRows: Set<number> | undefined;
   const mutableRecordIdRows: number[] = [];
-  const textDecoder = new TextDecoder(input.textEncoding, { fatal: true, ignoreBOM: true });
+  const textDecoder = createCellTextDecoder(input.textEncoding);
   const rawTextSlots = input.rawTextValidationUnavailable
     ? []
     : primaryKeyIndices.map(columnIndex => {
