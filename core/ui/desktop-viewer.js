@@ -695,7 +695,8 @@ if (!bridge) {
         // not just the console.
         const surface = (label) => (err) => {
             console.error(err);
-            updateStatus(`${label}: ${err.message}`);
+            // Rust command refusals arrive as strings through Tauri invoke.
+            updateStatus(`${label}: ${err?.message ?? err}`);
         };
 
         // The status line is the app's only feedback channel, and every file

@@ -985,6 +985,24 @@ function shellOpenLaneSource(): string {
     return source.slice(start, end + terminator.length);
 }
 
+test('desktop action errors preserve both shell string refusals and JavaScript Error messages', () => {
+    const source = readFileSync(path.resolve(process.cwd(), 'core/ui/desktop-viewer.js'), 'utf8');
+    const start = source.indexOf('const surface = (label) => (err) => {');
+    assert.notEqual(start, -1);
+    const end = source.indexOf('\n        };', start);
+    assert.notEqual(end, -1);
+    const shown: string[] = [];
+    const logged: unknown[] = [];
+    const surface = new Function('console', 'updateStatus',
+        source.slice(start, end + '\n        };'.length) + '\nreturn surface;'
+    )({ error: (error: unknown) => logged.push(error) }, (message: string) => shown.push(message));
+    const refusal = 'This database is already open in another SQLite Explorer window.';
+    const errors = [refusal, new Error(refusal), { message: refusal }];
+    for (const error of errors) surface('Open failed')(error);
+    assert.deepEqual(shown, errors.map(() => `Open failed: ${refusal}`));
+    assert.deepEqual(logged, errors);
+});
+
 test('FIXED F-B: OS-delivered opens run one at a time, in delivery order, and every file is attempted', async () => {
     const running: string[] = [];
     const overlaps: string[] = [];
