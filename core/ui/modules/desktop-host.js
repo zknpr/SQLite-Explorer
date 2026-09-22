@@ -98,6 +98,22 @@ const DESKTOP_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
 // aggregate ceiling still applies inside the worker).
 const NATIVE_IMPORT_RESULT_BYTES = MAX_FRAME_BYTES - 2 * 1024 * 1024;
 
+// Rust canonicalization returns Windows extended paths; native dialogs return
+// ordinary drive/UNC paths. Compare those equivalent spellings without changing
+// the path sent to the shell. Verbatim-only names must stay distinct: Win32 trims
+// trailing dots/spaces and interprets reserved device names in ordinary paths.
+function databasePathKey(path) {
+    if (typeof path !== 'string') return path;
+    let ordinary;
+    if (path.startsWith('\\\\?\\UNC\\')) ordinary = '\\\\' + path.slice(8);
+    else if (/^\\\\\?\\[A-Za-z]:\\/.test(path)) ordinary = path.slice(4);
+    else return path;
+    const parts = ordinary.replace(/^[A-Za-z]:\\/, '').split('\\').filter(Boolean);
+    if (parts.some(part => /[ .]$|[<>:"|?*]/.test(part)
+        || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) return path;
+    return ordinary;
+}
+
 const STARTUP_DB_NAME = 'untitled.db';
 
 /** The largest maxFileSize a user can express, in MiB (src/config.ts MAX_FILE_SIZE_MB). */
@@ -1060,8 +1076,10 @@ export function createDesktopHost({ bridge, createWorker }) {
      */
     function findEntryByPath(path) {
         if (path === null || path === undefined) return null;
+        const key = databasePathKey(path);
         for (const entry of databases.values()) {
-            if (entry.currentPath === path || entry.nativeBoundPath === path) return entry;
+            if (databasePathKey(entry.currentPath) === key
+                || databasePathKey(entry.nativeBoundPath) === key) return entry;
         }
         return null;
     }
@@ -1263,8 +1281,8 @@ export function createDesktopHost({ bridge, createWorker }) {
      * bound to. Resolves null on every failure the WASM lane can still serve
      * (allowlist refusal, symlinked final component, spawn/handshake failure,
      * the shell's open cap, version skew) — and THROWS on the one it cannot:
-     * the configured maxFileSize refusal is a user-selected limit that binds
-     * both engines, so falling back cannot make the file admissible (the VS
+     * size and ownership refusals bind both engines, so falling back cannot
+     * make the file admissible (the VS
      * Code host refuses before choosing an engine for the same reason).
      */
     async function bindNativeSidecar(path) {
@@ -1285,6 +1303,9 @@ export function createDesktopHost({ bridge, createWorker }) {
             opened = await bridge.nativeOpen(path, false, maxFileSizeBytes());
         } catch (error) {
             if (isShellError(error, 'ERR_FILE_TOO_LARGE')) throw sizeRefusal(error);
+            // Ownership applies to both engines. Falling back here can create a
+            // second editable snapshot in this same window under another spelling.
+            if (isShellError(error, 'ERR_NATIVE_DB_ALREADY_OPEN')) throw error;
             // Allowlist refusal, symlinked final component, spawn/handshake
             // failure, the shell's open cap — all fall back to bytes. Nothing
             // was registered, so there is nothing to clean up.
@@ -1407,14 +1428,16 @@ export function createDesktopHost({ bridge, createWorker }) {
         // double-click on a Finder file, Open Recent twice). Two concurrent
         // opens of one path would both miss and spawn two writable sidecars on
         // it — so a second request for a path already being opened joins the
-        // first instead of racing it. Keyed by the requested spelling: two
+        // first instead of racing it. Windows extended prefixes share a key;
+        // for other aliases, two
         // DIFFERENT spellings racing still fall through to the post-open
         // boundPath dedupe, one open later.
-        const inFlight = openRequests.get(path);
+        const key = databasePathKey(path);
+        const inFlight = openRequests.get(key);
         if (inFlight) return inFlight;
         const request = openPathOnce(path, name)
-            .finally(() => { openRequests.delete(path); });
-        openRequests.set(path, request);
+            .finally(() => { openRequests.delete(key); });
+        openRequests.set(key, request);
         return request;
     }
 

@@ -3226,6 +3226,72 @@ test('opening an already-open file switches to it instead of opening a second in
   assert.equal(host.hasUnsavedChanges(), true);
 });
 
+for (const [plain, extended] of [
+  [String.raw`C:\data\東京 space.sqlite`, String.raw`\\?\C:\data\東京 space.sqlite`],
+  [String.raw`\\server\share\data.sqlite`, String.raw`\\?\UNC\server\share\data.sqlite`]
+]) {
+  for (const paths of [[plain, extended], [extended, plain]]) {
+    test('Windows extended and dialog spellings reuse pending native work: ' + paths[0], async () => {
+      const { host, nativeLog } = makeMultiNativeHost();
+      await host.start();
+      host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+      await host.openFromShellPath(paths[0]);
+      const original = host.activeDatabaseId();
+      await host.invoke('updateCell', ['t', 1, 'c', 'pending', 'old', 1048576]);
+      await host.openFromShellPath(paths[1]);
+      assert.equal(host.activeDatabaseId(), original);
+      assert.equal(host.listDatabases().length, 1);
+      assert.equal(nativeLog.opens.length, 1);
+      assert.equal(host.hasUnsavedChanges(), true);
+    });
+  }
+}
+
+test('a native ownership refusal never falls back to a second WASM copy', async () => {
+  const { members } = makeNativeBridgeMembers({}, {
+    openError: 'ERR_NATIVE_DB_ALREADY_OPEN: close the existing database first'
+  });
+  let reads = 0;
+  const { host } = makeHost({}, {
+    ...members,
+    readDatabaseBytes: async () => { reads++; return new Uint8Array([1, 2, 3]); }
+  });
+  await host.start();
+  await assert.rejects(host.openFromShellPath('/tmp/alias.db'), /ERR_NATIVE_DB_ALREADY_OPEN/);
+  assert.equal(reads, 0);
+  assert.deepEqual(host.listDatabases().map(db => db.name), ['untitled.db']);
+});
+
+test('concurrent Windows spellings share one WASM open without rereading', async () => {
+  let reads = 0;
+  const { host } = makeHost({}, {
+    readDatabaseBytes: async () => { reads++; return new Uint8Array([1, 2, 3]); }
+  });
+  await host.start();
+  host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+  await Promise.all([
+    host.openFromShellPath('C:\\data\\a.db'),
+    host.openFromShellPath('\\\\?\\C:\\data\\a.db')
+  ]);
+  assert.equal(reads, 1);
+  assert.equal(host.listDatabases().length, 1);
+});
+
+for (const [first, second] of [
+  ['/tmp/a\\b.db', '/tmp/a/b.db'],
+  ['C:\\data.\\a.db', '\\\\?\\C:\\data.\\a.db'],
+  ['C:\\data\\CON.db', '\\\\?\\C:\\data\\CON.db']
+]) {
+  test('path dedupe preserves distinct Unix or verbatim-only names: ' + first, async () => {
+    const { host } = makeHost({});
+    await host.start();
+    host.setWebviewMethods({ refreshContent: async () => ({ success: true }) });
+    await host.openFromShellPath(first);
+    await host.openFromShellPath(second);
+    assert.equal(host.listDatabases().length, 2);
+  });
+}
+
 test('a second spelling of an already-open native file resolves to the same entry and reaps the duplicate sidecar', async () => {
   // The shell canonicalises, so one file has two spellings the host can be
   // handed. The canonical one is caught before any spawn; a symlink (or any
