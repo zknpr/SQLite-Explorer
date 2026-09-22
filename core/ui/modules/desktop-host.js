@@ -1516,7 +1516,12 @@ export function createDesktopHost({ bridge, createWorker }) {
     // Save-dialog results report the full picked path; only the filename is
     // status-bar-worthy (and the only part VS Code's webContents.postMessage
     // equivalent would ever have had access to).
-    const basename = (p) => String(p).split('/').pop();
+    const basename = (p) => {
+        const path = String(p);
+        // Backslashes are separators in drive/UNC paths, but literal filename
+        // characters on Unix. Shell paths are absolute, so keep that distinction.
+        return path.split(/^(?:[A-Za-z]:[\\/]|\\\\)/.test(path) ? /[\\/]/ : '/').pop();
+    };
 
     // Methods answered by the host itself, against the ACTIVE database.
     const databaseMethods = {
@@ -2133,7 +2138,7 @@ export function createDesktopHost({ bridge, createWorker }) {
             return openFromPath(picked.path, picked.name);
         },
         async openFromShellPath(path) {
-            const name = String(path).split('/').pop() || 'database.db';
+            const name = basename(path) || 'database.db';
             return openFromPath(path, name);
         },
         // REMOVED: openDatabaseFromFile(file). It opened a dropped `File` handle

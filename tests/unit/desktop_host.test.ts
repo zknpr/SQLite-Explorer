@@ -178,6 +178,21 @@ test('start boots an empty database and initialize reports connected', async () 
   });
 });
 
+test('shell-open names handle Windows paths without splitting a literal Unix backslash', async () => {
+  for (const [file, name] of [
+    ['C:\\data\\東京.sqlite', '東京.sqlite'],
+    ['\\\\?\\C:\\data\\東京.sqlite', '東京.sqlite'],
+    ['\\\\server\\share\\database.db', 'database.db'],
+    ['/tmp/literal\\name.db', 'literal\\name.db']
+  ]) {
+    const { host } = makeHost({});
+    await host.start();
+    await host.openFromShellPath(file);
+    const result = await host.invoke('initialize', []) as { filename: string };
+    assert.equal(result.filename, name);
+  }
+});
+
 test('unknown methods forward to the worker verbatim', async () => {
   const { host, posted } = makeHost({ fetchSchema: () => ({ tables: [], views: [], indexes: [] }) });
   await host.start();
