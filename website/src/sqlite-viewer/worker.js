@@ -2807,7 +2807,14 @@ async function fetchTableData(table, options = {}) {
   // Build column list - if columns specified, use them; otherwise SELECT *
   let columnList;
   if (valueProjectionColumns && valueProjectionColumns.length > 0) {
-    columnList = valueProjectionColumns.map(escapeIdentifier).join(', ');
+    // INTEGER PRIMARY KEY aliases make an unaliased rowid project as the PK's
+    // name too. Give the synthetic identity its own name so the native shim can
+    // obtain all columns before stepping a parameterized (filtered) page.
+    columnList = valueProjectionColumns.map((column, index) =>
+      isRowIdTable && index === 0 && column.toLowerCase() === 'rowid'
+        ? `${escapeIdentifier(column)} AS ${escapeIdentifier('rowid')}`
+        : escapeIdentifier(column)
+    ).join(', ');
   } else {
     columnList = '*';
   }

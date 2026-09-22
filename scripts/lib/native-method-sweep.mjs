@@ -407,6 +407,21 @@ const SWEEP = [
     }],
 
     ['fetchTableData', async ({ s, check }) => {
+        // The grid includes a synthetic rowid before the declared INTEGER PK.
+        // Without an explicit alias SQLite names both columns `id`, which the
+        // native shim cannot probe before stepping a parameterized statement.
+        for (const [label, filter, expectedRows] of [
+            ['global', { globalFilter: 'alpha' }, 1],
+            ['column', { filters: [{ column: 'name', value: 'alpha' }] }, 1],
+            ['empty', { globalFilter: 'no matching row' }, 0]
+        ]) {
+            const filtered = await s.invoke('fetchTableData', ['people', {
+                columns: ['rowid', 'id', 'name', 'note', 'payload', 'big', 'r'],
+                limit: 10, offset: 0, ...filter
+            }]);
+            check(body(filtered).success === true && body(filtered).data?.rows?.length === expectedRows,
+                `sweep/fetchTableData/aliased-integer-primary-key-${label}-filter`, detail(filtered));
+        }
         const page = await s.invoke('fetchTableData', ['people', { limit: 2, offset: 1, orderBy: 'id' }]);
         const data = body(page).data;
         check(body(page).success === true

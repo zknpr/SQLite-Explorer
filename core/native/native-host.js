@@ -24,6 +24,7 @@ import path from 'tjs:path';
 import { createShimDatabase } from './sqljs-shim.js';
 import { createStdioTransport } from './stdio-transport.js';
 import { frameErrorResponse, toFrameErrorData } from './frame-codec.js';
+import { decodeBoundPathArgument } from './bound-path-argument.js';
 
 export const EXIT_CLEAN = 0;
 export const EXIT_TRANSPORT_FATAL = 1;
@@ -46,17 +47,24 @@ if (args.length !== 2 || args[0] === '' || (args[1] !== 'ro' && args[1] !== 'rw'
   );
   tjs.exit(EXIT_USAGE);
 }
-const boundPath = args[0];
+let boundPath;
+try {
+  boundPath = decodeBoundPathArgument(args[0]);
+  if (!boundPath) throw new Error('database path is empty');
+} catch (error) {
+  console.error(`[native-worker] invalid bound path: ${error.message}`);
+  tjs.exit(EXIT_USAGE);
+}
 const boundReadOnly = args[1] === 'ro';
 
 // ---------------------------------------------------------------------------
 // Engine factory (the worker.js seam's `__desktopNativeCreateEngine`)
 // ---------------------------------------------------------------------------
 
-// tjs.env.TMPDIR is the user-private temp root on macOS; the fallback only
-// matters for stripped environments. makeTempDir itself guarantees the fresh,
+// TMPDIR is the user-private temp root on macOS; Windows supplies TEMP/TMP.
+// The /tmp fallback is for Unix environments without TMPDIR. makeTempDir guarantees the fresh,
 // uniquely named, owner-only directory the shim's export contract requires.
-const tempRoot = (tjs.env.TMPDIR ?? '/tmp').replace(/\/+$/, '');
+const tempRoot = (tjs.env.TMPDIR ?? tjs.env.TEMP ?? tjs.env.TMP ?? '/tmp').replace(/[\\/]+$/, '');
 
 const shimDeps = {
   sqlite: { Database },

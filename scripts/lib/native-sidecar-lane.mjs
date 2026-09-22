@@ -63,7 +63,8 @@ function createFixture(dbPath) {
  * a change to the spawn contract cannot silently apply to only one of them.
  */
 export function startSidecar(binary, dbPath, mode) {
-    const child = spawn(binary, ['run', BUNDLE_PATH, dbPath, mode], {
+    const child = spawn(binary, ['run', path.basename(BUNDLE_PATH), `--path-utf8=${encodeURIComponent(dbPath)}`, mode], {
+        cwd: path.dirname(BUNDLE_PATH),
         stdio: ['pipe', 'pipe', 'pipe']
     });
 
