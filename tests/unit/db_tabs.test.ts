@@ -376,10 +376,9 @@ test('clicking a sidebar entry switches to that database', async () => {
 test('closing a clean database closes it without prompting', async () => {
     const elements = installDocument();
     let prompts = 0;
-    (globalThis as any).confirm = () => { prompts += 1; return true; };
     const host = makeHost([db('a', { isActive: true }), db('b')]);
     const { initDatabaseTabs, renderDatabaseTabs } = await import(dbTabsModulePath);
-    initDatabaseTabs({ host });
+    initDatabaseTabs({ host, confirmClose: async () => { prompts += 1; return true; } });
     renderDatabaseTabs(host.listDatabases());
 
     findAllByClass(elements.dbTabStrip, 'db-tab-close')[1].click();
@@ -391,10 +390,13 @@ test('closing a clean database closes it without prompting', async () => {
 test('closing a dirty database prompts first, and a cancelled prompt closes nothing', async () => {
     const elements = installDocument();
     const asked: string[] = [];
-    (globalThis as any).confirm = (message: string) => { asked.push(message); return false; };
+    let answer = false;
     const host = makeHost([db('a', { isActive: true }), db('b', { isDirty: true })]);
     const { initDatabaseTabs, renderDatabaseTabs } = await import(dbTabsModulePath);
-    initDatabaseTabs({ host });
+    initDatabaseTabs({ host, confirmClose: async ({ message }: { message: string }) => {
+        asked.push(message);
+        return answer;
+    } });
     renderDatabaseTabs(host.listDatabases());
 
     findAllByClass(elements.dbTabStrip, 'db-tab-close')[1].click();
@@ -405,25 +407,59 @@ test('closing a dirty database prompts first, and a cancelled prompt closes noth
     // closeDatabase DISCARDS: a cancelled prompt must not reach it at all.
     assert.deepEqual(host.calls, []);
 
-    (globalThis as any).confirm = () => true;
+    answer = true;
     findAllByClass(elements.dbTabStrip, 'db-tab-close')[1].click();
     await flush();
     assert.deepEqual(host.calls, [['closeDatabase', 'b']]);
 });
 
-test('a dirty database is not closed when the page has no confirm at all', async () => {
+test('an unavailable in-page confirmation reports an error without closing the dirty database', async () => {
     const elements = installDocument();
     const host = makeHost([db('a', { isActive: true }), db('b', { isDirty: true })]);
     const { initDatabaseTabs, renderDatabaseTabs } = await import(dbTabsModulePath);
-    initDatabaseTabs({ host });
+    const errors: Error[] = [];
+    initDatabaseTabs({ host, surface: () => (error: Error) => errors.push(error) });
     renderDatabaseTabs(host.listDatabases());
 
-    // No globalThis.confirm: the prompt cannot be shown, so the close fails
-    // CLOSED. Discarding unsaved edits because a dialog was unavailable is the
-    // one outcome this path may never produce.
+    // The fake document has no body for the real dialog. Do not substitute
+    // window.confirm or silently treat that rendering failure as approval.
     findAllByClass(elements.dbTabStrip, 'db-tab-close')[1].click();
     await flush();
     assert.deepEqual(host.calls, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0].message, /document to render/);
+});
+
+test('dirty close awaits an explicit answer and rejects a stale answer after a database switch', async () => {
+    const elements = installDocument();
+    const host = makeHost([db('a'), db('b', { isActive: true, isDirty: true })]);
+    let answer!: (approved: boolean) => void;
+    const { initDatabaseTabs } = await import(dbTabsModulePath);
+    initDatabaseTabs({ host, confirmClose: () => new Promise<boolean>(resolve => { answer = resolve; }) });
+    findAllByClass(elements.dbTabStrip, 'db-tab-close')[1].click();
+    await flush();
+    assert.deepEqual(host.calls, [], 'must await the prompt instead of treating a Promise as approval');
+    host.rows[0].isActive = true;
+    host.rows[1].isActive = false;
+    answer(true);
+    await flush();
+    assert.deepEqual(host.calls, [], 'switching databases invalidates the pending close');
+});
+
+test('a rejected close confirmation is surfaced and preserves all databases', async () => {
+    const elements = installDocument();
+    const host = makeHost([db('a'), db('b', { isActive: true, isDirty: true })]);
+    const errors: Error[] = [];
+    const { initDatabaseTabs } = await import(dbTabsModulePath);
+    initDatabaseTabs({ host,
+        confirmClose: async () => { throw new Error('dialog failed'); },
+        surface: () => (error: Error) => errors.push(error)
+    });
+    findAllByClass(elements.dbTabStrip, 'db-tab-close')[1].click();
+    await flush();
+    assert.deepEqual(host.calls, []);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].message, 'dialog failed');
 });
 
 // ---- keyboard -------------------------------------------------------------
@@ -474,10 +510,9 @@ test('Cmd+W is left to the shell at one open database', async () => {
 test('Cmd+W on a dirty active database prompts before closing', async () => {
     installDocument();
     let asked = 0;
-    (globalThis as any).confirm = () => { asked += 1; return false; };
     const host = makeHost([db('a'), db('b', { isActive: true, isDirty: true })]);
     const { initDatabaseTabs, handleDatabaseShortcut } = await import(dbTabsModulePath);
-    initDatabaseTabs({ host });
+    initDatabaseTabs({ host, confirmClose: async () => { asked += 1; return false; } });
 
     await handleDatabaseShortcut(keyEvent({ key: 'w', code: 'KeyW' }));
     assert.equal(asked, 1);

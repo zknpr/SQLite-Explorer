@@ -25,10 +25,13 @@
  * they can never disagree about whether this window is showing "a database" or
  * "several databases".
  */
+import { confirmDestructiveAction } from './modals.js';
+
 const MIN_DATABASES_FOR_CHROME = 2;
 
 /** @type {import('./desktop-host.js').DesktopHost | null} */
 let host = null;
+let confirmClose = confirmDestructiveAction;
 
 /**
  * The desktop entry's error surfacer (`(label) => (err) => …`), which puts the
@@ -42,9 +45,11 @@ let surface = (label) => (err) => console.error(label, err);
  * @param {object} options
  * @param {import('./desktop-host.js').DesktopHost} options.host
  * @param {(label: string) => (err: Error) => void} [options.surface]
+ * @param {typeof confirmDestructiveAction} [options.confirmClose]
  */
 export function initDatabaseTabs(options) {
     host = options.host;
+    confirmClose = options.confirmClose ?? confirmDestructiveAction;
     if (options.surface) surface = options.surface;
     renderDatabaseTabs();
 }
@@ -114,7 +119,7 @@ export function handleDatabaseShortcut(event) {
  *
  * `host.closeDatabase` DISCARDS them without asking — this prompt is the only
  * thing between a stray click on a tab's × and losing the edits, which is why
- * an unavailable `confirm` counts as a refusal rather than a pass.
+ * an unavailable confirmation fails without closing the database.
  *
  * Not exported: every close in the UI goes through `closeFromUi`, which adds
  * the error surfacing the click and key handlers have no caller to do for them.
@@ -129,14 +134,21 @@ async function requestCloseDatabase(dbId) {
     // programmatic caller and noise for this one.
     if (!database) return false;
     if (database.isDirty) {
-        const discard = globalThis.confirm?.(
-            `"${database.name}" has unsaved changes.\n\n`
-            + 'Closing it discards them. Close without saving?'
-        );
-        // Fail closed: `undefined` means the page could not ask, and silently
-        // discarding a user's edits because a dialog was unavailable is the one
-        // outcome this path may never produce.
+        const askingHost = host;
+        const activeId = host.activeDatabaseId();
+        // Browser confirm is unavailable in the desktop webview. Reuse the
+        // in-page dialog; cancellation and database switches settle it false.
+        const discard = await confirmClose({
+            title: 'Unsaved changes',
+            message: `"${database.name}" has unsaved changes.\n\n`
+                + 'Closing it discards them. Close without saving?',
+            confirmLabel: 'Close without saving'
+        });
         if (discard !== true) return false;
+        // The prompt is asynchronous: a menu action can switch or close a
+        // database before the answer. Never apply a stale close to a new view.
+        if (host !== askingHost || host.activeDatabaseId() !== activeId
+            || !host.listDatabases().some(entry => entry.dbId === dbId)) return false;
     }
     await host.closeDatabase(dbId);
     return true;
