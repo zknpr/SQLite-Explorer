@@ -49,6 +49,157 @@ function describeNativeError(error, fallback) {
     + `... [truncated from ${message.length} characters]`;
 }
 
+// ============================================================================
+// SQL Path Authority
+// ============================================================================
+
+/**
+ * Stable identity of the ATTACH/DETACH refusal. Worker errors cross IPC as
+ * plain strings, so the code is part of the message as well as `error.code`.
+ */
+const NATIVE_SQL_ATTACH_BLOCKED = 'ERR_NATIVE_SQL_ATTACH_BLOCKED';
+
+/** SQLite's whitespace (sqlite3Isspace): space and \t \n \v \f \r. */
+function isSqliteSpace(code) {
+  return code === 0x20 || (code >= 0x09 && code <= 0x0d);
+}
+
+/** SQLite's IdChar: ASCII letters, digits, `_`, `$`, and every code unit >= 0x80. */
+function isSqliteIdChar(code) {
+  return (code >= 0x61 && code <= 0x7a) || (code >= 0x41 && code <= 0x5a)
+    || (code >= 0x30 && code <= 0x39) || code === 0x5f || code === 0x24 || code >= 0x80;
+}
+
+/**
+ * Skip the whitespace and comments SQLite skips before a token, mirroring
+ * tokenize.c: `--` runs to `\n` only, `/*` to the first `*\/` (no nesting; an
+ * unterminated comment runs to the end), and a U+FEFF byte-order mark at a
+ * token start is whitespace (CC_BOM), so `\uFEFFATTACH ...` runs the ATTACH.
+ * Between statements SQLite also skips the `;` of empty statements, so
+ * `;; ATTACH ...` compiles the ATTACH.
+ */
+function skipSqlTrivia(sql, index, skipEmptyStatements) {
+  for (;;) {
+    const code = sql.charCodeAt(index);
+    if (isSqliteSpace(code) || code === 0xfeff || (skipEmptyStatements && code === 0x3b)) {
+      index++;
+    } else if (code === 0x2d && sql.charCodeAt(index + 1) === 0x2d) {
+      const end = sql.indexOf('\n', index + 2);
+      index = end < 0 ? sql.length : end;
+    } else if (code === 0x2f && sql.charCodeAt(index + 1) === 0x2a) {
+      const end = sql.indexOf('*/', index + 2);
+      index = end < 0 ? sql.length : end + 2;
+    } else {
+      return index;
+    }
+  }
+}
+
+/**
+ * The keyword-shaped token at `index`, ASCII-lowercased, and where it ends.
+ * SQLite folds keyword case in ASCII only, so a token containing anything but
+ * ASCII letters is an identifier and never one of the keywords compared here.
+ */
+function readSqlWord(sql, index) {
+  let end = index;
+  while (end < sql.length && isSqliteIdChar(sql.charCodeAt(end))) end++;
+  const word = sql.slice(index, end);
+  return { word: /^[A-Za-z]+$/.test(word) ? word.toLowerCase() : word, end };
+}
+
+/**
+ * The verb of the first statement SQLite would compile from `sql`, looking
+ * through `EXPLAIN` and `EXPLAIN QUERY PLAN`.
+ */
+function leadingStatementVerb(sql) {
+  let token = readSqlWord(sql, skipSqlTrivia(sql, 0, true));
+  if (token.word !== 'explain') return token.word;
+  token = readSqlWord(sql, skipSqlTrivia(sql, token.end, false));
+  if (token.word !== 'query') return token.word;
+  token = readSqlWord(sql, skipSqlTrivia(sql, token.end, false));
+  if (token.word !== 'plan') return token.word;
+  return readSqlWord(sql, skipSqlTrivia(sql, token.end, false)).word;
+}
+
+/**
+ * Refuse SQL that would ATTACH or DETACH a database.
+ *
+ * The connections here are real-filesystem SQLite handles. ATTACH opens any
+ * path the process can reach: it reads every existing database, writes into
+ * it, and turns any existing empty file into one (even under a read-only
+ * open, which blocks writes through the attached schema but not ATTACH or the
+ * reads). It would make the bound path meaningless, so it is never allowed.
+ *
+ * Checking the first statement's leading verb is complete because ATTACH and
+ * DETACH only exist as a whole statement: SQLite rejects them at compile time
+ * inside WITH, a subquery, VALUES or a trigger body, and the `sqlite_attach`
+ * function they compile to is not callable by name. Every caller passes a
+ * string whose FIRST statement is the only one it compiles (prepare, allAsync,
+ * AsyncDatabase.all/run); exec, which runs every statement, is rebuilt below
+ * as a per-statement walk that checks each one before compiling it.
+ *
+ * EXPLAIN ATTACH lists opcodes without running them and opens nothing on the
+ * bundled SQLite 3.51.2; it is refused anyway so this guard never depends on
+ * EXPLAIN semantics. Non-string SQL is refused because the binding coerces it
+ * with ToString: an array ['ATTACH ...'] would otherwise compile unchecked.
+ */
+function assertSqlPathAuthority(sql) {
+  if (typeof sql !== 'string') {
+    throw new TypeError('Native SQLite requires SQL text as a string');
+  }
+  const verb = leadingStatementVerb(sql);
+  if (verb !== 'attach' && verb !== 'detach') return;
+  const error = new Error(
+    `${verb.toUpperCase()} is not allowed on the native SQLite engine: it can open, read ` +
+    'or write a database file outside the one this editor opened. ' +
+    `(${NATIVE_SQL_ATTACH_BLOCKED})`
+  );
+  error.code = NATIVE_SQL_ATTACH_BLOCKED;
+  throw error;
+}
+
+/**
+ * Install the guard on the connection classes themselves, once, before any
+ * connection exists. Every handle this worker opens (the primary, the
+ * AsyncDatabase reader, dedicated cell-read snapshots) and every RPC that
+ * reaches SQL then goes through it, including any added later.
+ */
+function installSqlPathAuthorityGuard() {
+  const rawPrepare = Database.prototype.prepare;
+  Database.prototype.prepare = function prepare(sql, ...rest) {
+    assertSqlPathAuthority(sql);
+    return rawPrepare.call(this, sql, ...rest);
+  };
+
+  // The native exec runs every statement in the string, so checking only the
+  // first would miss `SELECT 1; ATTACH ...`. Executing one statement at a
+  // time through the guarded prepare lets SQLite's own parser find each
+  // boundary, and runs earlier DDL before a later statement that needs it is
+  // compiled. This is what sqlite3_exec does internally (prepare, step to
+  // completion, finalize), so the worker's own statements keep their meaning.
+  Database.prototype.exec = function exec(sql) {
+    executeQuery(this, sql, []);
+  };
+
+  const guardAsync = (prototype, name) => {
+    const raw = prototype?.[name];
+    if (typeof raw !== 'function') return;
+    prototype[name] = function (sql, ...rest) {
+      try {
+        assertSqlPathAuthority(sql);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return raw.call(this, sql, ...rest);
+    };
+  };
+  guardAsync(Database.prototype, 'allAsync');
+  guardAsync(AsyncDatabase?.prototype, 'all');
+  guardAsync(AsyncDatabase?.prototype, 'run');
+}
+
+installSqlPathAuthorityGuard();
+
 // Both stdio handles changed API in the same txiki generation. Detect once so
 // the legacy path stays identical and the WHATWG handles remain locked to one
 // reader/writer for the worker's lifetime.

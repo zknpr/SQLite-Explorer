@@ -472,6 +472,21 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
         );
         const engine = connection.databaseOps;
 
+        await testContext.test('refuses SQL-level ATTACH through the native host operations', async () => {
+            // The read-only copy is an existing database the bound path does
+            // not cover; before the guard this attached it and read through it.
+            await assert.rejects(
+                engine.executeQuery(`SELECT 1; ATTACH '${readOnlyDatabasePath}' AS smoke_attached`),
+                /ERR_NATIVE_SQL_ATTACH_BLOCKED/
+            );
+            const schemas = await engine.executeQuery('PRAGMA database_list');
+            assert.deepStrictEqual(
+                schemas[0].rows.map(row => row[1]).filter(name => name !== 'main' && name !== 'temp'),
+                []
+            );
+            assert.deepStrictEqual((await engine.executeQuery('SELECT 1 AS ok'))[0].rows, [[1]]);
+        });
+
         await testContext.test('serializes through an isolated native snapshot', async () => {
             const snapshot = await engine.serializeDatabase();
             assert.strictEqual(
@@ -4531,54 +4546,21 @@ SELECT value AS x, value * 10 AS x FROM sequence`;
             );
         });
 
-        await testContext.test('refuses to rebind a native TEMP trigger historically attached elsewhere', async () => {
-            await engine.executeQuery("ATTACH DATABASE ':memory:' AS native_aux_history");
-            await engine.executeQuery(
-                'CREATE TABLE native_aux_history.native_historical_rows (value INTEGER)'
+        await testContext.test('cannot bind a native TEMP trigger to an attached schema', async () => {
+            // Native connections refuse every ATTACH, including ':memory:'
+            // (which opens no file), so a TEMP trigger historically bound to an
+            // attached schema cannot exist here. The rebind refusal for that
+            // state stays covered on WASM in view_operations.test.ts and
+            // web_demo_worker.test.ts, whose in-memory VFS has no path to escape.
+            await assert.rejects(
+                engine.executeQuery("ATTACH DATABASE ':memory:' AS native_aux_history"),
+                /ERR_NATIVE_SQL_ATTACH_BLOCKED/
             );
-            await engine.executeQuery(
-                'CREATE VIEW native_aux_history.native_historical_view AS ' +
-                'SELECT value FROM native_historical_rows'
-            );
-            await engine.executeQuery(
-                'CREATE TEMP TABLE native_historical_log (value INTEGER)'
-            );
-            await engine.executeQuery(
-                'CREATE TEMP TRIGGER native_historical_aux_insert ' +
-                'INSTEAD OF INSERT ON native_historical_view ' +
-                'BEGIN INSERT INTO native_historical_log VALUES (NEW.value); END'
-            );
-            await engine.executeQuery('CREATE TABLE native_historical_main_rows (value INTEGER)');
-            await engine.executeQuery(
-                'CREATE VIEW native_historical_view AS ' +
-                'SELECT value FROM native_historical_main_rows'
-            );
-
-            const browsed = await engine.getViewDefinition('native_historical_view');
-            assert.deepStrictEqual(browsed.triggers, []);
+            const schemas = await engine.executeQuery('PRAGMA database_list');
             assert.deepStrictEqual(
-                browsed.ambiguousTemporaryTriggerNames,
-                ['native_historical_aux_insert']
+                schemas[0].rows.map(row => row[1]).filter(name => name !== 'main' && name !== 'temp'),
+                []
             );
-            await assert.rejects(
-                engine.editView(
-                    'native_historical_view',
-                    'SELECT value * 2 AS value FROM native_historical_main_rows',
-                    true
-                ),
-                /native_historical_aux_insert.*TEMP trigger.*schema-qualified target/is
-            );
-            await assert.rejects(
-                engine.executeQuery('INSERT INTO main.native_historical_view VALUES (23)'),
-                /cannot modify.*view|SQL logic error/i
-            );
-            await engine.executeQuery(
-                'INSERT INTO native_aux_history.native_historical_view VALUES (29)'
-            );
-            const logged = await engine.executeQuery(
-                'SELECT value FROM native_historical_log'
-            );
-            assert.strictEqual(logged[0].rows[0][0], 29);
         });
 
         await testContext.test('preserves a bracket-qualified main TEMP trigger through a temp shadow', async () => {
