@@ -4181,8 +4181,15 @@ describe('native async VACUUM routing', () => {
             { isExplicitlyOutsideTransaction }
         );
         const calls: unknown[][] = [];
+        let failNextRun = false;
         const asyncDatabase = {
-            async run(...args: unknown[]) { calls.push(args); }
+            // The runtime refuses VACUUM INTO's internal ATTACH unless the
+            // destination is the connection's one permitted path.
+            permitAttach(path: string | null) { calls.push(['permitAttach', path]); },
+            async run(...args: unknown[]) {
+                calls.push(['run', ...args]);
+                if (failNextRun) throw new Error('disk full');
+            }
         };
         const signal = new AbortController().signal;
 
@@ -4192,17 +4199,31 @@ describe('native async VACUUM routing', () => {
             "/private/quote'snapshot.sqlite",
             signal
         );
-        assert.deepStrictEqual(calls, [[
-            'VACUUM main INTO ?',
-            ["/private/quote'snapshot.sqlite"],
-            { signal }
-        ]]);
+        assert.deepStrictEqual(calls, [
+            ['permitAttach', "/private/quote'snapshot.sqlite"],
+            ['run', 'VACUUM main INTO ?', ["/private/quote'snapshot.sqlite"], { signal }],
+            ['permitAttach', null]
+        ]);
 
+        // A failed VACUUM still withdraws the permit.
+        calls.length = 0;
+        failNextRun = true;
+        await assert.rejects(
+            runVacuumInto(asyncDatabase, { inTransaction: false }, '/private/failed.sqlite', signal),
+            /disk full/
+        );
+        assert.deepStrictEqual(calls.map(call => call[0] === 'run' ? 'run' : call), [
+            ['permitAttach', '/private/failed.sqlite'],
+            'run',
+            ['permitAttach', null]
+        ]);
+
+        calls.length = 0;
         await assert.rejects(
             runVacuumInto(asyncDatabase, { inTransaction: true }, '/private/blocked.sqlite', signal),
             /active transaction/i
         );
-        assert.strictEqual(calls.length, 1);
+        assert.deepStrictEqual(calls, [], 'a refused snapshot never grants a permit');
     });
 
     it('reports a deadline that lands before an async completion is observed', async () => {

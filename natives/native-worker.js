@@ -138,10 +138,15 @@ function leadingStatementVerb(sql) {
  * AsyncDatabase.all/run); exec, which runs every statement, is rebuilt below
  * as a per-statement walk that checks each one before compiling it.
  *
- * EXPLAIN ATTACH lists opcodes without running them and opens nothing on the
- * bundled SQLite 3.51.2; it is refused anyway so this guard never depends on
- * EXPLAIN semantics. Non-string SQL is refused because the binding coerces it
- * with ToString: an array ['ATTACH ...'] would otherwise compile unchecked.
+ * EXPLAIN ATTACH is refused too, so this guard never depends on EXPLAIN
+ * semantics. Non-string SQL is refused because the binding coerces it with
+ * ToString: an array ['ATTACH ...'] would otherwise compile unchecked.
+ *
+ * The bundled runtime enforces the same rule in C: every connection installs
+ * an authorizer at open that refuses ATTACH and DETACH (see runVacuumInto for
+ * the one permitted path), so a future SQLite tokenizer change that this
+ * mirror misses still cannot attach a file. This check stays in front for its
+ * specific error code.
  */
 function assertSqlPathAuthority(sql) {
   if (typeof sql !== 'string') {
@@ -599,7 +604,15 @@ function executeInterruptibleAsyncOperation(requestId, timeoutMs, operation) {
   })();
 }
 
-/** VACUUM must run on the interruptible connection and outside transactions. */
+/**
+ * VACUUM must run on the interruptible connection and outside transactions.
+ *
+ * VACUUM INTO attaches its destination, and the runtime's authorizer refuses
+ * every ATTACH except the one path a connection permits. The permit names
+ * exactly this host-chosen snapshot and is withdrawn when the VACUUM settles,
+ * so SQL-level VACUUM INTO any other path (which would create an arbitrary
+ * file holding a copy of the database) stays refused.
+ */
 function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
   if (!asyncDatabase || typeof asyncDatabase.run !== 'function') {
     return Promise.reject(
@@ -614,7 +627,19 @@ function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
   if (typeof snapshotPath !== 'string' || snapshotPath.length === 0) {
     return Promise.reject(new Error('A native export snapshot path is required'));
   }
-  return asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal });
+  try {
+    asyncDatabase.permitAttach(snapshotPath);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal }).finally(() => {
+    try {
+      asyncDatabase.permitAttach(null);
+    } catch {
+      // permitAttach(null) throws only once the connection is closing, and a
+      // closed handle takes its permit with it.
+    }
+  });
 }
 
 /** Abort one active async operation without affecting queued or future work. */

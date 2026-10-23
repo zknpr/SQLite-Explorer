@@ -1,6 +1,7 @@
 import './vscode_mock_setup'; // Must be first
 
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -17,6 +18,8 @@ import { NativeWorkerProcess } from '../../src/nativeWorker';
  */
 
 const BLOCKED = /ERR_NATIVE_SQL_ATTACH_BLOCKED/;
+// The runtime's own authorizer: sqlite3_errstr(SQLITE_AUTH).
+const AUTHORIZER_DENIED = /authorization denied/;
 const NOT_TEXT = /Native SQLite requires SQL text as a string/;
 const SECRET = 'TOP-SECRET-OUTSIDE-BOUND-PATH';
 const BOUNDARY = '/*sqlite_explorer_boundary_attach_guard*/';
@@ -260,8 +263,8 @@ it('refuses ATTACH and DETACH at every SQL entry point of the native worker', as
             return worker.call('stmtRun', [stmtId, []]);
         }, NOT_TEXT],
         ['workspaceQueryPlan: SQL as a one-element array', (p, a) => worker.call('workspaceQueryPlan', [[`ATTACH '${p}' AS ${a}`], [], f.runtime.library, 5000]), NOT_TEXT],
-        // EXPLAIN of an ATTACH is inert on SQLite 3.51.2 (it lists opcodes and
-        // opens nothing); it is refused anyway so the guard never depends on that.
+        // EXPLAIN of an ATTACH lists opcodes and opens nothing; it is refused
+        // anyway so the guard never depends on that.
         ['query: EXPLAIN ATTACH', (p, a) => f.query(`EXPLAIN ATTACH '${p}' AS ${a}`)],
         ['query: EXPLAIN QUERY PLAN ATTACH', (p, a) => f.query(`EXPLAIN /* c */ QUERY\nPLAN ATTACH '${p}' AS ${a}`)],
     ];
@@ -347,4 +350,86 @@ it('keeps the worker\'s own SQL and benign scripts working (control arm)', async
 
     assert.deepEqual(await f.attachedSchemas(), []);
     await f.control();
+});
+
+it('refuses SQL-level VACUUM INTO a path the worker did not choose', async t => {
+    const f = await startFixture(t); if (!f) return;
+    const { worker } = f;
+    await f.control();
+
+    // VACUUM INTO creates a new file holding a copy of the open database, and
+    // a read-only open does not stop it. The runtime's authorizer sees the
+    // destination as the ATTACH that VACUUM performs internally.
+    const cases: Array<[string, (target: string) => Promise<unknown>]> = [
+        ['query', p => f.query(`VACUUM INTO '${p}'`)],
+        ['query: bound destination', p => f.query('VACUUM main INTO ?', [p])],
+        ['run', p => worker.call('run', [`VACUUM main INTO '${p}'`])],
+        ['exec: 2nd statement', p => worker.call('exec', [`SELECT 1; VACUUM INTO '${p}'`])],
+    ];
+    const problems: string[] = [];
+    for (const [label, attempt] of cases) {
+        const target = f.outsidePath('vacuum');
+        const problem = await refusalProblem(f, label, () => attempt(target), AUTHORIZER_DENIED);
+        if (problem !== undefined) problems.push(problem);
+        if (fs.existsSync(target)) problems.push(`${label}: wrote ${path.basename(target)}`);
+    }
+    await f.worker.call('open', [f.bound, true]);
+    const readOnlyTarget = f.outsidePath('vacuum-read-only');
+    const readOnly = await refusalProblem(f, 'read-only open: VACUUM INTO', () => f.query(`VACUUM INTO '${readOnlyTarget}'`), AUTHORIZER_DENIED);
+    if (readOnly !== undefined) problems.push(readOnly);
+    await f.worker.call('open', [f.bound, false]);
+
+    // Control arm: the host's own snapshot RPC still writes its destination,
+    // and the permit it needed is gone once it settles, even for that path.
+    const snapshot = path.join(f.directory, 'snapshot.sqlite');
+    await worker.call('vacuumInto', [snapshot, 5000]);
+    assert.equal(fs.existsSync(snapshot), true, 'vacuumInto writes the host-chosen snapshot');
+    fs.rmSync(snapshot);
+    const reuse = await refusalProblem(f, 'query: VACUUM INTO the snapshot path after vacuumInto settled',
+        () => f.query(`VACUUM INTO '${snapshot}'`), AUTHORIZER_DENIED);
+    if (reuse !== undefined) problems.push(reuse);
+    if (fs.existsSync(snapshot)) problems.push('the vacuumInto permit outlived the RPC');
+
+    assert.deepEqual(problems, []);
+    await f.control();
+});
+
+it('enforces the ATTACH refusal in the runtime itself, beneath the worker guard', async t => {
+    const f = await startFixture(t); if (!f) return;
+
+    // Run the bundled runtime directly, without native-worker.js and its
+    // JavaScript guard: the refusal must come from the runtime's authorizer.
+    const script = path.join(f.directory, 'runtime-authority.js');
+    fs.writeFileSync(script, `
+        import { Database } from 'tjs:sqlite';
+        const [bound, secret] = ${JSON.stringify([f.bound, f.secret])};
+        const quote = p => "'" + p.replaceAll("'", "''") + "'";
+        const outcome = {};
+        const db = new Database(bound);
+        try {
+            db.exec('ATTACH ' + quote(secret) + ' AS leak');
+            outcome.unpermitted = db.prepare('SELECT v FROM leak.secret').all();
+        } catch (error) {
+            outcome.unpermitted = { errno: error.errno, message: error.message };
+        }
+        db.permitAttach(secret);
+        try {
+            db.exec('ATTACH ' + quote(secret) + ' AS permitted');
+            outcome.permitted = db.prepare('SELECT v FROM permitted.secret').all();
+        } catch (error) {
+            outcome.permitted = { errno: error.errno, message: error.message };
+        }
+        db.close();
+        console.log(JSON.stringify(outcome));
+    `);
+    const outcome = JSON.parse(execFileSync(f.runtime.binary, ['run', script], { encoding: 'utf8' }).trim()) as {
+        unpermitted: unknown;
+        permitted: unknown;
+    };
+
+    assert.deepEqual(outcome.unpermitted, { errno: 23, message: 'authorization denied' },
+        'the runtime refuses ATTACH with SQLITE_AUTH even without the worker guard');
+    // Control arm: the same statement attaches once permitted, so the refusal
+    // above is the authorizer and not the path or the syntax.
+    assert.deepEqual(outcome.permitted, [{ v: SECRET }]);
 });
