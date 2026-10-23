@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createPinnedArtifactPolicy } from './lib/pinned-artifacts.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const sourceCommit = '3181cc5ee888d3251228d3995c32bf9ea03c3240';
+const sourceCommit = '7245c26ebdd0905b11a2a16d1f7a555abd768eec';
 const manifestPath = 'vendor/query-plan-manifest.json';
 const sourceFiles = ['src/runtime/query-plan.c', 'scripts/build-query-plan.mjs'];
 const nativeTargets = [
