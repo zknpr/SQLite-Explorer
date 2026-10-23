@@ -28,8 +28,8 @@ const sourceRepositoryRoot = path.resolve(
 );
 
 const TXIKI_BRANCH = 'master';
-const TXIKI_COMMIT = '62b02dc97461662abc5a34cc1b97ddd49e43c808';
-const TXIKI_RUN = '34697570391';
+const TXIKI_COMMIT = '9875455640b8ae62f52200a9fa7fa2a66d079dc7';
+const TXIKI_RUN = '40021160289';
 
 interface ScriptSpec {
     name: string;

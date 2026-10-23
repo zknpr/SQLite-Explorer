@@ -4170,7 +4170,7 @@ describe('native synchronous query deadlines', () => {
 });
 
 describe('native async VACUUM routing', () => {
-    it('uses a bound VACUUM main INTO path only outside the main transaction', async () => {
+    it('snapshots through the runtime vacuumInto only outside the main transaction', async () => {
         const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
             'isExplicitlyOutsideTransaction',
             ['database']
@@ -4181,28 +4181,149 @@ describe('native async VACUUM routing', () => {
             { isExplicitlyOutsideTransaction }
         );
         const calls: unknown[][] = [];
+        let failNext = false;
         const asyncDatabase = {
-            async run(...args: unknown[]) { calls.push(args); }
+            // The runtime refuses SQL-level VACUUM INTO; vacuumInto is its one
+            // way to write a copy, scoped to that statement.
+            async vacuumInto(...args: unknown[]) {
+                calls.push(args);
+                if (failNext) throw new Error('disk full');
+            }
         };
         const signal = new AbortController().signal;
 
-        await runVacuumInto(
-            asyncDatabase,
-            { inTransaction: false },
-            "/private/quote'snapshot.sqlite",
-            signal
-        );
-        assert.deepStrictEqual(calls, [[
-            'VACUUM main INTO ?',
-            ["/private/quote'snapshot.sqlite"],
-            { signal }
-        ]]);
+        await runVacuumInto(asyncDatabase, { inTransaction: false }, "/private/quote'snapshot.sqlite", signal);
+        assert.deepStrictEqual(calls, [["/private/quote'snapshot.sqlite", { signal }]]);
 
+        calls.length = 0;
+        failNext = true;
+        await assert.rejects(
+            runVacuumInto(asyncDatabase, { inTransaction: false }, '/private/failed.sqlite', signal),
+            /disk full/
+        );
+
+        calls.length = 0;
         await assert.rejects(
             runVacuumInto(asyncDatabase, { inTransaction: true }, '/private/blocked.sqlite', signal),
             /active transaction/i
         );
-        assert.strictEqual(calls.length, 1);
+        assert.deepStrictEqual(calls, [], 'a refused snapshot never reaches the runtime');
+
+        // A runtime without the scoped call cannot snapshot at all.
+        await assert.rejects(
+            runVacuumInto({ async run() {} }, { inTransaction: false }, '/private/old.sqlite', signal),
+            /unavailable in this runtime/
+        );
+    });
+
+    it('reports a synchronous throw from vacuumInto as a rejection', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const runVacuumInto = loadNativeWorkerFunction(
+            'runVacuumInto',
+            ['asyncDatabase', 'database', 'snapshotPath', 'signal'],
+            { isExplicitlyOutsideTransaction }
+        );
+        const asyncDatabase = { vacuumInto() { throw new TypeError('bad arguments'); } };
+        const result = runVacuumInto(asyncDatabase, { inTransaction: false }, '/private/a.sqlite', new AbortController().signal);
+        assert.ok(result instanceof Promise);
+        await assert.rejects(result, /bad arguments/);
+    });
+
+    it('keeps every failure when reporting a runtime ATTACH refusal', () => {
+        const forEachWrappedError: (error: unknown, visit: (error: { errno?: number }) => void) => void =
+            loadNativeWorkerFunction('forEachWrappedError', ['error', 'visit', 'depth = 0', 'seen = new Set()']);
+        const isPathAuthorityRefusal = loadNativeWorkerFunction(
+            'isPathAuthorityRefusal',
+            ['error'],
+            { SQLITE_AUTH: 23, forEachWrappedError }
+        );
+        const describeWorkerError = loadNativeWorkerFunction(
+            'describeWorkerError',
+            ['error'],
+            { isPathAuthorityRefusal, forEachWrappedError, SQLITE_AUTH: 23, NATIVE_SQL_ATTACH_BLOCKED: 'ERR_NATIVE_SQL_ATTACH_BLOCKED' }
+        );
+        const refusal = () => Object.assign(new Error('authorization denied'), { errno: 23 });
+
+        const withdrawal = describeWorkerError(
+            new AggregateError([refusal(), new Error('disk I/O error')], 'combined')
+        );
+        assert.match(withdrawal, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(withdrawal, /disk I\/O error/, 'a second failure must not be dropped');
+
+        // runWithQueryDeadline wraps executeStatement's failure in another AggregateError.
+        const nested = describeWorkerError(new AggregateError([
+            new AggregateError([refusal()], 'inner'),
+            new Error('clearing the query deadline failed')
+        ], 'outer'));
+        assert.match(nested, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(nested, /clearing the query deadline failed/);
+
+        const viaCause = describeWorkerError(new Error('Operation cancelled', { cause: refusal() }));
+        assert.match(viaCause, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(viaCause, /Operation cancelled/);
+
+        assert.strictEqual(describeWorkerError(new Error('disk I/O error')), 'disk I/O error');
+
+        // The joined text keeps the IPC bound every other native error has.
+        const long = (label: string) => new Error(`${label}: ${'x'.repeat(8000)}`);
+        const bounded = describeWorkerError(new AggregateError(
+            [refusal(), long('withdrawal'), long('deadline'), new Error('cancelled', { cause: long('cause') })],
+            'combined'
+        ));
+        assert.match(bounded, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(bounded, /\[truncated from \d+ characters\]$/);
+        assert.ok(bounded.length < 8300, `refusal text is ${bounded.length} characters`);
+    });
+
+    it('keeps a runtime ATTACH refusal coded when the batch savepoint cleanup also fails', () => {
+        const forEachWrappedError = loadNativeWorkerFunction('forEachWrappedError', ['error', 'visit', 'depth = 0', 'seen = new Set()']);
+        const isPathAuthorityRefusal = loadNativeWorkerFunction(
+            'isPathAuthorityRefusal',
+            ['error'],
+            { SQLITE_AUTH: 23, forEachWrappedError }
+        );
+        const describeWorkerError = loadNativeWorkerFunction(
+            'describeWorkerError',
+            ['error'],
+            { isPathAuthorityRefusal, forEachWrappedError, SQLITE_AUTH: 23, NATIVE_SQL_ATTACH_BLOCKED: 'ERR_NATIVE_SQL_ATTACH_BLOCKED' }
+        );
+        const batchCleanupError = loadNativeWorkerFunction('batchCleanupError', ['error', 'cleanupError']);
+        const refusal = Object.assign(new Error('authorization denied'), { errno: 23 });
+
+        const coded = describeWorkerError(batchCleanupError(refusal, new Error('cannot rollback - no transaction is active')));
+        assert.match(coded, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(coded, /cannot rollback - no transaction is active/);
+
+        // Other batch failures keep the text they had.
+        assert.strictEqual(
+            describeWorkerError(batchCleanupError(new Error('UNIQUE constraint failed'), new Error('disk I/O error'))),
+            'Batch failed (Error: UNIQUE constraint failed); savepoint cleanup failed (Error: disk I/O error)'
+        );
+    });
+
+    it('reports a failing statement once when finalize repeats its error code', () => {
+        const executeStatement = loadNativeWorkerFunction('executeStatement', ['db', 'sql', 'params']);
+        const sqliteError = (errno: number, message: string) => Object.assign(new Error(message), { errno });
+        const database = (finalizeErrno: number) => ({
+            prepare() {
+                return {
+                    run() { throw sqliteError(19, 'constraint failed'); },
+                    finalize() { throw sqliteError(finalizeErrno, finalizeErrno === 19 ? 'constraint failed' : 'disk I/O error'); }
+                };
+            }
+        });
+        assert.throws(
+            () => executeStatement(database(19), 'INSERT INTO t VALUES (NULL)', []),
+            (error: Error) => error.message === 'constraint failed' && !(error instanceof AggregateError)
+        );
+        // A different finalize failure is still reported alongside.
+        assert.throws(
+            () => executeStatement(database(10), 'INSERT INTO t VALUES (NULL)', []),
+            (error: Error) => error instanceof AggregateError && /constraint failed/.test(error.message) && /disk I\/O error/.test(error.message)
+        );
     });
 
     it('reports a deadline that lands before an async completion is observed', async () => {

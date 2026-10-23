@@ -3,7 +3,12 @@ import './vscode_mock_setup';
 import assert from 'node:assert/strict';
 import { it, type TestContext } from 'node:test';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import { buildCellContainmentQuery, containUnrepresentableTextCells, decodeRawTextColumns } from '../../src/core/cell-containment';
+import {
+    buildCellContainmentQuery,
+    containUnrepresentableTextCells,
+    decodeRawTextColumns,
+    findUnrepresentableTextRows
+} from '../../src/core/cell-containment';
 
 async function database(t: TestContext, encoding = 'UTF-8') {
     const { operations } = await createDatabaseEngine({ content: null, maxSize: 0 });
@@ -98,6 +103,26 @@ for (const [encoding, malformed, nul] of [
         assert.equal(clipped.oversizedCells?.[4]?.[2].byteLength, encoding === 'UTF-8' ? 8 : 16);
     });
 }
+
+it('keeps TEXT containing NUL as bytes even when the engine returns it exactly', () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const rows = findUnrepresentableTextRows({
+        sourceRows: [['a\0b'], ['ordinary']],
+        sourceColumnIndices: [0],
+        rawTextRows: [[encode('a\0b')], [encode('ordinary')]],
+        rawTextColumnIndices: [0],
+        textEncoding: 'utf-8'
+    });
+    assert.deepEqual([...(rows ?? [])], [0]);
+});
+
+it('stores bound TEXT containing NUL exactly', async t => {
+    const engine = await database(t);
+    await engine.executeQuery('CREATE TABLE cells(value TEXT)');
+    await engine.executeQuery('INSERT INTO cells VALUES (?)', ['c\0d']);
+    const rows = (await engine.executeQuery('SELECT hex(CAST(value AS BLOB)) FROM cells'))[0].rows;
+    assert.deepEqual(rows, [['630064']], 'the WASM engine must not truncate a bound value at NUL');
+});
 
 it('keeps the default native raw TEXT transport as BLOBs', async t => {
     const engine = await database(t);

@@ -415,6 +415,24 @@ export function decodeRawTextColumns(
   });
 }
 
+/**
+ * Whether an engine's decoded string reproduces SQLite's stored TEXT bytes.
+ * TEXT containing NUL never counts: some engines and connections truncate it
+ * at NUL and others return it whole, so it stays bytes on all of them.
+ */
+function decodedTextReproducesBytes(
+  decoder: { decode(bytes: Uint8Array): string },
+  rawBytes: Uint8Array,
+  value: string
+): boolean {
+  if (value.includes('\0')) return false;
+  try {
+    return decoder.decode(rawBytes) === value;
+  } catch {
+    return false;
+  }
+}
+
 /** Identify rows whose decoded TEXT cells cannot reproduce SQLite's bytes. */
 export function findUnrepresentableTextRows(input: {
   sourceRows: readonly (readonly unknown[])[];
@@ -454,14 +472,8 @@ export function findUnrepresentableTextRows(input: {
       const value = row[input.sourceColumnIndices[slot]];
       if (typeof value !== 'string') continue;
       const rawBytes = rawRow[rawSlots[slot]];
-      let representable = false;
-      if (rawBytes instanceof Uint8Array) {
-        try {
-          representable = decoder.decode(rawBytes) === value;
-        } catch {
-          representable = false;
-        }
-      }
+      const representable = rawBytes instanceof Uint8Array
+        && decodedTextReproducesBytes(decoder, rawBytes, value);
       if (!representable) {
         unrepresentableRows ??= new Set();
         unrepresentableRows.add(rowIndex);
@@ -528,13 +540,7 @@ export function containUnrepresentableTextCells(input: {
           `Raw TEXT containment bytes are missing at row ${rowIndex}, column ${columnIndex}`
         );
       }
-      let representable = false;
-      try {
-        representable = decoder.decode(rawBytes) === sourceValue;
-      } catch {
-        representable = false;
-      }
-      if (representable) return;
+      if (decodedTextReproducesBytes(decoder, rawBytes, sourceValue)) return;
       const previousValue = rows[rowIndex][columnIndex];
       const metadataInsertionBytes = oversizedMetadataInsertionWireBytes(
         oversizedCells,

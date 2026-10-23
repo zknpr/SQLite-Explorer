@@ -49,6 +49,228 @@ function describeNativeError(error, fallback) {
     + `... [truncated from ${message.length} characters]`;
 }
 
+// ============================================================================
+// SQL Path Authority
+// ============================================================================
+
+/**
+ * Stable identity of the ATTACH/DETACH refusal. Worker errors cross IPC as
+ * plain strings, so the code is part of the message as well as `error.code`.
+ */
+const NATIVE_SQL_ATTACH_BLOCKED = 'ERR_NATIVE_SQL_ATTACH_BLOCKED';
+
+/**
+ * Whitespace for the leading-verb check: space and \t \n \v \f \r. SQLite's
+ * tokenizer classes \v (0x0B) as illegal rather than space, so skipping it
+ * only makes this check refuse statements SQLite would reject anyway.
+ */
+function isSqliteSpace(code) {
+  return code === 0x20 || (code >= 0x09 && code <= 0x0d);
+}
+
+/** SQLite's IdChar: ASCII letters, digits, `_`, `$`, and every code unit >= 0x80. */
+function isSqliteIdChar(code) {
+  return (code >= 0x61 && code <= 0x7a) || (code >= 0x41 && code <= 0x5a)
+    || (code >= 0x30 && code <= 0x39) || code === 0x5f || code === 0x24 || code >= 0x80;
+}
+
+/**
+ * Skip the whitespace and comments SQLite skips before a token, mirroring
+ * tokenize.c: `--` runs to `\n` only, `/*` to the first `*\/` (no nesting; an
+ * unterminated comment runs to the end), and a U+FEFF byte-order mark at a
+ * token start is whitespace (CC_BOM), so `\uFEFFATTACH ...` runs the ATTACH.
+ * Between statements SQLite also skips the `;` of empty statements, so
+ * `;; ATTACH ...` compiles the ATTACH.
+ */
+function skipSqlTrivia(sql, index, skipEmptyStatements) {
+  for (;;) {
+    const code = sql.charCodeAt(index);
+    if (isSqliteSpace(code) || code === 0xfeff || (skipEmptyStatements && code === 0x3b)) {
+      index++;
+    } else if (code === 0x2d && sql.charCodeAt(index + 1) === 0x2d) {
+      const end = sql.indexOf('\n', index + 2);
+      index = end < 0 ? sql.length : end;
+    } else if (code === 0x2f && sql.charCodeAt(index + 1) === 0x2a) {
+      const end = sql.indexOf('*/', index + 2);
+      index = end < 0 ? sql.length : end + 2;
+    } else {
+      return index;
+    }
+  }
+}
+
+/**
+ * The keyword-shaped token at `index`, ASCII-lowercased, and where it ends.
+ * SQLite folds keyword case in ASCII only, so a token containing anything but
+ * ASCII letters is an identifier and never one of the keywords compared here.
+ */
+function readSqlWord(sql, index) {
+  let end = index;
+  while (end < sql.length && isSqliteIdChar(sql.charCodeAt(end))) end++;
+  const word = sql.slice(index, end);
+  return { word: /^[A-Za-z]+$/.test(word) ? word.toLowerCase() : word, end };
+}
+
+/**
+ * The verb of the first statement SQLite would compile from `sql`, looking
+ * through `EXPLAIN` and `EXPLAIN QUERY PLAN`.
+ */
+function leadingStatementVerb(sql) {
+  let token = readSqlWord(sql, skipSqlTrivia(sql, 0, true));
+  if (token.word !== 'explain') return token.word;
+  token = readSqlWord(sql, skipSqlTrivia(sql, token.end, false));
+  if (token.word !== 'query') return token.word;
+  token = readSqlWord(sql, skipSqlTrivia(sql, token.end, false));
+  if (token.word !== 'plan') return token.word;
+  return readSqlWord(sql, skipSqlTrivia(sql, token.end, false)).word;
+}
+
+/**
+ * Refuse SQL that would ATTACH or DETACH a database.
+ *
+ * The connections here are real-filesystem SQLite handles. ATTACH opens any
+ * path the process can reach: it reads every existing database, writes into
+ * it, and turns any existing empty file into one (even under a read-only
+ * open, which blocks writes through the attached schema but not ATTACH or the
+ * reads). It would make the bound path meaningless, so it is never allowed.
+ *
+ * Checking the first statement's leading verb is complete because ATTACH and
+ * DETACH only exist as a whole statement: SQLite rejects them at compile time
+ * inside WITH, a subquery, VALUES or a trigger body, and the `sqlite_attach`
+ * function they compile to is not callable by name. Every caller passes a
+ * string whose FIRST statement is the only one it compiles (prepare, allAsync,
+ * AsyncDatabase.all/run); exec, which runs every statement, is rebuilt below
+ * as a per-statement walk that checks each one before compiling it.
+ *
+ * EXPLAIN ATTACH is refused too, so this guard never depends on EXPLAIN
+ * semantics. Non-string SQL is refused because the binding coerces it with
+ * ToString: an array ['ATTACH ...'] would otherwise compile unchecked.
+ *
+ * The bundled runtime enforces the same rule in C: every connection installs
+ * an authorizer at open that refuses ATTACH and DETACH (runVacuumInto uses
+ * the runtime's one exception), so a future SQLite tokenizer change that this
+ * mirror misses still cannot attach a file. This check stays in front for its
+ * specific error code.
+ */
+function assertSqlPathAuthority(sql) {
+  if (typeof sql !== 'string') {
+    throw new TypeError('Native SQLite requires SQL text as a string');
+  }
+  const verb = leadingStatementVerb(sql);
+  if (verb !== 'attach' && verb !== 'detach') return;
+  const reason = verb === 'attach'
+    ? 'it can open, read or write a database file outside the one this editor opened'
+    : 'this editor keeps one database per connection, so there is nothing to detach';
+  const error = new Error(
+    `${verb.toUpperCase()} is not allowed on the native SQLite engine: ${reason}. ` +
+    `(${NATIVE_SQL_ATTACH_BLOCKED})`
+  );
+  error.code = NATIVE_SQL_ATTACH_BLOCKED;
+  throw error;
+}
+
+const SQLITE_AUTH = 23;
+
+/**
+ * Visit an error and everything it wraps: AggregateError members and `cause`
+ * chains (deadline, cancellation and cleanup wrappers nest them). Bounded and
+ * cycle-safe because the values come from the runtime.
+ */
+function forEachWrappedError(error, visit, depth = 0, seen = new Set()) {
+  if (!error || typeof error !== 'object' || depth > 8 || seen.has(error)) return;
+  seen.add(error);
+  visit(error);
+  if (Array.isArray(error.errors)) {
+    for (const member of error.errors) forEachWrappedError(member, visit, depth + 1, seen);
+  }
+  forEachWrappedError(error.cause, visit, depth + 1, seen);
+}
+
+/**
+ * The runtime's authorizer denies only ATTACH, DETACH and the ATTACH inside
+ * VACUUM INTO, so SQLITE_AUTH on these connections is exactly that refusal,
+ * wherever a wrapper put it.
+ */
+function isPathAuthorityRefusal(error) {
+  let found = false;
+  forEachWrappedError(error, candidate => { if (candidate.errno === SQLITE_AUTH) found = true; });
+  return found;
+}
+
+/**
+ * Error text for the IPC reply. The authorizer's refusal gets its code, and
+ * every other failure it was wrapped with (a failed savepoint cleanup, a
+ * failed deadline cleanup, a cancellation) is kept rather than replaced.
+ */
+function describeWorkerError(error) {
+  if (!isPathAuthorityRefusal(error)) return describeNativeError(error, 'Unknown native worker error');
+  const others = [];
+  forEachWrappedError(error, candidate => {
+    // An AggregateError's own message repeats its members; the refusal is
+    // replaced by the coded text below.
+    if (candidate.errno === SQLITE_AUTH || Array.isArray(candidate.errors)) return;
+    const message = describeNativeError(candidate, 'Unknown error');
+    if (!others.includes(message)) others.push(message);
+  });
+  const text = 'The native SQLite engine refused a statement that would ATTACH, DETACH or ' +
+    'VACUUM INTO a database other than the one this editor opened. ' +
+    `(${NATIVE_SQL_ATTACH_BLOCKED})` + others.map(message => `; ${message}`).join('');
+  // The same IPC bound as every other worker error.
+  return describeNativeError({ message: text }, 'Unknown native worker error');
+}
+
+/** A failed batch whose savepoint cleanup also failed, keeping both errors for describeWorkerError. */
+function batchCleanupError(error, cleanupError) {
+  return new AggregateError(
+    [error, cleanupError],
+    `Batch failed (${String(error)}); savepoint cleanup failed (${String(cleanupError)})`
+  );
+}
+
+/**
+ * Install the guard on the connection classes themselves, once, before any
+ * connection exists. Every handle this worker opens (the primary, the
+ * AsyncDatabase reader, dedicated cell-read snapshots) and every RPC that
+ * reaches SQL then goes through it, including any added later.
+ */
+function installSqlPathAuthorityGuard() {
+  const rawPrepare = Database.prototype.prepare;
+  Database.prototype.prepare = function prepare(sql, ...rest) {
+    assertSqlPathAuthority(sql);
+    return rawPrepare.call(this, sql, ...rest);
+  };
+
+  // The native exec runs every statement in the string, so checking only the
+  // first would miss `SELECT 1; ATTACH ...`. Executing one statement at a
+  // time through the guarded prepare lets SQLite's own parser find each
+  // boundary, and runs earlier DDL before a later statement that needs it is
+  // compiled. It is not a drop-in sqlite3_exec: it materializes each
+  // statement's rows, caps a script at MAX_QUERY_STATEMENTS, and refuses
+  // parameter tokens (sqlite3_exec binds them as NULL). Every caller sends one
+  // parameterless statement.
+  Database.prototype.exec = function exec(sql) {
+    executeQuery(this, sql, []);
+  };
+
+  const guardAsync = (prototype, name) => {
+    const raw = prototype?.[name];
+    if (typeof raw !== 'function') return;
+    prototype[name] = function (sql, ...rest) {
+      try {
+        assertSqlPathAuthority(sql);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return raw.call(this, sql, ...rest);
+    };
+  };
+  guardAsync(Database.prototype, 'allAsync');
+  guardAsync(AsyncDatabase?.prototype, 'all');
+  guardAsync(AsyncDatabase?.prototype, 'run');
+}
+
+installSqlPathAuthorityGuard();
+
 // Both stdio handles changed API in the same txiki generation. Detect once so
 // the legacy path stays identical and the WHATWG handles remain locked to one
 // reader/writer for the worker's lifetime.
@@ -448,9 +670,17 @@ function executeInterruptibleAsyncOperation(requestId, timeoutMs, operation) {
   })();
 }
 
-/** VACUUM must run on the interruptible connection and outside transactions. */
+/**
+ * VACUUM must run on the interruptible connection and outside transactions.
+ *
+ * VACUUM INTO attaches its destination, and the runtime's authorizer refuses
+ * every ATTACH, so SQL-level VACUUM INTO (which would create an arbitrary file
+ * holding a copy of the database) is refused. vacuumInto is the runtime's one
+ * exception: it runs a fixed `VACUUM main INTO ?` and accepts this host-chosen
+ * destination only for that statement, on the thread running it.
+ */
 function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
-  if (!asyncDatabase || typeof asyncDatabase.run !== 'function') {
+  if (!asyncDatabase || typeof asyncDatabase.vacuumInto !== 'function') {
     return Promise.reject(
       new Error('Interruptible native database snapshots are unavailable in this runtime')
     );
@@ -463,7 +693,8 @@ function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
   if (typeof snapshotPath !== 'string' || snapshotPath.length === 0) {
     return Promise.reject(new Error('A native export snapshot path is required'));
   }
-  return asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal });
+  // Through a promise, so a synchronous throw is reported as a rejection.
+  return new Promise(resolve => resolve(asyncDatabase.vacuumInto(snapshotPath, { signal })));
 }
 
 /** Abort one active async operation without affecting queued or future work. */
@@ -587,6 +818,10 @@ function executeStatement(db, sql, params) {
         stmt.finalize();
       } catch (finalizeError) {
         if (executionError !== undefined) {
+          // finalize reports a failed step's code again: that is one failure.
+          if (finalizeError?.errno !== undefined && finalizeError.errno === executionError?.errno) {
+            throw executionError;
+          }
           throw new AggregateError(
             [executionError, finalizeError],
             `${describeNativeError(executionError, 'Statement execution failed')}; ` +
@@ -2196,9 +2431,7 @@ async function handleRequest(request) {
             db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
             if (ownsSavepoint) db.exec(`RELEASE SAVEPOINT ${savepointName}`);
           } catch (rollbackErr) {
-            throw new Error(
-              `Batch failed (${String(err)}); savepoint cleanup failed (${String(rollbackErr)})`
-            );
+            throw batchCleanupError(err, rollbackErr);
           }
           throw err;
         }
@@ -2345,7 +2578,7 @@ async function handleRequest(request) {
     return { id, result };
 
   } catch (err) {
-    const errorMsg = describeNativeError(err, 'Unknown native worker error');
+    const errorMsg = describeWorkerError(err);
     console.error(`[native-worker] ERROR in ${method}:`, errorMsg);
     return {
       id,
