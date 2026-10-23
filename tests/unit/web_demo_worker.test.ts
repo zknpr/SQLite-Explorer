@@ -36,9 +36,10 @@ const bundledWorkerPath = path.resolve(
     process.cwd(),
     'website/public/sqlite-viewer/worker.js'
 );
-const BUNDLED_SQLJS_SQLITE_VERSION = '3.49.1';
+const BUNDLED_SQLJS_SQLITE_VERSION = '3.54.1';
 const DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION: Record<string, string> = {
-    '3.49.1': '9.6529377952985e+282'
+    '3.49.1': '9.6529377952985e+282',
+    '3.54.1': '9.6529377952984946e+282'
 };
 
 let currentWorkerBundle: Promise<string> | undefined;
