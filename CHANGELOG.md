@@ -16,7 +16,7 @@
 ### Maintenance
 
 - Resolve all open Dependabot alerts in build tooling and website dependencies. None of the affected packages ship in the extension.
-- Make the WebAssembly and query-plan runtime build reproducible: a rebuild from any directory produces identical bytes.
+- Make the WebAssembly and query-plan runtime build reproducible with the pinned toolchain (Emscripten 5.0.0 and the official Zig 0.16.0 release): a rebuild from any directory produces identical bytes, and the builder refuses other Zig distributions, whose Linux libraries differ.
 - Link the SQLite Explorer desktop app from the README.
 
 ## 1.8.1

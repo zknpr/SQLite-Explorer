@@ -18,8 +18,8 @@ import { NativeWorkerProcess } from '../../src/nativeWorker';
  */
 
 const BLOCKED = /ERR_NATIVE_SQL_ATTACH_BLOCKED/;
-// The runtime's own authorizer: sqlite3_errstr(SQLITE_AUTH).
-const AUTHORIZER_DENIED = /authorization denied/;
+/** A SQL string literal: fixture paths may contain apostrophes. */
+const sqlLiteral = (value: string) => `'${value.replaceAll("'", "''")}'`;
 const NOT_TEXT = /Native SQLite requires SQL text as a string/;
 const SECRET = 'TOP-SECRET-OUTSIDE-BOUND-PATH';
 const BOUNDARY = '/*sqlite_explorer_boundary_attach_guard*/';
@@ -62,6 +62,12 @@ async function startFixture(t: TestContext) {
     const root = process.cwd();
     fs.mkdirSync(path.join(root, '.tmp'), { recursive: true });
     const directory = fs.mkdtempSync(path.join(root, '.tmp', 'native-attach-guard-'));
+    let worker: NativeWorkerProcess | undefined;
+    // Registered before anything can throw, so a failed start leaks nothing.
+    t.after(() => {
+        worker?.stop();
+        fs.rmSync(directory, { recursive: true, force: true });
+    });
     // The bound database and the attacker's targets live in sibling
     // directories: nothing under outside/ is reachable through the bound path.
     const boundDirectory = path.join(directory, 'bound');
@@ -84,36 +90,29 @@ async function startFixture(t: TestContext) {
     const outsideSeen = new Set(fs.readdirSync(outsideDirectory));
     let emptyFileSize = 0;
 
-    const worker = new NativeWorkerProcess(runtime.binary, path.join(root, 'natives', 'native-worker.js'));
-    await worker.start();
-    t.after(() => {
-        worker.stop();
-        fs.rmSync(directory, { recursive: true, force: true });
-    });
-    await worker.call('open', [bound, false]);
+    const started = new NativeWorkerProcess(runtime.binary, path.join(root, 'natives', 'native-worker.js'));
+    worker = started;
+    await started.start();
+    await started.call('open', [bound, false]);
 
     let counter = 0;
     const outsidePath = (label: string) => path.join(outsideDirectory, `${label}-${++counter}.sqlite`);
-    const query = (sql: string, params?: unknown[]) => worker.call<QueryResult>('query', [sql, params]);
+    const query = (sql: string, params?: unknown[]) => started.call<QueryResult>('query', [sql, params]);
     const attachedSchemas = async () => (await query('PRAGMA database_list')).values
         .map(row => String(row[1]))
         .filter(name => name !== 'main' && name !== 'temp');
 
     /**
      * Observable effects of an executed ATTACH since the last call: an extra
-     * schema on the connection, or a file the bound path does not cover. Any
-     * schema found is detached so one executed case cannot mask the next.
+     * schema on the connection, or a file the bound path does not cover. DETACH
+     * is refused like ATTACH, so an attached schema is cleared by reopening the
+     * bound database, which keeps one executed case from masking the next.
      */
     const sideEffects = async (): Promise<string[]> => {
         const effects: string[] = [];
-        for (const schema of await attachedSchemas()) {
-            effects.push(`schema "${schema}" attached`);
-            try {
-                await worker.call('exec', [`DETACH DATABASE "${schema}"`]);
-            } catch (error) {
-                effects.push(`could not detach "${schema}": ${(error as Error).message}`);
-            }
-        }
+        const schemas = await attachedSchemas();
+        for (const schema of schemas) effects.push(`schema "${schema}" attached`);
+        if (schemas.length > 0) await started.call('open', [bound, false]);
         // Report each file effect once, so a later case is not blamed for it.
         for (const entry of fs.readdirSync(outsideDirectory)) {
             if (outsideSeen.has(entry)) continue;
@@ -133,7 +132,7 @@ async function startFixture(t: TestContext) {
             'a benign read on the same connection must keep working');
     };
 
-    return { worker, runtime, directory, bound, secret, emptyFile, outsidePath, query, attachedSchemas, sideEffects, control };
+    return { worker: started, runtime, directory, bound, secret, emptyFile, outsidePath, query, attachedSchemas, sideEffects, control };
 }
 
 type Fixture = NonNullable<Awaited<ReturnType<typeof startFixture>>>;
@@ -361,21 +360,21 @@ it('refuses SQL-level VACUUM INTO a path the worker did not choose', async t => 
     // a read-only open does not stop it. The runtime's authorizer sees the
     // destination as the ATTACH that VACUUM performs internally.
     const cases: Array<[string, (target: string) => Promise<unknown>]> = [
-        ['query', p => f.query(`VACUUM INTO '${p}'`)],
+        ['query', p => f.query(`VACUUM INTO ${sqlLiteral(p)}`)],
         ['query: bound destination', p => f.query('VACUUM main INTO ?', [p])],
-        ['run', p => worker.call('run', [`VACUUM main INTO '${p}'`])],
-        ['exec: 2nd statement', p => worker.call('exec', [`SELECT 1; VACUUM INTO '${p}'`])],
+        ['run', p => worker.call('run', [`VACUUM main INTO ${sqlLiteral(p)}`])],
+        ['exec: 2nd statement', p => worker.call('exec', [`SELECT 1; VACUUM INTO ${sqlLiteral(p)}`])],
     ];
     const problems: string[] = [];
     for (const [label, attempt] of cases) {
         const target = f.outsidePath('vacuum');
-        const problem = await refusalProblem(f, label, () => attempt(target), AUTHORIZER_DENIED);
+        const problem = await refusalProblem(f, label, () => attempt(target));
         if (problem !== undefined) problems.push(problem);
         if (fs.existsSync(target)) problems.push(`${label}: wrote ${path.basename(target)}`);
     }
     await f.worker.call('open', [f.bound, true]);
     const readOnlyTarget = f.outsidePath('vacuum-read-only');
-    const readOnly = await refusalProblem(f, 'read-only open: VACUUM INTO', () => f.query(`VACUUM INTO '${readOnlyTarget}'`), AUTHORIZER_DENIED);
+    const readOnly = await refusalProblem(f, 'read-only open: VACUUM INTO', () => f.query(`VACUUM INTO ${sqlLiteral(readOnlyTarget)}`));
     if (readOnly !== undefined) problems.push(readOnly);
     await f.worker.call('open', [f.bound, false]);
 
@@ -386,9 +385,17 @@ it('refuses SQL-level VACUUM INTO a path the worker did not choose', async t => 
     assert.equal(fs.existsSync(snapshot), true, 'vacuumInto writes the host-chosen snapshot');
     fs.rmSync(snapshot);
     const reuse = await refusalProblem(f, 'query: VACUUM INTO the snapshot path after vacuumInto settled',
-        () => f.query(`VACUUM INTO '${snapshot}'`), AUTHORIZER_DENIED);
+        () => f.query(`VACUUM INTO ${sqlLiteral(snapshot)}`));
     if (reuse !== undefined) problems.push(reuse);
     if (fs.existsSync(snapshot)) problems.push('the vacuumInto permit outlived the RPC');
+
+    // The refusal reads as one policy error, not a step failure followed by
+    // the same code again from finalize.
+    const runRefusal = await worker.call('run', [`VACUUM INTO ${sqlLiteral(f.outsidePath('vacuum-message'))}`])
+        .then(() => undefined, (error: Error) => error.message);
+    if (runRefusal === undefined || !BLOCKED.test(runRefusal) || /finalization also failed/.test(runRefusal)) {
+        problems.push(`run: VACUUM INTO refusal message is ${render(runRefusal)}`);
+    }
 
     assert.deepEqual(problems, []);
     await f.control();
@@ -432,4 +439,12 @@ it('enforces the ATTACH refusal in the runtime itself, beneath the worker guard'
     // Control arm: the same statement attaches once permitted, so the refusal
     // above is the authorizer and not the path or the syntax.
     assert.deepEqual(outcome.permitted, [{ v: SECRET }]);
+});
+
+it('explains a DETACH refusal without the ATTACH justification', async t => {
+    const f = await startFixture(t); if (!f) return;
+    const message = await f.query('DETACH DATABASE elsewhere').then(() => undefined, (error: Error) => error.message);
+    assert.match(message ?? '', BLOCKED);
+    assert.doesNotMatch(message ?? '', /open, read or write a database file/,
+        'DETACH opens nothing; its refusal must not claim it can');
 });

@@ -4226,6 +4226,40 @@ describe('native async VACUUM routing', () => {
         assert.deepStrictEqual(calls, [], 'a refused snapshot never grants a permit');
     });
 
+    it('surfaces a failed ATTACH permit withdrawal unless the connection is closing', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const runVacuumInto = loadNativeWorkerFunction(
+            'runVacuumInto',
+            ['asyncDatabase', 'database', 'snapshotPath', 'signal'],
+            { isExplicitlyOutsideTransaction }
+        );
+        const signal = new AbortController().signal;
+        const connection = (withdrawError: Error | undefined, runError?: Error) => ({
+            permitAttach(path: string | null) {
+                if (path === null && withdrawError) throw withdrawError;
+            },
+            async run() {
+                if (runError) throw runError;
+            }
+        });
+
+        // A permit left open with nothing reported is the silent failure.
+        await assert.rejects(
+            runVacuumInto(connection(new Error('permit store failed')), { inTransaction: false }, '/private/a.sqlite', signal),
+            /permit store failed/
+        );
+        // Both failures are reported when the VACUUM itself also failed.
+        await assert.rejects(
+            runVacuumInto(connection(new Error('permit store failed'), new Error('disk full')), { inTransaction: false }, '/private/b.sqlite', signal),
+            (error: Error) => /disk full/.test(error.message) && /permit store failed/.test(error.message)
+        );
+        // A closing connection takes its permit with it.
+        await runVacuumInto(connection(new Error('Invalid DB')), { inTransaction: false }, '/private/c.sqlite', signal);
+    });
+
     it('reports a deadline that lands before an async completion is observed', async () => {
         const activeOperations = new Map<number, {
             controller: AbortController;

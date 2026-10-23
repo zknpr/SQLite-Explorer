@@ -5,7 +5,7 @@
   "zig": "0.16.0",
   "inputs": {
     "src/runtime/query-plan.c": "a2e6d39c36152bf36bb3729aff12567ed4fa2d9c7ef3751e60db580f5276cc8f",
-    "scripts/build-query-plan.mjs": "d5f3860d085c7245ebd22fcfaf557c84dd3b20ee98047a0f48f98887f588c484"
+    "scripts/build-query-plan.mjs": "4850145b3232ea554e54897a9f48527a8f8c1b0a0286c046ed64d3737d5404f4"
   },
   "outputs": {
     "natives/aarch64-macos/query-plan.dylib": "3a51dcd0ebc627e63d664e9b9c317667cb356f197e0d5645262bc3b5ef7b8c3c",

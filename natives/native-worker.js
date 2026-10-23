@@ -154,13 +154,38 @@ function assertSqlPathAuthority(sql) {
   }
   const verb = leadingStatementVerb(sql);
   if (verb !== 'attach' && verb !== 'detach') return;
+  const reason = verb === 'attach'
+    ? 'it can open, read or write a database file outside the one this editor opened'
+    : 'this editor keeps one database per connection, so there is nothing to detach';
   const error = new Error(
-    `${verb.toUpperCase()} is not allowed on the native SQLite engine: it can open, read ` +
-    'or write a database file outside the one this editor opened. ' +
+    `${verb.toUpperCase()} is not allowed on the native SQLite engine: ${reason}. ` +
     `(${NATIVE_SQL_ATTACH_BLOCKED})`
   );
   error.code = NATIVE_SQL_ATTACH_BLOCKED;
   throw error;
+}
+
+const SQLITE_AUTH = 23;
+
+/**
+ * The runtime's authorizer denies only ATTACH, DETACH and the ATTACH inside
+ * VACUUM INTO, so SQLITE_AUTH on these connections is exactly that refusal.
+ * A step failure is reported again by finalize, so the code can sit on either
+ * member of the AggregateError executeStatement builds.
+ */
+function isPathAuthorityRefusal(error) {
+  if (error?.errno === SQLITE_AUTH) return true;
+  return Array.isArray(error?.errors) && error.errors.some(member => member?.errno === SQLITE_AUTH);
+}
+
+/** Error text for the IPC reply, with the authorizer's refusal given its code. */
+function describeWorkerError(error) {
+  if (isPathAuthorityRefusal(error)) {
+    return 'The native SQLite engine refused a statement that would ATTACH, DETACH or ' +
+      'VACUUM INTO a database other than the one this editor opened. ' +
+      `(${NATIVE_SQL_ATTACH_BLOCKED})`;
+  }
+  return describeNativeError(error, 'Unknown native worker error');
 }
 
 /**
@@ -180,8 +205,10 @@ function installSqlPathAuthorityGuard() {
   // first would miss `SELECT 1; ATTACH ...`. Executing one statement at a
   // time through the guarded prepare lets SQLite's own parser find each
   // boundary, and runs earlier DDL before a later statement that needs it is
-  // compiled. This is what sqlite3_exec does internally (prepare, step to
-  // completion, finalize), so the worker's own statements keep their meaning.
+  // compiled. It is not a drop-in sqlite3_exec: it materializes each
+  // statement's rows, caps a script at MAX_QUERY_STATEMENTS, and refuses
+  // parameter tokens (sqlite3_exec binds them as NULL). Every caller sends one
+  // parameterless statement.
   Database.prototype.exec = function exec(sql) {
     executeQuery(this, sql, []);
   };
@@ -632,14 +659,34 @@ function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
   } catch (error) {
     return Promise.reject(error);
   }
-  return asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal }).finally(() => {
+  const withdrawPermit = () => {
     try {
       asyncDatabase.permitAttach(null);
-    } catch {
-      // permitAttach(null) throws only once the connection is closing, and a
-      // closed handle takes its permit with it.
+    } catch (error) {
+      // A closing connection ('Invalid DB') takes its permit with it. Any
+      // other failure leaves the permit open and must be reported.
+      if (error?.message !== 'Invalid DB') throw error;
     }
-  });
+  };
+  return asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal }).then(
+    result => {
+      withdrawPermit();
+      return result;
+    },
+    error => {
+      try {
+        withdrawPermit();
+      } catch (withdrawError) {
+        throw new AggregateError(
+          [error, withdrawError],
+          `${describeNativeError(error, 'VACUUM INTO failed')}; ` +
+          `withdrawing the ATTACH permit also failed: ` +
+          `${describeNativeError(withdrawError, 'Unknown permit error')}`
+        );
+      }
+      throw error;
+    }
+  );
 }
 
 /** Abort one active async operation without affecting queued or future work. */
@@ -2521,7 +2568,7 @@ async function handleRequest(request) {
     return { id, result };
 
   } catch (err) {
-    const errorMsg = describeNativeError(err, 'Unknown native worker error');
+    const errorMsg = describeWorkerError(err);
     console.error(`[native-worker] ERROR in ${method}:`, errorMsg);
     return {
       id,

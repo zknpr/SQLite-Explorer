@@ -64,11 +64,19 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
   }
   const emccVersion = String(run(options.emcc, ['--version'], { stdio: 'pipe' })).split('\n')[0];
   const zigVersion = String(run(options.zig, ['version'], { stdio: 'pipe' })).trim();
-  if (!emccVersion.includes('5.0.0') || zigVersion !== '0.16.0') throw new Error('Reproducible runtime builds require Emscripten 5.0.0 and Zig 0.16.0.');
   const inputs = Object.fromEntries(sourceFiles.map(file => [file, hash(readFileSync(path.join(root, file)))]));
   mkdirSync(path.join(root, '.tmp'), { recursive: true });
   const build = mkdtempSync(path.join(root, '.tmp/query-plan-build-'));
   try {
+    // Linux outputs record the linker identity in .comment, so only the official
+    // Zig 0.16.0 release (bundled LLVM 21.1.0) reproduces the pinned bytes.
+    // Distribution builds such as Homebrew's report the same `zig version`.
+    // `zig cc --version` also writes an empty a.o, so it runs in the build dir.
+    const zigClang = String(run(options.zig, ['cc', '--version'], { stdio: 'pipe', cwd: build })).split('\n')[0].trim();
+    if (!emccVersion.includes('5.0.0') || zigVersion !== '0.16.0' || zigClang !== 'clang version 21.1.0') {
+      throw new Error('Reproducible runtime builds require Emscripten 5.0.0 and the official Zig 0.16.0 release ' +
+        `(zig cc must report "clang version 21.1.0"; found "${zigClang}").`);
+    }
     let checkout = options.source && path.resolve(options.source);
     if (!checkout) {
       checkout = path.join(build, 'upstream');
@@ -123,10 +131,10 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     const manifest = { schema: 1, sqlJsCommit: sourceCommit, emcc: emccVersion, zig: zigVersion, inputs,
       outputs: Object.fromEntries([...outputs].map(([file, contents]) => [file, hash(contents)])) };
     outputs.set(manifestPath, Buffer.from(JSON.stringify(manifest, null, 2) + '\n'));
-    // Reuse the existing rollback-protected installer. Provenance above refers
-    // to this source build; the pinned run identifies only its upstream base.
+    // Reuse only the rollback-protected installer. The manifest above is this
+    // source build's provenance; a local build has no Actions run to pin.
     const { installArtifacts } = createPinnedArtifactPolicy({ scriptName: 'build-query-plan.mjs', repository: 'zknpr/sql.js',
-      sourceBranch: 'agent/paged-vfs-attach-isolation', sourceCommit, pinnedRunId: '31639875548', expectedArtifactPaths: {} });
+      sourceBranch: 'master', sourceCommit, pinnedRunId: null, expectedArtifactPaths: {} });
     installArtifacts([...outputs].map(([file, contents]) => ({ destination: path.join(root, file), contents, expectedHash: hash(contents) })));
     verifyQueryPlanArtifacts();
     console.log('Built and verified WASM query-plan support and five native libraries.');

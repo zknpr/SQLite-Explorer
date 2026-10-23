@@ -93,10 +93,27 @@ it('requires the pinned source commit even when a different local checkout is su
         // Version-only tools let this exercise source admission without compiling.
         const emcc = path.join(directory, 'emcc'), zig = path.join(directory, 'zig');
         fs.writeFileSync(emcc, `#!${process.execPath}\nprocess.stdout.write('emcc 5.0.0\\n');\n`, { mode: 0o755 });
-        fs.writeFileSync(zig, `#!${process.execPath}\nprocess.stdout.write('0.16.0\\n');\n`, { mode: 0o755 });
+        fs.writeFileSync(zig, `#!${process.execPath}\nprocess.stdout.write(process.argv[2] === 'cc' ? 'clang version 21.1.0\\n' : '0.16.0\\n');\n`, { mode: 0o755 });
         const result = spawnSync(process.execPath, ['scripts/refresh-sqljs.mjs', '--emcc', emcc, '--zig', zig, '--sqljs-source', checkout], { encoding: 'utf8' });
         assert.equal(result.status, 1, result.stderr);
         assert.match(result.stderr, new RegExp(`not a (?:valid object name|tree object): ${before.sqlJsCommit}`));
         assert.deepEqual(verifyQueryPlanArtifacts(), before);
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+it('refuses a Zig distribution whose clang identity differs from the official 0.16.0 release', () => {
+    const before = verifyQueryPlanArtifacts();
+    const directory = fs.mkdtempSync(path.resolve('.tmp/query-plan-toolchain-'));
+    try {
+        const emcc = path.join(directory, 'emcc'), zig = path.join(directory, 'zig');
+        fs.writeFileSync(emcc, `#!${process.execPath}\nprocess.stdout.write('emcc 5.0.0\\n');\n`, { mode: 0o755 });
+        // Same `zig version` as the official release, different bundled LLVM:
+        // its Linux libraries would differ in .comment.
+        fs.writeFileSync(zig, `#!${process.execPath}\nprocess.stdout.write(process.argv[2] === 'cc' ? 'Homebrew clang version 21.1.8\\n' : '0.16.0\\n');\n`, { mode: 0o755 });
+        const result = spawnSync(process.execPath, ['scripts/build-query-plan.mjs', '--emcc', emcc, '--zig', zig], { encoding: 'utf8' });
+        assert.equal(result.status, 1, result.stderr);
+        assert.match(result.stderr, /official Zig 0\.16\.0 release.*found "Homebrew clang version 21\.1\.8"/);
+        assert.deepEqual(verifyQueryPlanArtifacts(), before);
+        assert.equal(fs.existsSync(path.resolve('a.o')), false, 'the identity probe must not write a.o into the checkout');
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
