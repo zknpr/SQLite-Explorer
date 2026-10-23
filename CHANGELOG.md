@@ -14,6 +14,7 @@
 ### Maintenance
 
 - Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `9875455`, sql.js `35ac205`).
+- Run the native ATTACH, DETACH and VACUUM INTO fuzz on all five native targets in CI (`native-fuzz.yml`). Its first run generated 40,000 statements, 39,990 of them distinct, and found no attached database or file write on any target.
 
 ## 1.8.2
 
