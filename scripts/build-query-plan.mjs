@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createPinnedArtifactPolicy } from './lib/pinned-artifacts.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const sourceCommit = '424163d6c9c34acec7bac07eb2cecedd86185a60';
+const sourceCommit = '3181cc5ee888d3251228d3995c32bf9ea03c3240';
 const manifestPath = 'vendor/query-plan-manifest.json';
 const sourceFiles = ['src/runtime/query-plan.c', 'scripts/build-query-plan.mjs'];
 const nativeTargets = [
@@ -79,9 +79,9 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     run('tar', ['-xf', '-', '-C', source], { input: archive, stdio: ['pipe', 'inherit', 'inherit'] });
     const sqliteSource = path.join(source, 'sqlite-src'); mkdirSync(sqliteSource, { recursive: true });
     const zip = path.join(build, 'sqlite.zip');
-    await download('https://sqlite.org/2025/sqlite-amalgamation-3490100.zip', zip, 'sha3-256', 'e7eb4cfb2d95626e782cfa748f534c74482f2c3c93f13ee828b9187ce05b2da7');
+    await download('https://sqlite.org/2026/sqlite-amalgamation-3540100.zip', zip, 'sha3-256', '92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30');
     run('unzip', ['-q', zip, '-d', sqliteSource]);
-    const headers = path.join(sqliteSource, 'sqlite-amalgamation-3490100');
+    const headers = path.join(sqliteSource, 'sqlite-amalgamation-3540100');
     await download('https://www.sqlite.org/contrib/download/extension-functions.c?get=25', path.join(headers, 'extension-functions.c'), 'sha1', 'c68fa706d6d9ff98608044c00212473f9c14892f');
     const helper = path.join(root, sourceFiles[0]);
     const outputs = new Map();
@@ -96,13 +96,16 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     }
     const out = path.join(source, 'out'), dist = path.join(source, 'dist');
     mkdirSync(out, { recursive: true }); mkdirSync(dist, { recursive: true });
-    const compileFlags = ['-Oz', '-DSQLITE_OMIT_LOAD_EXTENSION', '-DSQLITE_DISABLE_LFS', '-DSQLITE_ENABLE_FTS3', '-DSQLITE_ENABLE_FTS3_PARENTHESIS',
+    // extension-functions.c asserts embed __FILE__; map the random build
+    // directory (and the checkout) to fixed names so outputs reproduce.
+    const prefixMaps = [`-ffile-prefix-map=${build}=/query-plan-build`, `-ffile-prefix-map=${root}=/sqlite-explorer`];
+    const compileFlags = ['-Oz', ...prefixMaps, '-DSQLITE_OMIT_LOAD_EXTENSION', '-DSQLITE_DISABLE_LFS', '-DSQLITE_ENABLE_FTS3', '-DSQLITE_ENABLE_FTS3_PARENTHESIS',
       '-DSQLITE_ENABLE_FTS5', '-DSQLITE_THREADSAFE=0', '-DSQLITE_ENABLE_NORMALIZE', '-DSQLITE_LIKE_DOESNT_MATCH_BLOBS'];
     for (const [input, name, flags] of [
       [path.join(headers, 'sqlite3.c'), 'sqlite3', compileFlags],
       [path.join(headers, 'extension-functions.c'), 'extension-functions', compileFlags],
       [path.join(source, 'src/vfs.c'), 'vfs', compileFlags],
-      [helper, 'query-plan', ['-Oz', '-DSQLITE_CORE']]
+      [helper, 'query-plan', ['-Oz', ...prefixMaps, '-DSQLITE_CORE']]
     ]) run(options.emcc, [...flags, '-I', headers, '-c', input, '-o', path.join(out, `${name}.o`)]);
     const exportsPath = path.join(source, 'src/exported_functions.json');
     const exported = JSON.parse(readFileSync(exportsPath, 'utf8'));
