@@ -16,6 +16,7 @@
 ### Maintenance
 
 - Resolve all open Dependabot alerts in build tooling and website dependencies. None of the affected packages ship in the extension.
+- Package with `@vscode/vsce` 4.0.0, from 3.9.2. The six VSIX packages contain the same files as before.
 - Make the WebAssembly and query-plan runtime build reproducible with the pinned toolchain (Emscripten 5.0.0 and the official Zig 0.16.0 release): a rebuild from any directory produces identical bytes, and the builder refuses other Zig distributions, whose Linux libraries differ.
 - Link the SQLite Explorer desktop app from the README.
 
