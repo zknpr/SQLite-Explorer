@@ -284,7 +284,8 @@
     "test:gui:interactions": "node tests/gui/interaction-details.mjs",
     "test:gui:contention": "node tests/gui/native-contention.mjs",
     "test:gui:uploads": "node tests/gui/drop-upload.mjs",
-    "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts"
+    "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts",
+    "test:native-fuzz": "node --import tsx --test tests/fuzz/native_attach_fuzz.test.ts"
   },
   "devDependencies": {
     "@codemirror/autocomplete": "6.20.3",

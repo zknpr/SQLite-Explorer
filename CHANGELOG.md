@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.8.3
+## Unreleased
 
 ### Security
 
@@ -8,11 +8,13 @@
 
 ### Fixes
 
-- Keep TEXT values that contain a NUL character intact. The WebAssembly engine cut such a value short at the first NUL when writing it, for example from an import, and when reading it for exports and the query console; the native engine did the same on some reads. Both engines now read and write the whole value. The grid still shows these cells as bytes, now on every engine and connection.
+- Keep TEXT values that contain a NUL character intact. The WebAssembly engine cut such a value short at the first NUL when writing it, for example from an import, and when reading it in the query console; the native engine did the same on some reads. Both engines now read and write the whole value. The grid still shows these cells as bytes on both engines; in tables with more than 999 columns it checks only the key columns, so other columns show such a value as text. A row whose WITHOUT ROWID primary key contains NUL stays read-only, and the reason now says so.
+- Store TEXT that contains an unpaired surrogate, such as half of an emoji left by a truncated string, whole in the WebAssembly engine. When a multibyte character followed it, the end of the value was cut off. The stored bytes now match the native engine's.
 
 ### Maintenance
 
-- Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `9875455`, sql.js `7245c26`).
+- Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `9875455`, sql.js `35ac205`).
+- Run the native ATTACH, DETACH and VACUUM INTO fuzz on all five native targets in CI (`native-fuzz.yml`). Its first run generated 40,000 statements, 39,990 of them distinct, and found no attached database or file write on any target.
 
 ## 1.8.2
 
