@@ -68,7 +68,8 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     options[key] = args[index + 1];
   }
   // Resolve once so every child process runs the same tool whatever its cwd.
-  for (const tool of ['emcc', 'zig']) if (options[tool].includes(path.sep)) options[tool] = path.resolve(options[tool]);
+  // Either separator marks a path on Windows; a bare name stays a PATH lookup.
+  for (const tool of ['emcc', 'zig']) if (/[\\/]/.test(options[tool])) options[tool] = path.resolve(options[tool]);
   const emccVersion = String(run(options.emcc, ['--version'], { stdio: 'pipe' })).split('\n')[0].trim();
   if (emccVersion !== expectedEmcc) {
     throw new Error(`Reproducible runtime builds require Emscripten 5.0.0 ("${expectedEmcc}"); found "${emccVersion}".`);

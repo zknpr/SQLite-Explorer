@@ -113,11 +113,15 @@ if (process.argv[2] === 'cc') {
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 }
 
+// The builder shells out to make, tar and unzip, and the fake tools are
+// shebang scripts; neither runs on Windows.
+const posixToolchain = { skip: process.platform === 'win32' ? 'the runtime builder and its fake tools need a POSIX toolchain' : false };
+
 function runBuilder(args: string[]) {
     return spawnSync(process.execPath, ['scripts/build-query-plan.mjs', ...args], { encoding: 'utf8' });
 }
 
-it('requires the pinned source commit even when a different local checkout is supplied', () => {
+it('requires the pinned source commit even when a different local checkout is supplied', posixToolchain, () => {
     const before = verifyQueryPlanArtifacts();
     withFakeToolchain({}, (directory, emcc, zig) => {
         const checkout = path.join(directory, 'source');
@@ -129,7 +133,7 @@ it('requires the pinned source commit even when a different local checkout is su
     });
 });
 
-it('accepts relative --emcc and --zig paths', () => {
+it('accepts relative --emcc and --zig paths', posixToolchain, () => {
     const before = verifyQueryPlanArtifacts();
     withFakeToolchain({}, (directory, emcc, zig) => {
         const checkout = path.join(directory, 'source');
@@ -142,7 +146,7 @@ it('accepts relative --emcc and --zig paths', () => {
     });
 });
 
-it('runs the zig identity probe outside the checkout', () => {
+it('runs the zig identity probe outside the checkout', posixToolchain, () => {
     const marker = path.resolve('a.o');
     const stamp = () => (fs.existsSync(marker) ? fs.statSync(marker).mtimeMs : undefined);
     const before = stamp();
@@ -156,7 +160,7 @@ it('runs the zig identity probe outside the checkout', () => {
     });
 });
 
-it('refuses a Zig distribution whose clang identity differs from the official 0.16.0 release', () => {
+it('refuses a Zig distribution whose clang identity differs from the official 0.16.0 release', posixToolchain, () => {
     const before = verifyQueryPlanArtifacts();
     // Same `zig version` as the official release, different bundled LLVM: its
     // Linux libraries would differ in .comment.
@@ -168,7 +172,7 @@ it('refuses a Zig distribution whose clang identity differs from the official 0.
     });
 });
 
-it('names the toolchain check that failed', () => {
+it('names the toolchain check that failed', posixToolchain, () => {
     for (const [tools, expected] of [
         [{ emcc: OFFICIAL_EMCC.replace(' 5.0.0 ', ' 4.0.10 ') }, /Emscripten 5\.0\.0.*found "emcc .* 4\.0\.10 /],
         // A substring test would admit 15.0.0.

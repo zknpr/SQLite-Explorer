@@ -694,10 +694,7 @@ function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
       // wrapper later hides this error) and the failure is reported. A
       // reworded closing message lands here too, which fails closed.
       if (error?.message === 'Invalid DB') return;
-      asyncDatabase.close().catch(closeError => {
-        console.error('[native-worker] closing the snapshot connection failed:',
-          describeNativeError(closeError, 'Unknown close error'));
-      });
+      releaseAsyncDatabase(asyncDatabase);
       throw error;
     }
   };
@@ -731,6 +728,19 @@ function cancelOperation(correlationId) {
     operation.controller.abort();
   }
   return true;
+}
+
+/**
+ * Take an AsyncDatabase out of service now. For the shared connection this
+ * goes through closeAsyncDatabase, which clears `asyncDb` synchronously, so
+ * later reads fall back to the primary connection instead of a closed handle.
+ */
+function releaseAsyncDatabase(connection) {
+  const closing = connection === asyncDb ? closeAsyncDatabase() : connection.close();
+  closing.catch(closeError => {
+    console.error('[native-worker] closing the snapshot connection failed:',
+      describeNativeError(closeError, 'Unknown close error'));
+  });
 }
 
 function closeAsyncDatabase() {
