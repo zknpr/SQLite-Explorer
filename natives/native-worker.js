@@ -147,8 +147,8 @@ function leadingStatementVerb(sql) {
  * ToString: an array ['ATTACH ...'] would otherwise compile unchecked.
  *
  * The bundled runtime enforces the same rule in C: every connection installs
- * an authorizer at open that refuses ATTACH and DETACH (see runVacuumInto for
- * the one permitted path), so a future SQLite tokenizer change that this
+ * an authorizer at open that refuses ATTACH and DETACH (runVacuumInto uses
+ * the runtime's one exception), so a future SQLite tokenizer change that this
  * mirror misses still cannot attach a file. This check stays in front for its
  * specific error code.
  */
@@ -199,7 +199,7 @@ function isPathAuthorityRefusal(error) {
 
 /**
  * Error text for the IPC reply. The authorizer's refusal gets its code, and
- * every other failure it was wrapped with (a failed permit withdrawal, a
+ * every other failure it was wrapped with (a failed savepoint cleanup, a
  * failed deadline cleanup, a cancellation) is kept rather than replaced.
  */
 function describeWorkerError(error) {
@@ -674,13 +674,13 @@ function executeInterruptibleAsyncOperation(requestId, timeoutMs, operation) {
  * VACUUM must run on the interruptible connection and outside transactions.
  *
  * VACUUM INTO attaches its destination, and the runtime's authorizer refuses
- * every ATTACH except the one path a connection permits. The permit names
- * exactly this host-chosen snapshot and is withdrawn when the VACUUM settles,
- * so SQL-level VACUUM INTO any other path (which would create an arbitrary
- * file holding a copy of the database) stays refused.
+ * every ATTACH, so SQL-level VACUUM INTO (which would create an arbitrary file
+ * holding a copy of the database) is refused. vacuumInto is the runtime's one
+ * exception: it runs a fixed `VACUUM main INTO ?` and accepts this host-chosen
+ * destination only for that statement, on the thread running it.
  */
 function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
-  if (!asyncDatabase || typeof asyncDatabase.run !== 'function') {
+  if (!asyncDatabase || typeof asyncDatabase.vacuumInto !== 'function') {
     return Promise.reject(
       new Error('Interruptible native database snapshots are unavailable in this runtime')
     );
@@ -693,47 +693,8 @@ function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
   if (typeof snapshotPath !== 'string' || snapshotPath.length === 0) {
     return Promise.reject(new Error('A native export snapshot path is required'));
   }
-  try {
-    asyncDatabase.permitAttach(snapshotPath);
-  } catch (error) {
-    return Promise.reject(error);
-  }
-  const withdrawPermit = () => {
-    try {
-      asyncDatabase.permitAttach(null);
-    } catch (error) {
-      // A closing connection ('Invalid DB') takes its permit with it. Any
-      // other failure leaves the permit installed, so the connection is
-      // closed (no handle keeps authorizing the path, even if a cancellation
-      // wrapper later hides this error) and the failure is reported. A
-      // reworded closing message lands here too, which fails closed.
-      if (error?.message === 'Invalid DB') return;
-      releaseAsyncDatabase(asyncDatabase);
-      throw error;
-    }
-  };
-  // Through a promise, so a synchronous throw from run also withdraws the permit.
-  return new Promise(resolve => resolve(
-    asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal })
-  )).then(
-    result => {
-      withdrawPermit();
-      return result;
-    },
-    error => {
-      try {
-        withdrawPermit();
-      } catch (withdrawError) {
-        throw new AggregateError(
-          [error, withdrawError],
-          `${describeNativeError(error, 'VACUUM INTO failed')}; ` +
-          `withdrawing the ATTACH permit also failed: ` +
-          `${describeNativeError(withdrawError, 'Unknown permit error')}`
-        );
-      }
-      throw error;
-    }
-  );
+  // Through a promise, so a synchronous throw is reported as a rejection.
+  return new Promise(resolve => resolve(asyncDatabase.vacuumInto(snapshotPath, { signal })));
 }
 
 /** Abort one active async operation without affecting queued or future work. */
@@ -745,23 +706,6 @@ function cancelOperation(correlationId) {
     operation.controller.abort();
   }
   return true;
-}
-
-/**
- * Take an AsyncDatabase out of service now. For the shared connection this
- * goes through closeAsyncDatabase, which clears `asyncDb` synchronously, so
- * later reads fall back to the primary connection instead of a closed handle.
- */
-function releaseAsyncDatabase(connection) {
-  // Any other connection's close may be synchronous or throw; it is reported
-  // here rather than replacing the failure the caller is about to throw.
-  const closing = connection === asyncDb
-    ? closeAsyncDatabase()
-    : new Promise(resolve => resolve(connection.close()));
-  closing.catch(closeError => {
-    console.error('[native-worker] closing the snapshot connection failed:',
-      describeNativeError(closeError, 'Unknown close error'));
-  });
 }
 
 function closeAsyncDatabase() {
