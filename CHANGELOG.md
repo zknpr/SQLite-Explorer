@@ -9,10 +9,11 @@
 ### Fixes
 
 - Keep TEXT values that contain a NUL character intact. The WebAssembly engine cut such a value short at the first NUL when writing it, for example from an import, and when reading it for exports and the query console; the native engine did the same on some reads. Both engines now read and write the whole value. The grid still shows these cells as bytes, now on every engine and connection.
+- Store TEXT that contains an unpaired surrogate, such as half of an emoji left by a truncated string, whole in the WebAssembly engine. When a multibyte character followed it, the end of the value was cut off. The stored bytes now match the native engine's.
 
 ### Maintenance
 
-- Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `9875455`, sql.js `7245c26`).
+- Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `9875455`, sql.js `35ac205`).
 
 ## 1.8.2
 

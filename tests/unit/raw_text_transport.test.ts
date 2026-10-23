@@ -124,6 +124,25 @@ it('stores bound TEXT containing NUL exactly', async t => {
     assert.deepEqual(rows, [['630064']], 'the WASM engine must not truncate a bound value at NUL');
 });
 
+it('stores bound TEXT with lone surrogates byte for byte as the native engine does', async t => {
+    // Expected bytes are what the native runtime stores: each lone surrogate
+    // as its 3-byte encoding, and nothing appended or cut off around it.
+    const values: Array<[string, string]> = [
+        ['x\uD800', '78EDA080'],
+        ['tweet \uD83D', '747765657420EDA0BD'],
+        ['\uD83D中文', 'EDA0BDE4B8ADE69687'],
+        ['\uDE00a', 'EDB88061'],
+        ['ok 😀', '6F6B20F09F9880']
+    ];
+    const engine = await database(t);
+    await engine.executeQuery('CREATE TABLE cells(id INTEGER PRIMARY KEY, value TEXT)');
+    for (const [index, [value]] of values.entries()) {
+        await engine.executeQuery('INSERT INTO cells VALUES (?, ?)', [index, value]);
+    }
+    const rows = (await engine.executeQuery('SELECT hex(CAST(value AS BLOB)) FROM cells ORDER BY id'))[0].rows;
+    assert.deepEqual(rows.map(row => row[0]), values.map(([, hex]) => hex));
+});
+
 it('keeps the default native raw TEXT transport as BLOBs', async t => {
     const engine = await database(t);
     const query = buildCellContainmentQuery("SELECT 'native'", 1, { limit: 1 }, [0]);
