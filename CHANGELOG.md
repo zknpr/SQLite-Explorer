@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.8.3
+
+### Security
+
+- Narrow the native runtime's exception for export snapshots to the one statement that writes the snapshot, on the thread running it. In 1.8.2 the exception covered the connection while an export ran; the worker's statement check and its one-request-at-a-time order kept other SQL from using it.
+
+### Fixes
+
+- Keep TEXT values that contain a NUL character intact. The WebAssembly engine cut such a value short at the first NUL when writing it, for example from an import, and when reading it for exports and the query console; the native engine did the same on some reads. Both engines now read and write the whole value. The grid still shows these cells as bytes, now on every engine and connection.
+
+### Maintenance
+
+- Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `9875455`, sql.js `7245c26`).
+
 ## 1.8.2
 
 ### Security
