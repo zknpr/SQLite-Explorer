@@ -168,24 +168,49 @@ function assertSqlPathAuthority(sql) {
 const SQLITE_AUTH = 23;
 
 /**
- * The runtime's authorizer denies only ATTACH, DETACH and the ATTACH inside
- * VACUUM INTO, so SQLITE_AUTH on these connections is exactly that refusal.
- * A step failure is reported again by finalize, so the code can sit on either
- * member of the AggregateError executeStatement builds.
+ * Visit an error and everything it wraps: AggregateError members and `cause`
+ * chains (deadline, cancellation and cleanup wrappers nest them). Bounded and
+ * cycle-safe because the values come from the runtime.
  */
-function isPathAuthorityRefusal(error) {
-  if (error?.errno === SQLITE_AUTH) return true;
-  return Array.isArray(error?.errors) && error.errors.some(member => member?.errno === SQLITE_AUTH);
+function forEachWrappedError(error, visit, depth = 0, seen = new Set()) {
+  if (!error || typeof error !== 'object' || depth > 8 || seen.has(error)) return;
+  seen.add(error);
+  visit(error);
+  if (Array.isArray(error.errors)) {
+    for (const member of error.errors) forEachWrappedError(member, visit, depth + 1, seen);
+  }
+  forEachWrappedError(error.cause, visit, depth + 1, seen);
 }
 
-/** Error text for the IPC reply, with the authorizer's refusal given its code. */
+/**
+ * The runtime's authorizer denies only ATTACH, DETACH and the ATTACH inside
+ * VACUUM INTO, so SQLITE_AUTH on these connections is exactly that refusal,
+ * wherever a wrapper put it.
+ */
+function isPathAuthorityRefusal(error) {
+  let found = false;
+  forEachWrappedError(error, candidate => { if (candidate.errno === SQLITE_AUTH) found = true; });
+  return found;
+}
+
+/**
+ * Error text for the IPC reply. The authorizer's refusal gets its code, and
+ * every other failure it was wrapped with (a failed permit withdrawal, a
+ * failed deadline cleanup, a cancellation) is kept rather than replaced.
+ */
 function describeWorkerError(error) {
-  if (isPathAuthorityRefusal(error)) {
-    return 'The native SQLite engine refused a statement that would ATTACH, DETACH or ' +
-      'VACUUM INTO a database other than the one this editor opened. ' +
-      `(${NATIVE_SQL_ATTACH_BLOCKED})`;
-  }
-  return describeNativeError(error, 'Unknown native worker error');
+  if (!isPathAuthorityRefusal(error)) return describeNativeError(error, 'Unknown native worker error');
+  const others = [];
+  forEachWrappedError(error, candidate => {
+    // An AggregateError's own message repeats its members; the refusal is
+    // replaced by the coded text below.
+    if (candidate.errno === SQLITE_AUTH || Array.isArray(candidate.errors)) return;
+    const message = describeNativeError(candidate, 'Unknown error');
+    if (!others.includes(message)) others.push(message);
+  });
+  return 'The native SQLite engine refused a statement that would ATTACH, DETACH or ' +
+    'VACUUM INTO a database other than the one this editor opened. ' +
+    `(${NATIVE_SQL_ATTACH_BLOCKED})` + others.map(message => `; ${message}`).join('');
 }
 
 /**
@@ -664,8 +689,16 @@ function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
       asyncDatabase.permitAttach(null);
     } catch (error) {
       // A closing connection ('Invalid DB') takes its permit with it. Any
-      // other failure leaves the permit open and must be reported.
-      if (error?.message !== 'Invalid DB') throw error;
+      // other failure leaves the permit installed, so the connection is
+      // closed (no handle keeps authorizing the path, even if a cancellation
+      // wrapper later hides this error) and the failure is reported. A
+      // reworded closing message lands here too, which fails closed.
+      if (error?.message === 'Invalid DB') return;
+      asyncDatabase.close().catch(closeError => {
+        console.error('[native-worker] closing the snapshot connection failed:',
+          describeNativeError(closeError, 'Unknown close error'));
+      });
+      throw error;
     }
   };
   return asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal }).then(
@@ -810,6 +843,10 @@ function executeStatement(db, sql, params) {
         stmt.finalize();
       } catch (finalizeError) {
         if (executionError !== undefined) {
+          // finalize reports a failed step's code again: that is one failure.
+          if (finalizeError?.errno !== undefined && finalizeError.errno === executionError?.errno) {
+            throw executionError;
+          }
           throw new AggregateError(
             [executionError, finalizeError],
             `${describeNativeError(executionError, 'Statement execution failed')}; ` +

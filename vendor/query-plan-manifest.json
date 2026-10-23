@@ -3,9 +3,10 @@
   "sqlJsCommit": "3181cc5ee888d3251228d3995c32bf9ea03c3240",
   "emcc": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 5.0.0 (a7c5deabd7c88ba1c38ebe988112256775f944c6)",
   "zig": "0.16.0",
+  "zigClang": "clang version 21.1.0",
   "inputs": {
     "src/runtime/query-plan.c": "a2e6d39c36152bf36bb3729aff12567ed4fa2d9c7ef3751e60db580f5276cc8f",
-    "scripts/build-query-plan.mjs": "4850145b3232ea554e54897a9f48527a8f8c1b0a0286c046ed64d3737d5404f4"
+    "scripts/build-query-plan.mjs": "a4f22a505947176a190411a70c6eda803f67c7db9f1e292725b2183f78556de8"
   },
   "outputs": {
     "natives/aarch64-macos/query-plan.dylib": "3a51dcd0ebc627e63d664e9b9c317667cb356f197e0d5645262bc3b5ef7b8c3c",

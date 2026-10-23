@@ -23,6 +23,11 @@ const wasmCopies = {
 };
 const outputFiles = [...Object.values(wasmCopies).flat(), ...nativeTargets.map(([triple, , extension]) => `natives/${triple}/query-plan.${extension}`)];
 const hash = contents => createHash('sha256').update(contents).digest('hex');
+// Exact identities, not substrings: a different Emscripten commit or a Zig
+// distribution with another bundled LLVM produces different bytes.
+const expectedEmcc = 'emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 5.0.0 (a7c5deabd7c88ba1c38ebe988112256775f944c6)';
+const expectedZigVersion = '0.16.0';
+const expectedZigClang = 'clang version 21.1.0';
 
 export function verifyQueryPlanArtifacts(directory = root, { includeBuildAssets = true } = {}) {
   const manifest = JSON.parse(readFileSync(path.join(directory, manifestPath), 'utf8'));
@@ -62,8 +67,16 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     if (!key || !args[index + 1]) throw new Error('Usage: node scripts/build-query-plan.mjs [--check] [--emcc PATH] [--zig PATH] [--sqljs-source GIT_CHECKOUT]');
     options[key] = args[index + 1];
   }
-  const emccVersion = String(run(options.emcc, ['--version'], { stdio: 'pipe' })).split('\n')[0];
+  // Resolve once so every child process runs the same tool whatever its cwd.
+  for (const tool of ['emcc', 'zig']) if (options[tool].includes(path.sep)) options[tool] = path.resolve(options[tool]);
+  const emccVersion = String(run(options.emcc, ['--version'], { stdio: 'pipe' })).split('\n')[0].trim();
+  if (emccVersion !== expectedEmcc) {
+    throw new Error(`Reproducible runtime builds require Emscripten 5.0.0 ("${expectedEmcc}"); found "${emccVersion}".`);
+  }
   const zigVersion = String(run(options.zig, ['version'], { stdio: 'pipe' })).trim();
+  if (zigVersion !== expectedZigVersion) {
+    throw new Error(`Reproducible runtime builds require the official Zig ${expectedZigVersion} release; found "${zigVersion}".`);
+  }
   const inputs = Object.fromEntries(sourceFiles.map(file => [file, hash(readFileSync(path.join(root, file)))]));
   mkdirSync(path.join(root, '.tmp'), { recursive: true });
   const build = mkdtempSync(path.join(root, '.tmp/query-plan-build-'));
@@ -73,9 +86,9 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     // Distribution builds such as Homebrew's report the same `zig version`.
     // `zig cc --version` also writes an empty a.o, so it runs in the build dir.
     const zigClang = String(run(options.zig, ['cc', '--version'], { stdio: 'pipe', cwd: build })).split('\n')[0].trim();
-    if (!emccVersion.includes('5.0.0') || zigVersion !== '0.16.0' || zigClang !== 'clang version 21.1.0') {
-      throw new Error('Reproducible runtime builds require Emscripten 5.0.0 and the official Zig 0.16.0 release ' +
-        `(zig cc must report "clang version 21.1.0"; found "${zigClang}").`);
+    if (zigClang !== expectedZigClang) {
+      throw new Error(`Reproducible runtime builds require the official Zig ${expectedZigVersion} release ` +
+        `(zig cc must report "${expectedZigClang}"); found "${zigClang}".`);
     }
     let checkout = options.source && path.resolve(options.source);
     if (!checkout) {
@@ -128,7 +141,7 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
       for (const copy of copies) outputs.set(copy, contents);
     }
     for (const file of sourceFiles) if (hash(readFileSync(path.join(root, file))) !== inputs[file]) throw new Error(`Source changed during runtime build: ${file}`);
-    const manifest = { schema: 1, sqlJsCommit: sourceCommit, emcc: emccVersion, zig: zigVersion, inputs,
+    const manifest = { schema: 1, sqlJsCommit: sourceCommit, emcc: emccVersion, zig: zigVersion, zigClang, inputs,
       outputs: Object.fromEntries([...outputs].map(([file, contents]) => [file, hash(contents)])) };
     outputs.set(manifestPath, Buffer.from(JSON.stringify(manifest, null, 2) + '\n'));
     // Reuse only the rollback-protected installer. The manifest above is this

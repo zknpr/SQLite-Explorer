@@ -94,6 +94,13 @@ async function startFixture(t: TestContext) {
     worker = started;
     await started.start();
     await started.call('open', [bound, false]);
+    // Tests switch modes through reopen() so a side-effect reset restores the
+    // mode the case is running in.
+    let readOnly = false;
+    const reopen = async (mode: boolean) => {
+        readOnly = mode;
+        await started.call('open', [bound, mode]);
+    };
 
     let counter = 0;
     const outsidePath = (label: string) => path.join(outsideDirectory, `${label}-${++counter}.sqlite`);
@@ -112,7 +119,7 @@ async function startFixture(t: TestContext) {
         const effects: string[] = [];
         const schemas = await attachedSchemas();
         for (const schema of schemas) effects.push(`schema "${schema}" attached`);
-        if (schemas.length > 0) await started.call('open', [bound, false]);
+        if (schemas.length > 0) await started.call('open', [bound, readOnly]);
         // Report each file effect once, so a later case is not blamed for it.
         for (const entry of fs.readdirSync(outsideDirectory)) {
             if (outsideSeen.has(entry)) continue;
@@ -132,7 +139,7 @@ async function startFixture(t: TestContext) {
             'a benign read on the same connection must keep working');
     };
 
-    return { worker: started, runtime, directory, bound, secret, emptyFile, outsidePath, query, attachedSchemas, sideEffects, control };
+    return { worker: started, reopen, runtime, directory, bound, secret, emptyFile, outsidePath, query, attachedSchemas, sideEffects, control };
 }
 
 type Fixture = NonNullable<Awaited<ReturnType<typeof startFixture>>>;
@@ -171,14 +178,14 @@ it('refuses SQL-level ATTACH that reads a database outside the bound path', asyn
     const f = await startFixture(t); if (!f) return;
     await f.control();
 
-    const readSecret = `SELECT 1 AS ok; ATTACH DATABASE '${f.secret}' AS leak; SELECT v FROM leak.secret`;
+    const readSecret = `SELECT 1 AS ok; ATTACH DATABASE ${sqlLiteral(f.secret)} AS leak; SELECT v FROM leak.secret`;
     const writable = await refusalProblem(f, 'query: ATTACH as 2nd statement, then read', () => f.query(readSecret));
 
     // A read-only open does not help: it blocks writes through the attached
     // schema, never the ATTACH itself or a read through it.
-    await f.worker.call('open', [f.bound, true]);
+    await f.reopen(true);
     const readOnly = await refusalProblem(f, 'read-only open: ATTACH, then read', () => f.query(readSecret));
-    await f.worker.call('open', [f.bound, false]);
+    await f.reopen(false);
 
     assert.deepEqual([writable, readOnly].filter(problem => problem !== undefined), []);
     await f.control();
@@ -193,7 +200,7 @@ it('refuses SQL-level ATTACH that writes files outside the bound path', async t 
 
     // Write into an existing SQLite database outside the bound directory.
     record(await refusalProblem(f, 'exec: ATTACH an existing outside database, CREATE TABLE, INSERT', () => f.worker.call('exec', [
-        `ATTACH '${f.secret}' AS planted; CREATE TABLE planted.injected(a); INSERT INTO planted.injected VALUES ('written')`
+        `ATTACH ${sqlLiteral(f.secret)} AS planted; CREATE TABLE planted.injected(a); INSERT INTO planted.injected VALUES ('written')`
     ])));
     const secretCopy = new DatabaseSync(f.secret, { readOnly: true });
     try {
@@ -205,7 +212,7 @@ it('refuses SQL-level ATTACH that writes files outside the bound path', async t 
 
     // Turn an existing empty file into a database.
     record(await refusalProblem(f, 'exec: ATTACH an existing empty file, CREATE TABLE', () => f.worker.call('exec', [
-        `ATTACH '${f.emptyFile}' AS planted_empty; CREATE TABLE planted_empty.t(a); INSERT INTO planted_empty.t VALUES ('written')`
+        `ATTACH ${sqlLiteral(f.emptyFile)} AS planted_empty; CREATE TABLE planted_empty.t(a); INSERT INTO planted_empty.t VALUES ('written')`
     ])));
 
     // Create a new file. The worker opens without SQLITE_OPEN_CREATE, which
@@ -213,7 +220,7 @@ it('refuses SQL-level ATTACH that writes files outside the bound path', async t 
     // guard must refuse it before SQLite is consulted at all.
     const target = f.outsidePath('created');
     record(await refusalProblem(f, 'exec: ATTACH a new path, CREATE TABLE', () => f.worker.call('exec', [
-        `ATTACH '${target}' AS planted_new; CREATE TABLE planted_new.t(a)`
+        `ATTACH ${sqlLiteral(target)} AS planted_new; CREATE TABLE planted_new.t(a)`
     ])));
 
     assert.deepEqual(problems, []);
@@ -226,46 +233,46 @@ it('refuses ATTACH and DETACH at every SQL entry point of the native worker', as
     const { worker } = f;
 
     const cases: Array<[string, (target: string, alias: string) => Promise<unknown>, RegExp?]> = [
-        ['query', (p, a) => f.query(`ATTACH '${p}' AS ${a}`)],
-        ['query: 2nd of three statements', (p, a) => f.query(`SELECT 1; ATTACH '${p}' AS ${a}; SELECT 2`)],
-        ['query: block and line comments first', (p, a) => f.query(`/* leading */ -- line comment\n  ATTACH '${p}' AS ${a}`)],
-        ['query: empty statements, mixed case', (p, a) => f.query(`;;\n\t; AtTaCh DATABASE '${p}' AS ${a}`)],
+        ['query', (p, a) => f.query(`ATTACH ${sqlLiteral(p)} AS ${a}`)],
+        ['query: 2nd of three statements', (p, a) => f.query(`SELECT 1; ATTACH ${sqlLiteral(p)} AS ${a}; SELECT 2`)],
+        ['query: block and line comments first', (p, a) => f.query(`/* leading */ -- line comment\n  ATTACH ${sqlLiteral(p)} AS ${a}`)],
+        ['query: empty statements, mixed case', (p, a) => f.query(`;;\n\t; AtTaCh DATABASE ${sqlLiteral(p)} AS ${a}`)],
         // SQLite skips a U+FEFF byte-order mark at any token start (CC_BOM).
-        ['query: byte-order mark after a comment', (p, a) => f.query(`/**/\uFEFFATTACH '${p}' AS ${a}`)],
-        ['exec: byte-order mark before the 2nd statement', (p, a) => worker.call('exec', [`SELECT 1;\uFEFF\uFEFFATTACH '${p}' AS ${a}`])],
+        ['query: byte-order mark after a comment', (p, a) => f.query(`/**/\uFEFFATTACH ${sqlLiteral(p)} AS ${a}`)],
+        ['exec: byte-order mark before the 2nd statement', (p, a) => worker.call('exec', [`SELECT 1;\uFEFF\uFEFFATTACH ${sqlLiteral(p)} AS ${a}`])],
         ['query: bound filename', (p, a) => f.query(`ATTACH ? AS ${a}`, [p])],
-        ['queryNumeric', (p, a) => worker.call('queryNumeric', [`ATTACH '${p}' AS ${a}`, [], ['x']])],
-        ['queryBatch: 2nd item', (p, a) => worker.call('queryBatch', [[{ sql: 'SELECT 1' }, { sql: `ATTACH '${p}' AS ${a}` }]])],
-        ['querySingle', (p, a) => worker.call('querySingle', [`ATTACH '${p}' AS ${a}\n${BOUNDARY}`, [], BOUNDARY])],
-        ['run', (p, a) => worker.call('run', [`ATTACH '${p}' AS ${a}`])],
+        ['queryNumeric', (p, a) => worker.call('queryNumeric', [`ATTACH ${sqlLiteral(p)} AS ${a}`, [], ['x']])],
+        ['queryBatch: 2nd item', (p, a) => worker.call('queryBatch', [[{ sql: 'SELECT 1' }, { sql: `ATTACH ${sqlLiteral(p)} AS ${a}` }]])],
+        ['querySingle', (p, a) => worker.call('querySingle', [`ATTACH ${sqlLiteral(p)} AS ${a}\n${BOUNDARY}`, [], BOUNDARY])],
+        ['run', (p, a) => worker.call('run', [`ATTACH ${sqlLiteral(p)} AS ${a}`])],
         ['runSingle', (p, a) => {
-            const sql = `ATTACH '${p}' AS ${a}`;
+            const sql = `ATTACH ${sqlLiteral(p)} AS ${a}`;
             return worker.call('runSingle', [`${sql}\n${BOUNDARY}`, sql, [], BOUNDARY]);
         }],
-        ['exec: 2nd statement', (p, a) => worker.call('exec', [`SELECT 1; ATTACH '${p}' AS ${a}`])],
-        ['execBatch', (p, a) => worker.call('execBatch', [[{ sql: `ATTACH '${p}' AS ${a}` }]])],
+        ['exec: 2nd statement', (p, a) => worker.call('exec', [`SELECT 1; ATTACH ${sqlLiteral(p)} AS ${a}`])],
+        ['execBatch', (p, a) => worker.call('execBatch', [[{ sql: `ATTACH ${sqlLiteral(p)} AS ${a}` }]])],
         ['execBatch: paramsList', (p, a) => worker.call('execBatch', [[{ sql: `ATTACH ? AS ${a}`, paramsList: [[p]] }]])],
         ['prepare + stmtRun', async (p, a) => {
             const { stmtId } = await worker.call<{ stmtId: number }>('prepare', [`ATTACH ? AS ${a}`]);
             return worker.call('stmtRun', [stmtId, [p]]);
         }],
         ['queryBounded', (p, a) => {
-            const sql = `ATTACH '${p}' AS ${a}`;
+            const sql = `ATTACH ${sqlLiteral(p)} AS ${a}`;
             return worker.call('queryBounded', [`${sql}\n${BOUNDARY}`, sql, BOUNDARY, ['x'], undefined, 1, 5000]);
         }],
-        ['workspaceQuery: primary allAsync', (p, a) => worker.call('workspaceQuery', [`ATTACH '${p}' AS ${a}`, BOUNDARY, [], [], 5000])],
-        ['workspaceQueryPlan: primary allAsync', (p, a) => worker.call('workspaceQueryPlan', [`ATTACH '${p}' AS ${a}`, [], f.runtime.library, 5000])],
+        ['workspaceQuery: primary allAsync', (p, a) => worker.call('workspaceQuery', [`ATTACH ${sqlLiteral(p)} AS ${a}`, BOUNDARY, [], [], 5000])],
+        ['workspaceQueryPlan: primary allAsync', (p, a) => worker.call('workspaceQueryPlan', [`ATTACH ${sqlLiteral(p)} AS ${a}`, [], f.runtime.library, 5000])],
         // The binding coerces non-string SQL with ToString, so an array whose
         // only element is the statement compiles exactly like the string.
         ['prepare: SQL as a one-element array', async (p, a) => {
-            const { stmtId } = await worker.call<{ stmtId: number }>('prepare', [[`ATTACH '${p}' AS ${a}`]]);
+            const { stmtId } = await worker.call<{ stmtId: number }>('prepare', [[`ATTACH ${sqlLiteral(p)} AS ${a}`]]);
             return worker.call('stmtRun', [stmtId, []]);
         }, NOT_TEXT],
-        ['workspaceQueryPlan: SQL as a one-element array', (p, a) => worker.call('workspaceQueryPlan', [[`ATTACH '${p}' AS ${a}`], [], f.runtime.library, 5000]), NOT_TEXT],
+        ['workspaceQueryPlan: SQL as a one-element array', (p, a) => worker.call('workspaceQueryPlan', [[`ATTACH ${sqlLiteral(p)} AS ${a}`], [], f.runtime.library, 5000]), NOT_TEXT],
         // EXPLAIN of an ATTACH lists opcodes and opens nothing; it is refused
         // anyway so the guard never depends on that.
-        ['query: EXPLAIN ATTACH', (p, a) => f.query(`EXPLAIN ATTACH '${p}' AS ${a}`)],
-        ['query: EXPLAIN QUERY PLAN ATTACH', (p, a) => f.query(`EXPLAIN /* c */ QUERY\nPLAN ATTACH '${p}' AS ${a}`)],
+        ['query: EXPLAIN ATTACH', (p, a) => f.query(`EXPLAIN ATTACH ${sqlLiteral(p)} AS ${a}`)],
+        ['query: EXPLAIN QUERY PLAN ATTACH', (p, a) => f.query(`EXPLAIN /* c */ QUERY\nPLAN ATTACH ${sqlLiteral(p)} AS ${a}`)],
     ];
 
     // Every case targets the existing outside database: an executed ATTACH
@@ -280,7 +287,7 @@ it('refuses ATTACH and DETACH at every SQL entry point of the native worker', as
 
     // compileBatch reports compile failures per probe instead of rejecting.
     const compiled = await worker.call<{ errors: Array<string | null> }>('compileBatch', [[
-        `EXPLAIN ATTACH '${f.secret}' AS compile_probe`
+        `EXPLAIN ATTACH ${sqlLiteral(f.secret)} AS compile_probe`
     ]]);
     if (!BLOCKED.test(compiled.errors[0] ?? '')) {
         problems.push(`compileBatch: EXPLAIN ATTACH compiled (errors=${render(compiled.errors)})`);
@@ -288,7 +295,7 @@ it('refuses ATTACH and DETACH at every SQL entry point of the native worker', as
 
     // DETACH needs a schema to detach. Before the fix the ATTACH below
     // succeeds; after it, the ATTACH is refused and the DETACH must be too.
-    try { await worker.call('exec', [`ATTACH '${f.secret}' AS detach_target`]); } catch { /* refused */ }
+    try { await worker.call('exec', [`ATTACH ${sqlLiteral(f.secret)} AS detach_target`]); } catch { /* refused */ }
     for (const [label, sql] of [
         ['query: DETACH', 'DETACH DATABASE detach_target'],
         ['run: comment-prefixed DETACH', '/* c */ DETACH detach_target'],
@@ -372,11 +379,11 @@ it('refuses SQL-level VACUUM INTO a path the worker did not choose', async t => 
         if (problem !== undefined) problems.push(problem);
         if (fs.existsSync(target)) problems.push(`${label}: wrote ${path.basename(target)}`);
     }
-    await f.worker.call('open', [f.bound, true]);
+    await f.reopen(true);
     const readOnlyTarget = f.outsidePath('vacuum-read-only');
     const readOnly = await refusalProblem(f, 'read-only open: VACUUM INTO', () => f.query(`VACUUM INTO ${sqlLiteral(readOnlyTarget)}`));
     if (readOnly !== undefined) problems.push(readOnly);
-    await f.worker.call('open', [f.bound, false]);
+    await f.reopen(false);
 
     // Control arm: the host's own snapshot RPC still writes its destination,
     // and the permit it needed is gone once it settles, even for that path.
