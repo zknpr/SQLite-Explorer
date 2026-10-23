@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.8.2
+
+### Security
+
+- Update both bundled SQLite engines to 3.54.1, from 3.49.1 (WebAssembly) and 3.51.2 (native). This fixes FTS5 memory-safety bugs that a crafted database could reach: CVE-2025-7709 in the WebAssembly engine, and CVE-2026-11822 and CVE-2026-11824 in both engines. 3.54.1 rather than 3.54.0 because 3.54.0 has a heap overflow on 32-bit builds, which includes WebAssembly.
+- Refuse SQL-level `ATTACH` and `DETACH` on the native engine, so SQL that reaches the native worker cannot open, read or write another database file. The bundled runtime enforces the same rule in C, independent of the worker's statement check.
+- Refuse SQL-level `VACUUM INTO` on the native engine, which could create a copy of the open database at any path, even from a read-only connection. Exports keep using it for their own snapshot file.
+
+### Changes
+
+- SQLite 3.54 writes some REAL values as text with up to 17 significant digits, for example `9.6529377952984946e+282` instead of `9.6529377952985e+282`. The grid and exports show SQLite's text where JavaScript would render a REAL differently.
+- The WebAssembly engine includes upstream sql.js fixes for SQL larger than the WebAssembly stack, statement iterator cleanup, error messages thrown by user-defined functions, aggregate initialization over zero rows, and isolated SQL names and function registrations.
+
+### Maintenance
+
+- Resolve all open Dependabot alerts in build tooling and website dependencies. None of the affected packages ship in the extension.
+- Make the WebAssembly and query-plan runtime build reproducible: a rebuild from any directory produces identical bytes.
+- Link the SQLite Explorer desktop app from the README.
+
 ## 1.8.1
 
 ### Fixes
