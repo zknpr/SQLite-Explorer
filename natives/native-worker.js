@@ -219,6 +219,14 @@ function describeWorkerError(error) {
   return describeNativeError({ message: text }, 'Unknown native worker error');
 }
 
+/** A failed batch whose savepoint cleanup also failed, keeping both errors for describeWorkerError. */
+function batchCleanupError(error, cleanupError) {
+  return new AggregateError(
+    [error, cleanupError],
+    `Batch failed (${String(error)}); savepoint cleanup failed (${String(cleanupError)})`
+  );
+}
+
 /**
  * Install the guard on the connection classes themselves, once, before any
  * connection exists. Every handle this worker opens (the primary, the
@@ -704,7 +712,10 @@ function runVacuumInto(asyncDatabase, database, snapshotPath, signal) {
       throw error;
     }
   };
-  return asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal }).then(
+  // Through a promise, so a synchronous throw from run also withdraws the permit.
+  return new Promise(resolve => resolve(
+    asyncDatabase.run('VACUUM main INTO ?', [snapshotPath], { signal })
+  )).then(
     result => {
       withdrawPermit();
       return result;
@@ -742,7 +753,11 @@ function cancelOperation(correlationId) {
  * later reads fall back to the primary connection instead of a closed handle.
  */
 function releaseAsyncDatabase(connection) {
-  const closing = connection === asyncDb ? closeAsyncDatabase() : connection.close();
+  // Any other connection's close may be synchronous or throw; it is reported
+  // here rather than replacing the failure the caller is about to throw.
+  const closing = connection === asyncDb
+    ? closeAsyncDatabase()
+    : new Promise(resolve => resolve(connection.close()));
   closing.catch(closeError => {
     console.error('[native-worker] closing the snapshot connection failed:',
       describeNativeError(closeError, 'Unknown close error'));
@@ -2472,9 +2487,7 @@ async function handleRequest(request) {
             db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
             if (ownsSavepoint) db.exec(`RELEASE SAVEPOINT ${savepointName}`);
           } catch (rollbackErr) {
-            throw new Error(
-              `Batch failed (${String(err)}); savepoint cleanup failed (${String(rollbackErr)})`
-            );
+            throw batchCleanupError(err, rollbackErr);
           }
           throw err;
         }

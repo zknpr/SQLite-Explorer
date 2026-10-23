@@ -5,7 +5,7 @@
 ### Security
 
 - Update both bundled SQLite engines to 3.54.1, from 3.49.1 (WebAssembly) and 3.51.2 (native). This fixes an FTS5 out-of-bounds access that a crafted database can trigger (CVE-2025-7709, WebAssembly engine), FTS5 heap overflows reachable through SQL while defensive mode is off, which both engines leave off (CVE-2026-11822 and CVE-2026-11824, both engines), and an integer overflow reachable through SQL (CVE-2025-6965, WebAssembly engine). 3.54.1 rather than 3.54.0 because 3.54.0 has a heap overflow on 32-bit builds, which includes WebAssembly.
-- Refuse SQL-level `ATTACH` and `DETACH` on the native engine, so SQL that reaches the native worker cannot open, read or write another database file. The bundled runtime enforces the same rule in C, independent of the worker's statement check.
+- Refuse SQL-level `ATTACH` and `DETACH` on the native engine, so SQL sent to the native worker cannot open, read or write another database file. The bundled runtime enforces the same rule in C, independent of the worker's statement check, and allows only the snapshot file of a running export.
 - Refuse SQL-level `VACUUM INTO` on the native engine, which could create a copy of the open database at any path, even from a read-only connection. Exports keep using it for their own snapshot file.
 
 ### Changes

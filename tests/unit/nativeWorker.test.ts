@@ -4252,22 +4252,96 @@ describe('native async VACUUM routing', () => {
         assert.deepStrictEqual(released, [asyncDatabase]);
     });
 
-    it('releases the shared async connection so later work falls back to the primary', async () => {
-        let closedShared = 0;
-        let closedOther = 0;
-        const shared = { async close() { closedOther++; } };
-        const releaseAsyncDatabase = loadNativeWorkerFunction('releaseAsyncDatabase', ['connection'], {
-            asyncDb: shared,
-            closeAsyncDatabase: async () => { closedShared++; }
-        });
-        releaseAsyncDatabase(shared);
-        // closeAsyncDatabase clears the asyncDb reference shouldUseAsyncDatabase reads.
-        assert.strictEqual(closedShared, 1);
-        assert.strictEqual(closedOther, 0);
+    it('withdraws the ATTACH permit when run throws synchronously', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const runVacuumInto = loadNativeWorkerFunction(
+            'runVacuumInto',
+            ['asyncDatabase', 'database', 'snapshotPath', 'signal'],
+            { isExplicitlyOutsideTransaction, releaseAsyncDatabase: () => {} }
+        );
+        const permits: Array<string | null> = [];
+        const asyncDatabase = {
+            permitAttach(path: string | null) { permits.push(path); },
+            run() { throw new TypeError('bad arguments'); }
+        };
+        await assert.rejects(
+            () => runVacuumInto(asyncDatabase, { inTransaction: false }, '/private/a.sqlite', new AbortController().signal),
+            /bad arguments/
+        );
+        assert.deepStrictEqual(permits, ['/private/a.sqlite', null]);
+    });
 
-        const stray = { async close() { closedOther++; } };
-        releaseAsyncDatabase(stray);
-        assert.strictEqual(closedOther, 1);
+    it('releases the shared async connection so later work falls back to the primary', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const shouldUseAsyncDatabase = loadNativeWorkerFunction(
+            'shouldUseAsyncDatabase',
+            ['database', 'asyncDatabase'],
+            { isExplicitlyOutsideTransaction }
+        );
+        const describeNativeError = loadNativeWorkerFunction(
+            'describeNativeError',
+            ['error', 'fallback'],
+            { MAX_NATIVE_ERROR_MESSAGE_LENGTH: 8192 }
+        );
+        // The real releaseAsyncDatabase and closeAsyncDatabase over one shared
+        // `asyncDb` binding and spool set, as in the worker.
+        const source = ['function releaseAsyncDatabase(connection)', 'function closeAsyncDatabase()']
+            .map(signature => {
+                const escaped = signature.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const match = nativeWorkerSource.match(new RegExp(`${escaped} \\{[\\s\\S]*?^\\}`, 'm'))?.[0];
+                assert.ok(match, `native worker signature changed; expected ${signature}`);
+                return match;
+            })
+            .join('\n');
+        const errors: string[] = [];
+        const workerState = (initial: unknown) => Function(
+            'initial', 'describeNativeError', 'console',
+            `"use strict";
+            let asyncDb = initial;
+            const exportSpools = new Set(['spool_1']);
+            ${source}
+            return { releaseAsyncDatabase, state: () => ({ asyncDb, spools: exportSpools.size }) };`
+        )(initial, describeNativeError, { error: (...args: unknown[]) => errors.push(args.join(' ')) });
+
+        let closed = 0;
+        const shared = { async close() { closed++; } };
+        const worker = workerState(shared);
+        worker.releaseAsyncDatabase(shared);
+        // Synchronously, before the close settles: no later request can pick the
+        // stuck handle, and its TEMP spools are forgotten with it.
+        assert.deepStrictEqual(worker.state(), { asyncDb: null, spools: 0 });
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: false }, worker.state().asyncDb), false);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(closed, 1);
+
+        // A connection other than the shared one is closed without touching it.
+        const other = workerState(shared);
+        const stray = { async close() { closed++; } };
+        other.releaseAsyncDatabase(stray);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(closed, 2);
+        assert.deepStrictEqual(other.state(), { asyncDb: shared, spools: 1 });
+
+        // A synchronous close, returning nothing or throwing, is handled the same way.
+        other.releaseAsyncDatabase({ close() { closed++; } });
+        other.releaseAsyncDatabase({ close() { throw new Error('sync close failed'); } });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(closed, 3);
+
+        // A failed close is reported, not swallowed or left unhandled.
+        const failing = { async close() { throw new Error('close failed'); } };
+        workerState(failing).releaseAsyncDatabase(failing);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepStrictEqual(errors, [
+            '[native-worker] closing the snapshot connection failed: sync close failed',
+            '[native-worker] closing the snapshot connection failed: close failed'
+        ]);
     });
 
     it('keeps every failure when reporting a runtime ATTACH refusal', () => {
@@ -4314,6 +4388,32 @@ describe('native async VACUUM routing', () => {
         assert.match(bounded, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
         assert.match(bounded, /\[truncated from \d+ characters\]$/);
         assert.ok(bounded.length < 8300, `refusal text is ${bounded.length} characters`);
+    });
+
+    it('keeps a runtime ATTACH refusal coded when the batch savepoint cleanup also fails', () => {
+        const forEachWrappedError = loadNativeWorkerFunction('forEachWrappedError', ['error', 'visit', 'depth = 0', 'seen = new Set()']);
+        const isPathAuthorityRefusal = loadNativeWorkerFunction(
+            'isPathAuthorityRefusal',
+            ['error'],
+            { SQLITE_AUTH: 23, forEachWrappedError }
+        );
+        const describeWorkerError = loadNativeWorkerFunction(
+            'describeWorkerError',
+            ['error'],
+            { isPathAuthorityRefusal, forEachWrappedError, SQLITE_AUTH: 23, NATIVE_SQL_ATTACH_BLOCKED: 'ERR_NATIVE_SQL_ATTACH_BLOCKED' }
+        );
+        const batchCleanupError = loadNativeWorkerFunction('batchCleanupError', ['error', 'cleanupError']);
+        const refusal = Object.assign(new Error('authorization denied'), { errno: 23 });
+
+        const coded = describeWorkerError(batchCleanupError(refusal, new Error('cannot rollback - no transaction is active')));
+        assert.match(coded, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(coded, /cannot rollback - no transaction is active/);
+
+        // Other batch failures keep the text they had.
+        assert.strictEqual(
+            describeWorkerError(batchCleanupError(new Error('UNIQUE constraint failed'), new Error('disk I/O error'))),
+            'Batch failed (Error: UNIQUE constraint failed); savepoint cleanup failed (Error: disk I/O error)'
+        );
     });
 
     it('reports a failing statement once when finalize repeats its error code', () => {
