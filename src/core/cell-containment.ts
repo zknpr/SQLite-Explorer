@@ -419,7 +419,11 @@ export function decodeRawTextColumns(
  * TEXT containing NUL never counts: some engines and connections truncate it
  * at NUL and others return it whole, so it stays bytes on all of them.
  */
-function decodedTextReproducesBytes(decoder: TextDecoder, rawBytes: Uint8Array, value: string): boolean {
+function decodedTextReproducesBytes(
+  decoder: { decode(bytes: Uint8Array): string },
+  rawBytes: Uint8Array,
+  value: string
+): boolean {
   if (value.includes('\0')) return false;
   try {
     return decoder.decode(rawBytes) === value;
