@@ -477,7 +477,7 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             // The read-only copy is an existing database the bound path does
             // not cover; before the guard this attached it and read through it.
             await assert.rejects(
-                engine.executeQuery(`SELECT 1; ATTACH '${readOnlyDatabasePath}' AS smoke_attached`),
+                engine.executeQuery(`SELECT 1; ATTACH '${readOnlyDatabasePath.replaceAll("'", "''")}' AS smoke_attached`),
                 /ERR_NATIVE_SQL_ATTACH_BLOCKED/
             );
             const schemas = await engine.executeQuery('PRAGMA database_list');

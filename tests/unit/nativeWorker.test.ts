@@ -4304,6 +4304,16 @@ describe('native async VACUUM routing', () => {
         assert.match(viaCause, /Operation cancelled/);
 
         assert.strictEqual(describeWorkerError(new Error('disk I/O error')), 'disk I/O error');
+
+        // The joined text keeps the IPC bound every other native error has.
+        const long = (label: string) => new Error(`${label}: ${'x'.repeat(8000)}`);
+        const bounded = describeWorkerError(new AggregateError(
+            [refusal(), long('withdrawal'), long('deadline'), new Error('cancelled', { cause: long('cause') })],
+            'combined'
+        ));
+        assert.match(bounded, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(bounded, /\[truncated from \d+ characters\]$/);
+        assert.ok(bounded.length < 8300, `refusal text is ${bounded.length} characters`);
     });
 
     it('reports a failing statement once when finalize repeats its error code', () => {

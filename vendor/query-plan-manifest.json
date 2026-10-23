@@ -6,7 +6,7 @@
   "zigClang": "clang version 21.1.0",
   "inputs": {
     "src/runtime/query-plan.c": "a2e6d39c36152bf36bb3729aff12567ed4fa2d9c7ef3751e60db580f5276cc8f",
-    "scripts/build-query-plan.mjs": "5e21e2468eb7936e10ad342cd12a95fb948d116b663210895af42c42ea9cde33"
+    "scripts/build-query-plan.mjs": "0e4d926fd88b8bbe057e661adbcf0b04cafffdeda633e88f5e2fa61565031eb4"
   },
   "outputs": {
     "natives/aarch64-macos/query-plan.dylib": "3a51dcd0ebc627e63d664e9b9c317667cb356f197e0d5645262bc3b5ef7b8c3c",

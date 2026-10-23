@@ -59,7 +59,11 @@ function describeNativeError(error, fallback) {
  */
 const NATIVE_SQL_ATTACH_BLOCKED = 'ERR_NATIVE_SQL_ATTACH_BLOCKED';
 
-/** SQLite's whitespace (sqlite3Isspace): space and \t \n \v \f \r. */
+/**
+ * Whitespace for the leading-verb check: space and \t \n \v \f \r. SQLite's
+ * tokenizer classes \v (0x0B) as illegal rather than space, so skipping it
+ * only makes this check refuse statements SQLite would reject anyway.
+ */
 function isSqliteSpace(code) {
   return code === 0x20 || (code >= 0x09 && code <= 0x0d);
 }
@@ -208,9 +212,11 @@ function describeWorkerError(error) {
     const message = describeNativeError(candidate, 'Unknown error');
     if (!others.includes(message)) others.push(message);
   });
-  return 'The native SQLite engine refused a statement that would ATTACH, DETACH or ' +
+  const text = 'The native SQLite engine refused a statement that would ATTACH, DETACH or ' +
     'VACUUM INTO a database other than the one this editor opened. ' +
     `(${NATIVE_SQL_ATTACH_BLOCKED})` + others.map(message => `; ${message}`).join('');
+  // The same IPC bound as every other worker error.
+  return describeNativeError({ message: text }, 'Unknown native worker error');
 }
 
 /**

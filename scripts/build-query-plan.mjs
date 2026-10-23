@@ -135,7 +135,7 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     writeFileSync(exportsPath, JSON.stringify(exported));
     // The Makefile's object prerequisites download tools that are unnecessary
     // here: all three upstream sources were verified and compiled above.
-    run('make', ['dist/sql-wasm.js', `EMCC=${options.emcc.includes(path.sep) ? path.resolve(options.emcc) : options.emcc}`, 'BITCODE_FILES=out/sqlite3.o out/extension-functions.o out/vfs.o out/query-plan.o',
+    run('make', ['dist/sql-wasm.js', `EMCC=${options.emcc}`, 'BITCODE_FILES=out/sqlite3.o out/extension-functions.o out/vfs.o out/query-plan.o',
       '-o', 'out/sqlite3.o', '-o', 'out/extension-functions.o', '-o', 'out/vfs.o'], { cwd: source });
     for (const [file, copies] of Object.entries(wasmCopies)) {
       const contents = readFileSync(path.join(dist, file));
