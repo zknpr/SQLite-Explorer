@@ -176,6 +176,18 @@ class StandInDatabase {
         return this.#require().isTransaction;
     }
 
+    /** The fork's statement-scoped snapshot; node has no authorizer to scope. */
+    vacuumInto(path: string): void {
+        if (typeof path !== 'string' || path.length === 0 || path.includes('\0')) {
+            throw new TypeError('A VACUUM INTO destination must be a non-empty path without NUL characters');
+        }
+        try {
+            this.#require().prepare('VACUUM main INTO ?').run(path);
+        } catch (error) {
+            rethrowAsFork(error);
+        }
+    }
+
     close(): void {
         // The fork tolerates a double close; node throws.
         if (this.#database === null) return;

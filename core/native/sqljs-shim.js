@@ -368,8 +368,8 @@ function compileNext(backing, sql, from, describe) {
     // silent). Rejected AFTER compile / BEFORE step because VACUUM INTO's file
     // is created at step, not prepare (verified against the shipped binary), so
     // the compiled-but-never-stepped statement writes nothing. The shim's own
-    // export issues its VACUUM INTO through `backing.prepare` directly (see
-    // `vacuumInto`), NOT through compileNext, so it is deliberately unaffected.
+    // export goes through `backing.vacuumInto` (see `vacuumInto`), NOT through
+    // compileNext, so it is deliberately unaffected.
     if (VACUUM_PREFIX.test(leading) && INTO_WORD.test(source)) {
         finalizeQuietly(compiled);
         throw vacuumIntoBlockedError();
@@ -1022,13 +1022,11 @@ export function createShimDatabase(config = {}, deps = {}) {
 
     let progressHandler = null;
 
+    // The runtime refuses SQL-level VACUUM INTO: its authorizer denies the
+    // ATTACH that VACUUM performs on the destination. backing.vacuumInto is
+    // the one exception, scoped to that single statement.
     const vacuumInto = (target) => withInternalWrites(() => {
-        const statement = backing.prepare('VACUUM INTO ?');
-        try {
-            statement.run([target]);
-        } finally {
-            finalizeQuietly(statement);
-        }
+        backing.vacuumInto(target);
     });
 
     const database = {
