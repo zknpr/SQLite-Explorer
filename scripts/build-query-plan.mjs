@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createPinnedArtifactPolicy } from './lib/pinned-artifacts.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const sourceCommit = '424163d6c9c34acec7bac07eb2cecedd86185a60';
+const sourceCommit = '3181cc5ee888d3251228d3995c32bf9ea03c3240';
 const manifestPath = 'vendor/query-plan-manifest.json';
 const sourceFiles = ['src/runtime/query-plan.c', 'scripts/build-query-plan.mjs'];
 const nativeTargets = [
@@ -23,6 +23,11 @@ const wasmCopies = {
 };
 const outputFiles = [...Object.values(wasmCopies).flat(), ...nativeTargets.map(([triple, , extension]) => `natives/${triple}/query-plan.${extension}`)];
 const hash = contents => createHash('sha256').update(contents).digest('hex');
+// Exact identities, not substrings: a different Emscripten commit or a Zig
+// distribution with another bundled LLVM produces different bytes.
+const expectedEmcc = 'emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 5.0.0 (a7c5deabd7c88ba1c38ebe988112256775f944c6)';
+const expectedZigVersion = '0.16.0';
+const expectedZigClang = 'clang version 21.1.0';
 
 export function verifyQueryPlanArtifacts(directory = root, { includeBuildAssets = true } = {}) {
   const manifest = JSON.parse(readFileSync(path.join(directory, manifestPath), 'utf8'));
@@ -62,13 +67,30 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     if (!key || !args[index + 1]) throw new Error('Usage: node scripts/build-query-plan.mjs [--check] [--emcc PATH] [--zig PATH] [--sqljs-source GIT_CHECKOUT]');
     options[key] = args[index + 1];
   }
-  const emccVersion = String(run(options.emcc, ['--version'], { stdio: 'pipe' })).split('\n')[0];
+  // Resolve once so every child process runs the same tool whatever its cwd.
+  // Either separator marks a path on Windows; a bare name stays a PATH lookup.
+  for (const tool of ['emcc', 'zig']) if (/[\\/]/.test(options[tool])) options[tool] = path.resolve(options[tool]);
+  const emccVersion = String(run(options.emcc, ['--version'], { stdio: 'pipe' })).split('\n')[0].trim();
+  if (emccVersion !== expectedEmcc) {
+    throw new Error(`Reproducible runtime builds require Emscripten 5.0.0 ("${expectedEmcc}"); found "${emccVersion}".`);
+  }
   const zigVersion = String(run(options.zig, ['version'], { stdio: 'pipe' })).trim();
-  if (!emccVersion.includes('5.0.0') || zigVersion !== '0.16.0') throw new Error('Reproducible runtime builds require Emscripten 5.0.0 and Zig 0.16.0.');
+  if (zigVersion !== expectedZigVersion) {
+    throw new Error(`Reproducible runtime builds require the official Zig ${expectedZigVersion} release; found "${zigVersion}".`);
+  }
   const inputs = Object.fromEntries(sourceFiles.map(file => [file, hash(readFileSync(path.join(root, file)))]));
   mkdirSync(path.join(root, '.tmp'), { recursive: true });
   const build = mkdtempSync(path.join(root, '.tmp/query-plan-build-'));
   try {
+    // Linux outputs record the linker identity in .comment, so only the official
+    // Zig 0.16.0 release (bundled LLVM 21.1.0) reproduces the pinned bytes.
+    // Distribution builds such as Homebrew's report the same `zig version`.
+    // `zig cc --version` also writes an empty a.o, so it runs in the build dir.
+    const zigClang = String(run(options.zig, ['cc', '--version'], { stdio: 'pipe', cwd: build })).split('\n')[0].trim();
+    if (zigClang !== expectedZigClang) {
+      throw new Error(`Reproducible runtime builds require the official Zig ${expectedZigVersion} release ` +
+        `(zig cc must report "${expectedZigClang}"); found "${zigClang}".`);
+    }
     let checkout = options.source && path.resolve(options.source);
     if (!checkout) {
       checkout = path.join(build, 'upstream');
@@ -79,9 +101,9 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     run('tar', ['-xf', '-', '-C', source], { input: archive, stdio: ['pipe', 'inherit', 'inherit'] });
     const sqliteSource = path.join(source, 'sqlite-src'); mkdirSync(sqliteSource, { recursive: true });
     const zip = path.join(build, 'sqlite.zip');
-    await download('https://sqlite.org/2025/sqlite-amalgamation-3490100.zip', zip, 'sha3-256', 'e7eb4cfb2d95626e782cfa748f534c74482f2c3c93f13ee828b9187ce05b2da7');
+    await download('https://sqlite.org/2026/sqlite-amalgamation-3540100.zip', zip, 'sha3-256', '92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30');
     run('unzip', ['-q', zip, '-d', sqliteSource]);
-    const headers = path.join(sqliteSource, 'sqlite-amalgamation-3490100');
+    const headers = path.join(sqliteSource, 'sqlite-amalgamation-3540100');
     await download('https://www.sqlite.org/contrib/download/extension-functions.c?get=25', path.join(headers, 'extension-functions.c'), 'sha1', 'c68fa706d6d9ff98608044c00212473f9c14892f');
     const helper = path.join(root, sourceFiles[0]);
     const outputs = new Map();
@@ -96,13 +118,16 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     }
     const out = path.join(source, 'out'), dist = path.join(source, 'dist');
     mkdirSync(out, { recursive: true }); mkdirSync(dist, { recursive: true });
-    const compileFlags = ['-Oz', '-DSQLITE_OMIT_LOAD_EXTENSION', '-DSQLITE_DISABLE_LFS', '-DSQLITE_ENABLE_FTS3', '-DSQLITE_ENABLE_FTS3_PARENTHESIS',
+    // extension-functions.c asserts embed __FILE__; map the random build
+    // directory (and the checkout) to fixed names so outputs reproduce.
+    const prefixMaps = [`-ffile-prefix-map=${build}=/query-plan-build`, `-ffile-prefix-map=${root}=/sqlite-explorer`];
+    const compileFlags = ['-Oz', ...prefixMaps, '-DSQLITE_OMIT_LOAD_EXTENSION', '-DSQLITE_DISABLE_LFS', '-DSQLITE_ENABLE_FTS3', '-DSQLITE_ENABLE_FTS3_PARENTHESIS',
       '-DSQLITE_ENABLE_FTS5', '-DSQLITE_THREADSAFE=0', '-DSQLITE_ENABLE_NORMALIZE', '-DSQLITE_LIKE_DOESNT_MATCH_BLOBS'];
     for (const [input, name, flags] of [
       [path.join(headers, 'sqlite3.c'), 'sqlite3', compileFlags],
       [path.join(headers, 'extension-functions.c'), 'extension-functions', compileFlags],
       [path.join(source, 'src/vfs.c'), 'vfs', compileFlags],
-      [helper, 'query-plan', ['-Oz', '-DSQLITE_CORE']]
+      [helper, 'query-plan', ['-Oz', ...prefixMaps, '-DSQLITE_CORE']]
     ]) run(options.emcc, [...flags, '-I', headers, '-c', input, '-o', path.join(out, `${name}.o`)]);
     const exportsPath = path.join(source, 'src/exported_functions.json');
     const exported = JSON.parse(readFileSync(exportsPath, 'utf8'));
@@ -110,20 +135,20 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     writeFileSync(exportsPath, JSON.stringify(exported));
     // The Makefile's object prerequisites download tools that are unnecessary
     // here: all three upstream sources were verified and compiled above.
-    run('make', ['dist/sql-wasm.js', `EMCC=${options.emcc.includes(path.sep) ? path.resolve(options.emcc) : options.emcc}`, 'BITCODE_FILES=out/sqlite3.o out/extension-functions.o out/vfs.o out/query-plan.o',
+    run('make', ['dist/sql-wasm.js', `EMCC=${options.emcc}`, 'BITCODE_FILES=out/sqlite3.o out/extension-functions.o out/vfs.o out/query-plan.o',
       '-o', 'out/sqlite3.o', '-o', 'out/extension-functions.o', '-o', 'out/vfs.o'], { cwd: source });
     for (const [file, copies] of Object.entries(wasmCopies)) {
       const contents = readFileSync(path.join(dist, file));
       for (const copy of copies) outputs.set(copy, contents);
     }
     for (const file of sourceFiles) if (hash(readFileSync(path.join(root, file))) !== inputs[file]) throw new Error(`Source changed during runtime build: ${file}`);
-    const manifest = { schema: 1, sqlJsCommit: sourceCommit, emcc: emccVersion, zig: zigVersion, inputs,
+    const manifest = { schema: 1, sqlJsCommit: sourceCommit, emcc: emccVersion, zig: zigVersion, zigClang, inputs,
       outputs: Object.fromEntries([...outputs].map(([file, contents]) => [file, hash(contents)])) };
     outputs.set(manifestPath, Buffer.from(JSON.stringify(manifest, null, 2) + '\n'));
-    // Reuse the existing rollback-protected installer. Provenance above refers
-    // to this source build; the pinned run identifies only its upstream base.
+    // Reuse only the rollback-protected installer. The manifest above is this
+    // source build's provenance; a local build has no Actions run to pin.
     const { installArtifacts } = createPinnedArtifactPolicy({ scriptName: 'build-query-plan.mjs', repository: 'zknpr/sql.js',
-      sourceBranch: 'agent/paged-vfs-attach-isolation', sourceCommit, pinnedRunId: '31639875548', expectedArtifactPaths: {} });
+      sourceBranch: 'master', sourceCommit, pinnedRunId: null, expectedArtifactPaths: {} });
     installArtifacts([...outputs].map(([file, contents]) => ({ destination: path.join(root, file), contents, expectedHash: hash(contents) })));
     verifyQueryPlanArtifacts();
     console.log('Built and verified WASM query-plan support and five native libraries.');

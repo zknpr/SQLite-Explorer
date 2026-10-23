@@ -4178,11 +4178,18 @@ describe('native async VACUUM routing', () => {
         const runVacuumInto = loadNativeWorkerFunction(
             'runVacuumInto',
             ['asyncDatabase', 'database', 'snapshotPath', 'signal'],
-            { isExplicitlyOutsideTransaction }
+            { isExplicitlyOutsideTransaction, releaseAsyncDatabase: () => {} }
         );
         const calls: unknown[][] = [];
+        let failNextRun = false;
         const asyncDatabase = {
-            async run(...args: unknown[]) { calls.push(args); }
+            // The runtime refuses VACUUM INTO's internal ATTACH unless the
+            // destination is the connection's one permitted path.
+            permitAttach(path: string | null) { calls.push(['permitAttach', path]); },
+            async run(...args: unknown[]) {
+                calls.push(['run', ...args]);
+                if (failNextRun) throw new Error('disk full');
+            }
         };
         const signal = new AbortController().signal;
 
@@ -4192,17 +4199,278 @@ describe('native async VACUUM routing', () => {
             "/private/quote'snapshot.sqlite",
             signal
         );
-        assert.deepStrictEqual(calls, [[
-            'VACUUM main INTO ?',
-            ["/private/quote'snapshot.sqlite"],
-            { signal }
-        ]]);
+        assert.deepStrictEqual(calls, [
+            ['permitAttach', "/private/quote'snapshot.sqlite"],
+            ['run', 'VACUUM main INTO ?', ["/private/quote'snapshot.sqlite"], { signal }],
+            ['permitAttach', null]
+        ]);
 
+        // A failed VACUUM still withdraws the permit.
+        calls.length = 0;
+        failNextRun = true;
+        await assert.rejects(
+            runVacuumInto(asyncDatabase, { inTransaction: false }, '/private/failed.sqlite', signal),
+            /disk full/
+        );
+        assert.deepStrictEqual(calls.map(call => call[0] === 'run' ? 'run' : call), [
+            ['permitAttach', '/private/failed.sqlite'],
+            'run',
+            ['permitAttach', null]
+        ]);
+
+        calls.length = 0;
         await assert.rejects(
             runVacuumInto(asyncDatabase, { inTransaction: true }, '/private/blocked.sqlite', signal),
             /active transaction/i
         );
-        assert.strictEqual(calls.length, 1);
+        assert.deepStrictEqual(calls, [], 'a refused snapshot never grants a permit');
+    });
+
+    it('takes the snapshot connection out of service when the ATTACH permit cannot be withdrawn', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const released: unknown[] = [];
+        const runVacuumInto = loadNativeWorkerFunction(
+            'runVacuumInto',
+            ['asyncDatabase', 'database', 'snapshotPath', 'signal'],
+            { isExplicitlyOutsideTransaction, releaseAsyncDatabase: (connection: unknown) => { released.push(connection); } }
+        );
+        const asyncDatabase = {
+            permitAttach(path: string | null) {
+                if (path === null) throw new Error('permit store failed');
+            },
+            async run() {}
+        };
+        await assert.rejects(
+            runVacuumInto(asyncDatabase, { inTransaction: false }, '/private/a.sqlite', new AbortController().signal),
+            /permit store failed/
+        );
+        // No reachable handle may keep authorizing ATTACH of the snapshot path,
+        // and later reads must not be routed to a closed one.
+        assert.deepStrictEqual(released, [asyncDatabase]);
+    });
+
+    it('withdraws the ATTACH permit when run throws synchronously', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const runVacuumInto = loadNativeWorkerFunction(
+            'runVacuumInto',
+            ['asyncDatabase', 'database', 'snapshotPath', 'signal'],
+            { isExplicitlyOutsideTransaction, releaseAsyncDatabase: () => {} }
+        );
+        const permits: Array<string | null> = [];
+        const asyncDatabase = {
+            permitAttach(path: string | null) { permits.push(path); },
+            run() { throw new TypeError('bad arguments'); }
+        };
+        await assert.rejects(
+            () => runVacuumInto(asyncDatabase, { inTransaction: false }, '/private/a.sqlite', new AbortController().signal),
+            /bad arguments/
+        );
+        assert.deepStrictEqual(permits, ['/private/a.sqlite', null]);
+    });
+
+    it('releases the shared async connection so later work falls back to the primary', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const shouldUseAsyncDatabase = loadNativeWorkerFunction(
+            'shouldUseAsyncDatabase',
+            ['database', 'asyncDatabase'],
+            { isExplicitlyOutsideTransaction }
+        );
+        const describeNativeError = loadNativeWorkerFunction(
+            'describeNativeError',
+            ['error', 'fallback'],
+            { MAX_NATIVE_ERROR_MESSAGE_LENGTH: 8192 }
+        );
+        // The real releaseAsyncDatabase and closeAsyncDatabase over one shared
+        // `asyncDb` binding and spool set, as in the worker.
+        const source = ['function releaseAsyncDatabase(connection)', 'function closeAsyncDatabase()']
+            .map(signature => {
+                const escaped = signature.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const match = nativeWorkerSource.match(new RegExp(`${escaped} \\{[\\s\\S]*?^\\}`, 'm'))?.[0];
+                assert.ok(match, `native worker signature changed; expected ${signature}`);
+                return match;
+            })
+            .join('\n');
+        const errors: string[] = [];
+        const workerState = (initial: unknown) => Function(
+            'initial', 'describeNativeError', 'console',
+            `"use strict";
+            let asyncDb = initial;
+            const exportSpools = new Set(['spool_1']);
+            ${source}
+            return { releaseAsyncDatabase, state: () => ({ asyncDb, spools: exportSpools.size }) };`
+        )(initial, describeNativeError, { error: (...args: unknown[]) => errors.push(args.join(' ')) });
+
+        let closed = 0;
+        const shared = { async close() { closed++; } };
+        const worker = workerState(shared);
+        worker.releaseAsyncDatabase(shared);
+        // Synchronously, before the close settles: no later request can pick the
+        // stuck handle, and its TEMP spools are forgotten with it.
+        assert.deepStrictEqual(worker.state(), { asyncDb: null, spools: 0 });
+        assert.strictEqual(shouldUseAsyncDatabase({ inTransaction: false }, worker.state().asyncDb), false);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(closed, 1);
+
+        // A connection other than the shared one is closed without touching it.
+        const other = workerState(shared);
+        const stray = { async close() { closed++; } };
+        other.releaseAsyncDatabase(stray);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(closed, 2);
+        assert.deepStrictEqual(other.state(), { asyncDb: shared, spools: 1 });
+
+        // A synchronous close, returning nothing or throwing, is handled the same way.
+        other.releaseAsyncDatabase({ close() { closed++; } });
+        other.releaseAsyncDatabase({ close() { throw new Error('sync close failed'); } });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(closed, 3);
+
+        // A failed close is reported, not swallowed or left unhandled.
+        const failing = { async close() { throw new Error('close failed'); } };
+        workerState(failing).releaseAsyncDatabase(failing);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepStrictEqual(errors, [
+            '[native-worker] closing the snapshot connection failed: sync close failed',
+            '[native-worker] closing the snapshot connection failed: close failed'
+        ]);
+    });
+
+    it('keeps every failure when reporting a runtime ATTACH refusal', () => {
+        const forEachWrappedError: (error: unknown, visit: (error: { errno?: number }) => void) => void =
+            loadNativeWorkerFunction('forEachWrappedError', ['error', 'visit', 'depth = 0', 'seen = new Set()']);
+        const isPathAuthorityRefusal = loadNativeWorkerFunction(
+            'isPathAuthorityRefusal',
+            ['error'],
+            { SQLITE_AUTH: 23, forEachWrappedError }
+        );
+        const describeWorkerError = loadNativeWorkerFunction(
+            'describeWorkerError',
+            ['error'],
+            { isPathAuthorityRefusal, forEachWrappedError, SQLITE_AUTH: 23, NATIVE_SQL_ATTACH_BLOCKED: 'ERR_NATIVE_SQL_ATTACH_BLOCKED' }
+        );
+        const refusal = () => Object.assign(new Error('authorization denied'), { errno: 23 });
+
+        const withdrawal = describeWorkerError(
+            new AggregateError([refusal(), new Error('permit store failed')], 'combined')
+        );
+        assert.match(withdrawal, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(withdrawal, /permit store failed/, 'a second failure must not be dropped');
+
+        // runWithQueryDeadline wraps executeStatement's failure in another AggregateError.
+        const nested = describeWorkerError(new AggregateError([
+            new AggregateError([refusal()], 'inner'),
+            new Error('clearing the query deadline failed')
+        ], 'outer'));
+        assert.match(nested, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(nested, /clearing the query deadline failed/);
+
+        const viaCause = describeWorkerError(new Error('Operation cancelled', { cause: refusal() }));
+        assert.match(viaCause, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(viaCause, /Operation cancelled/);
+
+        assert.strictEqual(describeWorkerError(new Error('disk I/O error')), 'disk I/O error');
+
+        // The joined text keeps the IPC bound every other native error has.
+        const long = (label: string) => new Error(`${label}: ${'x'.repeat(8000)}`);
+        const bounded = describeWorkerError(new AggregateError(
+            [refusal(), long('withdrawal'), long('deadline'), new Error('cancelled', { cause: long('cause') })],
+            'combined'
+        ));
+        assert.match(bounded, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(bounded, /\[truncated from \d+ characters\]$/);
+        assert.ok(bounded.length < 8300, `refusal text is ${bounded.length} characters`);
+    });
+
+    it('keeps a runtime ATTACH refusal coded when the batch savepoint cleanup also fails', () => {
+        const forEachWrappedError = loadNativeWorkerFunction('forEachWrappedError', ['error', 'visit', 'depth = 0', 'seen = new Set()']);
+        const isPathAuthorityRefusal = loadNativeWorkerFunction(
+            'isPathAuthorityRefusal',
+            ['error'],
+            { SQLITE_AUTH: 23, forEachWrappedError }
+        );
+        const describeWorkerError = loadNativeWorkerFunction(
+            'describeWorkerError',
+            ['error'],
+            { isPathAuthorityRefusal, forEachWrappedError, SQLITE_AUTH: 23, NATIVE_SQL_ATTACH_BLOCKED: 'ERR_NATIVE_SQL_ATTACH_BLOCKED' }
+        );
+        const batchCleanupError = loadNativeWorkerFunction('batchCleanupError', ['error', 'cleanupError']);
+        const refusal = Object.assign(new Error('authorization denied'), { errno: 23 });
+
+        const coded = describeWorkerError(batchCleanupError(refusal, new Error('cannot rollback - no transaction is active')));
+        assert.match(coded, /ERR_NATIVE_SQL_ATTACH_BLOCKED/);
+        assert.match(coded, /cannot rollback - no transaction is active/);
+
+        // Other batch failures keep the text they had.
+        assert.strictEqual(
+            describeWorkerError(batchCleanupError(new Error('UNIQUE constraint failed'), new Error('disk I/O error'))),
+            'Batch failed (Error: UNIQUE constraint failed); savepoint cleanup failed (Error: disk I/O error)'
+        );
+    });
+
+    it('reports a failing statement once when finalize repeats its error code', () => {
+        const executeStatement = loadNativeWorkerFunction('executeStatement', ['db', 'sql', 'params']);
+        const sqliteError = (errno: number, message: string) => Object.assign(new Error(message), { errno });
+        const database = (finalizeErrno: number) => ({
+            prepare() {
+                return {
+                    run() { throw sqliteError(19, 'constraint failed'); },
+                    finalize() { throw sqliteError(finalizeErrno, finalizeErrno === 19 ? 'constraint failed' : 'disk I/O error'); }
+                };
+            }
+        });
+        assert.throws(
+            () => executeStatement(database(19), 'INSERT INTO t VALUES (NULL)', []),
+            (error: Error) => error.message === 'constraint failed' && !(error instanceof AggregateError)
+        );
+        // A different finalize failure is still reported alongside.
+        assert.throws(
+            () => executeStatement(database(10), 'INSERT INTO t VALUES (NULL)', []),
+            (error: Error) => error instanceof AggregateError && /constraint failed/.test(error.message) && /disk I\/O error/.test(error.message)
+        );
+    });
+
+    it('surfaces a failed ATTACH permit withdrawal unless the connection is closing', async () => {
+        const isExplicitlyOutsideTransaction = loadNativeWorkerFunction(
+            'isExplicitlyOutsideTransaction',
+            ['database']
+        );
+        const runVacuumInto = loadNativeWorkerFunction(
+            'runVacuumInto',
+            ['asyncDatabase', 'database', 'snapshotPath', 'signal'],
+            { isExplicitlyOutsideTransaction, releaseAsyncDatabase: () => {} }
+        );
+        const signal = new AbortController().signal;
+        const connection = (withdrawError: Error | undefined, runError?: Error) => ({
+            permitAttach(path: string | null) {
+                if (path === null && withdrawError) throw withdrawError;
+            },
+            async run() {
+                if (runError) throw runError;
+            },
+            async close() {}
+        });
+
+        // A permit left open with nothing reported is the silent failure.
+        await assert.rejects(
+            runVacuumInto(connection(new Error('permit store failed')), { inTransaction: false }, '/private/a.sqlite', signal),
+            /permit store failed/
+        );
+        // Both failures are reported when the VACUUM itself also failed.
+        await assert.rejects(
+            runVacuumInto(connection(new Error('permit store failed'), new Error('disk full')), { inTransaction: false }, '/private/b.sqlite', signal),
+            (error: Error) => /disk full/.test(error.message) && /permit store failed/.test(error.message)
+        );
+        // A closing connection takes its permit with it.
+        await runVacuumInto(connection(new Error('Invalid DB')), { inTransaction: false }, '/private/c.sqlite', signal);
     });
 
     it('reports a deadline that lands before an async completion is observed', async () => {
