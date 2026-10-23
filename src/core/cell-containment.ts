@@ -1082,20 +1082,14 @@ export function encodeByteFaithfulPrimaryKeyRecordId(
     const value = values[index];
     if (typeof value !== 'string') continue;
     const rawBytes = projectedRow[keyCount + index];
-    let representable = false;
-    if (rawBytes instanceof Uint8Array) {
-      try {
-        representable = decoder.decode(rawBytes) === value;
-      } catch {
-        representable = false;
-      }
-    }
+    const representable = rawBytes instanceof Uint8Array
+      && decodedTextReproducesBytes(decoder, rawBytes, value);
     if (!representable) {
       throw new Error(
         `${context}: WITHOUT ROWID primary-key column ` +
         `"${identity.columns[index].identifier}" contains text that is not valid ` +
-        `${textEncodingLabel(textEncoding)} without changing its stored bytes; ` +
-        `a byte-faithful editable identity cannot be minted`
+        `${textEncodingLabel(textEncoding)} without changing its stored bytes, ` +
+        `or that contains a NUL character; a byte-faithful editable identity cannot be minted`
       );
     }
   }
@@ -1110,8 +1104,8 @@ function readOnlyPrimaryKeyTextReason(
   return (
     `Row is read-only because WITHOUT ROWID primary-key ` +
     `${columns.length === 1 ? 'column' : 'columns'} ${names} contain text that is not valid ` +
-    `${textEncodingLabel(encoding)} without changing its stored bytes; ` +
-    `a byte-faithful editable identity cannot be minted.`
+    `${textEncodingLabel(encoding)} without changing its stored bytes, or that contains a NUL ` +
+    `character; a byte-faithful editable identity cannot be minted.`
   );
 }
 
@@ -1167,10 +1161,11 @@ export function remapPrimaryKeyContainment(
     ) {
       throw new Error(`Primary-key raw TEXT row missing at index ${rowIndex}`);
     }
-    // A byte-invalid TEXT key also has a sparse containment entry so the grid
-    // routes it to the raw inspector. Validate its authoritative bytes before
-    // classifying that entry as merely size-contained; otherwise a one-byte
-    // malformed key is mislabeled as exceeding an 800+ KiB inline limit.
+    // A byte-invalid TEXT key, or one containing NUL, also has a sparse
+    // containment entry so the grid routes it to the raw inspector. Validate
+    // its authoritative bytes before classifying that entry as merely
+    // size-contained; otherwise a one-byte malformed key is mislabeled as
+    // exceeding an 800+ KiB inline limit.
     const unrepresentableTextMembers = input.rawTextValidationUnavailable
       ? input.identity.columns.map(column => column.identifier)
       : input.identity.columns.flatMap((column, keyIndex) => {
@@ -1185,11 +1180,7 @@ export function remapPrimaryKeyContainment(
           }
           const rawBytes = rawTextRow[rawTextSlots[keyIndex]];
           if (!(rawBytes instanceof Uint8Array)) return [column.identifier];
-          try {
-            return textDecoder.decode(rawBytes) === value ? [] : [column.identifier];
-          } catch {
-            return [column.identifier];
-          }
+          return decodedTextReproducesBytes(textDecoder, rawBytes, value) ? [] : [column.identifier];
         });
     let recordId;
     if (input.rawTextValidationUnavailable) {

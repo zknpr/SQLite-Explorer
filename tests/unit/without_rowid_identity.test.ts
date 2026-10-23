@@ -208,6 +208,35 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
     });
 
+    it('keeps TEXT identities containing NUL read-only with a reason that names the NUL', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE nul_text_identity (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO nul_text_identity VALUES (CAST(X'610062' AS TEXT), 'nul'), ('plain', 'plain')"
+        );
+        const page = await engine.fetchTableData('nul_text_identity', {
+            columns: ['rowid', 'key', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        const nulIndex = page.rows.findIndex(row => row[2] === 'nul');
+        assert.notStrictEqual(nulIndex, -1);
+        assert.match(String(page.rows[nulIndex][0]), /^readonly-pk:/);
+        const reason = page.readOnlyRowReasons?.[nulIndex] ?? '';
+        assert.match(reason, /NUL character/);
+        assert.doesNotMatch(reason, /inline limit/);
+
+        await assert.rejects(
+            engine.insertRow('nul_text_identity', { key: 'b\0c', value: 'must-rollback' }),
+            /NUL character/
+        );
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT hex(CAST(key AS BLOB)) FROM nul_text_identity ORDER BY 1'
+            ))[0].rows,
+            [['610062'], ['706C61696E']]
+        );
+    });
+
     it('suppresses keyset anchors for malformed ordinary TEXT sort keys', async () => {
         await engine.executeQuery(
             'CREATE TABLE malformed_text_sort (' +
