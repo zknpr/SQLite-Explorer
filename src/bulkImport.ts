@@ -155,7 +155,7 @@ async function importData(): Promise<void> {
                         throw new Error('The destination database schema changed after the preview was prepared. Start the import again.');
                     }
                     return importRowsAtomically(transaction, table, rows, database.undoMemoryLimitBytes, abort.signal,
-                        completed => { if (completed % 50 === 0 || completed === rows.length) progress.report({ message: `${completed} / ${rows.length} ${rowLabel}` }); });
+                        completed => { if (completed % 50 === 0 || completed === rows.length) progress.report({ message: plainNotificationText(`${completed} / ${rows.length} ${rowLabel}`) }); });
                 });
                 // Recording belongs to the same document mutation gate as commit.
                 // Do not throw on cancellation after the transaction has committed.

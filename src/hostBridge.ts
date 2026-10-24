@@ -1642,21 +1642,21 @@ export class HostBridge implements ToastService {
    * Show an information toast message.
    */
   async showInformationToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return showToast(vsc.window.showInformationMessage, message, options, items);
+    return showToast('information', message, options, items);
   }
 
   /**
    * Show a warning toast message.
    */
   async showWarningToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return showToast(vsc.window.showWarningMessage, message, options, items);
+    return showToast('warning', message, options, items);
   }
 
   /**
    * Show an error toast message.
    */
   async showErrorToast<T extends string | DialogButton>(message: string, options?: DialogConfig, ...items: T[]): Promise<T | undefined> {
-    return showToast(vsc.window.showErrorMessage, message, options, items);
+    return showToast('error', message, options, items);
   }
 
   /**
@@ -2327,31 +2327,51 @@ export class HostBridge implements ToastService {
 }
 
 /**
- * Map DialogConfig/DialogButton to VS Code MessageOptions/MessageItem and invoke the show function.
+ * Map DialogConfig/DialogButton to VS Code MessageOptions/MessageItem and show the message.
  *
  * DialogConfig.detailText → MessageOptions.detail
  * DialogButton.caption    → MessageItem.title
  * DialogButton.isCloseAction → MessageItem.isCloseAffordance
+ *
+ * The message and detail can come from the webview, so they are shown without
+ * links like every other notification text.
  */
 async function showToast<T extends string | DialogButton>(
-  showFn: typeof vsc.window.showInformationMessage,
+  severity: 'information' | 'warning' | 'error',
   message: string,
   options: DialogConfig | undefined,
   items: T[]
 ): Promise<T | undefined> {
-  // Map DialogConfig → MessageOptions
-  const msgOptions: vsc.MessageOptions = options
-    ? { modal: options.modal, detail: options.detailText }
-    : {};
-
-  // Map DialogButton items → MessageItem, pass strings through
-  const msgItems: (string | vsc.MessageItem)[] = items.map(item =>
+  // Map DialogButton items → MessageItem, pass strings through. The show
+  // functions' overloads take either strings or MessageItems; VS Code accepts
+  // a mix of both.
+  const msgItems = items.map(item =>
     typeof item === 'string'
       ? item
       : { title: (item as DialogButton).caption, isCloseAffordance: (item as DialogButton).isCloseAction }
-  );
+  ) as vsc.MessageItem[];
 
-  const result = await (showFn as Function)(message, msgOptions, ...msgItems);
+  let result: string | vsc.MessageItem | undefined;
+  switch (severity) {
+    case 'information':
+      result = await vsc.window.showInformationMessage(plainNotificationText(message), {
+        modal: options?.modal,
+        detail: options?.detailText === undefined ? undefined : plainNotificationText(options.detailText)
+      }, ...msgItems);
+      break;
+    case 'warning':
+      result = await vsc.window.showWarningMessage(plainNotificationText(message), {
+        modal: options?.modal,
+        detail: options?.detailText === undefined ? undefined : plainNotificationText(options.detailText)
+      }, ...msgItems);
+      break;
+    case 'error':
+      result = await vsc.window.showErrorMessage(plainNotificationText(message), {
+        modal: options?.modal,
+        detail: options?.detailText === undefined ? undefined : plainNotificationText(options.detailText)
+      }, ...msgItems);
+      break;
+  }
 
   // Map MessageItem result back to the original DialogButton
   if (result && typeof result === 'object' && 'title' in result) {

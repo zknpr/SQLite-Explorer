@@ -1,18 +1,20 @@
 /**
  * VS Code still parses `[label](command:id?args)`, `https:` and `file:` links
- * in the text extensions pass to notifications, modal messages and progress
- * titles, and a click runs the command with the JSON arguments from the link
- * (microsoft/vscode notificationLegacy.ts, notificationsViewer.ts and
- * openerService.ts). SQLite error messages, table, column and index names and
- * file names can all come from a crafted database, so every such text goes
- * through this function before it is shown.
+ * in the text extensions pass to notifications and progress titles, and a click
+ * runs the command with the JSON arguments from the link (microsoft/vscode
+ * notificationLegacy.ts, notificationsViewer.ts and openerService.ts). SQLite
+ * error messages, table, column and index names and file names can all come
+ * from a crafted database, so every such text goes through this function before
+ * it is shown, including modal messages, which are cheap to cover.
  *
  * The link syntax needs `]` immediately followed by `(`. A zero-width space
- * between them leaves the text reading the same and leaves VS Code nothing to
- * parse.
+ * after every `]` leaves the text reading the same and leaves VS Code nothing
+ * to parse. It goes after every `]`, not only before `(`, because VS Code
+ * removes `$(icon)` syntax from a progress title before parsing it, so
+ * `]$(x)(` would become `](`; U+200B is not whitespace to that removal.
  */
 export function plainNotificationText(text: string): string {
-  return text.replaceAll('](', ']​(');
+  return text.replaceAll(']', ']\u200B');
 }
 
 /**
