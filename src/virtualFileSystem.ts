@@ -15,6 +15,7 @@ import {
 } from './core/view-utils';
 import { GlobalOutputChannel } from './main';
 import { getMaxInlineCellBytes } from './config';
+import { decodedTextReproduces } from './core/cell-containment';
 import { sqliteIdentifiersEqual } from './core/integer-utils';
 import {
     assertCellValueWithinEditLimit,
@@ -331,7 +332,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                         'Open its raw Hex inspector or export it instead.'
                     );
                 }
-                if (decoded !== value) {
+                if (!decodedTextReproduces(decoded, value)) {
                     throw vsc.FileSystemError.NoPermissions(
                         'This TEXT cell cannot be represented by the external text editor without ' +
                         'changing its stored bytes. Open its raw Hex inspector or export it instead.'
@@ -626,7 +627,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                     } catch {
                         decoded = '';
                     }
-                    if (decoded !== boundedValue) {
+                    if (typeof boundedValue !== 'string' || !decodedTextReproduces(decoded, boundedValue)) {
                         throw vsc.FileSystemError.NoPermissions(
                             'This TEXT cell cannot be edited as text without changing its stored bytes. ' +
                             'Open its raw Hex inspector or export it instead.'
