@@ -686,8 +686,9 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     let editState: 'applied' | 'undoing' | 'undone' | 'redoing' = 'applied';
 
     return {
-      label: modification.label,
-      // VS Code shows a rejected undo or redo in its own notification.
+      // VS Code shows the label in its "Could not undo" warning, and a
+      // rejected undo or redo in its own notification.
+      label: plainNotificationText(modification.label),
       undo: plainErrors(() => this.#runHistoryCallback(historyGeneration, async () => {
         if (editState !== 'applied') return;
         editState = 'undoing';

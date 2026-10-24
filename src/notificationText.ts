@@ -11,10 +11,12 @@
  * after every `]` leaves the text reading the same and leaves VS Code nothing
  * to parse. It goes after every `]`, not only before `(`, because VS Code
  * removes `$(icon)` syntax from a progress title before parsing it, so
- * `]$(x)(` would become `](`; U+200B is not whitespace to that removal.
+ * `]$(x)(` would become `](`; U+200B is not whitespace to that removal. A `]`
+ * already followed by one is left alone, so disarming twice changes nothing:
+ * errors are disarmed in place and can pass through a wrapper again.
  */
 export function plainNotificationText(text: string): string {
-  return text.replaceAll(']', ']\u200B');
+  return text.replace(/\](?!\u200B)/g, ']\u200B');
 }
 
 /**
@@ -27,15 +29,21 @@ export function plainNotificationText(text: string): string {
  *
  * A DOMException, such as an aborted save's AbortError, defines message as a
  * getter without a setter: assigning it throws in strict mode and would replace
- * the error. An own property shadows the getter instead. An error whose
- * message cannot be redefined is replaced by a plain Error with it as cause.
+ * the error. An own property shadows the getter instead; an own data property,
+ * which a sealed error keeps, only gets a new value. An error whose message
+ * cannot be changed, such as a frozen one, is replaced by a plain Error with it
+ * as cause. A message that is not text is left to VS Code.
  */
 export function plainNotificationError(error: unknown): unknown {
   if (error instanceof Error) {
+    if (typeof error.message !== 'string') return error;
     const message = plainNotificationText(error.message);
     if (message === error.message) return error;
+    const own = Object.getOwnPropertyDescriptor(error, 'message');
     try {
-      Object.defineProperty(error, 'message', { value: message, writable: true, configurable: true });
+      Object.defineProperty(error, 'message', own && 'value' in own
+        ? { value: message }
+        : { value: message, writable: true, configurable: true });
     } catch {
       return new Error(message, { cause: error });
     }

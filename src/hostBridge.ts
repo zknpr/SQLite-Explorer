@@ -2333,8 +2333,8 @@ export class HostBridge implements ToastService {
  * DialogButton.caption    → MessageItem.title
  * DialogButton.isCloseAction → MessageItem.isCloseAffordance
  *
- * The message and detail can come from the webview, so they are shown without
- * links like every other notification text.
+ * The message and detail are shown without links like every other notification
+ * text.
  */
 async function showToast<T extends string | DialogButton>(
   severity: 'information' | 'warning' | 'error',
@@ -2356,19 +2356,19 @@ async function showToast<T extends string | DialogButton>(
     case 'information':
       result = await vsc.window.showInformationMessage(plainNotificationText(message), {
         modal: options?.modal,
-        detail: options?.detailText === undefined ? undefined : plainNotificationText(options.detailText)
+        detail: options?.detailText == null ? undefined : plainNotificationText(options.detailText)
       }, ...msgItems);
       break;
     case 'warning':
       result = await vsc.window.showWarningMessage(plainNotificationText(message), {
         modal: options?.modal,
-        detail: options?.detailText === undefined ? undefined : plainNotificationText(options.detailText)
+        detail: options?.detailText == null ? undefined : plainNotificationText(options.detailText)
       }, ...msgItems);
       break;
     case 'error':
       result = await vsc.window.showErrorMessage(plainNotificationText(message), {
         modal: options?.modal,
-        detail: options?.detailText === undefined ? undefined : plainNotificationText(options.detailText)
+        detail: options?.detailText == null ? undefined : plainNotificationText(options.detailText)
       }, ...msgItems);
       break;
   }

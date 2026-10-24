@@ -10,7 +10,7 @@ import { DocumentRegistry } from '../../src/documentRegistry';
 import type { DatabaseDocument } from '../../src/databaseModel';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { exportTableCommand } from '../../src/tableExporter';
-import { plainErrors, plainNotificationText, withPlainErrors } from '../../src/notificationText';
+import { plainErrors, plainNotificationError, plainNotificationText, withPlainErrors } from '../../src/notificationText';
 
 // The pattern VS Code parses extension notifications, modal messages and
 // progress titles with (microsoft/vscode src/vs/base/common/linkedText.ts).
@@ -59,6 +59,8 @@ describe('notification text from a crafted database', () => {
         assert.deepEqual(linksIn(plainNotificationText(message)), []);
         assert.equal(plainNotificationText(message).replaceAll('\u200B', ''), message);
         assert.equal(plainNotificationText('Export failed: disk full'), 'Export failed: disk full');
+        // Errors are disarmed in place and can be rethrown through a wrapper again.
+        assert.equal(plainNotificationText(plainNotificationText(message)), plainNotificationText(message));
 
         const iconForm = `Exporting "${ICON_TABLE}"`;
         assert.deepEqual(linksIn(iconForm), [COMMAND], 'control arm: VS Code finds the link once icons are removed');
@@ -249,6 +251,24 @@ describe('errors handed back to VS Code', () => {
         });
     });
 
+    it('plainNotificationError keeps sealed errors and non-text messages, and replaces only frozen ones', () => {
+        class CodedError extends Error { readonly code = 'Unavailable'; }
+        const sealed = Object.seal(new CodedError(CRAFTED_ERROR));
+        assert.equal(plainNotificationError(sealed), sealed);
+        assert.deepEqual(linksIn(sealed.message), []);
+
+        const numeric = new Error('placeholder');
+        Object.defineProperty(numeric, 'message', { value: 42, writable: true, configurable: true });
+        assert.equal(plainNotificationError(numeric), numeric);
+
+        const frozen = Object.freeze(new Error(CRAFTED_ERROR));
+        const replaced = plainNotificationError(frozen) as Error;
+        assert.notEqual(replaced, frozen);
+        assert.equal(replaced.cause, frozen);
+        assert.match(replaced.message, /no such collation sequence/);
+        assert.deepEqual(linksIn(replaced.message), []);
+    });
+
     it('withPlainErrors keeps private fields, events, error classes and absent methods', async () => {
         class FileSystemFailure extends Error { readonly code = 'Unavailable'; }
         class Provider {
@@ -274,12 +294,12 @@ describe('errors handed back to VS Code', () => {
 });
 
 // Every notification, modal message and detail, progress title and message,
-// and input box prompt must be literal text or pass through
-// plainNotificationText, so a new call site that shows database text cannot
-// reintroduce links. Messages returned from validateInput cannot be checked
-// here; the one in src shows a parse error of text the user typed.
+// input box and quick pick prompt, input validation message and undo label
+// must be literal text or pass through plainNotificationText, so a new call
+// site that shows database text cannot reintroduce links.
 describe('notification call sites', () => {
     const NOTIFY = new Set(['showErrorMessage', 'showWarningMessage', 'showInformationMessage']);
+    const WINDOW_METHODS = new Set([...NOTIFY, 'withProgress', 'showInputBox', 'showQuickPick', 'createInputBox', 'createQuickPick']);
     // Commands and providers whose errors VS Code shows itself.
     const REGISTRATIONS = new Map([
         ['registerCommand', 'plainErrors'],
@@ -327,107 +347,229 @@ describe('notification call sites', () => {
             && isLiteralText(node.arguments[0]);
     }
 
-    // The value of the named property. A shorthand property or a spread could
-    // hide the text, so it is returned for the check to refuse.
-    function textProperty(options: ts.ObjectLiteralExpression, name: string): ts.Expression | undefined {
+    // A property's name when it is written literally; undefined for a computed
+    // name that could be anything.
+    function propertyName(name: ts.PropertyName): string | undefined {
+        if (ts.isComputedPropertyName(name)) return ts.isStringLiteralLike(name.expression) ? name.expression.text : undefined;
+        return (name as ts.Identifier).text;
+    }
+
+    // Every value the named property can take. A spread, a shorthand or an
+    // accessor yields an expression the check refuses; a computed name counts
+    // as every name.
+    function textProperty(options: ts.ObjectLiteralExpression, name: string): ts.Expression[] {
+        const values: ts.Expression[] = [];
         for (const property of options.properties) {
-            if (ts.isSpreadAssignment(property)) return property.expression;
-            if (property.name?.getText() !== name) continue;
-            return ts.isPropertyAssignment(property) ? property.initializer : property.name as ts.Expression;
+            if (ts.isSpreadAssignment(property)) {
+                values.push(property.expression);
+                continue;
+            }
+            const key = propertyName(property.name);
+            if (key !== undefined && key !== name) continue;
+            values.push(ts.isPropertyAssignment(property) ? property.initializer : ts.factory.createIdentifier(name));
         }
-        return undefined;
+        return values;
+    }
+
+    // The values a validateInput function can return, without the returns of
+    // functions nested in it.
+    function returnedValues(fn: ts.ArrowFunction | ts.FunctionExpression): ts.Expression[] {
+        if (!ts.isBlock(fn.body)) return [fn.body];
+        const values: ts.Expression[] = [];
+        const visit = (node: ts.Node) => {
+            if (ts.isReturnStatement(node) && node.expression) values.push(node.expression);
+            if (!ts.isFunctionLike(node)) ts.forEachChild(node, visit);
+        };
+        ts.forEachChild(fn.body, visit);
+        return values;
+    }
+
+    function scan(file: string, text: string) {
+        const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+        const offenders: string[] = [];
+        const counts = { notificationCalls: 0, registrations: 0, historyEdits: 0, progressReports: 0, inputBoxes: 0 };
+        const offend = (at: ts.Node, what: string) => {
+            const { line } = source.getLineAndCharacterOfPosition(at.getStart());
+            offenders.push(`${file}:${line + 1} ${what}`);
+        };
+        const check = (node: ts.Expression | undefined, what: string, at: ts.Node) => {
+            if (node && !isPlainText(node)) offend(at, what);
+        };
+        // Options written in place, so their text can be checked.
+        const checkOptions = (options: ts.Expression | undefined, name: string, what: string, at: ts.Node) => {
+            if (!options) return;
+            if (!ts.isObjectLiteralExpression(options)) offend(at, `${what} in options not written in place`);
+            else for (const value of textProperty(options, name)) check(value, what, at);
+        };
+        const checkValidation = (options: ts.Expression | undefined, at: ts.Node) => {
+            if (!options || !ts.isObjectLiteralExpression(options)) return;
+            for (const value of textProperty(options, 'validateInput')) {
+                if (!ts.isArrowFunction(value) && !ts.isFunctionExpression(value)) offend(at, 'validateInput not written in place');
+                else for (const returned of returnedValues(value)) check(returned, 'validateInput message', returned);
+            }
+        };
+        const directlyCalled = (node: ts.Node) => ts.isCallExpression(node.parent) && node.parent.expression === node;
+
+        // Names this file binds to the vscode module and to its window.
+        const namespaces = new Set<string>();
+        const windows = new Set<string>();
+        for (const statement of source.statements) {
+            if (ts.isImportEqualsDeclaration(statement) && statement.moduleReference.getText() === "require('vscode')") {
+                namespaces.add(statement.name.text);
+            }
+            if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)
+                || statement.moduleSpecifier.text !== 'vscode' || !statement.importClause) continue;
+            const { name, namedBindings } = statement.importClause;
+            if (name) namespaces.add(name.text);
+            if (namedBindings && ts.isNamespaceImport(namedBindings)) namespaces.add(namedBindings.name.text);
+            if (namedBindings && ts.isNamedImports(namedBindings)) {
+                for (const element of namedBindings.elements) {
+                    if ((element.propertyName ?? element.name).text === 'window') windows.add(element.name.text);
+                }
+            }
+        }
+        const isWindow = (node: ts.Node): boolean => {
+            if (ts.isPropertyAccessExpression(node)) {
+                return node.name.text === 'window' && ts.isIdentifier(node.expression) && namespaces.has(node.expression.text);
+            }
+            return ts.isIdentifier(node) && windows.has(node.text) && !ts.isImportSpecifier(node.parent)
+                && !((ts.isPropertyAccessExpression(node.parent) || ts.isPropertyAssignment(node.parent)) && node.parent.name === node);
+        };
+
+        const visit = (node: ts.Node) => {
+            // window and the functions checked here only through direct use,
+            // so an alias cannot skip the checks.
+            if (isWindow(node) && !(ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node)) {
+                offend(node, 'window used other than through one of its properties');
+            }
+            if (ts.isPropertyAccessExpression(node)) {
+                const method = node.name.text;
+                if (isWindow(node.expression) && WINDOW_METHODS.has(method) && !directlyCalled(node)) {
+                    offend(node, `${method} used other than in a direct call`);
+                }
+                if ((method === 'report' || REGISTRATIONS.has(method)) && !directlyCalled(node)) {
+                    offend(node, `${method} used other than in a direct call`);
+                }
+            }
+            if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+                const method = node.expression.name.text;
+                const [first, second] = node.arguments;
+                if (isWindow(node.expression.expression)) {
+                    if (NOTIFY.has(method)) {
+                        counts.notificationCalls++;
+                        check(first, `${method} message`, node);
+                        // The second argument is the options or the first item.
+                        if (second && !ts.isObjectLiteralExpression(second)) check(second, `${method} options or item`, node);
+                        else checkOptions(second, 'detail', `${method} detail`, node);
+                    } else if (method === 'withProgress') {
+                        checkOptions(first, 'title', 'withProgress title', node);
+                    } else if (method === 'showInputBox') {
+                        counts.inputBoxes++;
+                        checkOptions(first, 'prompt', 'showInputBox prompt', node);
+                        checkValidation(first, node);
+                    } else if (method === 'showQuickPick') {
+                        checkOptions(second, 'prompt', 'showQuickPick prompt', node);
+                    } else if (method === 'createInputBox' || method === 'createQuickPick') {
+                        offend(node, `${method}: its prompt and validationMessage cannot be checked here`);
+                    }
+                }
+                if (method === 'report') {
+                    counts.progressReports++;
+                    checkOptions(first, 'message', 'progress message', node);
+                }
+                const wrapper = REGISTRATIONS.get(method);
+                if (wrapper) {
+                    counts.registrations++;
+                    if (!second || !ts.isCallExpression(second) || second.expression.getText() !== wrapper) {
+                        offend(node, `${method} without ${wrapper}`);
+                    }
+                }
+            }
+            // A custom-document edit: VS Code shows a rejected undo or redo,
+            // and the label in its "Could not undo" warning.
+            if (ts.isObjectLiteralExpression(node)) {
+                const names = node.properties.map(property => ts.isSpreadAssignment(property) ? undefined : propertyName(property.name));
+                if (names.includes('undo') && names.includes('redo')) {
+                    counts.historyEdits++;
+                    for (const name of ['undo', 'redo']) {
+                        for (const value of textProperty(node, name)) {
+                            if (!ts.isCallExpression(value) || value.expression.getText() !== 'plainErrors') offend(node, `${name} without plainErrors`);
+                        }
+                    }
+                    for (const value of textProperty(node, 'label')) check(value, 'undo label', node);
+                }
+            }
+            ts.forEachChild(node, visit);
+        };
+        visit(source);
+        return { offenders, counts };
     }
 
     it('pass non-literal text through plainNotificationText and register through the error wrappers', () => {
         const offenders: string[] = [];
-        let notificationCalls = 0;
-        let registrations = 0;
-        let historyEdits = 0;
-        let progressReports = 0;
-        let inputBoxes = 0;
-
+        const totals = { notificationCalls: 0, registrations: 0, historyEdits: 0, progressReports: 0, inputBoxes: 0 };
         for (const file of sourceFiles(sourceRoot)) {
-            const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
-            const offend = (at: ts.Node, what: string) => {
-                const { line } = source.getLineAndCharacterOfPosition(at.getStart());
-                offenders.push(`${path.relative(sourceRoot, file)}:${line + 1} ${what}`);
-            };
-            const check = (node: ts.Expression | undefined, what: string, at: ts.Node) => {
-                if (node && !isPlainText(node)) offend(at, what);
-            };
-            // Options written in place, so their text can be checked.
-            const checkOptions = (options: ts.Expression | undefined, name: string, what: string, at: ts.Node) => {
-                if (!options) return;
-                if (ts.isObjectLiteralExpression(options)) check(textProperty(options, name), what, at);
-                else offend(at, `${what} in options not written in place`);
-            };
-            const visit = (node: ts.Node) => {
-                // window and its show*Message functions only through direct
-                // calls, so an alias or a passed function cannot skip the checks.
-                if (ts.isPropertyAccessExpression(node)) {
-                    const parent = node.parent;
-                    if (NOTIFY.has(node.name.text) && node.expression.getText().endsWith('window')
-                        && !(ts.isCallExpression(parent) && parent.expression === node)) {
-                        offend(node, `${node.name.text} used other than in a direct call`);
-                    }
-                    if (node.name.text === 'window' && /^(vsc|vscode)$/.test(node.expression.getText())
-                        && !(ts.isPropertyAccessExpression(parent) && parent.expression === node)) {
-                        offend(node, 'window used other than through one of its properties');
-                    }
-                }
-                if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
-                    const method = node.expression.name.text;
-                    const [first, second] = node.arguments;
-                    if (node.expression.expression.getText().endsWith('window')) {
-                        if (NOTIFY.has(method)) {
-                            notificationCalls++;
-                            check(first, `${method} message`, node);
-                            // The second argument is the options or the first item.
-                            if (second && !ts.isObjectLiteralExpression(second)) check(second, `${method} options or item`, node);
-                            else checkOptions(second, 'detail', `${method} detail`, node);
-                        } else if (method === 'withProgress') {
-                            checkOptions(first, 'title', 'withProgress title', node);
-                        } else if (method === 'showInputBox') {
-                            inputBoxes++;
-                            checkOptions(first, 'prompt', 'showInputBox prompt', node);
-                        }
-                    }
-                    if (method === 'report') {
-                        progressReports++;
-                        checkOptions(first, 'message', 'progress message', node);
-                    }
-                    const wrapper = REGISTRATIONS.get(method);
-                    if (wrapper) {
-                        registrations++;
-                        if (!second || !ts.isCallExpression(second) || second.expression.getText() !== wrapper) {
-                            offend(node, `${method} without ${wrapper}`);
-                        }
-                    }
-                }
-                // A custom-document edit: VS Code shows a rejected undo or redo itself.
-                if (ts.isObjectLiteralExpression(node)) {
-                    const history = node.properties.filter(property =>
-                        !ts.isSpreadAssignment(property) && ['undo', 'redo'].includes(property.name.getText()));
-                    if (history.length === 2) {
-                        historyEdits++;
-                        for (const property of history) {
-                            const value = ts.isPropertyAssignment(property) ? property.initializer : undefined;
-                            if (!value || !ts.isCallExpression(value) || value.expression.getText() !== 'plainErrors') {
-                                offend(property, `${property.name!.getText()} without plainErrors`);
-                            }
-                        }
-                    }
-                }
-                ts.forEachChild(node, visit);
-            };
-            visit(source);
+            const result = scan(path.relative(sourceRoot, file), readFileSync(file, 'utf8'));
+            offenders.push(...result.offenders);
+            for (const key of Object.keys(totals) as Array<keyof typeof totals>) totals[key] += result.counts[key];
         }
 
-        assert.ok(notificationCalls > 20, `control arm: the scan found ${notificationCalls} notification calls`);
-        assert.ok(registrations >= 6, `control arm: the scan found ${registrations} command and provider registrations`);
-        assert.ok(historyEdits >= 1, `control arm: the scan found ${historyEdits} undo/redo edits`);
-        assert.ok(progressReports >= 1, `control arm: the scan found ${progressReports} progress reports`);
-        assert.ok(inputBoxes >= 1, `control arm: the scan found ${inputBoxes} input boxes`);
+        assert.ok(totals.notificationCalls > 20, `control arm: the scan found ${totals.notificationCalls} notification calls`);
+        assert.ok(totals.registrations >= 6, `control arm: the scan found ${totals.registrations} command and provider registrations`);
+        assert.ok(totals.historyEdits >= 1, `control arm: the scan found ${totals.historyEdits} undo/redo edits`);
+        assert.ok(totals.progressReports >= 1, `control arm: the scan found ${totals.progressReports} progress reports`);
+        assert.ok(totals.inputBoxes >= 1, `control arm: the scan found ${totals.inputBoxes} input boxes`);
         assert.deepEqual(offenders, []);
+    });
+
+    it('reports each code shape that could show database text unchecked', () => {
+        // Each line marked "flagged" must be reported, and no other line.
+        const shapes = [
+            "import * as vs from 'vscode';",
+            "import { window } from 'vscode';",
+            "import { window as win } from 'vscode';",
+            'declare const dbText: string;',
+            'declare const opts: { title: string };',
+            'declare const f: () => void;',
+            'declare const progress: { report(value: { message?: string }): void };',
+            "vs.window.showErrorMessage(dbText); // flagged",
+            "vs.window.showWarningMessage('Failed', { modal: true, 'detail': dbText }); // flagged",
+            "vs.window.showWarningMessage('Failed', { ['detail']: dbText }); // flagged",
+            "vs.window.showWarningMessage('Failed', { detail: 'x', detail: dbText }); // flagged",
+            "vs.window.withProgress({ title: 'Exporting', ...opts }, async () => {}); // flagged",
+            "progress.report({ 'message': dbText }); // flagged",
+            "vs.window.showInputBox({ 'prompt': dbText }); // flagged",
+            'vs.window.showInputBox({ validateInput: value => value }); // flagged',
+            "vs.window.showQuickPick(['a'], { prompt: dbText }); // flagged",
+            'const box = vs.window.createInputBox(); // flagged',
+            'const w = vs.window; // flagged',
+            'window.showErrorMessage(dbText); // flagged',
+            'const w2 = window; // flagged',
+            'win.showInformationMessage(dbText); // flagged',
+            'const show = vs.window.showErrorMessage; // flagged',
+            'const report = progress.report; // flagged',
+            'const register = vs.commands.registerCommand; // flagged',
+            "vs.commands.registerCommand('x', f); // flagged",
+            'const edit = { label: dbText, undo: plainErrors(f), redo: plainErrors(f) }; // flagged',
+            'const edit2 = { label: "x", undo: f, redo: plainErrors(f) }; // flagged'
+        ];
+        const flagged = shapes.flatMap((line, index) => line.endsWith('// flagged') ? [index + 1] : []);
+        const reported = new Set(scan('shapes.ts', shapes.join('\n')).offenders.map(entry => Number(/^shapes\.ts:(\d+) /.exec(entry)![1])));
+        assert.deepEqual([...reported].sort((a, b) => a - b), flagged);
+
+        const compliant = [
+            "import * as vs from 'vscode';",
+            'declare const dbText: string;',
+            'declare const f: () => void;',
+            "vs.window.showErrorMessage(plainNotificationText(dbText), { modal: true, detail: plainNotificationText(dbText) }, 'Retry');",
+            'vs.window.withProgress({ location: 15, title: plainNotificationText(dbText) }, async progress => {',
+            '    progress.report({ message: plainNotificationText(dbText) });',
+            '});',
+            "vs.window.showInputBox({ prompt: 'Value', validateInput: value => value ? undefined : 'Required.' });",
+            "vs.window.showQuickPick(['a'], { prompt: plainNotificationText(dbText) });",
+            "vs.commands.registerCommand('x', plainErrors(f));",
+            'const edit = { label: plainNotificationText(dbText), undo: plainErrors(f), redo: plainErrors(f) };'
+        ];
+        assert.deepEqual(scan('compliant.ts', compliant.join('\n')).offenders, []);
     });
 });

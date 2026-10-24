@@ -133,8 +133,10 @@ export function registerSqlWorkspace(_context: vscode.ExtensionContext): vscode.
                 validateInput: value => {
                     try {
                         const values = parseQueryParameters(value);
-                        return values.length === prepared.parameterCount ? undefined : `Expected ${prepared.parameterCount} values.`;
-                    } catch (error) { return error instanceof Error ? error.message : String(error); }
+                        return values.length === prepared.parameterCount
+                            ? undefined
+                            : plainNotificationText(`Expected ${prepared.parameterCount} values.`);
+                    } catch (error) { return plainNotificationText(error instanceof Error ? error.message : String(error)); }
                 }
             });
             if (answer === undefined) return;
