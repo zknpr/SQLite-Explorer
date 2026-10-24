@@ -31,6 +31,7 @@ import { isInvocationTimeoutError } from './core/rpc';
 import { type DatabaseConnectionInvalidatedError, isDatabaseConnectionInvalidatedError } from './core/database-connection-invalidated';
 import type { LabeledModification, DatabaseOperations } from './core/types';
 import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
+import { plainErrors, plainNotificationText } from './notificationText';
 import {
   captureWorkspaceFileGeneration,
   writeWorkspaceFileAtomically
@@ -305,10 +306,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
           recoveryError = error;
         }
         await vsc.window.showErrorMessage(
-          vsc.l10n.t('[{0}] occurred while applying unsaved changes', errorMsg),
+          plainNotificationText(vsc.l10n.t('[{0}] occurred while applying unsaved changes', errorMsg)),
           {
             modal: true,
-            detail: !recoveryFailed
+            detail: plainNotificationText(!recoveryFailed
               ? vsc.l10n.t(
                   'The document was restored from backup, but changes could not be applied. '
                   + 'The saved database was reopened in read-only mode.'
@@ -317,7 +318,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
                   'The document was restored from backup, but changes could not be applied. '
                   + 'Reopening the saved database also failed: {0}',
                   recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
-                )
+                ))
           }
         );
         if (recoveryFailed) throw recoveryError;
@@ -658,7 +659,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         'Save the database before making more changes.'
       );
       try {
-        void Promise.resolve(vsc.window.showWarningMessage(message)).catch(error => {
+        void Promise.resolve(vsc.window.showWarningMessage(plainNotificationText(message))).catch(error => {
           GlobalOutputChannel?.appendLine(
             `[Undo history warning failed] ${error instanceof Error ? error.message : String(error)}`
           );
@@ -685,8 +686,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     let editState: 'applied' | 'undoing' | 'undone' | 'redoing' = 'applied';
 
     return {
-      label: modification.label,
-      undo: () => this.#runHistoryCallback(historyGeneration, async () => {
+      // VS Code shows the label in its "Could not undo" warning, and a
+      // rejected undo or redo in its own notification.
+      label: plainNotificationText(modification.label),
+      undo: plainErrors(() => this.#runHistoryCallback(historyGeneration, async () => {
         if (editState !== 'applied') return;
         editState = 'undoing';
 
@@ -736,13 +739,13 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             editState = 'applied';
             const errorMessage = e instanceof Error ? e.message : String(e);
             GlobalOutputChannel?.appendLine(`[Undo] Failed: ${errorMessage}`);
-            vsc.window.showErrorMessage(vsc.l10n.t('Undo failed: {0}', errorMessage));
+            vsc.window.showErrorMessage(plainNotificationText(vsc.l10n.t('Undo failed: {0}', errorMessage)));
             // A fulfilled callback tells VS Code that its edit was undone and
             // can clear the dirty marker, even though SQLite rolled it back.
             throw e;
         }
-      }),
-      redo: () => this.#runHistoryCallback(historyGeneration, async () => {
+      })),
+      redo: plainErrors(() => this.#runHistoryCallback(historyGeneration, async () => {
         if (editState !== 'undone') return;
         editState = 'redoing';
 
@@ -783,10 +786,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
              editState = 'undone';
              const errorMessage = e instanceof Error ? e.message : String(e);
              GlobalOutputChannel?.appendLine(`[Redo] Failed: ${errorMessage}`);
-             vsc.window.showErrorMessage(vsc.l10n.t('Redo failed: {0}', errorMessage));
+             vsc.window.showErrorMessage(plainNotificationText(vsc.l10n.t('Redo failed: {0}', errorMessage)));
              throw e;
         }
-      })
+      }))
     };
   }
 
@@ -1253,7 +1256,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         'The prior value was not retained for an oversized-cell replacement. ' +
         'File Revert cannot cross that edit; save the database first to establish a new baseline.'
       );
-      await vsc.window.showWarningMessage(message);
+      await vsc.window.showWarningMessage(plainNotificationText(message));
       throw new Error('File Revert cannot cross an unsaved oversized-cell history barrier');
     }
     let invalidatedByRecoveryReload = false;
@@ -1341,11 +1344,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         // and one visible warning until a current save request actually succeeds.
         this.#autoSaveFailureNotified = true;
         try {
-          void Promise.resolve(vsc.window.showErrorMessage(vsc.l10n.t(
+          void Promise.resolve(vsc.window.showErrorMessage(plainNotificationText(vsc.l10n.t(
             'Auto-save failed for {0}: {1}. Changes remain unsaved. Keep the database editor open and retry Save.',
             this.fileParts.filename,
             errorMessage
-          ))).catch(error => {
+          )))).catch(error => {
             GlobalOutputChannel?.appendLine(`[Auto-save notification failed] ${error instanceof Error ? error.message : String(error)}`);
           });
         } catch (error) {
@@ -1621,10 +1624,10 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       (this.viewerProvider.outputChannel ?? GlobalOutputChannel)?.appendLine(
         `[Connection cleanup failed] ${message}`
       );
-      void vsc.window.showErrorMessage(vsc.l10n.t(
+      void vsc.window.showErrorMessage(plainNotificationText(vsc.l10n.t(
         'The database was reloaded, but its previous worker could not be closed: {0}',
         message
-      ));
+      )));
     }
     return databaseOps;
   }

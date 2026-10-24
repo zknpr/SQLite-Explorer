@@ -236,7 +236,15 @@ it('native worker leaves no trace of any ATTACH/DETACH/VACUUM INTO SQLite would 
                 else if (kind === 'vacuum') {
                     const file = path.join(outside, `svac-${++counter}.sqlite`);
                     parts.push(vacuumStatement(file).sql.replace(/\?$/, () => sqlString(file)));
-                } else parts.push(attachStatement(pick([secret, empty]), `s${++counter}`).sql.replace(/\?(\s|$)/, (_match, tail: string) => `${sqlString(secret)}${tail}`));
+                } else {
+                    // The '?' can be followed by a comment, and nothing else in
+                    // the statement contains one.
+                    const target = pick([secret, empty]);
+                    const sql = attachStatement(target, `s${++counter}`).sql.replace('?', () => sqlString(target));
+                    // An unbound '?' would attach a temporary database instead.
+                    assert.ok(!sql.includes('?'), `script ATTACH left a placeholder unbound: ${JSON.stringify(sql)}`);
+                    parts.push(sql);
+                }
             }
             await attempt(`${lead()}${parts.join(pick([';', ';\n', ';/* c */', ';\uFEFF']))}`, [], 'exec');
         }

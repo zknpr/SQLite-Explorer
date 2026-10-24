@@ -28,6 +28,7 @@ import { WebviewMessageHandler } from './webviewMessageHandler';
 import { HostBridge } from './hostBridge';
 import type { CellMaterializationService } from './cellMaterialization';
 import { confirmFileReplacement } from './fileReplacementConfirmation';
+import { withPlainErrors } from './notificationText';
 
 /** Coalesce provider opens that race before their shared document is registered. */
 const PendingDocumentOpens = new Map<string, { uri: vsc.Uri; document: Promise<DatabaseDocument> }>();
@@ -593,6 +594,16 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
   }
 }
 
+// VS Code shows the errors of these provider methods itself (see withPlainErrors).
+const CUSTOM_EDITOR_METHODS = [
+  'openCustomDocument',
+  'resolveCustomEditor',
+  'saveCustomDocument',
+  'saveCustomDocumentAs',
+  'revertCustomDocument',
+  'backupCustomDocument'
+] satisfies (keyof vsc.CustomEditorProvider)[];
+
 /**
  * Register an editor provider for SQLite files.
  *
@@ -620,7 +631,7 @@ export function registerEditorProvider(
   const Provider = enableReadWrite ? DatabaseEditorProvider : DatabaseViewerProvider;
   return vsc.window.registerCustomEditorProvider(
     viewType,
-    new Provider(
+    withPlainErrors(new Provider(
       viewType,
       context,
       reporter,
@@ -629,7 +640,7 @@ export function registerEditorProvider(
       accessToken,
       readOnly,
       cellMaterializer
-    ),
+    ), CUSTOM_EDITOR_METHODS),
     {
       webviewOptions: {
         enableFindWidget: false,

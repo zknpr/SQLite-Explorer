@@ -67,6 +67,7 @@ import { createSharedCancellationFlag } from './core/cancellation-utils';
 import { writePagedWritableOverlayToFile } from './pagedWritableSave';
 import { canPersistLocalDatabase } from './fileWritability';
 import { DatabaseFileSizeLimitError } from './databaseFileSizeLimit';
+import { plainNotificationText } from './notificationText';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
@@ -1399,10 +1400,10 @@ function warnWalReadOnlyDowngrade(displayName: string): void {
   );
   // Fire-and-forget: the toast resolves when dismissed and must not block
   // connection establishment.
-  void vsc.window.showWarningMessage(vsc.l10n.t(
+  void vsc.window.showWarningMessage(plainNotificationText(vsc.l10n.t(
     '{0} has WAL changes the WebAssembly SQLite backend cannot read, so it is opened read-only and the data shown may be incomplete. Run "PRAGMA wal_checkpoint(TRUNCATE)" on the database (or close the program writing to it), then reopen it.',
     displayName
-  ));
+  )));
 }
 
 /**
@@ -1420,8 +1421,8 @@ function warnPagedReadOnlyDowngrade(displayName: string): void {
     'or use the native desktop backend to edit and save it.'
   );
   // Fire-and-forget, matching warnWalReadOnlyDowngrade.
-  void vsc.window.showWarningMessage(vsc.l10n.t(
+  void vsc.window.showWarningMessage(plainNotificationText(vsc.l10n.t(
     '{0} is open page-on-demand as read-only. Reopen with writable page-on-demand support or use the native desktop backend to edit and save it.',
     displayName
-  ));
+  )));
 }

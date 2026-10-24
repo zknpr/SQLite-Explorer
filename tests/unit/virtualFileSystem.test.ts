@@ -391,6 +391,53 @@ describe('SQLiteFileSystemProvider', () => {
             }
         });
 
+        it('refuses a writable text document for SQLite TEXT containing NUL', async () => {
+            // Both engines return such TEXT whole, but VS Code guesses UTF-16
+            // from the NUL bytes, so it stays bytes as in the grid.
+            const result = await createDatabaseEngine({ content: null, maxSize: 0 });
+            const engine = result.operations!;
+            const document = setupMockDocument(docKey, engine);
+            const uri = vscode.Uri.parse(
+                `vscode-sqlite://${docKey}/nul_vfs/group/1/value.txt`
+            );
+            try {
+                await engine.executeQuery(
+                    'CREATE TABLE nul_vfs (value TEXT); ' +
+                    "INSERT INTO nul_vfs VALUES (CAST(X'610062' AS TEXT))"
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery('SELECT value FROM nul_vfs'))[0].rows,
+                    [['a\0b']],
+                    'control arm: the engine returns the TEXT whole'
+                );
+
+                await assert.rejects(
+                    provider.readFile(uri),
+                    /cannot be represented by the external text editor.*raw Hex/i
+                );
+                await assert.rejects(
+                    provider.writeFile(
+                        uri,
+                        new TextEncoder().encode('a\0c'),
+                        { create: false, overwrite: true }
+                    ),
+                    /cannot be edited as text.*raw Hex/i
+                );
+                assert.deepStrictEqual(
+                    (await engine.executeQuery(
+                        'SELECT hex(CAST(value AS BLOB)) FROM nul_vfs'
+                    ))[0].rows,
+                    [['610062']]
+                );
+                assert.strictEqual(
+                    (document.recordExternalModification as any).mock.callCount(),
+                    0
+                );
+            } finally {
+                (engine as WasmDatabaseEngine).shutdown();
+            }
+        });
+
         it('refuses a direct oversized VFS read before fetching the raw value', async () => {
             const dbOps = {
                 getCellMetadata: mock.fn(async () => ({
