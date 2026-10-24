@@ -4,6 +4,7 @@
 
 ### Security
 
+- Show text that comes from a database file without links in VS Code notifications. VS Code turns `[label](command:…)` in an extension's notification, dialog or progress title into a link that runs that command, with arguments taken from the link, when clicked. A crafted database could put such a link into what SQLite Explorer showed: an error message, for example from exporting a view whose column name is a link, or a table, view or file name. These texts are now shown without links. The same applies to errors that VS Code shows itself, such as a failed save, which VS Code before 1.141 also turns into links.
 - Narrow the native runtime's exception for export snapshots to the one statement that writes the snapshot, on the thread running it. In 1.8.2 the exception covered the connection while an export ran; the worker's statement check and its one-request-at-a-time order kept other SQL from using it.
 
 ### Fixes

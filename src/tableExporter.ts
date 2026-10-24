@@ -21,6 +21,7 @@ import {
   type ExportCancellation
 } from './tableExportStreaming';
 import { crypto as webCrypto } from './platform/cryptoShim';
+import { plainNotificationText } from './notificationText';
 import {
   replacementFileMetadataFromStats,
   restoreTemporaryMetadata,
@@ -953,7 +954,7 @@ export async function exportTableCommand(
     const tableName = dbParams.table;
     if (!tableName) {
       const message = 'No table specified for export';
-      showExportNotification(vsc.window.showErrorMessage(message));
+      showExportNotification(vsc.window.showErrorMessage(plainNotificationText(message)));
       return { success: false, message };
     }
 
@@ -985,7 +986,7 @@ export async function exportTableCommand(
       }
       if (!document) {
         const message = 'The requested database is no longer open';
-        showExportNotification(vsc.window.showErrorMessage(message));
+        showExportNotification(vsc.window.showErrorMessage(plainNotificationText(message)));
         return { success: false, message };
       }
     } else {
@@ -997,7 +998,7 @@ export async function exportTableCommand(
 
     if (!document || !document.databaseOperations) {
       const message = 'No active database connection';
-      showExportNotification(vsc.window.showErrorMessage(message));
+      showExportNotification(vsc.window.showErrorMessage(plainNotificationText(message)));
       return { success: false, message };
     }
 
@@ -1013,7 +1014,7 @@ export async function exportTableCommand(
       );
     } catch (e) {
       const message = (e as Error).message;
-      showExportNotification(vsc.window.showErrorMessage(message));
+      showExportNotification(vsc.window.showErrorMessage(plainNotificationText(message)));
       return { success: false, message };
     }
 
@@ -1042,7 +1043,7 @@ export async function exportTableCommand(
     const rowCount = await vsc.window.withProgress(
       {
         location: vsc.ProgressLocation.Notification,
-        title: `Exporting "${tableName}"`,
+        title: plainNotificationText(`Exporting "${tableName}"`),
         cancellable: true
       },
       async (_progress, cancellation) => {
@@ -1069,10 +1070,10 @@ export async function exportTableCommand(
         );
       }
     );
-    showExportNotification(vsc.window.showInformationMessage(
+    showExportNotification(vsc.window.showInformationMessage(plainNotificationText(
       `Exported ${rowCount} row${rowCount === 1 ? '' : 's'} to `
       + `${uri.fsPath || uri.toString()}`
-    ));
+    )));
     return {
       success: true,
       rowCount,
@@ -1085,7 +1086,7 @@ export async function exportTableCommand(
       return { success: false, cancelled: true };
     }
     const message = err instanceof Error ? err.message : String(err);
-    showExportNotification(vsc.window.showErrorMessage(`Export failed: ${message}`));
+    showExportNotification(vsc.window.showErrorMessage(plainNotificationText(`Export failed: ${message}`)));
     console.error('Export error:', err);
     return { success: false, message };
   }

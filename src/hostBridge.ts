@@ -50,6 +50,7 @@ import { estimateUndoMemoryBytes } from './core/undo-history';
 import type { CellMaterializationService } from './cellMaterialization';
 import { openCellContentViewer } from './cellContentViewer';
 import { writeCellFile } from './tableExporter';
+import { plainNotificationText } from './notificationText';
 import {
   assertCellValueWithinEditLimit,
   assertCellValuesWithinEditLimit,
@@ -597,7 +598,7 @@ export class HostBridge implements ToastService {
           byteLength: Number(byteLength)
         } as const;
         const answer = await vsc.window.showWarningMessage(
-          formatOversizedCellReplacementWarning(table, column, expected),
+          plainNotificationText(formatOversizedCellReplacementWarning(table, column, expected)),
           { modal: true },
           { title: vsc.l10n.t('Replace Without Undo'), value: true },
           { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
@@ -896,7 +897,7 @@ export class HostBridge implements ToastService {
       );
 
       const result = await vsc.window.showWarningMessage(
-        message,
+        plainNotificationText(message),
         { modal: true },
         { title: vsc.l10n.t('Drop Indexes & Continue'), value: true },
         { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
@@ -1194,11 +1195,11 @@ export class HostBridge implements ToastService {
       if (current.triggers.length > 0) {
         const triggerNames = current.triggers.map(trigger => trigger.identifier).join(', ');
         const answer = await vsc.window.showWarningMessage(
-          vsc.l10n.t(
+          plainNotificationText(vsc.l10n.t(
             'Editing view "{0}" without preserving triggers will permanently drop: {1}',
             view,
             triggerNames
-          ),
+          )),
           { modal: true },
           { title: vsc.l10n.t('Edit and Drop Triggers'), value: true },
           { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
@@ -1248,7 +1249,7 @@ export class HostBridge implements ToastService {
           )
         : vsc.l10n.t('Drop view "{0}"?', view);
       const answer = await vsc.window.showWarningMessage(
-        confirmationMessage,
+        plainNotificationText(confirmationMessage),
         { modal: true },
         { title: vsc.l10n.t('Drop View'), value: true },
         { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
@@ -2088,7 +2089,7 @@ export class HostBridge implements ToastService {
     if (!Number.isSafeInteger(itemCount) || itemCount <= 0) throw new Error('Large change count must be a positive safe integer');
     if (unit !== 'rows' && unit !== 'cells') throw new Error('Large change unit must be rows or cells');
     const answer = await vsc.window.showWarningMessage(vsc.l10n.t('Large Change Warning'), {
-      detail: `This operation changes ${itemCount.toLocaleString()} ${unit}. Do you want to continue?`,
+      detail: plainNotificationText(`This operation changes ${itemCount.toLocaleString()} ${unit}. Do you want to continue?`),
       modal: true,
     }, { title: vsc.l10n.t('Continue'), value: true }, { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true });
     return answer?.value ?? false;
@@ -2115,11 +2116,11 @@ export class HostBridge implements ToastService {
     }
 
     const answer = await vsc.window.showWarningMessage(vsc.l10n.t('Large Selection Warning'), {
-      detail: vsc.l10n.t(
+      detail: plainNotificationText(vsc.l10n.t(
         'Selecting {0} {1} may slow or freeze the editor. Cancel and use Export for large data operations. Continue?',
         itemCount.toLocaleString(),
         unit
-      ),
+      )),
       modal: true,
     }, { title: vsc.l10n.t('Continue'), value: true }, {
       title: vsc.l10n.t('Cancel'),

@@ -1,5 +1,6 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
+import { plainNotificationText } from './notificationText';
 import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './core/sql-utils';
 import {
     buildRecordIdentityPredicate,
@@ -428,7 +429,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing view definition: ${rawMessage}`);
                 const detail = getViewDefinitionErrorDetail(err);
                 void vsc.window.showErrorMessage(
-                    `Invalid view definition: ${detail}. The view was not modified.`
+                    plainNotificationText(`Invalid view definition: ${detail}. The view was not modified.`)
                 ).then(undefined, notificationError => {
                     GlobalOutputChannel?.appendLine(
                         `[VirtualFileSystem] Failed to show view error notification: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`
@@ -526,7 +527,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                         byteLength: metadata.byteLength
                     };
                     const answer = await vsc.window.showWarningMessage(
-                        formatOversizedCellReplacementWarning(table, column, expected),
+                        plainNotificationText(formatOversizedCellReplacementWarning(table, column, expected)),
                         { modal: true },
                         { title: vsc.l10n.t('Replace Without Undo'), value: true },
                         { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }

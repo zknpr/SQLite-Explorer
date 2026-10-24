@@ -5,6 +5,7 @@ import { ExtensionId } from './config';
 import { IMPORT_MAX_BYTES, IMPORT_LIMIT_DESCRIPTION, parseImport, mapImportRows, importRowsAtomically } from './core/bulk-import';
 import { runReadSnapshot } from './core/operation-serializer';
 import type { DatabaseOperations } from './core/types';
+import { plainErrors, plainNotificationText } from './notificationText';
 
 /** Read no more than the accepted source size, including when a file grows during preview. */
 const readSource: (uri: vscode.Uri) => Promise<string> = import.meta.env?.VSCODE_BROWSER_EXT
@@ -56,10 +57,10 @@ function assertCurrent(database: DatabaseDocument, generation: number): void {
 }
 
 export function registerBulkImport(): vscode.Disposable {
-    return vscode.commands.registerCommand(`${ExtensionId}.importData`, async () => {
+    return vscode.commands.registerCommand(`${ExtensionId}.importData`, plainErrors(async () => {
         try { await importData(); }
-        catch (error) { await vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error)); }
-    });
+        catch (error) { await vscode.window.showErrorMessage(plainNotificationText(error instanceof Error ? error.message : String(error))); }
+    }));
 }
 
 async function importData(): Promise<void> {
@@ -129,7 +130,7 @@ async function importData(): Promise<void> {
     await vscode.window.showTextDocument(preview, { preview: true });
     const native = await database.databaseOperations.engineKind === 'native';
     const rowLabel = rows.length === 1 ? 'row' : 'rows';
-    const confirmed = await vscode.window.showWarningMessage(`Import ${rows.length} ${rowLabel} into ${table}?`, {
+    const confirmed = await vscode.window.showWarningMessage(plainNotificationText(`Import ${rows.length} ${rowLabel} into ${table}?`), {
         modal: true,
         detail: 'The preview shows the first five mapped rows, destination column types, and declared SQL default expressions. Defaults apply to omitted columns, not explicit JSON null or CSV empty strings. SQLite evaluates expressions when inserting each row. Preview edits do not change the import.\n\n' +
             (native ? 'This writes to the database file immediately. ' : '') +
@@ -137,7 +138,7 @@ async function importData(): Promise<void> {
     }, 'Import');
     if (confirmed !== 'Import') return;
     assertCurrent(database, generation);
-    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Importing into ${table}`, cancellable: true }, async (progress, token) => {
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: plainNotificationText(`Importing into ${table}`), cancellable: true }, async (progress, token) => {
         const abort = new AbortController();
         const cancellation = token.onCancellationRequested(() => abort.abort());
         const closed = database.onDidDispose(() => abort.abort());
@@ -162,5 +163,5 @@ async function importData(): Promise<void> {
             }, true);
         } finally { cancellation.dispose(); closed.dispose(); }
     });
-    await vscode.window.showInformationMessage(`Imported ${rows.length} ${rowLabel} into ${table}.`);
+    await vscode.window.showInformationMessage(plainNotificationText(`Imported ${rows.length} ${rowLabel} into ${table}.`));
 }

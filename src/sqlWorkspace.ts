@@ -6,6 +6,7 @@ import { escapeIdentifier } from './core/sql-utils';
 import { parseQueryParameters, prepareReadQuery, resultCsv, SQL_RESULT_ROWS } from './core/sql-workspace';
 import type { QueryResultSet } from './core/types';
 import { writeQueryResultFile } from './tableExporter';
+import { plainErrors, plainNotificationText } from './notificationText';
 
 interface QueryBinding { database: DatabaseDocument }
 interface QueryOutput { text: string; csv: string }
@@ -160,12 +161,12 @@ export function registerSqlWorkspace(_context: vscode.ExtensionContext): vscode.
             } finally { cancel.dispose(); close.dispose(); }
         });
     };
-    const command = (suffix: string, action: (...args: unknown[]) => Promise<unknown> | unknown) => subscriptions.push(vscode.commands.registerCommand(`${ExtensionId}.${suffix}`, async (...args: unknown[]) => {
+    const command = (suffix: string, action: (...args: unknown[]) => Promise<unknown> | unknown) => subscriptions.push(vscode.commands.registerCommand(`${ExtensionId}.${suffix}`, plainErrors(async (...args: unknown[]) => {
         try { await action(...args); }
         catch (error) {
-            if (!(error instanceof vscode.CancellationError)) await vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+            if (!(error instanceof vscode.CancellationError)) await vscode.window.showErrorMessage(plainNotificationText(error instanceof Error ? error.message : String(error)));
         }
-    }));
+    })));
     command('newQuery', async (target?: unknown) => {
         const database = await selectDatabase(target); if (!database) return;
         const document = await vscode.workspace.openTextDocument({ language: 'sql', content: 'SELECT 1 AS value;\n' });

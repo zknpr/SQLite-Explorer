@@ -12,6 +12,7 @@ import { CellMaterializationService } from './cellMaterialization';
 import { createDesktopTestApi, type DesktopTestApi } from './desktopTestApi';
 import { DocumentRegistry } from './documentRegistry';
 import { generateDatabaseDocumentKey } from './helpers';
+import { plainErrors, withPlainErrors } from './notificationText';
 
 export let GlobalOutputChannel: vsc.OutputChannel|null = null;
 
@@ -40,13 +41,13 @@ export async function activate(
 
   // Register refresh command
   context.subscriptions.push(
-    vsc.commands.registerCommand(`${ExtensionId}.refresh`, refreshActiveDatabase),
+    vsc.commands.registerCommand(`${ExtensionId}.refresh`, plainErrors(refreshActiveDatabase)),
   );
 
   // Register export table command
   context.subscriptions.push(
-    vsc.commands.registerCommand(`${ExtensionId}.exportTable`, (dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: ExportOptions, extras?: unknown) =>
-      exportTableCommand(context, reporter, dbParams, columns, dbOptions, tableStore, exportOptions, extras)),
+    vsc.commands.registerCommand(`${ExtensionId}.exportTable`, plainErrors((dbParams: DbParams, columns: string[], dbOptions?: unknown, tableStore?: unknown, exportOptions?: ExportOptions, extras?: unknown) =>
+      exportTableCommand(context, reporter, dbParams, columns, dbOptions, tableStore, exportOptions, extras))),
   );
 
   context.globalState.setKeysForSync(SyncedKeys);
@@ -129,7 +130,11 @@ export async function activateProviders(context: vsc.ExtensionContext, reporter?
   if (cellMaterializer) subs.push(cellMaterializer);
 
   // Register file system provider
-  subs.push(vsc.workspace.registerFileSystemProvider(UriScheme, new SQLiteFileSystemProvider(), { isCaseSensitive: true }));
+  subs.push(vsc.workspace.registerFileSystemProvider(
+    UriScheme,
+    withPlainErrors(new SQLiteFileSystemProvider(), ['stat', 'readDirectory', 'createDirectory', 'readFile', 'writeFile', 'delete', 'rename']),
+    { isCaseSensitive: true }
+  ));
 
   // Register the main editor provider (default for .sqlite, .db, etc.)
   subs.push(registerEditorProvider(
