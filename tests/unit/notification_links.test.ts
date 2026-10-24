@@ -10,7 +10,7 @@ import { DocumentRegistry } from '../../src/documentRegistry';
 import type { DatabaseDocument } from '../../src/databaseModel';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { exportTableCommand } from '../../src/tableExporter';
-import { plainNotificationText, withPlainErrors } from '../../src/notificationText';
+import { plainErrors, plainNotificationText, withPlainErrors } from '../../src/notificationText';
 
 // The pattern VS Code parses extension notifications, modal messages and
 // progress titles with (microsoft/vscode src/vs/base/common/linkedText.ts).
@@ -178,6 +178,23 @@ describe('errors handed back to VS Code', () => {
         } finally {
             restorations.reverse().forEach(restore => restore());
         }
+    });
+
+    it('keeps a DOMException, whose message has only a getter, as the error VS Code receives', async () => {
+        // An aborted save rethrows its AbortSignal's DOMException.
+        const aborted = new DOMException('This operation was aborted', 'AbortError');
+        await assert.rejects(plainErrors(async () => { throw aborted; })(), (error: unknown) => {
+            assert.equal(error, aborted);
+            return true;
+        });
+        const crafted = new DOMException(CRAFTED_ERROR, 'DataCloneError');
+        await assert.rejects(plainErrors(async () => { throw crafted; })(), (error: unknown) => {
+            assert.equal(error, crafted);
+            assert.equal((error as DOMException).name, 'DataCloneError');
+            assert.match((error as Error).message, /no such collation sequence/);
+            assert.deepEqual(linksIn((error as Error).message), []);
+            return true;
+        });
     });
 
     it('withPlainErrors keeps private fields, events, error classes and absent methods', async () => {

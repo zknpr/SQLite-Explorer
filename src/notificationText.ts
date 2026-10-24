@@ -22,10 +22,21 @@ export function plainNotificationText(text: string): string {
  * this extension supports parse them like extension messages. The message is
  * disarmed in place so the error keeps its class and code
  * (vscode.CancellationError, vscode.FileSystemError).
+ *
+ * A DOMException, such as an aborted save's AbortError, defines message as a
+ * getter without a setter: assigning it throws in strict mode and would replace
+ * the error. An own property shadows the getter instead. An error whose
+ * message cannot be redefined is replaced by a plain Error with it as cause.
  */
 export function plainNotificationError(error: unknown): unknown {
   if (error instanceof Error) {
-    error.message = plainNotificationText(error.message);
+    const message = plainNotificationText(error.message);
+    if (message === error.message) return error;
+    try {
+      Object.defineProperty(error, 'message', { value: message, writable: true, configurable: true });
+    } catch {
+      return new Error(message, { cause: error });
+    }
     return error;
   }
   return typeof error === 'string' ? plainNotificationText(error) : error;
