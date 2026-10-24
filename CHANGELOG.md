@@ -10,10 +10,11 @@
 
 - Keep TEXT values that contain a NUL character intact. The WebAssembly engine cut such a value short at the first NUL when writing it, for example from an import, and when reading it in the query console; the native engine did the same on some reads. Both engines now read and write the whole value. The grid still shows these cells as bytes on both engines; in tables with more than 999 columns it checks only the key columns, so other columns show such a value as text. A row whose WITHOUT ROWID primary key contains NUL stays read-only, and the reason now says so.
 - Store TEXT that contains an unpaired surrogate, such as half of an emoji left by a truncated string, whole in the WebAssembly engine. When a multibyte character followed it, the end of the value was cut off. The stored bytes now match the native engine's.
+- When the native engine fails to write a copy of the database, for Save As or an export, the error now gives SQLite's reason instead of "SQL logic error".
 
 ### Maintenance
 
-- Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `9875455`, sql.js `35ac205`).
+- Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `b45ac83`, sql.js `35ac205`). The runtime also resets a statement whose rows fail to convert, instead of leaving it running, and checks every step of that conversion; SQLite Explorer's worker finalizes its statements, so it was not affected.
 - Run the native ATTACH, DETACH and VACUUM INTO fuzz on all five native targets in CI (`native-fuzz.yml`). Its first run generated 40,000 statements, 39,990 of them distinct, and found no attached database or file write on any target.
 
 ## 1.8.2
