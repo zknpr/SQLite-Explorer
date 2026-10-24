@@ -21,7 +21,7 @@ const linksIn = (text: string): string[] => [...text.matchAll(VSCODE_LINK)].map(
 // A crafted database: a view named as a command link, selecting a missing
 // column that is also named as one, so reading the view fails with an error
 // quoting the name.
-const COMMAND = 'command:workbench.action.terminal.sendSequence?%7B%22text%22%3A%22id%5Cn%22%7D';
+const COMMAND = 'command:workbench.action.showCommands';
 const VIEW = `[Show export](${COMMAND})`;
 const COLUMN = `[Open details](${COMMAND})`;
 
@@ -257,6 +257,7 @@ describe('notification call sites', () => {
         const offenders: string[] = [];
         let notificationCalls = 0;
         let registrations = 0;
+        let historyEdits = 0;
 
         for (const file of sourceFiles(sourceRoot)) {
             const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -278,6 +279,21 @@ describe('notification call sites', () => {
                         check(textProperty(node.arguments[0], 'title'), 'withProgress title', node);
                     }
                 }
+                // A custom-document edit: VS Code shows a rejected undo or redo itself.
+                if (ts.isObjectLiteralExpression(node)) {
+                    const history = node.properties.filter(property =>
+                        !ts.isSpreadAssignment(property) && ['undo', 'redo'].includes(property.name.getText()));
+                    if (history.length === 2) {
+                        historyEdits++;
+                        for (const property of history) {
+                            const value = ts.isPropertyAssignment(property) ? property.initializer : undefined;
+                            if (!value || !ts.isCallExpression(value) || value.expression.getText() !== 'plainErrors') {
+                                const { line } = source.getLineAndCharacterOfPosition(property.getStart());
+                                offenders.push(`${path.relative(sourceRoot, file)}:${line + 1} ${property.name!.getText()} without plainErrors`);
+                            }
+                        }
+                    }
+                }
                 if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
                     const method = node.expression.name.text;
                     const wrapper = REGISTRATIONS.get(method);
@@ -297,6 +313,7 @@ describe('notification call sites', () => {
 
         assert.ok(notificationCalls > 20, `control arm: the scan found ${notificationCalls} notification calls`);
         assert.ok(registrations >= 6, `control arm: the scan found ${registrations} command and provider registrations`);
+        assert.ok(historyEdits >= 1, `control arm: the scan found ${historyEdits} undo/redo edits`);
         assert.deepEqual(offenders, []);
     });
 });

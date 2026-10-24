@@ -2750,6 +2750,48 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         assert.strictEqual(writes, 1, 'the no-write lease must end before a later ordinary Save');
     });
 
+    it('rejects a failed Undo or Redo without links in the error VS Code shows', async t => {
+        // VS Code shows a rejected custom-document Undo or Redo in its own
+        // notification. SQLite's error quotes the name of the CHECK constraint
+        // a crafted file's rows already violate.
+        const VSCODE_LINK = /\[([^\]]+)\]\(((?:https?:\/\/|command:|file:)[^\)\s]+)(?: (["'])(.+?)(\3))?\)/gi;
+        const linked = '[Open details](command:workbench.action.showCommands)';
+        const { operations } = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+        const engine = operations as DatabaseOperations & { shutdown(): void };
+        t.after(() => engine.shutdown());
+        await engine.executeQuery(
+            `CREATE TABLE t(v TEXT CONSTRAINT "${linked}" CHECK (v NOT IN ('before', 'after')));`
+            + " PRAGMA ignore_check_constraints = ON; INSERT INTO t VALUES ('after'); PRAGMA ignore_check_constraints = OFF"
+        );
+        t.mock.method(mockVscode.window, 'showErrorMessage', async () => undefined);
+        const doc = createDocBypassingFactory(engine, createFileUri('/test/linked-history-error.db'));
+        let edit: { undo(): Promise<void>; redo(): Promise<void> } | undefined;
+        doc.onDidChange((event: { undo(): Promise<void>; redo(): Promise<void> }) => { edit = event; });
+        doc.recordModification({
+            label: 'Update t.v',
+            description: 'Update t.v',
+            modificationType: 'cell_update',
+            targetTable: 't',
+            targetRowId: 1,
+            targetColumn: 'v',
+            priorValue: 'before',
+            newValue: 'after',
+            priorState: { storageClass: 'text', value: 'before' },
+            postState: { storageClass: 'text', value: 'after' }
+        });
+        const withoutLinks = (error: unknown) => {
+            assert.match((error as Error).message, /Open details/, 'control arm: the trigger supplied the error');
+            assert.deepStrictEqual([...(error as Error).message.matchAll(VSCODE_LINK)], []);
+            return true;
+        };
+
+        await assert.rejects(edit!.undo(), withoutLinks);
+        await engine.executeQuery('PRAGMA ignore_check_constraints = ON');
+        await edit!.undo();
+        await engine.executeQuery('PRAGMA ignore_check_constraints = OFF');
+        await assert.rejects(edit!.redo(), withoutLinks);
+    });
+
     it('keeps obsolete host Undo and Redo clean without replaying discarded history', async t => {
         const replayed: string[] = [];
         const replacementOps = {

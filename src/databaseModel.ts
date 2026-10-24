@@ -31,7 +31,7 @@ import { isInvocationTimeoutError } from './core/rpc';
 import { type DatabaseConnectionInvalidatedError, isDatabaseConnectionInvalidatedError } from './core/database-connection-invalidated';
 import type { LabeledModification, DatabaseOperations } from './core/types';
 import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
-import { plainNotificationText } from './notificationText';
+import { plainErrors, plainNotificationText } from './notificationText';
 import {
   captureWorkspaceFileGeneration,
   writeWorkspaceFileAtomically
@@ -687,7 +687,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
     return {
       label: modification.label,
-      undo: () => this.#runHistoryCallback(historyGeneration, async () => {
+      // VS Code shows a rejected undo or redo in its own notification.
+      undo: plainErrors(() => this.#runHistoryCallback(historyGeneration, async () => {
         if (editState !== 'applied') return;
         editState = 'undoing';
 
@@ -742,8 +743,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             // can clear the dirty marker, even though SQLite rolled it back.
             throw e;
         }
-      }),
-      redo: () => this.#runHistoryCallback(historyGeneration, async () => {
+      })),
+      redo: plainErrors(() => this.#runHistoryCallback(historyGeneration, async () => {
         if (editState !== 'undone') return;
         editState = 'redoing';
 
@@ -787,7 +788,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
              vsc.window.showErrorMessage(plainNotificationText(vsc.l10n.t('Redo failed: {0}', errorMessage)));
              throw e;
         }
-      })
+      }))
     };
   }
 
