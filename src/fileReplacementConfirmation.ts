@@ -1,4 +1,5 @@
 import * as vsc from 'vscode';
+import { plainNotificationText } from './notificationText';
 
 /** Native save dialogs do not consistently confirm replacement on every host. */
 export async function confirmFileReplacement(uri: vsc.Uri, exists?: boolean): Promise<boolean> {
@@ -16,7 +17,7 @@ export async function confirmFileReplacement(uri: vsc.Uri, exists?: boolean): Pr
   const replace = vsc.l10n.t('Replace');
   const selected = await vsc.window.showWarningMessage(
     vsc.l10n.t('Replace the existing file?'),
-    { modal: true, detail: uri.fsPath || uri.toString() },
+    { modal: true, detail: plainNotificationText(uri.fsPath || uri.toString()) },
     replace
   );
   return selected === replace;

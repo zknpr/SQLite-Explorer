@@ -2147,6 +2147,60 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('keeps native NUL TEXT whole, shows it as bytes, and keeps NUL keys read-only', async () => {
+            await engine.executeQuery(
+                'CREATE TABLE native_nul_text (id INTEGER PRIMARY KEY, value TEXT); ' +
+                "INSERT INTO native_nul_text VALUES (1, CAST(X'610062' AS TEXT)), (2, 'plain')"
+            );
+            // Bound writes keep NUL and lone surrogates byte for byte; the
+            // WASM engine stores the same bytes (raw_text_transport.test.ts).
+            await engine.executeQuery(
+                'INSERT INTO native_nul_text VALUES (?, ?), (?, ?)',
+                [3, 'c\0d', 4, 'x\uD800']
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT hex(CAST(value AS BLOB)) FROM native_nul_text ORDER BY id'
+                ))[0].rows,
+                [['610062'], ['706C61696E'], ['630064'], ['78EDA080']]
+            );
+            // The sync read now returns NUL TEXT whole, so only the
+            // containment rule keeps it out of the grid as a string.
+            const page = await engine.fetchTableData('native_nul_text', {
+                columns: ['rowid', 'id', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            assert.deepStrictEqual(page.rows[0][2], new Uint8Array([0x61, 0x00, 0x62]));
+            assert.strictEqual(page.rows[1][2], 'plain');
+            assert.deepStrictEqual(page.rows[2][2], new Uint8Array([0x63, 0x00, 0x64]));
+
+            await engine.executeQuery(
+                'CREATE TABLE native_nul_text_identity (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+                "INSERT INTO native_nul_text_identity VALUES (CAST(X'610062' AS TEXT), 'nul'), ('plain', 'plain')"
+            );
+            const keyed = await engine.fetchTableData('native_nul_text_identity', {
+                columns: ['rowid', 'key', 'value'],
+                limit: 10,
+                offset: 0
+            });
+            const nulIndex = keyed.rows.findIndex(row => row[2] === 'nul');
+            assert.notStrictEqual(nulIndex, -1);
+            assert.match(String(keyed.rows[nulIndex][0]), /^readonly-pk:/);
+            assert.match(keyed.readOnlyRowReasons?.[nulIndex] ?? '', /NUL character/);
+            assert.doesNotMatch(keyed.readOnlyRowReasons?.[nulIndex] ?? '', /inline limit/);
+            await assert.rejects(
+                engine.insertRow('native_nul_text_identity', { key: 'b\0c', value: 'must-rollback' }),
+                /NUL character/
+            );
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT hex(CAST(key AS BLOB)) FROM native_nul_text_identity ORDER BY 1'
+                ))[0].rows,
+                [['610062'], ['706C61696E']]
+            );
+        });
+
         await testContext.test('retains raw prefixes for malformed native table and view TEXT', async () => {
             await engine.executeQuery(
                 'CREATE TABLE native_malformed_text_value (value TEXT); ' +

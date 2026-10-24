@@ -337,7 +337,7 @@ const BOUNDED_QUERY_TRANSPORT_MARGIN_MS = 2000;
  * @param extensionPath - Extension installation directory
  * @returns Path to native binary or null if unsupported
  */
-async function getNativeBinaryPath(extensionPath: string): Promise<string | null> {
+export async function getNativeBinaryPath(extensionPath: string): Promise<string | null> {
   const platform = process.platform;
   const arch = process.arch;
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.8.3
+
+### Security
+
+- Show text that comes from a database file without links in VS Code notifications. VS Code turns `[label](command:…)` in an extension's notification or progress title into a link that runs that command, with arguments taken from the link, when clicked. A crafted database could put such a link into what SQLite Explorer showed: an error message, for example from exporting a view whose column name is a link, or a table, view or file name. These texts are now shown without links. The same applies to errors that VS Code shows itself, such as a failed save, which VS Code before 1.141 also turns into links.
+- Narrow the native runtime's exception for export snapshots to the one statement that writes the snapshot, on the thread running it. In 1.8.2 the exception covered the connection while an export ran; the worker's statement check and its one-request-at-a-time order kept other SQL from using it.
+
+### Fixes
+
+- Keep TEXT values that contain a NUL character intact. The WebAssembly engine cut such a value short at the first NUL when writing it, for example from an import, and when reading it in the query console; the native engine did the same on some reads. Both engines now read and write the whole value. The grid still shows these cells as bytes on both engines; in tables with more than 999 columns it checks only the key columns, so other columns show such a value as text. A row whose WITHOUT ROWID primary key contains NUL stays read-only, and the reason now says so.
+- Store TEXT that contains an unpaired surrogate, such as half of an emoji left by a truncated string, whole in the WebAssembly engine. When a multibyte character followed it, the end of the value was cut off. The stored bytes now match the native engine's.
+- When the native engine fails to write a copy of the database, for Save As or an export, the error now gives SQLite's message instead of the generic text for its error code, such as "SQL logic error".
+
+### Maintenance
+
+- Update the native runtime and the WebAssembly build to the fork commits with these fixes (txiki.js `b45ac83`, sql.js `35ac205`). The runtime also resets a statement whose rows fail to convert, instead of leaving it running, and checks every step of that conversion; SQLite Explorer's worker finalizes its statements, so it was not affected.
+- Run the native ATTACH, DETACH and VACUUM INTO fuzz on all five native targets in CI (`native-fuzz.yml`). Its run against this release's runtime generated 40,000 statements, 39,990 of them distinct, and found no attached database or file write on any target.
+
 ## 1.8.2
 
 ### Security

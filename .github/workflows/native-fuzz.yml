@@ -1,0 +1,100 @@
+name: Native fuzz
+
+# Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/) against the
+# bundled native worker on all five shipped txiki.js targets (CI's native lanes
+# run on Linux x64 only). Opt-in: manual, or on dev pushes and pull requests to
+# dev that change the harness, the runtimes, the worker client it drives, the
+# toolchain or this workflow.
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - 'tests/fuzz/**'
+      - 'tests/unit/vscode_mock_setup.ts'
+      - 'tests/unit/mocks/**'
+      - 'natives/**'
+      - 'src/nativeWorker.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.nvmrc'
+      - '.github/workflows/native-fuzz.yml'
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'tests/fuzz/**'
+      - 'tests/unit/vscode_mock_setup.ts'
+      - 'tests/unit/mocks/**'
+      - 'natives/**'
+      - 'src/nativeWorker.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.nvmrc'
+      - '.github/workflows/native-fuzz.yml'
+
+concurrency:
+  group: native-fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  native-fuzz:
+    name: Native fuzz (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    # Above the harness's own 60-minute test timeout, so a slow runner fails
+    # with the test's report rather than a bare cancellation.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-gnu
+          - runner: windows-latest
+            target: x86_64-windows
+          # macos-13 is retired; macos-15-intel matches the arm64 lane's OS.
+          - runner: macos-15-intel
+            target: x86_64-macos
+          - runner: macos-15
+            target: aarch64-macos
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # FUZZ_EXPECT_TARGET makes the harness fail unless it resolved and ran
+      # natives/<target> (no fallback to another runtime or arch). The worker
+      # logs every refusal, so the summary lines are copied to the job summary.
+      - name: Native ATTACH fuzz
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          npm run test:native-fuzz 2>&1 | tee native-fuzz.log
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: |
+          {
+            echo "### ${RUNNER_LABEL} (expected ${FUZZ_EXPECT_TARGET})"
+            echo '```'
+            grep -F '[native fuzz]' native-fuzz.log || echo 'no [native fuzz] lines: the harness did not reach the worker'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

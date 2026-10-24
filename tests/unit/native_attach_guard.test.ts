@@ -386,7 +386,7 @@ it('refuses SQL-level VACUUM INTO a path the worker did not choose', async t => 
     await f.reopen(false);
 
     // Control arm: the host's own snapshot RPC still writes its destination,
-    // and the permit it needed is gone once it settles, even for that path.
+    // and that destination is not accepted once it settles, even for that path.
     const snapshot = path.join(f.directory, 'snapshot.sqlite');
     await worker.call('vacuumInto', [snapshot, 5000]);
     assert.equal(fs.existsSync(snapshot), true, 'vacuumInto writes the host-chosen snapshot');
@@ -394,7 +394,7 @@ it('refuses SQL-level VACUUM INTO a path the worker did not choose', async t => 
     const reuse = await refusalProblem(f, 'query: VACUUM INTO the snapshot path after vacuumInto settled',
         () => f.query(`VACUUM INTO ${sqlLiteral(snapshot)}`));
     if (reuse !== undefined) problems.push(reuse);
-    if (fs.existsSync(snapshot)) problems.push('the vacuumInto permit outlived the RPC');
+    if (fs.existsSync(snapshot)) problems.push('the vacuumInto destination stayed writable after the RPC');
 
     // The refusal reads as one policy error, not a step failure followed by
     // the same code again from finalize.
@@ -426,26 +426,39 @@ it('enforces the ATTACH refusal in the runtime itself, beneath the worker guard'
         } catch (error) {
             outcome.unpermitted = { errno: error.errno, message: error.message };
         }
-        db.permitAttach(secret);
+        // Control arms: the file is readable, ATTACH syntax works for the
+        // private temporary database, and the runtime's one exception writes
+        // a copy without leaving its destination attachable.
+        const direct = new Database(secret, { readOnly: true });
+        outcome.readable = direct.prepare('SELECT v FROM secret').all();
+        direct.close();
+        db.exec("ATTACH '' AS scratch");
+        outcome.scratch = true;
+        const copy = secret + '.copy';
+        db.vacuumInto(copy);
         try {
-            db.exec('ATTACH ' + quote(secret) + ' AS permitted');
-            outcome.permitted = db.prepare('SELECT v FROM permitted.secret').all();
+            db.exec('ATTACH ' + quote(copy) + ' AS copied');
+            outcome.copyAttach = 'attached';
         } catch (error) {
-            outcome.permitted = { errno: error.errno, message: error.message };
+            outcome.copyAttach = { errno: error.errno };
         }
         db.close();
         console.log(JSON.stringify(outcome));
     `);
     const outcome = JSON.parse(execFileSync(f.runtime.binary, ['run', script], { encoding: 'utf8' }).trim()) as {
         unpermitted: unknown;
-        permitted: unknown;
+        readable: unknown;
+        scratch: unknown;
+        copyAttach: unknown;
     };
 
     assert.deepEqual(outcome.unpermitted, { errno: 23, message: 'authorization denied' },
         'the runtime refuses ATTACH with SQLITE_AUTH even without the worker guard');
-    // Control arm: the same statement attaches once permitted, so the refusal
-    // above is the authorizer and not the path or the syntax.
-    assert.deepEqual(outcome.permitted, [{ v: SECRET }]);
+    // SQLITE_AUTH comes only from an authorizer, and the control arms rule out
+    // the path and the syntax.
+    assert.deepEqual(outcome.readable, [{ v: SECRET }]);
+    assert.equal(outcome.scratch, true);
+    assert.deepEqual(outcome.copyAttach, { errno: 23 }, 'a vacuumInto destination does not stay attachable');
 });
 
 it('explains a DETACH refusal without the ATTACH justification', async t => {

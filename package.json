@@ -3,7 +3,7 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.8.2",
+  "version": "1.8.3",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
@@ -282,7 +282,8 @@
     "test:gui:interactions": "node tests/gui/interaction-details.mjs",
     "test:gui:contention": "node tests/gui/native-contention.mjs",
     "test:gui:uploads": "node tests/gui/drop-upload.mjs",
-    "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts"
+    "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts",
+    "test:native-fuzz": "node --import tsx --test tests/fuzz/native_attach_fuzz.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

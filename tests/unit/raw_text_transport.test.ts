@@ -3,7 +3,12 @@ import './vscode_mock_setup';
 import assert from 'node:assert/strict';
 import { it, type TestContext } from 'node:test';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import { buildCellContainmentQuery, containUnrepresentableTextCells, decodeRawTextColumns } from '../../src/core/cell-containment';
+import {
+    buildCellContainmentQuery,
+    containUnrepresentableTextCells,
+    decodeRawTextColumns,
+    findUnrepresentableTextRows
+} from '../../src/core/cell-containment';
 
 async function database(t: TestContext, encoding = 'UTF-8') {
     const { operations } = await createDatabaseEngine({ content: null, maxSize: 0 });
@@ -98,6 +103,45 @@ for (const [encoding, malformed, nul] of [
         assert.equal(clipped.oversizedCells?.[4]?.[2].byteLength, encoding === 'UTF-8' ? 8 : 16);
     });
 }
+
+it('keeps TEXT containing NUL as bytes even when the engine returns it exactly', () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const rows = findUnrepresentableTextRows({
+        sourceRows: [['a\0b'], ['ordinary']],
+        sourceColumnIndices: [0],
+        rawTextRows: [[encode('a\0b')], [encode('ordinary')]],
+        rawTextColumnIndices: [0],
+        textEncoding: 'utf-8'
+    });
+    assert.deepEqual([...(rows ?? [])], [0]);
+});
+
+it('stores bound TEXT containing NUL exactly', async t => {
+    const engine = await database(t);
+    await engine.executeQuery('CREATE TABLE cells(value TEXT)');
+    await engine.executeQuery('INSERT INTO cells VALUES (?)', ['c\0d']);
+    const rows = (await engine.executeQuery('SELECT hex(CAST(value AS BLOB)) FROM cells'))[0].rows;
+    assert.deepEqual(rows, [['630064']], 'the WASM engine must not truncate a bound value at NUL');
+});
+
+it('stores bound TEXT with lone surrogates byte for byte as the native engine does', async t => {
+    // Expected bytes are what the native runtime stores: each lone surrogate
+    // as its 3-byte encoding, and nothing appended or cut off around it.
+    const values: Array<[string, string]> = [
+        ['x\uD800', '78EDA080'],
+        ['tweet \uD83D', '747765657420EDA0BD'],
+        ['\uD83D中文', 'EDA0BDE4B8ADE69687'],
+        ['\uDE00a', 'EDB88061'],
+        ['ok 😀', '6F6B20F09F9880']
+    ];
+    const engine = await database(t);
+    await engine.executeQuery('CREATE TABLE cells(id INTEGER PRIMARY KEY, value TEXT)');
+    for (const [index, [value]] of values.entries()) {
+        await engine.executeQuery('INSERT INTO cells VALUES (?, ?)', [index, value]);
+    }
+    const rows = (await engine.executeQuery('SELECT hex(CAST(value AS BLOB)) FROM cells ORDER BY id'))[0].rows;
+    assert.deepEqual(rows.map(row => row[0]), values.map(([, hex]) => hex));
+});
 
 it('keeps the default native raw TEXT transport as BLOBs', async t => {
     const engine = await database(t);

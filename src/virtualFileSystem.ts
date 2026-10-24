@@ -1,5 +1,6 @@
 import * as vsc from 'vscode';
 import { DocumentRegistry } from './documentRegistry';
+import { plainNotificationText } from './notificationText';
 import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './core/sql-utils';
 import {
     buildRecordIdentityPredicate,
@@ -14,6 +15,7 @@ import {
 } from './core/view-utils';
 import { GlobalOutputChannel } from './main';
 import { getMaxInlineCellBytes } from './config';
+import { decodedTextReproduces } from './core/cell-containment';
 import { sqliteIdentifiersEqual } from './core/integer-utils';
 import {
     assertCellValueWithinEditLimit,
@@ -330,7 +332,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                         'Open its raw Hex inspector or export it instead.'
                     );
                 }
-                if (decoded !== value) {
+                if (!decodedTextReproduces(decoded, value)) {
                     throw vsc.FileSystemError.NoPermissions(
                         'This TEXT cell cannot be represented by the external text editor without ' +
                         'changing its stored bytes. Open its raw Hex inspector or export it instead.'
@@ -428,7 +430,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                 GlobalOutputChannel?.appendLine(`[VirtualFileSystem] Error writing view definition: ${rawMessage}`);
                 const detail = getViewDefinitionErrorDetail(err);
                 void vsc.window.showErrorMessage(
-                    `Invalid view definition: ${detail}. The view was not modified.`
+                    plainNotificationText(`Invalid view definition: ${detail}. The view was not modified.`)
                 ).then(undefined, notificationError => {
                     GlobalOutputChannel?.appendLine(
                         `[VirtualFileSystem] Failed to show view error notification: ${notificationError instanceof Error ? notificationError.message : String(notificationError)}`
@@ -526,7 +528,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                         byteLength: metadata.byteLength
                     };
                     const answer = await vsc.window.showWarningMessage(
-                        formatOversizedCellReplacementWarning(table, column, expected),
+                        plainNotificationText(formatOversizedCellReplacementWarning(table, column, expected)),
                         { modal: true },
                         { title: vsc.l10n.t('Replace Without Undo'), value: true },
                         { title: vsc.l10n.t('Cancel'), value: false, isCloseAffordance: true }
@@ -625,7 +627,7 @@ export class SQLiteFileSystemProvider implements vsc.FileSystemProvider {
                     } catch {
                         decoded = '';
                     }
-                    if (decoded !== boundedValue) {
+                    if (typeof boundedValue !== 'string' || !decodedTextReproduces(decoded, boundedValue)) {
                         throw vsc.FileSystemError.NoPermissions(
                             'This TEXT cell cannot be edited as text without changing its stored bytes. ' +
                             'Open its raw Hex inspector or export it instead.'
