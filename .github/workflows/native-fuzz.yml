@@ -3,7 +3,8 @@ name: Native fuzz
 # Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/) against the
 # bundled native worker on all five shipped txiki.js targets (CI's native lanes
 # run on Linux x64 only). Opt-in: manual, or on dev pushes that change the
-# harness, the runtimes or this workflow.
+# harness, the runtimes, the worker client it drives, the toolchain or this
+# workflow.
 on:
   workflow_dispatch:
   push:
@@ -11,6 +12,9 @@ on:
     paths:
       - 'tests/fuzz/**'
       - 'natives/**'
+      - 'src/nativeWorker.ts'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/native-fuzz.yml'
 
 concurrency:
