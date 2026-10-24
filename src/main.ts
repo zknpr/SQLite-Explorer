@@ -132,7 +132,8 @@ export async function activateProviders(context: vsc.ExtensionContext, reporter?
   // Register file system provider
   subs.push(vsc.workspace.registerFileSystemProvider(
     UriScheme,
-    withPlainErrors(new SQLiteFileSystemProvider(), ['stat', 'readDirectory', 'createDirectory', 'readFile', 'writeFile', 'delete', 'rename']),
+    withPlainErrors(new SQLiteFileSystemProvider(),
+      ['stat', 'readDirectory', 'createDirectory', 'readFile', 'writeFile', 'delete', 'rename'] satisfies (keyof vsc.FileSystemProvider)[]),
     { isCaseSensitive: true }
   ));
 

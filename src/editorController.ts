@@ -594,6 +594,16 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
   }
 }
 
+// VS Code shows the errors of these provider methods itself (see withPlainErrors).
+const CUSTOM_EDITOR_METHODS = [
+  'openCustomDocument',
+  'resolveCustomEditor',
+  'saveCustomDocument',
+  'saveCustomDocumentAs',
+  'revertCustomDocument',
+  'backupCustomDocument'
+] satisfies (keyof vsc.CustomEditorProvider)[];
+
 /**
  * Register an editor provider for SQLite files.
  *
@@ -604,15 +614,6 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
  * @param options - Provider options
  * @returns Disposable for the registered provider
  */
-// VS Code shows the errors of these provider methods itself (see withPlainErrors).
-const CUSTOM_EDITOR_METHODS = [
-  'openCustomDocument',
-  'resolveCustomEditor',
-  'saveCustomDocument',
-  'saveCustomDocumentAs',
-  'revertCustomDocument',
-  'backupCustomDocument'
-];
 
 export function registerEditorProvider(
   viewType: string,
