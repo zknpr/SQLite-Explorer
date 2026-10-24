@@ -614,7 +614,6 @@ const CUSTOM_EDITOR_METHODS = [
  * @param options - Provider options
  * @returns Disposable for the registered provider
  */
-
 export function registerEditorProvider(
   viewType: string,
   context: vsc.ExtensionContext,

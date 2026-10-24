@@ -2780,7 +2780,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             postState: { storageClass: 'text', value: 'after' }
         });
         const withoutLinks = (error: unknown) => {
-            assert.match((error as Error).message, /Open details/, 'control arm: the trigger supplied the error');
+            assert.match((error as Error).message, /Open details/, 'control arm: the constraint name supplied the error');
             assert.deepStrictEqual([...(error as Error).message.matchAll(VSCODE_LINK)], []);
             return true;
         };
