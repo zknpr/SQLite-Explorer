@@ -13,7 +13,8 @@
 
 ### Maintenance
 
-- Stop building and packaging the browser worker bundle. VS Code Web runs SQLite in the extension host, so nothing loaded it. Each VSIX is 83 KB smaller.
+- Stop building and packaging the browser worker bundle. VS Code Web runs SQLite in the extension host, so nothing loaded it.
+- Ship the extension icon at 256 by 256 pixels, the size VS Code asks for, instead of 500 by 500. With the removed bundle, each VSIX is 210 KB smaller.
 - Fail the build when the web demo viewer cannot be bundled. The build used to report success and keep the previous viewer.
 
 ## 1.8.3
