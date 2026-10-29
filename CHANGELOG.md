@@ -6,6 +6,8 @@
 
 - CSV and JSON imports insert up to 500 rows per engine call instead of one, and the native engine sends each step for those rows to its worker in one message. In a local test a 100,000-row import took 9 seconds instead of 89 on the native engine and 6 seconds instead of 21 on WebAssembly. Undoing and redoing an import is 1.5 to 5 times faster, and native undo and redo of deleted rows use the same batched path.
 - An import writes one line per batch to the SQLite Explorer output channel. It wrote one line per row, with the row's values.
+- The native engine converts grid rows in one pass instead of two. In a local test a 5,000-row page took 85 ms instead of 97 at 11 columns, and 364 ms instead of 416 at 51 columns.
+- After a Tab-committed edit, an inserted row, deleted rows or cleared cells, the grid requests its page once instead of twice. VS Code already reloads the grid after each edit, and the editor loaded the same page again.
 
 ### Fixes
 
