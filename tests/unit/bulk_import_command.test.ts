@@ -65,7 +65,7 @@ async function runWizard(backend: 'wasm' | 'native', scenario: Scenario) {
                         return (action: (snapshot: DatabaseOperations) => Promise<unknown>) => value.call(target,
                             (snapshot: DatabaseOperations) => action(intercept(snapshot)));
                     }
-                    if (property === 'insertRowWithHistory') {
+                    if (property === 'insertRowsWithHistory') {
                         return async (...args: unknown[]) => {
                             if (!inserted) { inserted = true; await scenario.beforeFirstInsert!(); }
                             return value.apply(target, args);

@@ -157,8 +157,10 @@ import {
   assertDeleteSnapshotFitsUndoBudget,
   buildDeleteSnapshotSizeQuery,
   deleteSnapshotValueColumns,
-  parseDeleteSnapshotSizeRow
+  parseDeleteSnapshotSizeRow,
+  undoSnapshotBudgetError
 } from '../../delete-history';
+import { estimateUndoMemoryBytes } from '../../undo-history';
 import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
@@ -352,6 +354,23 @@ function wasmBindPlaceholder(value: CellValue): string {
     : '?';
 }
 
+function buildWasmInsert(
+  table: string,
+  data: Record<string, CellValue>
+): { columns: string[]; sql: string; params: CellValue[] } {
+  const columns = Object.keys(data);
+  if (columns.length === 0) {
+    return { columns, sql: `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`, params: [] };
+  }
+  const params = columns.map(col => data[col]);
+  return {
+    columns,
+    sql: `INSERT INTO ${escapeMainIdentifier(table)} (${columns.map(escapeIdentifier).join(', ')}) ` +
+      `VALUES (${params.map(wasmBindPlaceholder).join(', ')})`,
+    params
+  };
+}
+
 // ============================================================================
 // Database Engine Implementation
 // ============================================================================
@@ -361,6 +380,9 @@ function wasmBindPlaceholder(value: CellValue): string {
  */
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const PROGRESS_HANDLER_INTERVAL = 1000;
+// Generated history statements run synchronously in chunks of this many rows,
+// each chunk under one deadline registration (see mapInDeadlineChunks).
+const HISTORY_DEADLINE_CHUNK_ROWS = 256;
 
 interface WasmCellReadSessionState {
   sessionId: string;
@@ -1538,16 +1560,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       await this.assertDeleteHasNoUntrackedPrograms(table);
-      for (const snapshot of snapshots) {
+      this.mapInDeadlineChunks(snapshots, snapshot => {
         const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
         const rowState = buildRowHistoryPredicate(snapshot, wasmBindPlaceholder);
-        await this.executeQuery(
+        this.runHistoryStatement(
           `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
           `(${rowIdentity.sql}) AND (${rowState.sql})`,
           [...rowIdentity.params, ...rowState.params]
         );
         if (this.readChangesCount() !== 1) throw new RowHistoryConflictError(table);
-      }
+      });
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (error) {
       await this.safeRollbackSavepoint(savepointName, 'deleteRowHistorySnapshots');
@@ -1569,11 +1591,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const savepointName = this.createSavepointName('sp_history_restore_rows');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
+      const probedShapes = new Set<string>();
       for (const entry of prepared) {
-        await this.assertInsertHasNoUntrackedPrograms(
-          table,
-          entry.states.map(state => state.column)
-        );
+        const columns = entry.states.map(state => state.column);
+        const shape = JSON.stringify(columns);
+        if (probedShapes.has(shape)) continue;
+        probedShapes.add(shape);
+        await this.assertInsertHasNoUntrackedPrograms(table, columns);
+      }
+      this.mapInDeadlineChunks(prepared, entry => {
         const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
         const existing = this.queryRaw(
           `SELECT 1 FROM ${escapeMainIdentifier(table)} ` +
@@ -1581,9 +1607,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           rowIdentity.params
         );
         if (existing.rows.length !== 0) throw new RowHistoryConflictError(table);
-      }
+      });
 
-      for (const entry of prepared) {
+      this.mapInDeadlineChunks(prepared, entry => {
         const columns = entry.writes.map(item => item.column);
         const values = entry.writes.map(item => item.write.sql);
         const params = entry.writes.flatMap(item => item.write.params);
@@ -1595,7 +1621,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           values.unshift(wasmBindPlaceholder(entry.snapshot.rowId));
           params.unshift(entry.snapshot.rowId);
         }
-        await this.executeQuery(
+        this.runHistoryStatement(
           `INSERT INTO ${escapeMainIdentifier(table)} ` +
           `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
           params
@@ -1610,7 +1636,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           [...rowIdentity.params, ...rowState.params]
         );
         if (verified.rows.length !== 1) throw new RowHistoryConflictError(table);
-      }
+      });
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (error) {
       await this.safeRollbackSavepoint(savepointName, 'restoreRowHistorySnapshots');
@@ -2437,6 +2463,140 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     return result;
   }
 
+  async insertRowsWithHistory(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]> {
+    this.assertNoActiveReadSession();
+    if (rows.length === 0) return [];
+    for (const row of rows) assertCellValuesWithinEditLimit(Object.values(row), maxEditValueBytes);
+    // Schema, and with it identity, insertable columns and trigger programs,
+    // cannot change inside the savepoint, so resolve them once per call.
+    const identity = await this.resolveTableIdentity(table);
+    const insertableColumns = await this.getInsertableColumnNames(table);
+    const savepointName = this.createSavepointName('sp_insert_rows_history');
+    await this.executeQuery(`SAVEPOINT ${savepointName}`);
+    try {
+      const probedShapes = new Set<string>();
+      for (const row of rows) {
+        const columns = Object.keys(row);
+        const shape = JSON.stringify(columns);
+        if (probedShapes.has(shape)) continue;
+        probedShapes.add(shape);
+        await this.assertInsertHasNoUntrackedPrograms(table, columns);
+      }
+      const textEncoding = this.getCellTextEncoding();
+      let remainingSnapshotBytes = maxUndoSnapshotBytes;
+      const snapshots = this.mapInDeadlineChunks(rows, row => {
+        const rowId = this.insertRowForHistory(table, identity, row, textEncoding);
+        if (remainingSnapshotBytes !== undefined) {
+          this.assertDeleteSnapshotWithinBudget(
+            table,
+            insertableColumns,
+            [buildRecordIdentityPredicate(rowId, identity)],
+            [rowId],
+            identity.kind === 'rowid',
+            remainingSnapshotBytes,
+            'Insert'
+          );
+        }
+        const snapshot = this.readRowHistorySnapshot(table, identity, rowId, insertableColumns);
+        if (remainingSnapshotBytes !== undefined) {
+          remainingSnapshotBytes -= estimateUndoMemoryBytes(snapshot);
+          if (remainingSnapshotBytes < 0) throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes!);
+        }
+        return snapshot;
+      });
+      await this.executeQuery(`RELEASE ${savepointName}`);
+      return snapshots;
+    } catch (error) {
+      await this.safeRollbackSavepoint(savepointName, 'insertRowsWithHistory');
+      throw error;
+    }
+  }
+
+  /**
+   * Map rows synchronously in bounded chunks. Registering the sql.js progress
+   * handler costs about as much as a small statement, so per-row history work
+   * shares one registration per chunk; chunking keeps queryTimeout a bound on
+   * a few hundred generated statements rather than on a whole undo or import.
+   */
+  private mapInDeadlineChunks<T, R>(items: readonly T[], work: (item: T) => R): R[] {
+    const results: R[] = [];
+    for (let start = 0; start < items.length; start += HISTORY_DEADLINE_CHUNK_ROWS) {
+      const end = Math.min(items.length, start + HISTORY_DEADLINE_CHUNK_ROWS);
+      this.executeWithProgressHandler(() => {
+        for (let index = start; index < end; index++) results.push(work(items[index]));
+      });
+    }
+    return results;
+  }
+
+  /**
+   * Run one generated write statement synchronously, inside a caller's
+   * executeWithProgressHandler, with executeQuery's error wording.
+   */
+  private runHistoryStatement(sql: string, params: readonly CellValue[]): void {
+    const statement = this.instance.prepare(sql);
+    try {
+      if (params.length > 0) statement.bind(normalizeWasmBindParams(params));
+      while (statement.step()) { /* generated writes return no rows */ }
+    } catch (err) {
+      throw new Error(`Query failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      statement.free();
+    }
+  }
+
+  /** insertRowInternal's per-row checks, run synchronously inside the caller's savepoint. */
+  private insertRowForHistory(
+    table: string,
+    identity: TableIdentity,
+    data: Record<string, CellValue>,
+    textEncoding: CellTextEncoding
+  ): RecordId {
+    const { sql, params } = buildWasmInsert(table, data);
+    if (identity.kind === 'primaryKey') {
+      const result = this.queryRaw(
+        `${sql} RETURNING ${buildByteFaithfulPrimaryKeyProjection(identity)}`,
+        params
+      );
+      if (result.rows.length !== 1) {
+        throw new Error(`Insert into ${table} did not return exactly one primary-key identity`);
+      }
+      const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+        identity,
+        result.rows[0],
+        textEncoding,
+        `Cannot insert into ${table}`
+      );
+      return this.readPrimaryKeyRecordId(
+        table,
+        identity,
+        buildRecordIdentityPredicate(candidateId, identity)
+      );
+    }
+    this.runHistoryStatement(sql, params);
+    if (this.readChangesCount() !== 1) {
+      throw new Error(`Insert into ${table} did not create exactly one row`);
+    }
+    const rawRowId = this.queryRaw('SELECT CAST(last_insert_rowid() AS TEXT)').rows[0]?.[0];
+    const rowId = validateRowId(rawRowId as RecordId | bigint);
+    const predicate = buildRecordIdentityPredicate(rowId, identity);
+    const current = this.queryRaw(
+      `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+      predicate.params
+    );
+    if (current.rows.length !== 1) {
+      throw new Error(
+        `Insert into ${table} did not leave one addressable row; the insert was rolled back`
+      );
+    }
+    return rowId;
+  }
+
   private async insertRowInternal(
     table: string,
     data: Record<string, CellValue>,
@@ -2449,18 +2609,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
     }
     const identity = await this.resolveTableIdentity(table);
-    const columns = Object.keys(data);
-    let sql: string;
-    let params: CellValue[] = [];
-
-    if (columns.length === 0) {
-      sql = `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`;
-    } else {
-      const colNames = columns.map(escapeIdentifier).join(', ');
-      params = columns.map(col => data[col]);
-      const placeholders = params.map(wasmBindPlaceholder).join(', ');
-      sql = `INSERT INTO ${escapeMainIdentifier(table)} (${colNames}) VALUES (${placeholders})`;
-    }
+    const { columns, sql, params } = buildWasmInsert(table, data);
 
     if (identity.kind === 'primaryKey') {
       const savepointName = this.createSavepointName('sp_insert_pk_row');
@@ -3152,11 +3301,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       predicate.params
     );
     if (result.rows.length !== 1) throw new RowHistoryConflictError(table);
+    const textEncoding = this.getCellTextEncoding();
     const states = insertableColumns.map((column, index) => parseStoredCellState(
       result.rows[0][index * 2],
       result.rows[0][index * 2 + 1],
       `${table}.${column}`,
-      { textEncoding: this.getCellTextEncoding() }
+      { textEncoding }
     ));
     const row = Object.fromEntries(insertableColumns.map(
       (column, index) => [

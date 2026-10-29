@@ -312,6 +312,24 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
+    async insertRowsWithHistory(
+        table: string,
+        rows: Record<string, CellValue>[],
+        maxEditValueBytes?: number,
+        maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow[]> {
+        this.log(`INSERT batch: ${rows.length} rows into ${escapeIdentifier(table)}`, true);
+        if (typeof this.wrapped.insertRowsWithHistory !== 'function') {
+            throw new Error('Backend does not support guarded row insertion history');
+        }
+        return this.wrapped.insertRowsWithHistory(
+            table,
+            rows,
+            maxEditValueBytes,
+            maxUndoSnapshotBytes
+        );
+    }
+
     async insertRowBatch(
         table: string,
         rows: Record<string, CellValue>[],

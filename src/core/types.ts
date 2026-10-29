@@ -566,6 +566,18 @@ export interface DatabaseOperations {
     maxUndoSnapshotBytes?: number
   ): Promise<DeletedRow>;
 
+  /**
+   * Insert rows atomically with the same guards and post-image history as
+   * insertRowWithHistory. maxUndoSnapshotBytes is the budget for all returned
+   * snapshots, accounted in order like successive single-row calls.
+   */
+  insertRowsWithHistory?(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
+
   /** Insert multiple rows in a batch */
   insertRowBatch(
     table: string,

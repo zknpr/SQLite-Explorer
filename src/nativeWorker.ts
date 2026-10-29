@@ -132,8 +132,11 @@ import {
   assertDeleteSnapshotFitsUndoBudget,
   buildDeleteSnapshotSizeQuery,
   deleteSnapshotValueColumns,
-  parseDeleteSnapshotSizeRow
+  parseDeleteSnapshotSizeRow,
+  projectDeleteSnapshotBytes,
+  undoSnapshotBudgetError
 } from './core/delete-history';
+import { estimateUndoMemoryBytes } from './core/undo-history';
 import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
@@ -326,6 +329,63 @@ function isGeneratedExportSpoolStatement(sql: string): boolean {
 
 /** Let a bounded worker query report its own precise timeout before RPC expires. */
 const BOUNDED_QUERY_TRANSPORT_MARGIN_MS = 2000;
+
+// Row-history work batches many generated statements per queryBatch round
+// trip. Bytes bound request and response frames; items bound how long one
+// round trip holds the worker, and with it import cancellation latency.
+const NATIVE_HISTORY_BATCH_BYTES = 8 * 1024 * 1024;
+const NATIVE_HISTORY_BATCH_ITEMS = 512;
+
+function approximateParamBytes(params: readonly CellValue[]): number {
+  let bytes = 0;
+  for (const value of params) {
+    if (typeof value === 'string') bytes += value.length * 2;
+    else if (value instanceof Uint8Array) bytes += value.byteLength;
+    else bytes += 8;
+  }
+  return bytes;
+}
+
+/** Consecutive groups within both bounds; an item larger than maxBytes stands alone. */
+function groupConsecutive<T>(
+  items: readonly T[],
+  bytesOf: (item: T) => number,
+  maxBytes: number = NATIVE_HISTORY_BATCH_BYTES,
+  maxItems: number = NATIVE_HISTORY_BATCH_ITEMS
+): T[][] {
+  const groups: T[][] = [];
+  let current: T[] = [];
+  let currentBytes = 0;
+  for (const item of items) {
+    const bytes = bytesOf(item);
+    if (current.length > 0 && (current.length >= maxItems || currentBytes + bytes > maxBytes)) {
+      groups.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(item);
+    currentBytes += bytes;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+function buildNativeInsert(
+  table: string,
+  data: Record<string, CellValue>
+): { columns: string[]; sql: string; params: CellValue[] } {
+  const columns = Object.keys(data);
+  if (columns.length === 0) {
+    return { columns, sql: `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`, params: [] };
+  }
+  return {
+    columns,
+    sql: `INSERT INTO ${escapeMainIdentifier(table)} ` +
+      `(${columns.map(escapeIdentifier).join(', ')}) ` +
+      `VALUES (${columns.map(() => '?').join(', ')})`,
+    params: columns.map(column => data[column])
+  };
+}
 
 // ============================================================================
 // Platform Detection
@@ -1422,6 +1482,16 @@ export async function createNativeDatabaseConnection(
           `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
           predicate.params
         ]);
+        return parseNativeRowHistorySnapshot(table, rowId, insertableColumns, result, textEncoding);
+      };
+
+      const parseNativeRowHistorySnapshot = (
+        table: string,
+        rowId: RecordId,
+        insertableColumns: readonly string[],
+        result: NativeQueryResult,
+        textEncoding: CellTextEncoding
+      ): DeletedRow => {
         if (result.values.length !== 1) throw new RowHistoryConflictError(table);
         const states = insertableColumns.map((column, index) => parseStoredCellState(
           result.values[0][index * 2],
@@ -2462,18 +2532,7 @@ export async function createNativeDatabaseConnection(
           assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
         }
         const identity = await resolveNativeTableIdentity(table);
-        const columns = Object.keys(data);
-        let sql: string;
-        let params: CellValue[] = [];
-
-        if (columns.length === 0) {
-          sql = `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`;
-        } else {
-          params = columns.map(column => data[column]);
-          sql = `INSERT INTO ${escapeMainIdentifier(table)} ` +
-            `(${columns.map(escapeIdentifier).join(', ')}) ` +
-            `VALUES (${columns.map(() => '?').join(', ')})`;
-        }
+        const { columns, sql, params } = buildNativeInsert(table, data);
 
         const savepointName = createSavepointName(
           identity.kind === 'primaryKey' ? 'sp_insert_pk_row' : 'sp_insert_rowid_row'
@@ -2539,6 +2598,178 @@ export async function createNativeDatabaseConnection(
         }
       };
 
+      const queryNativeBatch = async (
+        queries: Array<{ sql: string; params: CellValue[] }>
+      ): Promise<NativeQueryResult[]> => {
+        const batch = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
+        if (!Array.isArray(batch?.results) || batch.results.length !== queries.length) {
+          throw new Error('Native SQLite returned an incomplete query batch');
+        }
+        return batch.results;
+      };
+
+      /**
+       * insertNativeRowInternal's guards for many rows at a time. Each phase
+       * sends its per-row statements in queryBatch round trips; per-row IPC
+       * made a 100,000-row import take minutes.
+       */
+      const insertNativeRowsWithHistory = async (
+        table: string,
+        rows: Record<string, CellValue>[],
+        maxEditValueBytes?: number,
+        maxUndoSnapshotBytes?: number
+      ): Promise<DeletedRow[]> => {
+        if (rows.length === 0) return [];
+        for (const row of rows) assertCellValuesWithinEditLimit(Object.values(row), maxEditValueBytes);
+        // Schema, and with it identity, insertable columns and trigger programs,
+        // cannot change inside the savepoint, so resolve them once per call.
+        const identity = await resolveNativeTableIdentity(table);
+        const insertableColumns = await getNativeInsertableColumnNames(table);
+        const textEncoding = await readNativeCellTextEncoding();
+        const escapedTable = escapeMainIdentifier(table);
+        const inserts = rows.map(row => buildNativeInsert(table, row));
+        const savepointName = createSavepointName('sp_insert_rows_history');
+        await beginNativeSavepoint(savepointName);
+        try {
+          const probedShapes = new Set<string>();
+          for (const insert of inserts) {
+            const shape = JSON.stringify(insert.columns);
+            if (probedShapes.has(shape)) continue;
+            probedShapes.add(shape);
+            await assertNativeMutationHasNoUntrackedPrograms('INSERT', table, insert.columns);
+          }
+
+          // A later plain INSERT cannot change an earlier row, so checking each
+          // row after its group ran is equivalent to checking it before the next.
+          const rowIds: RecordId[] = [];
+          const insertGroups = groupConsecutive(inserts, insert => approximateParamBytes(insert.params));
+          if (identity.kind === 'primaryKey') {
+            const projection = buildByteFaithfulPrimaryKeyProjection(identity);
+            for (const group of insertGroups) {
+              const returned = await queryNativeBatch(group.map(insert => ({
+                sql: `${insert.sql} RETURNING ${projection}`,
+                params: insert.params
+              })));
+              const resolved = await queryNativeBatch(returned.map(result => {
+                if (result.values?.length !== 1) {
+                  throw new Error(`Insert into ${table} did not return exactly one primary-key identity`);
+                }
+                const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+                  identity,
+                  result.values[0],
+                  textEncoding,
+                  `Cannot insert into ${table}`
+                );
+                const predicate = buildRecordIdentityPredicate(candidateId, identity);
+                return {
+                  sql: `SELECT ${projection} FROM ${escapedTable} WHERE ${predicate.sql} LIMIT 2`,
+                  params: predicate.params
+                };
+              }));
+              for (const result of resolved) {
+                if (result.values.length === 0) throw new Error(`Updated row in ${table} no longer exists`);
+                if (result.values.length !== 1) {
+                  throw new Error(`Primary-key identity for ${table} matched more than one row`);
+                }
+                rowIds.push(encodeByteFaithfulPrimaryKeyRecordId(
+                  identity,
+                  result.values[0],
+                  textEncoding,
+                  `Cannot resolve updated identity in ${table}`
+                ));
+              }
+            }
+          } else {
+            for (const group of insertGroups) {
+              // changes() and last_insert_rowid() describe the INSERT just before them.
+              const results = await queryNativeBatch(group.flatMap(insert => [
+                { sql: insert.sql, params: insert.params },
+                { sql: 'SELECT changes(), CAST(last_insert_rowid() AS TEXT)', params: [] }
+              ]));
+              for (let index = 1; index < results.length; index += 2) {
+                const metadata = results[index];
+                if (metadata.values?.length !== 1 || Number(metadata.values[0][0]) !== 1) {
+                  throw new Error(`Insert into ${table} did not create exactly one row`);
+                }
+                rowIds.push(validateRowId(metadata.values[0][1] as RecordId));
+              }
+            }
+          }
+
+          const predicates = rowIds.map(rowId => buildRecordIdentityPredicate(rowId, identity));
+          const valueColumns = deleteSnapshotValueColumns(insertableColumns, identity.kind === 'rowid');
+          const sizes: Array<{ rowCount: number; valueBytes: number }> = [];
+          for (const group of groupConsecutive(predicates, predicate => approximateParamBytes(predicate.params))) {
+            const results = await queryNativeBatch(group.map(predicate => (
+              buildDeleteSnapshotSizeQuery(table, valueColumns, predicate)
+            )));
+            for (const result of results) sizes.push(parseDeleteSnapshotSizeRow(result.values?.[0]));
+          }
+          if (identity.kind === 'rowid' && sizes.some(size => size.rowCount !== 1)) {
+            // The size COUNT(*) uses the addressable check's predicate.
+            throw new Error(
+              `Insert into ${table} did not leave one addressable row; the insert was rolled back`
+            );
+          }
+
+          // Snapshot reads follow the single-row budget order exactly: each row
+          // is checked against the budget left after every earlier snapshot.
+          // A group's first row is checked before the group is read, and a row
+          // whose projection exceeds the group bound is read alone, so no read
+          // materializes more than one bound beyond what the budget admitted.
+          const projections = insertableColumns.map(buildStoredCellStateProjection).join(', ');
+          let remainingSnapshotBytes = maxUndoSnapshotBytes;
+          const checkBudget = (index: number): void => {
+            if (remainingSnapshotBytes === undefined) return;
+            assertDeleteSnapshotFitsUndoBudget({
+              table,
+              insertableColumns,
+              includeSyntheticRowId: identity.kind === 'rowid',
+              rowIds: [rowIds[index]],
+              rowCount: sizes[index].rowCount,
+              valueBytes: sizes[index].valueBytes,
+              maxSnapshotBytes: remainingSnapshotBytes,
+              operation: 'Insert'
+            });
+          };
+          const snapshots: DeletedRow[] = [];
+          const indices = rowIds.map((_, index) => index);
+          const readGroups = groupConsecutive(indices, index => projectDeleteSnapshotBytes({
+            insertableColumns,
+            rowIds: [rowIds[index]],
+            rowCount: sizes[index].rowCount,
+            valueBytes: sizes[index].valueBytes
+          }));
+          for (const group of readGroups) {
+            checkBudget(group[0]);
+            const results = await queryNativeBatch(group.map(index => ({
+              sql: `SELECT ${projections} FROM ${escapedTable} WHERE ${predicates[index].sql} LIMIT 2`,
+              params: predicates[index].params
+            })));
+            group.forEach((index, position) => {
+              if (position > 0) checkBudget(index);
+              const snapshot = parseNativeRowHistorySnapshot(
+                table,
+                rowIds[index],
+                insertableColumns,
+                results[position],
+                textEncoding
+              );
+              if (remainingSnapshotBytes !== undefined) {
+                remainingSnapshotBytes -= estimateUndoMemoryBytes(snapshot);
+                if (remainingSnapshotBytes < 0) throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes!);
+              }
+              snapshots.push(snapshot);
+            });
+          }
+          await releaseNativeSavepoint(savepointName);
+          return snapshots;
+        } catch (error) {
+          await safeRollbackSavepoint(savepointName, 'insertNativeRowsWithHistory', error);
+          throw error;
+        }
+      };
+
       const deleteNativeRowHistorySnapshots = async (
         table: string,
         snapshots: readonly DeletedRow[]
@@ -2550,15 +2781,24 @@ export async function createNativeDatabaseConnection(
         await beginNativeSavepoint(savepointName);
         try {
           await assertNativeMutationHasNoUntrackedPrograms('DELETE', table);
-          for (const snapshot of snapshots) {
+          const deletes = snapshots.map(snapshot => {
             const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
             const rowState = buildRowHistoryPredicate(snapshot);
-            const result = await worker.call<{ changes: number }>('run', [
-              `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
-              `(${rowIdentity.sql}) AND (${rowState.sql})`,
-              [...rowIdentity.params, ...rowState.params]
-            ]);
-            if (result?.changes !== 1) throw new RowHistoryConflictError(table);
+            return {
+              sql: `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
+                `(${rowIdentity.sql}) AND (${rowState.sql})`,
+              params: [...rowIdentity.params, ...rowState.params]
+            };
+          });
+          // Deletes keep their order (undo removes imported children first).
+          for (const group of groupConsecutive(deletes, item => approximateParamBytes(item.params))) {
+            const results = await queryNativeBatch(group.flatMap(item => [
+              item,
+              { sql: 'SELECT changes()', params: [] }
+            ]));
+            for (let index = 1; index < results.length; index += 2) {
+              if (Number(results[index].values?.[0]?.[0]) !== 1) throw new RowHistoryConflictError(table);
+            }
           }
           await releaseNativeSavepoint(savepointName);
         } catch (error) {
@@ -2581,22 +2821,30 @@ export async function createNativeDatabaseConnection(
         const savepointName = createSavepointName('sp_history_restore_rows');
         await beginNativeSavepoint(savepointName);
         try {
+          const probedShapes = new Set<string>();
           for (const entry of prepared) {
-            await assertNativeMutationHasNoUntrackedPrograms(
-              'INSERT',
-              table,
-              entry.states.map(state => state.column)
-            );
+            const columns = entry.states.map(state => state.column);
+            const shape = JSON.stringify(columns);
+            if (probedShapes.has(shape)) continue;
+            probedShapes.add(shape);
+            await assertNativeMutationHasNoUntrackedPrograms('INSERT', table, columns);
+          }
+          const existenceChecks = prepared.map(entry => {
             const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
-            const existing = await worker.call<NativeQueryResult>('query', [
-              `SELECT 1 FROM ${escapeMainIdentifier(table)} ` +
-              `WHERE ${rowIdentity.sql} LIMIT 1`,
-              rowIdentity.params
-            ]);
-            if (existing.values.length !== 0) throw new RowHistoryConflictError(table);
+            return {
+              sql: `SELECT 1 FROM ${escapeMainIdentifier(table)} ` +
+                `WHERE ${rowIdentity.sql} LIMIT 1`,
+              params: rowIdentity.params
+            };
+          });
+          for (const group of groupConsecutive(existenceChecks, item => approximateParamBytes(item.params))) {
+            const results = await queryNativeBatch(group);
+            if (results.some(result => result.values.length !== 0)) throw new RowHistoryConflictError(table);
           }
 
-          for (const entry of prepared) {
+          // Each restored row is verified after its group; a later plain INSERT
+          // cannot change an earlier row, so this matches verifying in between.
+          const restores = prepared.map(entry => {
             const columns = entry.writes.map(item => item.column);
             const values = entry.writes.map(item => item.write.sql);
             const params = entry.writes.flatMap(item => item.write.params);
@@ -2608,21 +2856,34 @@ export async function createNativeDatabaseConnection(
               values.unshift('?');
               params.unshift(entry.snapshot.rowId);
             }
-            const inserted = await worker.call<{ changes: number }>('run', [
-              `INSERT INTO ${escapeMainIdentifier(table)} ` +
-              `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
-              params
-            ]);
-            if (inserted?.changes !== 1) throw new RowHistoryConflictError(table);
-
             const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
             const rowState = buildRowHistoryPredicate(entry.snapshot);
-            const verified = await worker.call<NativeQueryResult>('query', [
-              `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ` +
-              `(${rowIdentity.sql}) AND (${rowState.sql}) LIMIT 2`,
-              [...rowIdentity.params, ...rowState.params]
-            ]);
-            if (verified.values.length !== 1) throw new RowHistoryConflictError(table);
+            return {
+              insert: {
+                sql: `INSERT INTO ${escapeMainIdentifier(table)} ` +
+                  `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
+                params
+              },
+              verify: {
+                sql: `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ` +
+                  `(${rowIdentity.sql}) AND (${rowState.sql}) LIMIT 2`,
+                params: [...rowIdentity.params, ...rowState.params]
+              }
+            };
+          });
+          const restoreBytes = (item: typeof restores[number]): number => (
+            approximateParamBytes(item.insert.params) + approximateParamBytes(item.verify.params)
+          );
+          for (const group of groupConsecutive(restores, restoreBytes)) {
+            const results = await queryNativeBatch(group.flatMap(item => [
+              item.insert,
+              { sql: 'SELECT changes()', params: [] },
+              item.verify
+            ]));
+            for (let index = 0; index < results.length; index += 3) {
+              if (Number(results[index + 1].values?.[0]?.[0]) !== 1) throw new RowHistoryConflictError(table);
+              if (results[index + 2].values.length !== 1) throw new RowHistoryConflictError(table);
+            }
           }
           await releaseNativeSavepoint(savepointName);
         } catch (error) {
@@ -3310,6 +3571,18 @@ export async function createNativeDatabaseConnection(
           }
           return result;
         },
+
+        insertRowsWithHistory: (
+          table: string,
+          rows: Record<string, CellValue>[],
+          maxEditValueBytes?: number,
+          maxUndoSnapshotBytes?: number
+        ): Promise<DeletedRow[]> => insertNativeRowsWithHistory(
+          table,
+          rows,
+          maxEditValueBytes,
+          maxUndoSnapshotBytes
+        ),
 
         /**
          * Insert multiple rows in a batch.

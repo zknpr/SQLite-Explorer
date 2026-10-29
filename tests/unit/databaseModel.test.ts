@@ -467,9 +467,10 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         const engine = opened.operations!;
         await engine.executeQuery('CREATE TABLE items (id INTEGER PRIMARY KEY)');
         const started = createDeferred<void>(), resume = createDeferred<void>();
-        const insert = engine.insertRowWithHistory!.bind(engine);
+        // Pause inside the import's snapshot, after its first guarded insert call.
+        const insert = engine.insertRowsWithHistory!.bind(engine);
         let first = true, saved: Uint8Array | undefined;
-        engine.insertRowWithHistory = async (...args) => {
+        engine.insertRowsWithHistory = async (...args) => {
             const row = await insert(...args);
             if (first) { first = false; started.resolve(); await resume.promise; }
             return row;

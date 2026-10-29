@@ -177,6 +177,12 @@ interface WorkerMethods {
     maxEditValueBytes?: number,
     maxUndoSnapshotBytes?: number
   ): Promise<DeletedRow>;
+  insertRowsWithHistory(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
   insertRowBatch(
     table: string,
     rows: Record<string, CellValue>[],
@@ -268,6 +274,7 @@ const WORKER_METHOD_NAMES = [
   'replaceOversizedCell',
   'insertRow',
   'insertRowWithHistory',
+  'insertRowsWithHistory',
   'insertRowBatch',
   'deleteRows',
   'deleteColumns',
@@ -704,6 +711,17 @@ async function createInProcessWasmDatabaseConnection(
         ) => endpoint.insertRowWithHistory(
           table,
           data,
+          maxEditValueBytes,
+          maxUndoSnapshotBytes
+        ),
+        insertRowsWithHistory: (
+          table: string,
+          rows: Record<string, CellValue>[],
+          maxEditValueBytes?: number,
+          maxUndoSnapshotBytes?: number
+        ) => endpoint.insertRowsWithHistory(
+          table,
+          rows,
           maxEditValueBytes,
           maxUndoSnapshotBytes
         ),
@@ -1150,6 +1168,26 @@ async function createWorkerBackedWasmDatabaseConnection(
             return workerProxy.insertRowWithHistory(
               table,
               wrappedData,
+              maxEditValueBytes,
+              maxUndoSnapshotBytes
+            );
+          },
+          insertRowsWithHistory: (
+            table: string,
+            rows: Record<string, CellValue>[],
+            maxEditValueBytes?: number,
+            maxUndoSnapshotBytes?: number
+          ) => {
+            const wrappedRows = rows.map(data => {
+              const wrappedData = Object.create(null) as Record<string, CellValue>;
+              for (const key of Object.keys(data)) {
+                wrappedData[key] = wrapForTransfer(data[key]);
+              }
+              return wrappedData;
+            });
+            return workerProxy.insertRowsWithHistory(
+              table,
+              wrappedRows,
               maxEditValueBytes,
               maxUndoSnapshotBytes
             );

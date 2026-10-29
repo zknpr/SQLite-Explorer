@@ -10,6 +10,11 @@ export const IMPORT_MAX_COLUMNS = 256;
 // objects. Bound their count independently of the source byte limit.
 export const IMPORT_MAX_CELLS = 2_000_000;
 export const IMPORT_LIMIT_DESCRIPTION = '64 MiB / 100,000 rows / 256 columns';
+// Rows per guarded engine call. Engines resolve schema metadata once per call
+// and the native engine sends each phase in one round trip, so larger batches
+// are faster; the bound keeps cancellation and progress responsive.
+const IMPORT_BATCH_ROWS = 500;
+const IMPORT_BATCH_BYTES = 8 * 1024 * 1024;
 export interface ImportData { columns: string[]; rows: Record<string, CellValue>[] }
 
 function validateColumns(columns: string[]): void {
@@ -180,16 +185,31 @@ export async function importRowsAtomically(
     let historyBytes = estimateUndoMemoryBytes(modification);
     if (!Number.isFinite(maxUndoBytes) || historyBytes >= maxUndoBytes) throw new Error('Import exceeds the undo memory limit.');
     return runReadSnapshot(operations, async transaction => {
-        if (!transaction.insertRowWithHistory) throw new Error('Backend does not support guarded import history.');
-        for (let index = 0; index < rows.length; index++) {
+        if (!transaction.insertRowsWithHistory) throw new Error('Backend does not support guarded import history.');
+        let completed = 0;
+        while (completed < rows.length) {
             signal?.throwIfAborted();
-            const snapshot = await transaction.insertRowWithHistory(table, rows[index], DEFAULT_MAX_CELL_EDIT_BYTES, maxUndoBytes - historyBytes);
-            historyBytes += estimateUndoMemoryBytes(snapshot);
-            if (historyBytes > maxUndoBytes) throw new Error('Import exceeds the undo memory limit. Split the file into smaller imports.');
-            modification.insertedRows!.push(snapshot);
-            progress?.(index + 1);
+            let end = completed, batchBytes = 0;
+            while (end < rows.length && end - completed < IMPORT_BATCH_ROWS) {
+                const rowBytes = estimateUndoMemoryBytes(rows[end]);
+                if (end > completed && batchBytes + rowBytes > IMPORT_BATCH_BYTES) break;
+                batchBytes += rowBytes;
+                end++;
+            }
+            const batch = rows.slice(completed, end);
+            const snapshots = await transaction.insertRowsWithHistory(table, batch, DEFAULT_MAX_CELL_EDIT_BYTES, maxUndoBytes - historyBytes);
+            if (snapshots.length !== batch.length) throw new Error('Backend returned incomplete import history.');
+            for (const snapshot of snapshots) {
+                historyBytes += estimateUndoMemoryBytes(snapshot);
+                if (historyBytes > maxUndoBytes) throw new Error('Import exceeds the undo memory limit. Split the file into smaller imports.');
+                modification.insertedRows!.push(snapshot);
+                completed++;
+                // Rows are reported once their batch is applied; a cancellation
+                // requested from progress is honored before the next batch.
+                progress?.(completed);
+            }
             // In-process WASM must yield so progress/cancellation can be delivered.
-            if ((index + 1) % 50 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+            await new Promise(resolve => setTimeout(resolve, 0));
         }
         signal?.throwIfAborted();
         return modification;

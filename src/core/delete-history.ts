@@ -80,6 +80,19 @@ export function assertDeleteSnapshotFitsUndoBudget(input: {
     throw new Error(`Cannot delete from ${input.table}: one or more row identities no longer exist`);
   }
 
+  const projectedBytes = projectDeleteSnapshotBytes(input);
+  if (!Number.isSafeInteger(projectedBytes) || projectedBytes > input.maxSnapshotBytes) {
+    throw undoSnapshotBudgetError(input.operation ?? 'Delete', input.maxSnapshotBytes);
+  }
+}
+
+/** Snapshot bytes assertDeleteSnapshotFitsUndoBudget compares against the budget. */
+export function projectDeleteSnapshotBytes(input: {
+  insertableColumns: readonly string[];
+  rowIds: readonly RecordId[];
+  rowCount: number;
+  valueBytes: number;
+}): number {
   const rowKeys = new Set(input.insertableColumns);
   const rowKeyBytes = [...rowKeys].reduce((total, key) => total + key.length * 2, 0);
   const identityBytes = input.rowIds.reduce<number>(
@@ -90,19 +103,18 @@ export function assertDeleteSnapshotFitsUndoBudget(input: {
     (total, column) => total + column.length * 2 + STORAGE_CLASS_ENTRY_STRUCTURAL_BYTES,
     0
   );
-  const projectedBytes = input.valueBytes
+  return input.valueBytes
     // Synthetic row identity is retained only in DeletedRow.rowId. Keeping it
     // out of row avoids colliding with a legal declared column named rowid.
     + identityBytes
     + input.rowCount * (DELETED_ROW_STRUCTURAL_BYTES + rowKeyBytes)
     + storageClassBytes;
+}
 
-  if (!Number.isSafeInteger(projectedBytes) || projectedBytes > input.maxSnapshotBytes) {
-    const operation = input.operation ?? 'Delete';
-    throw new Error(
-      `${operation} undo snapshot exceeds the ${input.maxSnapshotBytes}-byte memory budget; ` +
-      `${operation.toLowerCase()} fewer rows or increase ` +
-      'sqliteExplorer.maxUndoMemory.'
-    );
-  }
+export function undoSnapshotBudgetError(operation: 'Delete' | 'Insert', maxSnapshotBytes: number): Error {
+  return new Error(
+    `${operation} undo snapshot exceeds the ${maxSnapshotBytes}-byte memory budget; ` +
+    `${operation.toLowerCase()} fewer rows or increase ` +
+    'sqliteExplorer.maxUndoMemory.'
+  );
 }

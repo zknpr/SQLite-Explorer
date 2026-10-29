@@ -923,6 +923,20 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       );
     },
 
+    async insertRowsWithHistory(
+      table: string,
+      rows: Record<string, CellValue>[],
+      maxEditValueBytes?: number,
+      maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow[]> {
+      return requireEngine().insertRowsWithHistory(
+        table,
+        rows,
+        maxEditValueBytes,
+        maxUndoSnapshotBytes
+      );
+    },
+
     async insertRowBatch(
       table: string,
       rows: Record<string, CellValue>[],

@@ -30,6 +30,7 @@ import {
     revertDatabaseToSaved
 } from '../../src/core/restore-reconciler';
 import type {
+    CellValue,
     ColumnDropTableState,
     DatabaseOperations,
     LabeledModification,
@@ -1302,6 +1303,54 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 ))[0].rows,
                 [['text', '80']]
             );
+        });
+
+        await testContext.test('batches native import history through the bundled worker and keeps undo/redo guards', async () => {
+            const table = 'native_batched_import_history';
+            await engine.executeQuery(
+                `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT DEFAULT 'default', ` +
+                'payload BLOB, malformed TEXT DEFAULT (CAST(X\'80\' AS TEXT)))'
+            );
+            // More rows than one queryBatch group, mixed column shapes, and
+            // values that must survive the batch transport byte for byte.
+            const rows = Array.from({ length: 1100 }, (_, index): Record<string, CellValue> => (
+                index % 3 === 0 ? { id: index + 1 }
+                    : index % 3 === 1 ? { id: index + 1, value: `v${index}\u0000tail` }
+                        : { id: index + 1, payload: new Uint8Array([index & 0xff, 0, 0xff]) }
+            ));
+            const insertedRows = await engine.insertRowsWithHistory!(table, rows, undefined, 64 * 1024 * 1024);
+            assert.strictEqual(insertedRows.length, rows.length);
+            const insertion = {
+                modificationType: 'row_insert' as const,
+                targetTable: table,
+                description: 'Batched native import',
+                insertedRows
+            };
+            const state = async () => (await engine.executeQuery(
+                `SELECT count(*), sum(octet_length(value)), sum(length(payload)), ` +
+                `min(hex(CAST(malformed AS BLOB))), max(hex(CAST(malformed AS BLOB))), ` +
+                `sum(value = 'v1' || char(0) || 'tail'), sum(payload = X'0500FF') FROM ${table}`
+            ))[0].rows;
+            const valueBytes = rows.reduce((sum, row) => sum + Buffer.byteLength(String(row.value ?? 'default')), 0);
+            const payloads = rows.map(row => row.payload).filter((payload): payload is Uint8Array => payload instanceof Uint8Array);
+            const payloadBytes = payloads.reduce((sum, payload) => sum + payload.byteLength, 0);
+            const fiveRows = payloads.filter(payload => payload[0] === 5).length;
+            const imported = [[1100, valueBytes, payloadBytes, '80', '80', 1, fiveRows]];
+            assert.deepStrictEqual(await state(), imported);
+
+            await engine.undoModification(insertion);
+            assert.deepStrictEqual((await state())[0][0], 0);
+            await engine.redoModification(insertion);
+            assert.deepStrictEqual(await state(), imported);
+            assert.deepStrictEqual(insertedRows[5].row.payload, new Uint8Array([5, 0, 0xff]));
+
+            // An external change to any one row must still refuse the whole undo.
+            await engine.executeQuery(`UPDATE ${table} SET value = 'external' WHERE id = 1000`);
+            await assert.rejects(engine.undoModification(insertion), /changed outside SQLite Explorer history/i);
+            assert.deepStrictEqual((await state())[0][0], 1100);
+            await engine.executeQuery(`DELETE FROM ${table} WHERE id <> 1000`);
+            await assert.rejects(engine.redoModification(insertion), /changed outside SQLite Explorer history/i);
+            assert.deepStrictEqual((await state())[0][0], 1);
         });
 
         await testContext.test('replays native malformed UTF-16LE TEXT without transcoding', async () => {
