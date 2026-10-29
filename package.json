@@ -303,7 +303,7 @@
     "@scure/base": "^2.4.0",
     "@vscode/codicons": "^0.0.45",
     "@vscode/extension-telemetry": "^1.5.2",
-    "sql.js": "^1.15.0"
+    "sql.js": "^1.15.1"
   },
   "overrides": {
     "qs": "^6.16.0",
