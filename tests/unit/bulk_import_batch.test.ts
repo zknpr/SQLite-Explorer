@@ -14,9 +14,10 @@ import type { CellValue, DatabaseOperations, DeletedRow } from '../../src/core/t
 async function withBackend(
     backend: 'wasm' | 'native',
     setup: string,
-    action: (ops: DatabaseOperations) => Promise<void>
+    action: (ops: DatabaseOperations) => Promise<void>,
+    queryTimeout?: number
 ) {
-    const opened = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+    const opened = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false, queryTimeout });
     const wasm = opened.operations as WasmDatabaseEngine;
     let native: Awaited<ReturnType<typeof createNativeDatabaseConnection>> | undefined;
     let directory: string | undefined;
@@ -28,7 +29,7 @@ async function withBackend(
             directory = fs.mkdtempSync(path.resolve('.tmp/import-batch-'));
             const file = path.join(directory, 'fixture.db');
             fs.writeFileSync(file, await wasm.serializeDatabase());
-            native = await createNativeDatabaseConnection(vscode.Uri.file(process.cwd()));
+            native = await createNativeDatabaseConnection(vscode.Uri.file(process.cwd()), undefined, undefined, queryTimeout);
             ops = (await native.establishConnection(vscode.Uri.file(file), 'batch', false)).databaseOps;
         }
         await action(ops);
@@ -131,4 +132,80 @@ for (const backend of ['wasm', 'native'] as const) {
             assert.deepEqual(await count(), [1234, 1234 * 1235]);
         });
     });
+
+    it(`${backend} history replay gives every row the full queryTimeout`, async () => {
+        // Each guarded DELETE scans the unindexed child table: a few ms per row,
+        // well inside a 250 ms timeout, far beyond it for 256 rows together.
+        const setup =
+            'CREATE TABLE parent (id INTEGER PRIMARY KEY, v TEXT);' +
+            'CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));' +
+            'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200000) ' +
+            'INSERT INTO child (parent_id) SELECT NULL FROM n;';
+        await withBackend(backend, setup, async ops => {
+            await ops.executeQuery('PRAGMA foreign_keys = ON');
+            const rows = Array.from({ length: 300 }, (_, index) => ({ v: `row${index}` }));
+            const modification = await importRowsAtomically(ops, 'parent', rows, 50 * 1024 * 1024);
+            const count = async () => (await ops.executeQuery('SELECT count(*) FROM parent'))[0].rows[0][0];
+            await ops.undoModification(modification);
+            assert.equal(await count(), 0);
+            await ops.redoModification(modification);
+            assert.equal(await count(), 300);
+        }, 250);
+    });
 }
+
+it('native history units each get queryTimeout and resume after a partial batch', async () => {
+    // About 30-40 ms of CHECK work per INSERT: every unit fits the 1000 ms
+    // timeout, while import and redo outlast the 1000 ms request budget, so the
+    // worker returns a prefix and the host resends the rest.
+    const setup = 'CREATE TABLE slow (id INTEGER PRIMARY KEY, v TEXT CHECK (length(hex(randomblob(20000000))) > 0))';
+    await withBackend('native', setup, async ops => {
+        const rows = Array.from({ length: 40 }, (_, index) => ({ v: `row${index}` }));
+        const started = Date.now();
+        const modification = await importRowsAtomically(ops, 'slow', rows, 50 * 1024 * 1024);
+        assert.ok(Date.now() - started > 1000, 'the import must outlast one request budget');
+        assert.deepEqual(modification.insertedRows!.map(snapshot => snapshot.row.v), rows.map(row => row.v));
+        const read = async () => (await ops.executeQuery('SELECT id, v FROM slow ORDER BY id'))[0]?.rows ?? [];
+        const imported = rows.map((row, index) => [index + 1, row.v]);
+        assert.deepEqual(await read(), imported);
+        await ops.undoModification(modification);
+        assert.deepEqual(await read(), []);
+        await ops.redoModification(modification);
+        assert.deepEqual(await read(), imported);
+    }, 1000);
+});
+
+it('native history keeps wide-table responses inside the worker frame limit', async () => {
+    // Each history read names its result columns with expression text that
+    // repeats every column name; 500 such results once exceeded the 64 MiB frame.
+    const names = Array.from({ length: 200 }, (_, index) => `c${index}_`.padEnd(220, 'x'));
+    const setup = `CREATE TABLE wide (id INTEGER PRIMARY KEY, ${names.map(name => `"${name}" TEXT`).join(', ')})`;
+    await withBackend('native', setup, async ops => {
+        const rows = Array.from({ length: 500 }, (_, index) => ({ [names[0]]: `r${index}`, [names[199]]: index }));
+        const modification = await importRowsAtomically(ops, 'wide', rows, 256 * 1024 * 1024);
+        assert.deepEqual(modification.insertedRows!.map(snapshot => snapshot.row[names[0]]), rows.map(row => row[names[0]]));
+        const read = async () => (await ops.executeQuery(`SELECT count(*), sum("${names[199]}") FROM wide`))[0].rows[0];
+        assert.deepEqual(await read(), [500, 499 * 500 / 2]);
+        await ops.undoModification(modification);
+        assert.deepEqual(await read(), [0, null]);
+        await ops.redoModification(modification);
+        assert.deepEqual(await read(), [500, 499 * 500 / 2]);
+    });
+});
+
+it('native history bounds RETURNING responses the request cannot predict', async () => {
+    // The ~600 KB primary key comes from a DEFAULT and returns twice per row
+    // (decoded and raw); 60 rows together once exceeded the 64 MiB frame.
+    const setup = 'CREATE TABLE keyed (id TEXT PRIMARY KEY DEFAULT (hex(randomblob(300000))), v TEXT) WITHOUT ROWID';
+    await withBackend('native', setup, async ops => {
+        const rows = Array.from({ length: 60 }, (_, index) => ({ v: `r${index}` }));
+        const modification = await importRowsAtomically(ops, 'keyed', rows, 1024 * 1024 * 1024);
+        assert.equal(modification.insertedRows!.length, 60);
+        const read = async () => (await ops.executeQuery('SELECT count(*), min(length(id)), max(length(id)) FROM keyed'))[0].rows[0];
+        assert.deepEqual(await read(), [60, 600000, 600000]);
+        await ops.undoModification(modification);
+        assert.deepEqual(await read(), [0, null, null]);
+        await ops.redoModification(modification);
+        assert.deepEqual(await read(), [60, 600000, 600000]);
+    });
+});

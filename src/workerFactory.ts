@@ -383,6 +383,10 @@ function getWorkerInvocationTimeout(
   if (methodName === 'applyModifications' || methodName === 'discardModifications') {
     const modifications = parameters[0];
     workUnits = Array.isArray(modifications) ? Math.max(1, modifications.length) : 1;
+  } else if (methodName === 'insertRowsWithHistory') {
+    // One import batch replaces one guarded insert call per row.
+    const rows = parameters[1];
+    workUnits = Array.isArray(rows) ? Math.max(1, rows.length) : 1;
   } else if (methodName === 'undoModification' || methodName === 'redoModification') {
     const modification = parameters[0] as ModificationEntry | undefined;
     workUnits = getModificationWorkUnits(modification);

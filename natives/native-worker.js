@@ -969,6 +969,19 @@ function executeQuery(db, sql, params) {
     : lastResult;
 }
 
+/** Upper-bound estimate of the serialized size of result rows. */
+function approximateValuesBytes(values) {
+  let bytes = 0;
+  for (const row of values) {
+    for (const value of row) {
+      if (typeof value === 'string') bytes += 2 + value.length * 2;
+      else if (value instanceof Uint8Array) bytes += 8 + value.byteLength;
+      else bytes += 10;
+    }
+  }
+  return bytes;
+}
+
 function foreignKeyIntegerText(value) {
   if (value === null) return null;
   if (typeof value === 'bigint') return value.toString();
@@ -2305,6 +2318,41 @@ async function handleRequest(request) {
         break;
       }
 
+      case "queryHistoryBatch": {
+        // Generated row-history statements in units of `stride` queries (a
+        // write and the reads that check it). Each unit gets its own deadline,
+        // as separate requests did. After the unit that crosses the time or
+        // response budget the completed prefix is returned and the host sends
+        // the rest again, so one request is bounded by a budget plus a unit.
+        // Callers read values positionally; column names are not returned.
+        const [queries, stride, unitTimeoutMs, budgetMs, budgetBytes] = args;
+        if (!db) throw new Error("Database not open");
+        if (
+          !Array.isArray(queries) || !Number.isSafeInteger(stride) || stride < 1 ||
+          queries.length % stride !== 0 || !(budgetMs >= 0) || !(budgetBytes >= 0)
+        ) {
+          throw new Error("Invalid row-history batch");
+        }
+        const startedAt = Date.now();
+        const results = [];
+        let responseBytes = 0;
+        // One wrapper reports a timeout and clears the deadline; setting it
+        // again at each unit replaces the previous one.
+        runWithQueryDeadline(db, unitTimeoutMs, () => {
+          for (let start = 0; start < queries.length; start += stride) {
+            db.setQueryDeadline(unitTimeoutMs);
+            for (let index = start; index < start + stride; index++) {
+              const { values, rowCount } = executeQuery(db, queries[index].sql, queries[index].params);
+              responseBytes += approximateValuesBytes(values);
+              results.push({ columns: [], values, rowCount });
+            }
+            if (Date.now() - startedAt >= budgetMs || responseBytes >= budgetBytes) break;
+          }
+        });
+        result = { results };
+        break;
+      }
+
       case "compileBatch": {
         // Compile generated EXPLAIN statements on the transaction-owning
         // connection and return one independent validity result per probe.
@@ -2566,6 +2614,8 @@ async function handleRequest(request) {
       'close',
       'cancel',
       'ping',
+      // Arms one deadline per unit of generated statements.
+      'queryHistoryBatch',
       // These methods can execute on a dedicated snapshot connection. Each
       // case arms that actual handle rather than the unrelated main database.
       'openCellReadSession',

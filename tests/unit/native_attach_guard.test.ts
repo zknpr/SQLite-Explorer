@@ -243,6 +243,9 @@ it('refuses ATTACH and DETACH at every SQL entry point of the native worker', as
         ['query: bound filename', (p, a) => f.query(`ATTACH ? AS ${a}`, [p])],
         ['queryNumeric', (p, a) => worker.call('queryNumeric', [`ATTACH ${sqlLiteral(p)} AS ${a}`, [], ['x']])],
         ['queryBatch: 2nd item', (p, a) => worker.call('queryBatch', [[{ sql: 'SELECT 1' }, { sql: `ATTACH ${sqlLiteral(p)} AS ${a}` }]])],
+        ['queryHistoryBatch: 2nd unit', (p, a) => worker.call('queryHistoryBatch', [
+            [{ sql: 'SELECT 1', params: [] }, { sql: `ATTACH ${sqlLiteral(p)} AS ${a}`, params: [] }], 1, 5000, 1000, 1 << 20
+        ])],
         ['querySingle', (p, a) => worker.call('querySingle', [`ATTACH ${sqlLiteral(p)} AS ${a}\n${BOUNDARY}`, [], BOUNDARY])],
         ['run', (p, a) => worker.call('run', [`ATTACH ${sqlLiteral(p)} AS ${a}`])],
         ['runSingle', (p, a) => {

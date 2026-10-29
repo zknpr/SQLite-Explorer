@@ -1323,4 +1323,12 @@ describe('workerFactory error path tests', () => {
       DEFAULT_INVOCATION_TIMEOUT_MS
     );
   });
+
+  it('scales the import batch deadline with its rows, as one insert call per row had', async () => {
+    const timeoutPolicy = await establishTimeoutPolicy();
+    const rows = (count: number) => Array.from({ length: count }, (_, index) => ({ id: index }));
+    assert.strictEqual(timeoutPolicy('insertRowsWithHistory', ['items', rows(1)]), DEFAULT_INVOCATION_TIMEOUT_MS);
+    assert.strictEqual(timeoutPolicy('insertRowsWithHistory', ['items', rows(3)]), 3 * DEFAULT_INVOCATION_TIMEOUT_MS);
+    assert.strictEqual(timeoutPolicy('insertRowsWithHistory', ['items', rows(500)]), 10 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
 });

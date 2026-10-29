@@ -6,6 +6,7 @@
 
 - CSV and JSON imports insert up to 500 rows per engine call instead of one, and the native engine sends each step for those rows to its worker in one message. In a local test a 100,000-row import took 9 seconds instead of 89 on the native engine and 6 seconds instead of 21 on WebAssembly. Undoing and redoing an import is 1.5 to 5 times faster, and native undo and redo of deleted rows use the same batched path.
 - An import writes one line per batch to the SQLite Explorer output channel. It wrote one line per row, with the row's values.
+- On the native engine, each row of an import, and of undoing or redoing inserted or deleted rows, gets the `sqliteExplorer.queryTimeout` time limit (30 seconds by default), as on WebAssembly. These statements used a fixed 30 seconds.
 
 ### Fixes
 

@@ -330,11 +330,15 @@ function isGeneratedExportSpoolStatement(sql: string): boolean {
 /** Let a bounded worker query report its own precise timeout before RPC expires. */
 const BOUNDED_QUERY_TRANSPORT_MARGIN_MS = 2000;
 
-// Row-history work batches many generated statements per queryBatch round
-// trip. Bytes bound request and response frames; items bound how long one
-// round trip holds the worker, and with it import cancellation latency.
+// Row-history work sends many generated statements per queryHistoryBatch
+// request. Groups are bounded in request bytes (SQL plus parameters) and items.
+// The worker gives each unit its own deadline and returns early once a request
+// has run for the time budget or produced the response budget, which bounds
+// response frames whose size the request cannot predict (RETURNING defaults).
 const NATIVE_HISTORY_BATCH_BYTES = 8 * 1024 * 1024;
 const NATIVE_HISTORY_BATCH_ITEMS = 512;
+const NATIVE_HISTORY_REQUEST_BUDGET_MS = 1000;
+const NATIVE_HISTORY_RESPONSE_BUDGET_BYTES = 8 * 1024 * 1024;
 
 function approximateParamBytes(params: readonly CellValue[]): number {
   let bytes = 0;
@@ -344,6 +348,10 @@ function approximateParamBytes(params: readonly CellValue[]): number {
     else bytes += 8;
   }
   return bytes;
+}
+
+function approximateQueryBytes(query: { sql: string; params: readonly CellValue[] }): number {
+  return query.sql.length * 2 + approximateParamBytes(query.params);
 }
 
 /** Consecutive groups within both bounds; an item larger than maxBytes stands alone. */
@@ -2603,14 +2611,33 @@ export async function createNativeDatabaseConnection(
         }
       };
 
+      /**
+       * Run generated history statements in order, `stride` queries per unit.
+       * Each unit gets queryTimeout, as one request per statement did; the
+       * worker may return a prefix, and the rest is sent again.
+       */
       const queryNativeBatch = async (
-        queries: Array<{ sql: string; params: CellValue[] }>
+        queries: Array<{ sql: string; params: CellValue[] }>,
+        stride: number = 1
       ): Promise<NativeQueryResult[]> => {
-        const batch = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
-        if (!Array.isArray(batch?.results) || batch.results.length !== queries.length) {
-          throw new Error('Native SQLite returned an incomplete query batch');
+        const results: NativeQueryResult[] = [];
+        while (results.length < queries.length) {
+          const pending = results.length === 0 ? queries : queries.slice(results.length);
+          const batch = await worker.call<NativeQueryBatchResult>(
+            'queryHistoryBatch',
+            [pending, stride, queryTimeout, NATIVE_HISTORY_REQUEST_BUDGET_MS, NATIVE_HISTORY_RESPONSE_BUDGET_BYTES],
+            queryTimeout + NATIVE_HISTORY_REQUEST_BUDGET_MS + BOUNDED_QUERY_TRANSPORT_MARGIN_MS
+          );
+          const completed = batch?.results;
+          if (
+            !Array.isArray(completed) || completed.length === 0
+            || completed.length > pending.length || completed.length % stride !== 0
+          ) {
+            throw new Error('Native SQLite returned an incomplete query batch');
+          }
+          for (const result of completed) results.push(result);
         }
-        return batch.results;
+        return results;
       };
 
       /**
@@ -2644,10 +2671,14 @@ export async function createNativeDatabaseConnection(
             await assertNativeMutationHasNoUntrackedPrograms('INSERT', table, insert.columns);
           }
 
-          // A later plain INSERT cannot change an earlier row, so checking each
-          // row after its group ran is equivalent to checking it before the next.
+          // Identity metadata is read right after each INSERT; the identity,
+          // addressability and snapshot reads below run after later rows were
+          // inserted. That matches per-row order unless a later INSERT removes an
+          // earlier row, which only schema ON CONFLICT REPLACE can do: the earlier
+          // row then reads as missing (refused here) or as the replacing row, a
+          // history whose undo fails its conflict check instead of deleting data.
           const rowIds: RecordId[] = [];
-          const insertGroups = groupConsecutive(inserts, insert => approximateParamBytes(insert.params));
+          const insertGroups = groupConsecutive(inserts, approximateQueryBytes);
           if (identity.kind === 'primaryKey') {
             const projection = buildByteFaithfulPrimaryKeyProjection(identity);
             for (const group of insertGroups) {
@@ -2690,7 +2721,7 @@ export async function createNativeDatabaseConnection(
               const results = await queryNativeBatch(group.flatMap(insert => [
                 { sql: insert.sql, params: insert.params },
                 { sql: 'SELECT changes(), CAST(last_insert_rowid() AS TEXT)', params: [] }
-              ]));
+              ]), 2);
               for (let index = 1; index < results.length; index += 2) {
                 const metadata = results[index];
                 if (metadata.values?.length !== 1 || Number(metadata.values[0][0]) !== 1) {
@@ -2704,10 +2735,11 @@ export async function createNativeDatabaseConnection(
           const predicates = rowIds.map(rowId => buildRecordIdentityPredicate(rowId, identity));
           const valueColumns = deleteSnapshotValueColumns(insertableColumns, identity.kind === 'rowid');
           const sizes: Array<{ rowCount: number; valueBytes: number }> = [];
-          for (const group of groupConsecutive(predicates, predicate => approximateParamBytes(predicate.params))) {
-            const results = await queryNativeBatch(group.map(predicate => (
-              buildDeleteSnapshotSizeQuery(table, valueColumns, predicate)
-            )));
+          const sizeQueries = predicates.map(predicate => (
+            buildDeleteSnapshotSizeQuery(table, valueColumns, predicate)
+          ));
+          for (const group of groupConsecutive(sizeQueries, approximateQueryBytes)) {
+            const results = await queryNativeBatch(group);
             for (const result of results) sizes.push(parseDeleteSnapshotSizeRow(result.values?.[0]));
           }
           if (identity.kind === 'rowid' && sizes.some(size => size.rowCount !== 1)) {
@@ -2738,19 +2770,21 @@ export async function createNativeDatabaseConnection(
             });
           };
           const snapshots: DeletedRow[] = [];
+          const reads = predicates.map(predicate => ({
+            sql: `SELECT ${projections} FROM ${escapedTable} WHERE ${predicate.sql} LIMIT 2`,
+            params: predicate.params
+          }));
           const indices = rowIds.map((_, index) => index);
+          // Result column names repeat the projection text, so SQL bytes count too.
           const readGroups = groupConsecutive(indices, index => projectDeleteSnapshotBytes({
             insertableColumns,
             rowIds: [rowIds[index]],
             rowCount: sizes[index].rowCount,
             valueBytes: sizes[index].valueBytes
-          }));
+          }) + approximateQueryBytes(reads[index]));
           for (const group of readGroups) {
             checkBudget(group[0]);
-            const results = await queryNativeBatch(group.map(index => ({
-              sql: `SELECT ${projections} FROM ${escapedTable} WHERE ${predicates[index].sql} LIMIT 2`,
-              params: predicates[index].params
-            })));
+            const results = await queryNativeBatch(group.map(index => reads[index]));
             group.forEach((index, position) => {
               if (position > 0) checkBudget(index);
               const snapshot = parseNativeRowHistorySnapshot(
@@ -2796,11 +2830,11 @@ export async function createNativeDatabaseConnection(
             };
           });
           // Deletes keep their order (undo removes imported children first).
-          for (const group of groupConsecutive(deletes, item => approximateParamBytes(item.params))) {
+          for (const group of groupConsecutive(deletes, approximateQueryBytes)) {
             const results = await queryNativeBatch(group.flatMap(item => [
               item,
               { sql: 'SELECT changes()', params: [] }
-            ]));
+            ]), 2);
             for (let index = 1; index < results.length; index += 2) {
               if (Number(results[index].values?.[0]?.[0]) !== 1) throw new RowHistoryConflictError(table);
             }
@@ -2842,13 +2876,13 @@ export async function createNativeDatabaseConnection(
               params: rowIdentity.params
             };
           });
-          for (const group of groupConsecutive(existenceChecks, item => approximateParamBytes(item.params))) {
+          for (const group of groupConsecutive(existenceChecks, approximateQueryBytes)) {
             const results = await queryNativeBatch(group);
             if (results.some(result => result.values.length !== 0)) throw new RowHistoryConflictError(table);
           }
 
-          // Each restored row is verified after its group; a later plain INSERT
-          // cannot change an earlier row, so this matches verifying in between.
+          // Each unit's checks run in SQL order right after its INSERT; results
+          // are inspected after the group, and any failure rolls back all rows.
           const restores = prepared.map(entry => {
             const columns = entry.writes.map(item => item.column);
             const values = entry.writes.map(item => item.write.sql);
@@ -2877,14 +2911,14 @@ export async function createNativeDatabaseConnection(
             };
           });
           const restoreBytes = (item: typeof restores[number]): number => (
-            approximateParamBytes(item.insert.params) + approximateParamBytes(item.verify.params)
+            approximateQueryBytes(item.insert) + approximateQueryBytes(item.verify)
           );
           for (const group of groupConsecutive(restores, restoreBytes)) {
             const results = await queryNativeBatch(group.flatMap(item => [
               item.insert,
               { sql: 'SELECT changes()', params: [] },
               item.verify
-            ]));
+            ]), 3);
             for (let index = 0; index < results.length; index += 3) {
               if (Number(results[index + 1].values?.[0]?.[0]) !== 1) throw new RowHistoryConflictError(table);
               if (results[index + 2].values.length !== 1) throw new RowHistoryConflictError(table);

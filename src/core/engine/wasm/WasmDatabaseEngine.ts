@@ -381,7 +381,7 @@ function buildWasmInsert(
 const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const PROGRESS_HANDLER_INTERVAL = 1000;
 // Generated history statements run synchronously in chunks of this many rows,
-// each chunk under one deadline registration (see mapInDeadlineChunks).
+// each chunk under one handler registration (see mapInDeadlineChunks).
 const HISTORY_DEADLINE_CHUNK_ROWS = 256;
 
 interface WasmCellReadSessionState {
@@ -564,7 +564,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * paired with an unconditional clear before another engine operation can run.
    */
   private executeWithProgressHandler<T>(
-    operation: () => T,
+    operation: (restartDeadline: () => void) => T,
     cancellation?: WasmQueryCancellation
   ): T {
     const isCancelled = (): boolean => {
@@ -583,7 +583,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
     if (isCancelled()) throwCancellation();
 
-    const deadline = Date.now() + this.queryTimeout;
+    let deadline = Date.now() + this.queryTimeout;
     let termination: 'timeout' | 'cancelled' | undefined;
     this.instance.progress_handler(PROGRESS_HANDLER_INTERVAL, () => {
       if (isCancelled()) {
@@ -598,7 +598,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     });
 
     try {
-      return operation();
+      return operation(() => { deadline = Date.now() + this.queryTimeout; });
     } catch (error) {
       const pagedReadError = this.pagedState?.getReadError?.();
       if (pagedReadError) throw pagedReadError;
@@ -2520,15 +2520,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Map rows synchronously in bounded chunks. Registering the sql.js progress
    * handler costs about as much as a small statement, so per-row history work
-   * shares one registration per chunk; chunking keeps queryTimeout a bound on
-   * a few hundred generated statements rather than on a whole undo or import.
+   * shares one registration per chunk, but each row restarts the deadline:
+   * queryTimeout bounds one row's statements, as when each was its own call.
    */
   private mapInDeadlineChunks<T, R>(items: readonly T[], work: (item: T) => R): R[] {
     const results: R[] = [];
     for (let start = 0; start < items.length; start += HISTORY_DEADLINE_CHUNK_ROWS) {
       const end = Math.min(items.length, start + HISTORY_DEADLINE_CHUNK_ROWS);
-      this.executeWithProgressHandler(() => {
-        for (let index = start; index < end; index++) results.push(work(items[index]));
+      this.executeWithProgressHandler(restartDeadline => {
+        for (let index = start; index < end; index++) {
+          restartDeadline();
+          results.push(work(items[index]));
+        }
       });
     }
     return results;
