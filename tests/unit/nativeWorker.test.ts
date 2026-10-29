@@ -253,6 +253,8 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respo
                         ? { result: { columns: ['1'], values: [[1]] } }
                         : call.method === 'query' && call.args[0] === 'PRAGMA encoding'
                             ? { result: { columns: ['encoding'], values: [['UTF-8']] } }
+                        : call.method === 'prepareGridPage'
+                            ? { result: { encoding: 'UTF-8', cellHelpers: false } }
                         : await respondToCall?.(call);
                     const response: RecordedNativeResponse = call.method === 'compileBatch'
                         && suppliedResponse?.error === undefined

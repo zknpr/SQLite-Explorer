@@ -295,6 +295,8 @@ let asyncCapabilitySupported = false;
 /** AbortControllers for async operations addressable by their request id. */
 const activeOperations = new Map();
 const queryPlanDatabases = new WeakSet();
+// Connections whose runtime library failed to load; the error is reported once.
+const runtimeLoadFailures = new WeakSet();
 
 /** TEMP export spools owned by the interruptible secondary connection. */
 const exportSpools = new Set();
@@ -2173,6 +2175,30 @@ async function handleRequest(request) {
           throw new Error(`Unknown cell read session: ${sessionId}`);
         }
         result = { success: true };
+        break;
+      }
+
+      case "prepareGridPage": {
+        // One round trip before a grid page: the text encoding its decoder
+        // needs, and the runtime's grid cell helpers on this connection.
+        const [library] = args;
+        if (!db) throw new Error("Database not open");
+        if (typeof library !== 'string') throw new Error('Invalid runtime library path');
+        let cellHelperError;
+        if (!queryPlanDatabases.has(db) && !runtimeLoadFailures.has(db)) {
+          try {
+            db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
+            queryPlanDatabases.add(db);
+          } catch (error) {
+            runtimeLoadFailures.add(db);
+            cellHelperError = error instanceof Error ? error.message : String(error);
+          }
+        }
+        result = {
+          encoding: executeQuery(db, 'PRAGMA encoding', []).values[0]?.[0],
+          cellHelpers: queryPlanDatabases.has(db),
+          ...(cellHelperError ? { cellHelperError } : {})
+        };
         break;
       }
 

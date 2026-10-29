@@ -854,6 +854,13 @@ interface NativeQueryBatchResult {
   results: NativeQueryResult[];
 }
 
+interface NativeGridPagePreparation {
+  encoding: unknown;
+  cellHelpers: boolean;
+  /** Present once per connection, when the runtime library failed to load. */
+  cellHelperError?: string;
+}
+
 interface NativeCompileBatchResult {
   errors: Array<string | null>;
 }
@@ -915,6 +922,7 @@ export async function createNativeDatabaseConnection(
   }
 
   const workerScript = path.join(extensionPath, 'natives', 'native-worker.js');
+  const queryPlanLibrary = path.join(path.dirname(binaryPath), `query-plan.${process.platform === 'darwin' ? 'dylib' : process.platform === 'win32' ? 'dll' : 'so'}`);
 
   // Verify worker script exists
   if (!fs.existsSync(workerScript)) {
@@ -2944,8 +2952,7 @@ export async function createNativeDatabaseConnection(
           if (params.length !== prepared.parameterCount) throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
           if (explain) {
             const request = queryPlanRequest(prepared.sourceSql, params);
-            const library = path.join(path.dirname(binaryPath), `query-plan.${process.platform === 'darwin' ? 'dylib' : process.platform === 'win32' ? 'dll' : 'so'}`);
-            const value = await worker.call<CellValue>('workspaceQueryPlan', [request.sql, request.params, library, queryTimeout],
+            const value = await worker.call<CellValue>('workspaceQueryPlan', [request.sql, request.params, queryPlanLibrary, queryTimeout],
               queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
             signal?.throwIfAborted();
             return decodeQueryPlan(value);
@@ -4352,12 +4359,26 @@ export async function createNativeDatabaseConnection(
               valueColumns.length * 2 + 1 <= SQLITE_MAX_RESULT_COLUMNS
                 ? valueColumns.map((_, index) => index)
                 : identityContainmentRawTextColumnIndices;
+            // One round trip: the encoding the raw TEXT decoder needs, and the
+            // runtime's grid cell helpers, loaded once per connection.
+            const pagePreparation = await worker.call<NativeGridPagePreparation>('prepareGridPage', [
+              queryPlanLibrary
+            ]);
+            if (pagePreparation.cellHelperError) {
+              outputChannel?.appendLine(
+                `[NativeWorker] Grid cell helpers are unavailable; table pages use SQL containment: ` +
+                pagePreparation.cellHelperError
+              );
+            }
+            const databaseTextEncoding = normalizeCellTextEncoding(pagePreparation.encoding);
+            // The helpers read TEXT as stored, which is UTF-8 only in a UTF-8 database.
+            const checkedTransport = pagePreparation.cellHelpers && databaseTextEncoding === 'utf-8';
             const containmentQuery = buildCellContainmentQuery(
               sql,
               valueColumns.length,
               queryOptions,
               containmentRawTextColumnIndices,
-              'blob',
+              checkedTransport ? 'checked' : 'blob',
               true
             );
             const transportQuery = containmentQuery.numericTransport;
@@ -4438,7 +4459,8 @@ export async function createNativeDatabaseConnection(
               normalized.rows,
               valueColumns.length,
               normalized.exactIntegerTexts,
-              queryOptions.maxPageResponseBytes
+              queryOptions.maxPageResponseBytes,
+              containmentQuery.metadataMayBeNull
             );
             const decodedContained = rowIdResult
               ? prependCellContainmentColumn(
@@ -4454,10 +4476,7 @@ export async function createNativeDatabaseConnection(
               : valueContained;
             const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
             const textEncoding = containmentRawTextColumnIndices.length > 0
-              ? normalizeCellTextEncoding((await worker.call<NativeQueryResult>('query', [
-                  'PRAGMA encoding',
-                  []
-                ])).values[0]?.[0])
+              ? databaseTextEncoding
               : undefined;
             const sourceRawTextColumnIndices = splitSyntheticRowId
               ? containmentQuery.rawTextColumnIndices.map(index => index + 1)

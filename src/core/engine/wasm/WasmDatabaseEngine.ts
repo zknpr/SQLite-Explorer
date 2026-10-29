@@ -440,6 +440,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly logger: WasmEngineLogHandler;
   /** Whether SQLite's json_patch() function is available (JSON1 extension). */
   private readonly hasJsonPatch: boolean;
+  /** Whether the runtime registered its grid cell helpers on this connection. */
+  private readonly hasCellHelpers: boolean;
   private readonly cellReadSessionIdleTimeoutMs: number;
   private readonly cellReadSessionAbsoluteTimeoutMs: number;
   private cellReadSession: WasmCellReadSessionState | undefined;
@@ -496,6 +498,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.hasJsonPatch = true;
     } catch {
       this.hasJsonPatch = false;
+    }
+
+    // The bundled runtime registers these with the query-plan reader. Grid
+    // pages still work without them, through slower SQL.
+    try {
+      instance.exec('SELECT sqlite_explorer_cell_preview(NULL, 0, 0)');
+      this.hasCellHelpers = true;
+    } catch (error) {
+      this.hasCellHelpers = false;
+      this.logger('warn', 'Grid cell helpers are unavailable; table pages use SQL containment:', error);
     }
   }
 
@@ -4611,12 +4623,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           valueHeaders.length * 2 + 1 <= SQLITE_MAX_RESULT_COLUMNS
             ? valueHeaders.map((_, index) => index)
             : identityContainmentRawTextColumnIndices;
+        const textEncoding = containmentRawTextColumnIndices.length > 0
+          ? this.getCellTextEncoding()
+          : undefined;
+        // The helpers read TEXT as stored, which is UTF-8 only in a UTF-8 database.
+        const checkedTransport = this.hasCellHelpers
+          && (textEncoding ?? this.getCellTextEncoding()) === 'utf-8';
         const containmentQuery = buildCellContainmentQuery(
           sql,
           valueHeaders.length,
           queryOptions,
           containmentRawTextColumnIndices,
-          'hex',
+          checkedTransport ? 'checked' : 'hex',
           true
         );
         const transportQuery = containmentQuery.numericTransport;
@@ -4708,7 +4726,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           normalized.rows,
           valueHeaders.length,
           normalized.exactIntegerTexts,
-          queryOptions.maxPageResponseBytes
+          queryOptions.maxPageResponseBytes,
+          containmentQuery.metadataMayBeNull
         );
         const decodedContained = rowIdRows
           ? prependCellContainmentColumn(
@@ -4723,9 +4742,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             )
           : valueContained;
         const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
-        const textEncoding = containmentRawTextColumnIndices.length > 0
-          ? this.getCellTextEncoding()
-          : undefined;
         const sourceRawTextColumnIndices = splitSyntheticRowId
           ? containmentQuery.rawTextColumnIndices.map(index => index + 1)
           : containmentQuery.rawTextColumnIndices;

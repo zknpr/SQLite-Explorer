@@ -37,6 +37,9 @@ const CELL_RAW_TEXT_PREFIX = '__sqlite_explorer_cell_raw_text_';
 const CELL_REAL_TEXT_PREFIX = '__sqlite_explorer_cell_real_text_';
 const RAW_TEXT_DECODE_SLAB_BYTES = 64 * 1024;
 const METADATA_CHUNK_COLUMNS = 400;
+// Arguments per sqlite_explorer_cell_metadata() call, far below SQLite's
+// function-argument limit.
+const HELPER_METADATA_CHUNK_COLUMNS = 100;
 const MAX_UTF8_BYTES_PER_CODE_POINT = 4;
 // Both bundled SQLite builds use SQLite's default SQLITE_MAX_COLUMN. Private
 // raw-TEXT companions must never turn an otherwise valid grid projection into
@@ -58,19 +61,36 @@ export interface CellContainmentQuery {
   /** First private raw-TEXT byte slot, aligned with rawTextColumnIndices. */
   rawTextColumnStart: number;
   rawTextColumnCount: number;
-  /** Hex avoids one sql.js backing-store allocation per private TEXT cell. */
-  rawTextTransport: 'blob' | 'hex';
+  /**
+   * Hex avoids one sql.js backing-store allocation per private TEXT cell.
+   * 'checked' uses the runtime's grid cell helpers for previews, metadata and
+   * raw TEXT; engines choose it only for UTF-8 databases that registered them.
+   */
+  rawTextTransport: RawTextTransport;
   /** Source-column indices actually represented by private raw-TEXT slots. */
   rawTextColumnIndices: readonly number[];
   /** Requested raw validation was omitted to stay within SQLite's width cap. */
   rawTextValidationUnavailable: boolean;
   effectiveInlineCellBytes: number;
+  /** Packed metadata is NULL for a row with no oversized cell. */
+  metadataMayBeNull: boolean;
   /**
    * The statement as an exact-numeric transport. With a REAL text sidecar it
    * covers the value columns only, after every primary transport column.
    */
   numericTransport: ExactNumericTextQuery;
 }
+
+export type RawTextTransport = 'blob' | 'hex' | 'checked';
+
+/**
+ * Raw TEXT slot of a cell that SQLite found to be plain UTF-8 (no NUL, no
+ * leading BOM, neither U+FFFE nor U+FFFF), which the engine's string
+ * reproduces byte for byte. 'checked' transport also gives non-TEXT cells
+ * this slot; consumers read a slot only for a TEXT source value.
+ */
+export const VERIFIED_TEXT_BYTES: unique symbol = Symbol('verified TEXT bytes');
+export type RawTextSlot = Uint8Array | null | typeof VERIFIED_TEXT_BYTES;
 
 export interface DecodedCellContainment {
   rows: CellValue[][];
@@ -177,6 +197,23 @@ function buildPackedMetadataExpression(columns: string[], byteLimit: number): st
   return chunks.join(` || '|' || `);
 }
 
+/** The helper form of the packed metadata, NULL when no cell is oversized. */
+function buildHelperMetadataExpression(columns: string[], byteLimit: number): string {
+  const chunks: Array<{ sql: string; emptyTokens: string }> = [];
+  for (let offset = 0; offset < columns.length; offset += HELPER_METADATA_CHUNK_COLUMNS) {
+    const chunkColumns = columns.slice(offset, offset + HELPER_METADATA_CHUNK_COLUMNS);
+    chunks.push({
+      sql: `sqlite_explorer_cell_metadata(${byteLimit}, ${chunkColumns.join(', ')})`,
+      emptyTokens: `'${'|'.repeat(chunkColumns.length - 1)}'`
+    });
+  }
+  if (chunks.length === 1) return chunks[0].sql;
+  const joined = chunks
+    .map(chunk => `COALESCE(${chunk.sql}, ${chunk.emptyTokens})`)
+    .join(` || '|' || `);
+  return `NULLIF(${joined}, '${'|'.repeat(columns.length - 1)}')`;
+}
+
 /**
  * Wrap a filtered/ordered/paginated SELECT and project only bounded TEXT/BLOB
  * windows. The inner SELECT continues to own WHERE and ORDER BY semantics.
@@ -186,7 +223,7 @@ export function buildCellContainmentQuery(
   columnCount: number,
   options: Pick<TableQueryOptions, 'limit' | 'maxInlineCellBytes' | 'maxPageResponseBytes'>,
   rawTextColumnIndices: readonly number[] = [],
-  rawTextTransport: 'blob' | 'hex' = 'blob',
+  rawTextTransport: RawTextTransport = 'blob',
   includeRealTextSidecar = false
 ): CellContainmentQuery {
   const effectiveInlineCellBytes = deriveEffectiveInlineCellBytes(options, columnCount);
@@ -208,32 +245,42 @@ export function buildCellContainmentQuery(
   const projectedRawTextColumnIndices = rawTextValidationUnavailable
     ? []
     : rawTextColumnIndices;
+  const usesCellHelpers = rawTextTransport === 'checked';
+  const metadataUsesTrailer = columnCount + 1 > SQLITE_MAX_RESULT_COLUMNS;
   const projectedValues = quotedValues.map((column, index) => (
-    `CASE ` +
-    `WHEN typeof(${column}) = 'text' AND octet_length(${column}) > ${effectiveInlineCellBytes} ` +
-    `THEN substr(${column}, 1, ${textCharacterWindow}) ` +
-    `WHEN typeof(${column}) = 'blob' AND octet_length(${column}) > ${effectiveInlineCellBytes} ` +
-    `THEN substr(${column}, 1, ${effectiveInlineCellBytes}) ` +
-    `ELSE ${column} END AS ${escapeIdentifier(valueNames[index])}`
+    usesCellHelpers
+      ? `sqlite_explorer_cell_preview(${column}, ${effectiveInlineCellBytes}, ${textCharacterWindow}) ` +
+        `AS ${escapeIdentifier(valueNames[index])}`
+      : `CASE ` +
+        `WHEN typeof(${column}) = 'text' AND octet_length(${column}) > ${effectiveInlineCellBytes} ` +
+        `THEN substr(${column}, 1, ${textCharacterWindow}) ` +
+        `WHEN typeof(${column}) = 'blob' AND octet_length(${column}) > ${effectiveInlineCellBytes} ` +
+        `THEN substr(${column}, 1, ${effectiveInlineCellBytes}) ` +
+        `ELSE ${column} END AS ${escapeIdentifier(valueNames[index])}`
   ));
   const quotedSource = escapeIdentifier(CELL_SOURCE_ALIAS);
-  const metadataExpression = buildPackedMetadataExpression(
-    quotedValues,
-    effectiveInlineCellBytes
-  );
+  // The trailer concatenates one metadata value per row, so it keeps the form
+  // that is never NULL.
+  const metadataMayBeNull = usesCellHelpers && !metadataUsesTrailer;
+  const metadataExpression = metadataMayBeNull
+    ? buildHelperMetadataExpression(quotedValues, effectiveInlineCellBytes)
+    : buildPackedMetadataExpression(quotedValues, effectiveInlineCellBytes);
   const rawTextExpressions = projectedRawTextColumnIndices.map((columnIndex, keyIndex) => {
     const column = quotedValues[columnIndex];
+    const name = escapeIdentifier(`${CELL_RAW_TEXT_PREFIX}${keyIndex}`);
+    if (usesCellHelpers) {
+      return `sqlite_explorer_cell_text_check(${column}, ${effectiveInlineCellBytes}) AS ${name}`;
+    }
     return (
       `CASE WHEN typeof(${column}) = 'text' ` +
       `AND octet_length(${column}) <= ${effectiveInlineCellBytes} ` +
       `THEN ${rawTextTransport === 'hex' ? `hex(CAST(${column} AS BLOB))` : `CAST(${column} AS BLOB)`} END AS ` +
-      `${escapeIdentifier(`${CELL_RAW_TEXT_PREFIX}${keyIndex}`)}`
+      name
     );
   });
   const privateProjection = rawTextExpressions.length > 0
     ? `, ${rawTextExpressions.join(', ')}`
     : '';
-  const metadataUsesTrailer = columnCount + 1 > SQLITE_MAX_RESULT_COLUMNS;
   const sourceCte =
     `WITH ${quotedSource} (${quotedValues.join(', ')}) AS` +
     `${metadataUsesTrailer ? ' MATERIALIZED' : ''} (\n` +
@@ -296,6 +343,7 @@ export function buildCellContainmentQuery(
     rawTextColumnIndices: projectedRawTextColumnIndices,
     rawTextValidationUnavailable,
     effectiveInlineCellBytes,
+    metadataMayBeNull,
     numericTransport: realTextColumnCount > 0
       ? {
           sql,
@@ -401,7 +449,7 @@ export function decodeRawTextColumns(
   query: Pick<CellContainmentQuery,
     'rawTextColumnStart' | 'rawTextColumnCount' | 'transportColumnCount'
     | 'rawTextTransport' | 'effectiveInlineCellBytes'>
-): Array<Array<Uint8Array | null>> {
+): Array<Array<RawTextSlot>> {
   // Keep ownership per page, but allocate only small slabs as bytes arrive.
   // Hundreds of thousands of tiny sql.js BLOB ArrayBuffers otherwise trigger
   // long backing-store GC pauses in the Windows Electron worker. Large cells
@@ -453,6 +501,19 @@ export function decodeRawTextColumns(
     }
     return Array.from({ length: query.rawTextColumnCount }, (_, keyIndex) => {
       const value = row[query.rawTextColumnStart + keyIndex];
+      if (query.rawTextTransport === 'checked') {
+        // NULL: plain UTF-8 TEXT or not TEXT. 0: TEXT longer than the window,
+        // which carries no bytes, as in the other transports.
+        if (value === null) return VERIFIED_TEXT_BYTES;
+        if (value === 0 || value === 0n) return null;
+        if (
+          !(value instanceof Uint8Array)
+          || value.byteLength > query.effectiveInlineCellBytes
+        ) {
+          throw new Error(`Checked raw TEXT value at row ${rowIndex}, key ${keyIndex} is not bounded bytes`);
+        }
+        return value;
+      }
       if (value !== null && query.rawTextTransport === 'hex') {
         return decodeHex(value, rowIndex, keyIndex);
       }
@@ -492,7 +553,7 @@ function decodedTextReproducesBytes(
 export function findUnrepresentableTextRows(input: {
   sourceRows: readonly (readonly unknown[])[];
   sourceColumnIndices: readonly number[];
-  rawTextRows: readonly (readonly (Uint8Array | null)[])[];
+  rawTextRows: readonly (readonly RawTextSlot[])[];
   rawTextColumnIndices: readonly number[];
   textEncoding: CellTextEncoding;
   rawTextValidationUnavailable?: boolean;
@@ -527,8 +588,8 @@ export function findUnrepresentableTextRows(input: {
       const value = row[input.sourceColumnIndices[slot]];
       if (typeof value !== 'string') continue;
       const rawBytes = rawRow[rawSlots[slot]];
-      const representable = rawBytes instanceof Uint8Array
-        && decodedTextReproducesBytes(decoder, rawBytes, value);
+      const representable = rawBytes === VERIFIED_TEXT_BYTES
+        || (rawBytes instanceof Uint8Array && decodedTextReproducesBytes(decoder, rawBytes, value));
       if (!representable) {
         unrepresentableRows ??= new Set();
         unrepresentableRows.add(rowIndex);
@@ -547,7 +608,7 @@ export function findUnrepresentableTextRows(input: {
  */
 export function containUnrepresentableTextCells(input: {
   sourceRows: readonly (readonly unknown[])[];
-  rawTextRows: readonly (readonly (Uint8Array | null)[])[];
+  rawTextRows: readonly (readonly RawTextSlot[])[];
   rawTextColumnIndices: readonly number[];
   textEncoding: CellTextEncoding;
   contained: DecodedCellContainment;
@@ -590,6 +651,7 @@ export function containUnrepresentableTextCells(input: {
       // A size/page-contained cell is already routed through the raw reader.
       if (oversizedCells?.[rowIndex]?.[columnIndex]) return;
       const rawBytes = rawRow[rawIndex];
+      if (rawBytes === VERIFIED_TEXT_BYTES) return;
       if (!(rawBytes instanceof Uint8Array)) {
         throw new Error(
           `Raw TEXT containment bytes are missing at row ${rowIndex}, column ${columnIndex}`
@@ -798,7 +860,8 @@ export function decodeCellContainment(
   transportedRows: readonly (readonly unknown[])[],
   valueColumnCount: number,
   exactIntegerTexts?: ExactIntegerTextMap,
-  maxPageResponseBytes: number = DEFAULT_MAX_PAGE_RESPONSE_BYTES
+  maxPageResponseBytes: number = DEFAULT_MAX_PAGE_RESPONSE_BYTES,
+  metadataMayBeNull = false
 ): DecodedCellContainment {
   const pageByteBudget = positiveIntegerOr(
     maxPageResponseBytes,
@@ -823,6 +886,8 @@ export function decodeCellContainment(
     oversizedCells[rowIndex][columnIndex] ??= metadata;
   };
 
+  let noOversizedTokens: string[] | undefined;
+
   const rows = transportedRows.map((row, rowIndex) => {
     if (row.length < valueColumnCount + 1) {
       throw new Error(
@@ -831,10 +896,12 @@ export function decodeCellContainment(
       );
     }
     const packed = row[valueColumnCount];
-    if (typeof packed !== 'string') {
+    if (typeof packed !== 'string' && !(packed === null && metadataMayBeNull)) {
       throw new Error(`Cell containment metadata at row ${rowIndex} is not text`);
     }
-    const tokens = packed.split('|');
+    const tokens = packed === null
+      ? (noOversizedTokens ??= Array<string>(valueColumnCount).fill(''))
+      : packed.split('|');
     if (tokens.length !== valueColumnCount) {
       throw new Error(
         `Cell containment metadata at row ${rowIndex} has ${tokens.length} entries; ` +
@@ -934,7 +1001,7 @@ export interface PrimaryKeyContainmentInput {
   sourceColumns: readonly string[];
   visibleColumnCount: number;
   identityRows: readonly (readonly (CellValue | bigint)[])[];
-  rawTextBytes: readonly (readonly (Uint8Array | null)[])[];
+  rawTextBytes: readonly (readonly RawTextSlot[])[];
   /** Source indices aligned with each rawTextBytes row. */
   rawTextColumnIndices: readonly number[];
   rawTextValidationUnavailable?: boolean;
@@ -1235,6 +1302,7 @@ export function remapPrimaryKeyContainment(
             return [];
           }
           const rawBytes = rawTextRow[rawTextSlots[keyIndex]];
+          if (rawBytes === VERIFIED_TEXT_BYTES) return [];
           if (!(rawBytes instanceof Uint8Array)) return [column.identifier];
           return decodedTextReproducesBytes(textDecoder, rawBytes, value) ? [] : [column.identifier];
         });

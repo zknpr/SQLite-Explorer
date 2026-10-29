@@ -1,7 +1,8 @@
 /*
- * Bounded EXPLAIN QUERY PLAN reader, compiled into sql.js and as a native
- * loadable SQLite extension. Only this file owns plan extraction: neither
- * JavaScript binding has to materialize an unbounded detail string or array.
+ * Bounded EXPLAIN QUERY PLAN reader and grid cell helpers, compiled into
+ * sql.js and as a native loadable SQLite extension. Only this file owns plan
+ * extraction: neither JavaScript binding has to materialize an unbounded
+ * detail string or array.
  */
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
@@ -162,14 +163,165 @@ cleanup:
     else sqlite3_result_text(context, json, -1, sqlite3_free);
 }
 
+/*
+ * Grid page cell helpers. Each replaces SQL that called typeof() and
+ * octet_length() several times per cell. Engines call them only for UTF-8
+ * databases, where sqlite3_value_text() and sqlite3_value_bytes() return the
+ * stored bytes unconverted, and every scan stays inside those bytes.
+ */
+static int byte_limit(sqlite3_context *context, sqlite3_value *value, sqlite3_int64 *limit) {
+    if (sqlite3_value_type(value) != SQLITE_INTEGER
+        || (*limit = sqlite3_value_int64(value)) < 0 || *limit > 0x7fffffff) {
+        sqlite3_result_error(context, "Grid cell helper limits must be integers from 0 to 2147483647.", -1);
+        return 0;
+    }
+    return 1;
+}
+
+static int is_oversized(sqlite3_value *value, sqlite3_int64 limit) {
+    int type = sqlite3_value_type(value);
+    return (type == SQLITE_TEXT || type == SQLITE_BLOB) && sqlite3_value_bytes(value) > limit;
+}
+
+/* substr(value, 1, characters) as the bundled SQLite divides text: NUL ends
+ * it, and any other byte above 0x7f starts a character that absorbs the
+ * continuation bytes after it (tag-20260418-01 in sqlite3.c). SQLite leaves
+ * that division of malformed UTF-8 unspecified, so the differential tests
+ * compare this with substr() on every runtime build. */
+static int text_prefix_bytes(const unsigned char *text, int length, sqlite3_int64 characters) {
+    int index = 0;
+    while (index < length && characters > 0) {
+        unsigned char lead = text[index];
+        if (!lead) break;
+        index++;
+        if (lead >= 0x80) {
+            while (index < length && (text[index] & 0xc0) == 0x80) index++;
+        }
+        characters--;
+    }
+    return index;
+}
+
+/* The value, or a bounded prefix of TEXT or a BLOB longer than limit bytes. */
+static void cell_preview(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    sqlite3_int64 limit, characters;
+    (void) argc;
+    if (!byte_limit(context, argv[1], &limit) || !byte_limit(context, argv[2], &characters)) return;
+    int type = sqlite3_value_type(argv[0]);
+    if (type == SQLITE_TEXT) {
+        const unsigned char *text = sqlite3_value_text(argv[0]);
+        int length = sqlite3_value_bytes(argv[0]);
+        if (!text) { sqlite3_result_error_nomem(context); return; }
+        if (length > limit) {
+            sqlite3_result_text(context, (const char *) text,
+                text_prefix_bytes(text, length, characters), SQLITE_TRANSIENT);
+            return;
+        }
+    } else if (type == SQLITE_BLOB) {
+        const void *blob = sqlite3_value_blob(argv[0]);
+        if (sqlite3_value_bytes(argv[0]) > limit) {
+            sqlite3_result_blob(context, blob, (int) limit, SQLITE_TRANSIENT);
+            return;
+        }
+    }
+    sqlite3_result_value(context, argv[0]);
+}
+
+/* NULL when no argument after the limit is oversized, otherwise one token
+ * per argument joined by '|': empty, or t/b and the byte length. */
+static void cell_metadata(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    sqlite3_int64 limit;
+    if (argc < 2) {
+        sqlite3_result_error(context, "Grid cell metadata requires a limit and at least one value.", -1);
+        return;
+    }
+    if (!byte_limit(context, argv[0], &limit)) return;
+    int index = 1;
+    while (index < argc && !is_oversized(argv[index], limit)) index++;
+    if (index == argc) return;
+    sqlite3_str *output = sqlite3_str_new(0);
+    for (index = 1; index < argc; index++) {
+        if (index > 1) sqlite3_str_appendchar(output, 1, '|');
+        if (is_oversized(argv[index], limit)) {
+            sqlite3_str_appendf(output, "%c%d",
+                sqlite3_value_type(argv[index]) == SQLITE_TEXT ? 't' : 'b',
+                sqlite3_value_bytes(argv[index]));
+        }
+    }
+    int rc = sqlite3_str_errcode(output);
+    int length = sqlite3_str_length(output);
+    char *tokens = sqlite3_str_finish(output);
+    if (rc != SQLITE_OK || !tokens) {
+        sqlite3_free(tokens);
+        if (rc == SQLITE_TOOBIG) sqlite3_result_error_toobig(context);
+        else sqlite3_result_error_nomem(context);
+        return;
+    }
+    sqlite3_result_text(context, tokens, length, sqlite3_free);
+}
+
+/* Shortest-form UTF-8 scalar values with no NUL, no leading BOM and neither
+ * U+FFFE nor U+FFFF. Both engines decode such bytes to a string that encodes
+ * back to them; anything else needs the stored bytes. */
+static int is_plain_utf8(const unsigned char *text, int length) {
+    if (length >= 3 && text[0] == 0xef && text[1] == 0xbb && text[2] == 0xbf) return 0;
+    int index = 0;
+    while (index < length) {
+        unsigned lead = text[index];
+        if (lead < 0x80) {
+            if (!lead) return 0;
+            index++;
+            continue;
+        }
+        int extra = lead >= 0xc2 && lead <= 0xdf ? 1
+            : lead >= 0xe0 && lead <= 0xef ? 2
+            : lead >= 0xf0 && lead <= 0xf4 ? 3 : 0;
+        if (!extra || length - index <= extra) return 0;
+        unsigned point = lead & (0x3fu >> extra);
+        for (int offset = 1; offset <= extra; offset++) {
+            unsigned next = text[index + offset];
+            if ((next & 0xc0) != 0x80) return 0;
+            point = (point << 6) | (next & 0x3f);
+        }
+        if (extra == 2 && (point < 0x800 || (point >= 0xd800 && point <= 0xdfff) || point >= 0xfffe)) return 0;
+        if (extra == 3 && (point < 0x10000 || point > 0x10ffff)) return 0;
+        index += extra + 1;
+    }
+    return 1;
+}
+
+/* For TEXT of at most limit bytes: NULL when is_plain_utf8, else its bytes as
+ * a BLOB. 0 for longer TEXT and NULL for other values, so the common cells
+ * cost nothing to transport. */
+static void cell_text_check(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    sqlite3_int64 limit;
+    (void) argc;
+    if (!byte_limit(context, argv[1], &limit)) return;
+    if (sqlite3_value_type(argv[0]) != SQLITE_TEXT) return;
+    const unsigned char *text = sqlite3_value_text(argv[0]);
+    int length = sqlite3_value_bytes(argv[0]);
+    if (!text) { sqlite3_result_error_nomem(context); return; }
+    if (length > limit) sqlite3_result_int(context, 0);
+    else if (!is_plain_utf8(text, length)) sqlite3_result_blob(context, text, length, SQLITE_TRANSIENT);
+}
+
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
 int sqlite3_sqliteexplorer_init(sqlite3 *db, char **error, const sqlite3_api_routines *api) {
     SQLITE_EXTENSION_INIT2(api);
     (void) error;
-    return sqlite3_create_function_v2(db, "sqlite_explorer_query_plan", -1,
+    /* DIRECTONLY keeps schema code (views, triggers, CHECK, DEFAULT,
+     * generated columns, indexes) from calling any of these. */
+    int rc = sqlite3_create_function_v2(db, "sqlite_explorer_query_plan", -1,
         SQLITE_UTF8 | SQLITE_DIRECTONLY, 0, query_plan, 0, 0, 0);
+    if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_cell_preview", 3,
+        SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, cell_preview, 0, 0, 0);
+    if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_cell_metadata", -1,
+        SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, cell_metadata, 0, 0, 0);
+    if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_cell_text_check", 2,
+        SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, cell_text_check, 0, 0, 0);
+    return rc;
 }
 
 #ifdef SQLITE_CORE
