@@ -7,6 +7,7 @@
 const links = [
   { label: 'GitHub', href: 'https://github.com/zknpr/sqlite-explorer' },
   { label: 'Marketplace', href: 'https://marketplace.visualstudio.com/items?itemName=zknpr.sqlite-explorer' },
+  { label: 'Desktop App', href: 'https://github.com/zknpr/SQLite-Explorer-App/releases/latest' },
   { label: 'MIT License', href: 'https://github.com/zknpr/sqlite-explorer/blob/main/LICENSE.md' },
   { label: 'Buy Me a Coffee', href: 'https://buymeacoffee.com/zknpr' },
 ];
