@@ -17,7 +17,10 @@ async function withBackend(
     action: (ops: DatabaseOperations) => Promise<void>,
     queryTimeout?: number
 ) {
-    const opened = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false, queryTimeout });
+    // For native, the WASM engine only builds the fixture file.
+    const opened = await createDatabaseEngine({
+        content: null, maxSize: 0, readOnlyMode: false, queryTimeout: backend === 'wasm' ? queryTimeout : undefined
+    });
     const wasm = opened.operations as WasmDatabaseEngine;
     let native: Awaited<ReturnType<typeof createNativeDatabaseConnection>> | undefined;
     let directory: string | undefined;
@@ -133,7 +136,7 @@ for (const backend of ['wasm', 'native'] as const) {
         });
     });
 
-    it(`${backend} history replay gives every row the full queryTimeout`, async () => {
+    it(`${backend} history replay gives every row its own deadline`, async () => {
         // Each guarded DELETE scans the unindexed child table: a few ms per row,
         // well inside a 250 ms timeout, far beyond it for 256 rows together.
         const setup =
@@ -154,10 +157,10 @@ for (const backend of ['wasm', 'native'] as const) {
     });
 }
 
-it('native history units each get queryTimeout and resume after a partial batch', async () => {
-    // About 30-40 ms of CHECK work per INSERT: every unit fits the 1000 ms
-    // timeout, while import and redo outlast the 1000 ms request budget, so the
-    // worker returns a prefix and the host resends the rest.
+it('native history resumes after the worker returns a partial batch', async () => {
+    // About 30-40 ms of CHECK work per INSERT: import and redo outlast the
+    // 1000 ms request budget, so the worker returns a prefix and the host
+    // resends the rest.
     const setup = 'CREATE TABLE slow (id INTEGER PRIMARY KEY, v TEXT CHECK (length(hex(randomblob(20000000))) > 0))';
     await withBackend('native', setup, async ops => {
         const rows = Array.from({ length: 40 }, (_, index) => ({ v: `row${index}` }));
@@ -172,7 +175,25 @@ it('native history units each get queryTimeout and resume after a partial batch'
         assert.deepEqual(await read(), []);
         await ops.redoModification(modification);
         assert.deepEqual(await read(), imported);
-    }, 1000);
+    });
+});
+
+it('native history keeps the fixed 30 s statement limit when queryTimeout is lower', async () => {
+    // As in 1.8.3, history statements do not use sqliteExplorer.queryTimeout.
+    // A guarded DELETE that scans an unindexed child table runs past 5 ms, and
+    // an interrupted write rolls back the whole transaction, which retires the
+    // connection; the undo must instead complete.
+    const setup =
+        'CREATE TABLE parent (id INTEGER PRIMARY KEY, v TEXT);' +
+        'CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));' +
+        'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000000) ' +
+        'INSERT INTO child (parent_id) SELECT NULL FROM n;';
+    await withBackend('native', setup, async ops => {
+        await ops.executeQuery('PRAGMA foreign_keys = ON');
+        const modification = await importRowsAtomically(ops, 'parent', [{ v: 'a' }, { v: 'b' }, { v: 'c' }], 1024 * 1024);
+        await ops.undoModification(modification);
+        assert.deepEqual((await ops.executeQuery('SELECT count(*) FROM parent'))[0].rows, [[0]]);
+    }, 5);
 });
 
 it('native history keeps wide-table responses inside the worker frame limit', async () => {

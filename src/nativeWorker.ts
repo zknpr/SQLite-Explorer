@@ -2613,7 +2613,7 @@ export async function createNativeDatabaseConnection(
 
       /**
        * Run generated history statements in order, `stride` queries per unit.
-       * Each unit gets queryTimeout, as one request per statement did; the
+       * Each unit gets QUERY_TIMEOUT, as one request per statement did; the
        * worker may return a prefix, and the rest is sent again.
        */
       const queryNativeBatch = async (
@@ -2625,8 +2625,8 @@ export async function createNativeDatabaseConnection(
           const pending = results.length === 0 ? queries : queries.slice(results.length);
           const batch = await worker.call<NativeQueryBatchResult>(
             'queryHistoryBatch',
-            [pending, stride, queryTimeout, NATIVE_HISTORY_REQUEST_BUDGET_MS, NATIVE_HISTORY_RESPONSE_BUDGET_BYTES],
-            queryTimeout + NATIVE_HISTORY_REQUEST_BUDGET_MS + BOUNDED_QUERY_TRANSPORT_MARGIN_MS
+            [pending, stride, QUERY_TIMEOUT, NATIVE_HISTORY_REQUEST_BUDGET_MS, NATIVE_HISTORY_RESPONSE_BUDGET_BYTES],
+            QUERY_TIMEOUT + NATIVE_HISTORY_REQUEST_BUDGET_MS + BOUNDED_QUERY_TRANSPORT_MARGIN_MS
           );
           const completed = batch?.results;
           if (
