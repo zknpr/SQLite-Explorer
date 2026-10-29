@@ -731,13 +731,18 @@ export class NativeWorkerProcess {
       const fullBuffer = Buffer.concat(this.chunks);
       const body = fullBuffer.subarray(HEADER_SIZE, totalNeeded);
 
-      // Deserialize and handle
+      // An undecodable frame cannot be matched to its request, which would
+      // otherwise wait for its timeout. Treat it like an oversized frame.
+      let msg: unknown;
       try {
-        const msg = v8.deserialize(body);
-        this.handleMessage(msg);
-      } catch (err) {
-        console.error('[NativeWorker] Failed to deserialize message:', err);
+        msg = v8.deserialize(body);
+      } catch (cause) {
+        const error = new Error('Native worker response frame could not be deserialized', { cause });
+        console.error('[NativeWorker] Failed to deserialize message:', cause);
+        this.retire(error);
+        return;
       }
+      this.handleMessage(msg);
 
       // Handle remaining data
       const remaining = fullBuffer.subarray(totalNeeded);

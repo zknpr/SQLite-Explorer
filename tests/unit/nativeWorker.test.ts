@@ -3705,6 +3705,30 @@ describe('NativeWorkerProcess', () => {
         assert.strictEqual(errorLogged, true, 'Should log error on bad deserialization');
     });
 
+    it('rejects pending requests at once when a response frame cannot be deserialized', async () => {
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        let killCount = 0;
+        (worker as any).process = {
+            stdin: { write: () => true },
+            kill: () => { killCount++; }
+        };
+        mock.method(console, 'error', () => {});
+        const pending = worker.call('query', [], 5_000);
+        const started = performance.now();
+        // A well-formed length prefix around a truncated V8 object.
+        const body = Buffer.from([0xff, 0x0f, 0x6f]);
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(body.length, 0);
+
+        (worker as any).handleData(Buffer.concat([header, body]));
+
+        await assert.rejects(pending, /response frame could not be deserialized/);
+        assert.ok(performance.now() - started < 1_000, 'the request must fail with the frame, not at its timeout');
+        assert.strictEqual(killCount, 1);
+        assert.strictEqual((worker as any).process, null);
+        assert.strictEqual((worker as any).pendingRequests.size, 0);
+    });
+
     it('terminates the worker when a response frame advertises an unsafe allocation', async () => {
         const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
         let killCount = 0;
