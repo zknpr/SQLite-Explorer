@@ -70,6 +70,9 @@ export const state = {
     // edits. Row identities can be deleted and reused without changing the
     // connection generation, so delayed destructive intents bind to both.
     contentGeneration: 0,
+    // The contentGeneration whose broadcast refresh finished reloading the
+    // grid while still the newest broadcast (see reloadAfterOwnMutation).
+    refreshedContentGeneration: 0,
     selectedTable: null,
     selectedTableType: 'table',
     selectedTableIdentity: null,

@@ -350,6 +350,7 @@ async function saveCellEditAndMove(direction) {
         }
     }
 
+    const contentGenerationBeforeSave = state.contentGeneration;
     if (!await saveCellEdit()) return;
     if (state.selectedTable !== targetTable) return;
     if (targetRowId === editSession.rowId && editSession.updatedRowId !== undefined) {
@@ -376,7 +377,12 @@ async function saveCellEditAndMove(direction) {
             if (state.selectedTable !== targetTable
                 || state.connectionGeneration !== targetConnectionGeneration
                 || state.editingCellInfo) return;
-            const loaded = await loadTableData(false);
+            // That echo reloaded rows after the write; only the web demo, or
+            // an echo that did not finish its reload, needs a load here.
+            const loaded = state.contentGeneration !== contentGenerationBeforeSave
+                && state.refreshedContentGeneration === state.contentGeneration
+                ? true
+                : await loadTableData(false);
             if (state.contentRefreshPromise) continue;
             if (loaded !== true) return;
             break;

@@ -4,7 +4,7 @@
 import { state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
-import { loadTableData } from './grid.js';
+import { reloadAfterOwnMutation } from './grid.js';
 import { noteCellValuesChanged } from './count-cache.js';
 import {
     getCellValueForDisplay,
@@ -202,6 +202,7 @@ export async function clearSelectedCellValues() {
     try {
         if (updates.length > LARGE_CHANGE_WARNING_THRESHOLD && !(await confirmLargeChange(updates.length, 'cells'))) return;
         updateStatus('Clearing cells...');
+        const contentGenerationBeforeClear = state.contentGeneration;
         const outcomes = await backendApi.updateCellBatch(targetTable, updates, label);
         // Cleared values may leave an active filter's match set, so the
         // table's cached filtered counts are no longer trustworthy.
@@ -242,7 +243,10 @@ export async function clearSelectedCellValues() {
         }
 
         if (stillOnTargetTable) {
-            await loadTableData();
+            await reloadAfterOwnMutation(
+                contentGenerationBeforeClear,
+                () => state.selectedTable === targetTable
+            );
             updateToolbarButtons();
             updateStatus(`${label} - Ctrl+S to save`);
         }

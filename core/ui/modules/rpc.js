@@ -122,6 +122,9 @@ async function refreshContentOnce(filename, connectionResult) {
             }
         }
       }
+      if (state.contentGeneration === contentGeneration) {
+        state.refreshedContentGeneration = contentGeneration;
+      }
       return { success: true };
     } catch (error) {
       const message = getErrorMessage(error);

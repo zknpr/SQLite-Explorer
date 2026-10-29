@@ -197,6 +197,33 @@ function hasClippedCells(result) {
     return Object.keys(result?.oversizedCells || {}).length > 0;
 }
 
+/**
+ * Reload the grid after this webview's own mutation. The VS Code host posts
+ * its refreshContent broadcast before the mutation reply, and that refresh
+ * reloads schema, columns and rows after the write, so the page is not fetched
+ * a second time. Without a broadcast (the web demo), or when the newest one
+ * did not finish its reload, the page is loaded here.
+ *
+ * @param {number} contentGenerationBeforeMutation contentGeneration read
+ *   before the mutation request was sent
+ * @param {() => boolean} isTargetCurrent whether the mutated grid is still shown
+ */
+export async function reloadAfterOwnMutation(contentGenerationBeforeMutation, isTargetCurrent) {
+    if (state.contentGeneration !== contentGenerationBeforeMutation) {
+        while (state.contentRefreshPromise) {
+            try {
+                await state.contentRefreshPromise;
+            } catch {
+                // refreshContent shows its failure; load below as before.
+                break;
+            }
+        }
+        if (state.refreshedContentGeneration === state.contentGeneration) return true;
+        if (!isTargetCurrent()) return false;
+    }
+    return loadTableData();
+}
+
 export async function loadTableData(showSpinner = true, saveScrollPosition = true, navIntent) {
     if (!state.selectedTable) return;
 
