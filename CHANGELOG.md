@@ -11,6 +11,7 @@
 
 ### Fixes
 
+- Stop edits from silently deleting rows in tables whose schema declares `ON CONFLICT REPLACE`. An import, added row, cell edit, undo or redo that collided with another row's unique key deleted that row, and undo could not bring it back. These edits now fail with the constraint error and change nothing. Two other schema clauses change the same way: a write that `ON CONFLICT IGNORE` used to skip without notice now fails, and a NULL written to a `NOT NULL ON CONFLICT REPLACE` column fails instead of taking the column's default. A column left out of an insert still takes its default.
 - When the native worker sends a response that cannot be decoded, the pending operation fails at once and the worker stops. The operation used to wait for the query timeout.
 
 ### Maintenance

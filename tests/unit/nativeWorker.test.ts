@@ -1776,7 +1776,7 @@ describe('createNativeDatabaseConnection', () => {
                 .filter(call => call.method === 'run')
                 .map(call => String(call.args[0]));
             assert.match(runSql[0], /^SAVEPOINT "sp_update_rowid_cell_/);
-            assert.strictEqual(runSql[1], 'UPDATE main."native_large" SET "payload" = ? WHERE rowid = ? AND NOT (typeof("payload") IN (\'text\', \'blob\') AND length(CAST("payload" AS BLOB)) > ?)');
+            assert.strictEqual(runSql[1], 'UPDATE OR ABORT main."native_large" SET "payload" = ? WHERE rowid = ? AND NOT (typeof("payload") IN (\'text\', \'blob\') AND length(CAST("payload" AS BLOB)) > ?)');
             assert.deepStrictEqual(runSql.slice(2), ['ROLLBACK']);
         } finally {
             connection.dispose();
@@ -1907,7 +1907,7 @@ describe('createNativeDatabaseConnection', () => {
 
             const update = operationCalls[4];
             const [sql, params] = update.args as [string, unknown[]];
-            assert.match(sql, /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\) WHERE rowid = \?/);
+            assert.match(sql, /^UPDATE OR ABORT main\."docs" SET "payload" = CAST\(\? AS TEXT\) WHERE rowid = \?/);
             assert.match(sql, /typeof\("payload"\) = 'text'/);
             assert.deepStrictEqual(JSON.parse(params[0] as string), {
                 status: 'draft',
@@ -2014,7 +2014,7 @@ describe('createNativeDatabaseConnection', () => {
             const [sql, params] = update.args as [string, unknown[]];
             assert.strictEqual(
                 sql,
-                `UPDATE main."docs" SET "value" = CAST(? AS TEXT) WHERE rowid = ? AND ` +
+                `UPDATE OR ABORT main."docs" SET "value" = CAST(? AS TEXT) WHERE rowid = ? AND ` +
                 `(typeof("value") = 'text' AND CAST("value" AS BLOB) = CAST(? AS BLOB))`
             );
             assert.deepStrictEqual(params, ['before', 7, 'after']);
@@ -2222,10 +2222,10 @@ describe('createNativeDatabaseConnection', () => {
             const runCalls = connection.calls.filter(call => call.method === 'run');
             const runSql = runCalls.map(call => String(call.args[0]));
             assert.match(runSql[0], /^SAVEPOINT "sp_replay_cell_history_/);
-            assert.match(runSql[1], /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
+            assert.match(runSql[1], /^UPDATE OR ABORT main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
             assert.match(runSql[2], /^RELEASE "sp_replay_cell_history_/);
             assert.match(runSql[3], /^SAVEPOINT "sp_update_rowid_cell_/);
-            assert.strictEqual(runSql[4], 'UPDATE main."docs" SET "payload" = ? WHERE rowid = ?');
+            assert.strictEqual(runSql[4], 'UPDATE OR ABORT main."docs" SET "payload" = ? WHERE rowid = ?');
             assert.match(runSql[5], /^RELEASE "sp_update_rowid_cell_/);
             const undoRun = runCalls[1];
             const updateRun = runCalls[4];
@@ -2303,7 +2303,7 @@ describe('createNativeDatabaseConnection', () => {
             assert.strictEqual(call.method, 'run');
 
             const [sql, params] = call.args as [string, unknown[]];
-            assert.match(sql, /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
+            assert.match(sql, /^UPDATE OR ABORT main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
             assert.match(sql, /typeof\("payload"\) = 'text'/);
             assert.deepStrictEqual(JSON.parse(params[0] as string), JSON.parse(replayed));
             assert.strictEqual(params[1], 7);

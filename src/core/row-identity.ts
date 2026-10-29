@@ -107,17 +107,20 @@ export function buildUpdateTriggerProbeSql(
     return `${quoted} = ${quoted}`;
   });
   const predicate = hasIntrinsicRowId ? 'rowid = ?' : '0';
-  return `EXPLAIN UPDATE ${escapeMainIdentifier(table)} SET ${assignments.join(', ')} WHERE ${predicate}`;
+  return `EXPLAIN UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${assignments.join(', ')} WHERE ${predicate}`;
 }
 
-/** Compile the exact INSERT trigger set without executing constraints or user code. */
+/**
+ * Compile the exact INSERT trigger set without executing constraints or user
+ * code. Probes carry the OR ABORT the engines' history writes use.
+ */
 export function buildInsertTriggerProbeSql(
   table: string,
   columns: readonly string[]
 ): string {
   const insert = columns.length === 0
-    ? `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`
-    : `INSERT INTO ${escapeMainIdentifier(table)} ` +
+    ? `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`
+    : `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} ` +
       `(${columns.map(escapeIdentifier).join(', ')}) VALUES ` +
       `(${columns.map(() => 'NULL').join(', ')})`;
   return `EXPLAIN ${insert}`;

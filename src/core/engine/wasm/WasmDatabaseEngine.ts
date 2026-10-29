@@ -354,18 +354,22 @@ function wasmBindPlaceholder(value: CellValue): string {
     : '?';
 }
 
+// Every write this engine records in undo history says OR ABORT. That
+// overrides a schema ON CONFLICT clause: REPLACE would delete conflicting rows
+// history never saw, IGNORE would skip a write history claims, and ROLLBACK
+// would end the enclosing transaction.
 function buildWasmInsert(
   table: string,
   data: Record<string, CellValue>
 ): { columns: string[]; sql: string; params: CellValue[] } {
   const columns = Object.keys(data);
   if (columns.length === 0) {
-    return { columns, sql: `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`, params: [] };
+    return { columns, sql: `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`, params: [] };
   }
   const params = columns.map(col => data[col]);
   return {
     columns,
-    sql: `INSERT INTO ${escapeMainIdentifier(table)} (${columns.map(escapeIdentifier).join(', ')}) ` +
+    sql: `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} (${columns.map(escapeIdentifier).join(', ')}) ` +
       `VALUES (${params.map(wasmBindPlaceholder).join(', ')})`,
     params
   };
@@ -1478,7 +1482,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           wasmBindPlaceholder
         ));
         await this.executeQuery(
-          `UPDATE ${escapeMainIdentifier(table)} SET ` +
+          `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ` +
           `${rowCells.map((cell, index) => (
             `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`
           )).join(', ')} WHERE ${currentPredicate.sql} AND ` +
@@ -1622,7 +1626,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           params.unshift(entry.snapshot.rowId);
         }
         this.runHistoryStatement(
-          `INSERT INTO ${escapeMainIdentifier(table)} ` +
+          `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} ` +
           `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
           params
         );
@@ -1868,7 +1872,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         )).join(', ');
         const predicate = buildRecordIdentityPredicate(rowId, identity);
         const sql =
-          `UPDATE ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${predicate.sql}`;
+          `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${predicate.sql}`;
         let statement = statements.get(sql);
         if (!statement) {
           statement = this.instance.prepare(sql);
@@ -2273,7 +2277,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL semantics,
           // but the expected behavior is to treat NULL as empty object (matching JS fallback).
           sql =
-            `UPDATE ${escapedTbl} SET ${escapedCol} = ` +
+            `UPDATE OR ABORT ${escapedTbl} SET ${escapedCol} = ` +
             `json_patch(COALESCE(${escapedCol}, '{}'), ?) WHERE rowid = ?` +
             (enforcePriorPolicy
               ? ` AND NOT (typeof(${escapedCol}) IN ('text', 'blob') ` +
@@ -2308,13 +2312,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           const newValueObj = applyMergePatch(currentObj, patchObj);
           const newValueStr = JSON.stringify(newValueObj);
 
-          sql = `UPDATE ${escapedTbl} SET ${escapedCol} = ? WHERE rowid = ?`;
+          sql = `UPDATE OR ABORT ${escapedTbl} SET ${escapedCol} = ? WHERE rowid = ?`;
           params = [newValueStr, rowIdNum];
         }
       } else {
         const escapedColumn = escapeIdentifier(column);
         sql =
-          `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ` +
+          `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ` +
           `${wasmBindPlaceholder(value)} WHERE rowid = ?` +
           (enforcePriorPolicy
             ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
@@ -2368,7 +2372,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const escapedTable = escapeMainIdentifier(table);
     const escapedColumn = escapeIdentifier(column);
     const guardedSql =
-      `UPDATE ${escapedTable} SET ${escapedColumn} = ${wasmBindPlaceholder(value)} ` +
+      `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = ${wasmBindPlaceholder(value)} ` +
       `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
       `AND length(CAST(${escapedColumn} AS BLOB)) = ?`;
     const guardedParams = [
@@ -2715,8 +2719,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         if (!statement) {
           await this.assertInsertHasNoUntrackedPrograms(table, columns);
           const sql = columns.length === 0
-            ? `INSERT INTO ${escapedTable} DEFAULT VALUES`
-            : `INSERT INTO ${escapedTable} (${columns.map(escapeIdentifier).join(', ')}) ` +
+            ? `INSERT OR ABORT INTO ${escapedTable} DEFAULT VALUES`
+            : `INSERT OR ABORT INTO ${escapedTable} (${columns.map(escapeIdentifier).join(', ')}) ` +
               `VALUES (${placeholders.join(', ')})`;
           statement = this.instance.prepare(sql);
           statements.set(key, statement);
@@ -3503,7 +3507,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           ? `json_patch(COALESCE(${escapedColumn}, '{}'), ?)`
           : wasmBindPlaceholder(preparedUpdate.storedValue);
         await this.executeQuery(
-          `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${expression} ` +
+          `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${expression} ` +
           'WHERE rowid = ?',
           [storedBindValue, newRowId]
         );
@@ -3643,7 +3647,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           `${escapeIdentifier(update.column)} = ${wasmBindPlaceholder(storedValue)}`
         )).join(', ');
         await this.executeQuery(
-          `UPDATE ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
+          `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
           [
             ...preparedUpdates.map(update => update.storedValue),
             ...oldPredicate.params
@@ -4319,8 +4323,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL semantics,
           // but the expected behavior is to treat NULL as empty object (matching JS fallback).
           const sql = useNativePatch
-            ? `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
-            : `UPDATE ${escapedTable} SET ${escapedColumn} = ${valuePlaceholder} WHERE rowid = ?`;
+            ? `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
+            : `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = ${valuePlaceholder} WHERE rowid = ?`;
 
           const stmt = this.instance.prepare(sql);
 

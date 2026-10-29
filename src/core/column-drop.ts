@@ -612,7 +612,7 @@ export function buildColumnDropRestorePlan(
     renameCurrentTable: `ALTER TABLE ${escapedTable} RENAME TO ${escapedRenameTarget}`,
     createOriginalTable: snapshot.before.tableSql,
     copyRows:
-      `INSERT INTO ${escapedTable} (${copyColumns.join(', ')}) ` +
+      `INSERT OR ABORT INTO ${escapedTable} (${copyColumns.join(', ')}) ` +
       `SELECT ${copyColumns.join(', ')} FROM ${escapedStagingTable}`,
     dropStagingTable: `DROP TABLE ${escapedStagingTable}`,
     restoreSchemaObjects: snapshot.before.schemaObjects.map(object => (

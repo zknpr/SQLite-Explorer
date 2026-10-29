@@ -147,7 +147,7 @@ describe('atomic cell batches', () => {
             internals.readRowIdAliasColumn = async () => undefined;
             internals.assertUpdateHasNoTargetTableTriggerWrites = async () => {};
             internals.instance.prepare = (sql: string, params?: CellValue[]) => {
-                if (/^UPDATE main\."batch_bind_limit" SET "payload" = \? WHERE rowid = \?$/.test(sql)) {
+                if (/^UPDATE OR ABORT main\."batch_bind_limit" SET "payload" = \? WHERE rowid = \?$/.test(sql)) {
                     return {
                         run(bound: CellValue[]) {
                             assert.strictEqual(bound[0], 'after');

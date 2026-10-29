@@ -378,17 +378,21 @@ function groupConsecutive<T>(
   return groups;
 }
 
+// Every write this engine records in undo history says OR ABORT. That
+// overrides a schema ON CONFLICT clause: REPLACE would delete conflicting rows
+// history never saw, IGNORE would skip a write history claims, and ROLLBACK
+// would end the enclosing transaction.
 function buildNativeInsert(
   table: string,
   data: Record<string, CellValue>
 ): { columns: string[]; sql: string; params: CellValue[] } {
   const columns = Object.keys(data);
   if (columns.length === 0) {
-    return { columns, sql: `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`, params: [] };
+    return { columns, sql: `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`, params: [] };
   }
   return {
     columns,
-    sql: `INSERT INTO ${escapeMainIdentifier(table)} ` +
+    sql: `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} ` +
       `(${columns.map(escapeIdentifier).join(', ')}) ` +
       `VALUES (${columns.map(() => '?').join(', ')})`,
     params: columns.map(column => data[column])
@@ -1590,7 +1594,7 @@ export async function createNativeDatabaseConnection(
             return [cell.value ?? null, ...predicate.params];
           });
           const sql =
-            `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ? ` +
+            `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ? ` +
             `WHERE ${predicateSql ?? (identity.kind === 'rowid' ? 'rowid = ?' : '0')}`;
           return { sql, paramsList };
         }).filter(item => item.paramsList.length > 0);
@@ -1844,7 +1848,7 @@ export async function createNativeDatabaseConnection(
               ? `json_patch(COALESCE(${escapedColumn}, '{}'), ?)`
               : '?';
             const result = await worker.call<{ changes: number }>('run', [
-              `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${expression} ` +
+              `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${expression} ` +
               'WHERE rowid = ?',
               [storedBindValue, newRowId]
             ]);
@@ -1978,7 +1982,7 @@ export async function createNativeDatabaseConnection(
               return { update, priorValue, priorState, prepared, storedValue };
             }));
             const updateResult = await worker.call<{ changes: number }>('run', [
-              `UPDATE ${escapeMainIdentifier(table)} SET ` +
+              `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ` +
               `${preparedUpdates.map(({ update }) => `${escapeIdentifier(update.column)} = ?`).join(', ')} ` +
               `WHERE ${oldPredicate.sql}`,
               [
@@ -2142,7 +2146,7 @@ export async function createNativeDatabaseConnection(
           for (const { rowId, value } of column.data) {
             batch.push({
               sql:
-                `UPDATE ${escapeMainIdentifier(table)} SET ${escapeIdentifier(column.name)} = ? ` +
+                `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapeIdentifier(column.name)} = ? ` +
                 'WHERE rowid = ?',
               params: [value, validateRowId(rowId)]
             });
@@ -2410,7 +2414,7 @@ export async function createNativeDatabaseConnection(
                 const guards = plan.expected.map((state, index) => (
                   buildStoredCellPredicate(plan.rowCells[index].columnName, state)
                 ));
-                const sql = `UPDATE ${escapeMainIdentifier(table)} SET `
+                const sql = `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET `
                   + plan.rowCells.map((cell, index) => `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`).join(', ')
                   + ` WHERE ${plan.predicate.sql} AND ${guards.map(guard => `(${guard.sql})`).join(' AND ')}`;
                 const params = [
@@ -2489,7 +2493,7 @@ export async function createNativeDatabaseConnection(
               state
             ));
             const update = await worker.call<{ changes: number }>('run', [
-              `UPDATE ${escapeMainIdentifier(table)} SET ` +
+              `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ` +
               `${rowCells.map((cell, index) => (
                 `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`
               )).join(', ')} WHERE ${currentPredicate.sql} AND ` +
@@ -2899,7 +2903,7 @@ export async function createNativeDatabaseConnection(
             const rowState = buildRowHistoryPredicate(entry.snapshot);
             return {
               insert: {
-                sql: `INSERT INTO ${escapeMainIdentifier(table)} ` +
+                sql: `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} ` +
                   `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
                 params
               },
@@ -3447,7 +3451,7 @@ export async function createNativeDatabaseConnection(
               // but expected behavior is to treat NULL as empty object (matching WASM path)
               const escapedColumn = escapeIdentifier(column);
               sql =
-                `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ` +
+                `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ` +
                 `json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?` +
                 (enforcePriorPolicy
                   ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
@@ -3459,7 +3463,7 @@ export async function createNativeDatabaseConnection(
             } else {
               const escapedColumn = escapeIdentifier(column);
               sql =
-                `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ? WHERE rowid = ?` +
+                `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ? WHERE rowid = ?` +
                 (enforcePriorPolicy
                   ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
                     `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
@@ -3649,12 +3653,12 @@ export async function createNativeDatabaseConnection(
             let params: CellValue[] = [];
 
             if (columns.length === 0) {
-              sql = `INSERT INTO ${escapedTable} DEFAULT VALUES`;
+              sql = `INSERT OR ABORT INTO ${escapedTable} DEFAULT VALUES`;
             } else {
               const colNames = columns.map(escapeIdentifier).join(', ');
               const placeholders = columns.map(() => '?').join(', ');
               params = columns.map(col => row[col]);
-              sql = `INSERT INTO ${escapedTable} (${colNames}) VALUES (${placeholders})`;
+              sql = `INSERT OR ABORT INTO ${escapedTable} (${colNames}) VALUES (${placeholders})`;
             }
             batchItems.push({ sql, params });
           }
@@ -5013,10 +5017,10 @@ export async function createNativeDatabaseConnection(
               // COALESCE handles NULL columns: json_patch(NULL, x) returns NULL per SQL
               // semantics, but a patch on a NULL JSON cell must be applied to '{}' (matching
               // the single-cell updateCell path and both WasmDatabaseEngine json_patch sites).
-              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`;
+              sql = `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`;
             } else {
               // Standard set
-              sql = `UPDATE ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
+              sql = `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = ? WHERE rowid = ?`;
             }
 
             const paramsList = columnUpdates.map(update => {
