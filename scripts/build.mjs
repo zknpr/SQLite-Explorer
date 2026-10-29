@@ -181,37 +181,6 @@ const compileNodeWorker = () =>
   });
 
 /**
- * Compile browser worker bundle.
- * This runs SQLite operations in a web worker.
- */
-const compileBrowserWorker = () =>
-  esbuild.build({
-    ...baseWorkerConfig,
-    outfile: resolve(outDir, 'worker-browser.js'),
-    platform: 'browser',
-    // IIFE (not ESM): this bundle is loaded as a CLASSIC Web Worker via
-    // `new Worker(blobUrl)` in workerFactory.ts. An ESM bundle emits a top-level
-    // `export{...}` which a classic worker cannot parse ("SyntaxError: Unexpected
-    // token 'export'"), so the worker never boots and VS Code Web hangs on load.
-    // IIFE also keeps the classic-worker environment sql.js/emscripten expects.
-    format: 'iife',
-    mainFields: ['browser', 'module', 'main'],
-    external: ['fs/promises', 'path'],
-    define: {
-      ...baseWorkerConfig.define,
-      ...envToDefine({
-        DEV,
-        VSCODE_BROWSER_EXT: true,
-      })
-    },
-    plugins: [
-      polyfillNode({
-        polyfills: {}
-      })
-    ]
-  });
-
-/**
  * Bundle the standalone website worker from its authored source. The source
  * imports the canonical TypeScript view helpers, preventing parser drift.
  */
@@ -454,7 +423,6 @@ const validateBuildOutputs = () => {
     'out/extension.js',
     'out/extension-browser.js',
     'out/worker.cjs',
-    'out/worker-browser.js',
     'assets/sqlite3.wasm',
     'core/ui/viewer.html',
     'website/public/sqlite-viewer/worker.js',
@@ -493,7 +461,6 @@ const compileExt = async (target) => {
     { name: 'compileNodeMain', fn: compileNodeMain },
     { name: 'compileBrowserMain', fn: compileBrowserMain },
     { name: 'compileNodeWorker', fn: compileNodeWorker },
-    { name: 'compileBrowserWorker', fn: compileBrowserWorker },
     { name: 'bundleWebDemoWorker', fn: bundleWebDemoWorker },
     { name: 'copyAssets', fn: copyAssets },
     { name: 'bundleWebview', fn: bundleWebview },
@@ -516,6 +483,11 @@ const compileExt = async (target) => {
     }
     throw new Error(`Build failed: ${failures.length} task(s) failed: ${failures.map(f => f.task.name).join(', ')}`);
   }
+
+  // VS Code Web runs sql.js in the extension host (Trusted Types blocks blob
+  // workers, #418), so no browser worker bundle is built. Remove one left by an
+  // older build so local packaging cannot ship it.
+  fs.rmSync(resolve(outDir, 'worker-browser.js'), { force: true });
 
   // Validate all required outputs exist
   validateBuildOutputs();

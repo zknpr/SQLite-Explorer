@@ -213,8 +213,7 @@ npm test
 
 - `out/extension.js` - Node.js extension (desktop VS Code)
 - `out/extension-browser.js` - Browser extension (VS Code Web)
-- `out/worker.js` - Node.js worker
-- `out/worker-browser.js` - Browser worker
+- `out/worker.cjs` - Node.js worker (VS Code Web runs sql.js in the extension host; there is no browser worker bundle)
 - `core/ui/viewer.html` - Webview UI
 - `website/public/sqlite-viewer/viewer.html` - Web demo viewer (bundled)
 - `assets/sqlite3.wasm` - SQLite WASM binary
