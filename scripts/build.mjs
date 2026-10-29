@@ -381,8 +381,9 @@ const bundleWebDemoViewer = async () => {
     });
     finalJs = jsResult.outputFiles[0].text;
   } catch (err) {
-    console.error('Web demo JS bundling failed:', err);
-    return;
+    // Fail the build: returning here left the tracked demo viewer stale while
+    // the build reported success.
+    throw new Error('Web demo JS bundling failed', { cause: err });
   }
 
   // Minify CSS in production mode
