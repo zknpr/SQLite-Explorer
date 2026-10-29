@@ -2036,12 +2036,11 @@ async function fetchTableData(table, options = {}) {
     sql,
     valueHeaders.length,
     containmentOptions,
-    containmentRawTextColumnIndices
+    containmentRawTextColumnIndices,
+    'blob',
+    true
   );
-  const transportQuery = buildExactNumericTextQuery(
-    containmentQuery.sql,
-    containmentQuery.primaryTransportColumnCount
-  );
+  const transportQuery = containmentQuery.numericTransport;
   const results = db.exec(transportQuery.sql, params, { useBigInt: true });
   const valueSourceRows = mergeCellContainmentMetadataRows(
     results[0]?.values ?? [],
@@ -2095,7 +2094,8 @@ async function fetchTableData(table, options = {}) {
     valueSourceRows,
     transportQuery.valueColumnCount,
     splitSyntheticRowId ? undefined : companionExactTexts,
-    !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
+    !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined,
+    transportQuery.realTextColumnCount
   );
   const valueContained = decodeCellContainment(
     normalized.rows,

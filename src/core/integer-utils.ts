@@ -108,6 +108,11 @@ export interface ExactNumericTextQuery {
   transportColumns: string[];
   /** Present only when a second, SQLite-text companion exists per value. */
   valueColumnCount?: number;
+  /**
+   * Leading columns that have a companion, when fewer than valueColumnCount.
+   * The companions follow all valueColumnCount columns.
+   */
+  realTextColumnCount?: number;
 }
 
 export interface RowIdExactRealTextQuery {
@@ -333,8 +338,16 @@ export function normalizeIntegerRowsForTransport(
   sourceRows: readonly (readonly unknown[])[],
   valueColumnCount?: number,
   transportedExactTexts?: ExactIntegerTextMap,
-  exactIntegerIdentityColumn?: number
+  exactIntegerIdentityColumn?: number,
+  realTextColumnCount = valueColumnCount
 ): { rows: CellValue[][]; exactIntegerTexts?: ExactIntegerTextMap } {
+  if (
+    valueColumnCount !== undefined
+    && (!Number.isInteger(realTextColumnCount) || realTextColumnCount! < 1
+      || realTextColumnCount! > valueColumnCount)
+  ) {
+    throw new Error(`Invalid exact numeric text column count: ${realTextColumnCount}`);
+  }
   let exactIntegerTexts: ExactIntegerTextMap | undefined;
   const setExactText = (rowIndex: number, columnIndex: number, text: string) => {
     exactIntegerTexts ??= {};
@@ -344,10 +357,10 @@ export function normalizeIntegerRowsForTransport(
 
   const rows = sourceRows.map((sourceRow, rowIndex) => {
     const logicalColumnCount = valueColumnCount ?? sourceRow.length;
-    if (valueColumnCount !== undefined && sourceRow.length < valueColumnCount * 2) {
+    if (valueColumnCount !== undefined && sourceRow.length < valueColumnCount + realTextColumnCount!) {
       throw new Error(
         `Exact numeric text row ${rowIndex} has ${sourceRow.length} values; ` +
-        `expected at least ${valueColumnCount * 2}`
+        `expected at least ${valueColumnCount + realTextColumnCount!}`
       );
     }
 
@@ -371,7 +384,7 @@ export function normalizeIntegerRowsForTransport(
         }
       }
 
-      if (valueColumnCount !== undefined) {
+      if (valueColumnCount !== undefined && columnIndex < realTextColumnCount!) {
         const exactRealText = sourceRow[valueColumnCount + columnIndex];
         if (exactRealText !== null && exactRealText !== undefined) {
           if (typeof exactRealText !== 'string') {

@@ -376,6 +376,90 @@ describe('grid cell containment limits', () => {
         ));
     });
 
+    it('returns the same REAL text from the containment statement as from a second numeric layer', async () => {
+        const { buildCellContainmentQuery } = await loadContainmentModule();
+        const { buildExactNumericTextQuery, normalizeIntegerRowsForTransport } =
+            await import('../../src/core/integer-utils.ts');
+        const database = new DatabaseSync(':memory:');
+        try {
+            database.exec('CREATE TABLE t (r REAL, i INTEGER, s TEXT, b BLOB, n)');
+            database.exec(
+                "INSERT INTO t VALUES " +
+                "(0.1, 9007199254740993, 'short', x'00ff', NULL), " +
+                "(1.0 / 3, -1, printf('%.*c', 600, 'é'), zeroblob(700), 2.5), " +
+                "(1e300, 0, 'x', NULL, -0.0), " +
+                "(2.0, NULL, NULL, x'', 'text in an untyped column')"
+            );
+            const execute = (sql: string): unknown[][] => {
+                const statement = database.prepare(sql);
+                statement.setReturnArrays(true);
+                statement.setReadBigInts(true);
+                return statement.all() as unknown as unknown[][];
+            };
+            const source = 'SELECT r, i, s, b, n FROM t ORDER BY rowid';
+            const options = { limit: 4, maxInlineCellBytes: 300, maxPageResponseBytes: 16 * 1024 * 1024 };
+            const rawColumns = [0, 1, 2, 3, 4];
+            const merged = buildCellContainmentQuery(source, 5, options, rawColumns, 'blob', true);
+            const plain = buildCellContainmentQuery(source, 5, options, rawColumns, 'blob');
+            const layered = buildExactNumericTextQuery(plain.sql, plain.primaryTransportColumnCount);
+
+            assert.strictEqual(plain.numericTransport.valueColumnCount, undefined);
+            assert.strictEqual(merged.numericTransport.valueColumnCount, merged.primaryTransportColumnCount);
+            assert.strictEqual(merged.numericTransport.realTextColumnCount, 5);
+            assert.strictEqual(
+                merged.numericTransport.transportColumns.length,
+                merged.primaryTransportColumnCount + 5
+            );
+            const fromMerged = normalizeIntegerRowsForTransport(
+                execute(merged.sql),
+                merged.numericTransport.valueColumnCount,
+                undefined,
+                undefined,
+                merged.numericTransport.realTextColumnCount
+            );
+            const fromLayered = normalizeIntegerRowsForTransport(
+                execute(layered.sql),
+                layered.valueColumnCount
+            );
+            assert.deepStrictEqual(fromMerged, fromLayered);
+            assert.deepStrictEqual(fromMerged.exactIntegerTexts, {
+                0: { 1: '9007199254740993' },
+                1: { 0: '0.333333333333333' },
+                2: { 0: '1.0e+300', 4: '0.0' },
+                3: { 0: '2.0' }
+            });
+            // The oversized TEXT and BLOB of row 1 keep their metadata.
+            assert.deepStrictEqual(
+                fromMerged.rows.map(row => row[merged.metadataColumnIndex]),
+                ['||||', '||t1200|b700|', '||||', '||||']
+            );
+        } finally {
+            database.close();
+        }
+    });
+
+    it('reports an oversized cell in any metadata chunk of a wide row', async () => {
+        const { buildCellContainmentQuery, decodeCellContainment } = await loadContainmentModule();
+        const database = new DatabaseSync(':memory:');
+        try {
+            const columns = Array.from({ length: 450 }, (_, index) => (
+                index === 420 ? `zeroblob(5000) AS c${index}` : `${index} AS c${index}`
+            ));
+            const query = buildCellContainmentQuery(`SELECT ${columns.join(', ')}`, 450, {
+                limit: 1, maxInlineCellBytes: 1024, maxPageResponseBytes: 16 * 1024 * 1024
+            });
+            const statement = database.prepare(query.sql);
+            statement.setReturnArrays(true);
+            const rows = statement.all() as unknown as unknown[][];
+            const decoded = decodeCellContainment(rows, 450, undefined, 16 * 1024 * 1024);
+            assert.deepStrictEqual(decoded.oversizedCells, {
+                0: { 420: { storageClass: 'blob', byteLength: 5000 } }
+            });
+        } finally {
+            database.close();
+        }
+    });
+
     it('keeps 5000 rows of 50 ordinary UUID cells inline through SQLite', async () => {
         const rowCount = 5000;
         const columnCount = 50;

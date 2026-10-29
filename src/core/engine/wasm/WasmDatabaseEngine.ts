@@ -4616,12 +4616,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           valueHeaders.length,
           queryOptions,
           containmentRawTextColumnIndices,
-          'hex'
+          'hex',
+          true
         );
-        const transportQuery = buildExactNumericTextQuery(
-          containmentQuery.sql,
-          containmentQuery.primaryTransportColumnCount
-        );
+        const transportQuery = containmentQuery.numericTransport;
         const stmt = this.instance.prepare(transportQuery.sql, bindParams);
         executionState.stmt = stmt;
         const primaryRows: Array<Array<CellValue | bigint>> = [];
@@ -4703,7 +4701,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           valueSourceRows,
           transportQuery.valueColumnCount,
           splitSyntheticRowId ? undefined : companionExactTexts,
-          !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined
+          !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined,
+          transportQuery.realTextColumnCount
         );
         const valueContained = decodeCellContainment(
           normalized.rows,

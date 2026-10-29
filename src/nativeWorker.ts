@@ -4356,19 +4356,19 @@ export async function createNativeDatabaseConnection(
               sql,
               valueColumns.length,
               queryOptions,
-              containmentRawTextColumnIndices
+              containmentRawTextColumnIndices,
+              'blob',
+              true
             );
-            const transportQuery = buildExactNumericTextQuery(
-              containmentQuery.sql,
-              containmentQuery.primaryTransportColumnCount
-            );
+            const transportQuery = containmentQuery.numericTransport;
             const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
               && hasRowIdShape;
             const primaryResult = await worker.call<NativeQueryResult>('queryNumeric', [
               transportQuery.sql,
               params,
               transportQuery.transportColumns,
-              transportQuery.valueColumnCount
+              transportQuery.valueColumnCount,
+              transportQuery.realTextColumnCount
             ]);
             const valueSourceRows = mergeCellContainmentMetadataRows(
               primaryResult.values,

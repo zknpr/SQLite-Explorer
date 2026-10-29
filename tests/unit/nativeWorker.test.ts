@@ -77,7 +77,7 @@ function loadNativeBoundaryFunction(
     if (functionName === 'executeBoundedQuery') {
         dependencies.compactExactNumericResult = loadNativeWorkerFunction(
             'compactExactNumericResult',
-            ['result', 'transportColumns', 'valueColumnCount']
+            ['result', 'transportColumns', 'valueColumnCount', 'realTextColumnCount = valueColumnCount']
         );
     }
     return loadNativeWorkerFunction(functionName, parameters, dependencies);

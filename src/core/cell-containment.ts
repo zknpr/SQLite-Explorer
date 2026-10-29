@@ -1,4 +1,5 @@
 import { escapeIdentifier } from './sql-utils';
+import type { ExactNumericTextQuery } from './integer-utils';
 import type {
   CellValue,
   CellTextEncoding,
@@ -33,6 +34,7 @@ const CELL_SOURCE_ALIAS = '__sqlite_explorer_cell_source';
 const CELL_VALUE_PREFIX = '__sqlite_explorer_cell_value_';
 const CELL_METADATA_ALIAS = '__sqlite_explorer_cell_metadata';
 const CELL_RAW_TEXT_PREFIX = '__sqlite_explorer_cell_raw_text_';
+const CELL_REAL_TEXT_PREFIX = '__sqlite_explorer_cell_real_text_';
 const RAW_TEXT_DECODE_SLAB_BYTES = 64 * 1024;
 const METADATA_CHUNK_COLUMNS = 400;
 const MAX_UTF8_BYTES_PER_CODE_POINT = 4;
@@ -63,6 +65,11 @@ export interface CellContainmentQuery {
   /** Requested raw validation was omitted to stay within SQLite's width cap. */
   rawTextValidationUnavailable: boolean;
   effectiveInlineCellBytes: number;
+  /**
+   * The statement as an exact-numeric transport. With a REAL text sidecar it
+   * covers the value columns only, after every primary transport column.
+   */
+  numericTransport: ExactNumericTextQuery;
 }
 
 export interface DecodedCellContainment {
@@ -146,16 +153,26 @@ function metadataToken(column: string, byteLimit: number): string {
   );
 }
 
-/** Keep metadata in one packed column so wide grids do not triple result width. */
+/**
+ * Keep metadata in one packed column so wide grids do not triple result width.
+ * A chunk with no oversized cell is its constant run of empty tokens, so most
+ * rows skip the per-row compound select.
+ */
 function buildPackedMetadataExpression(columns: string[], byteLimit: number): string {
   const chunks: string[] = [];
   for (let offset = 0; offset < columns.length; offset += METADATA_CHUNK_COLUMNS) {
-    const tokens = columns.slice(offset, offset + METADATA_CHUNK_COLUMNS)
-      .map(column => metadataToken(column, byteLimit));
-    const compound = tokens.map((token, index) => (
-      `${index === 0 ? 'SELECT' : 'UNION ALL SELECT'} ${token} AS "cell"`
+    const chunkColumns = columns.slice(offset, offset + METADATA_CHUNK_COLUMNS);
+    const compound = chunkColumns.map((column, index) => (
+      `${index === 0 ? 'SELECT' : 'UNION ALL SELECT'} ${metadataToken(column, byteLimit)} AS "cell"`
     )).join('\n');
-    chunks.push(`(SELECT group_concat("cell", '|') FROM (\n${compound}\n))`);
+    const anyOversized = chunkColumns
+      .map(column => `(${oversizedPredicate(column, byteLimit)})`)
+      .join(' OR ');
+    chunks.push(
+      `CASE WHEN ${anyOversized} ` +
+      `THEN (SELECT group_concat("cell", '|') FROM (\n${compound}\n)) ` +
+      `ELSE '${'|'.repeat(chunkColumns.length - 1)}' END`
+    );
   }
   return chunks.join(` || '|' || `);
 }
@@ -169,7 +186,8 @@ export function buildCellContainmentQuery(
   columnCount: number,
   options: Pick<TableQueryOptions, 'limit' | 'maxInlineCellBytes' | 'maxPageResponseBytes'>,
   rawTextColumnIndices: readonly number[] = [],
-  rawTextTransport: 'blob' | 'hex' = 'blob'
+  rawTextTransport: 'blob' | 'hex' = 'blob',
+  includeRealTextSidecar = false
 ): CellContainmentQuery {
   const effectiveInlineCellBytes = deriveEffectiveInlineCellBytes(options, columnCount);
   const textCharacterWindow = Math.floor(
@@ -232,19 +250,43 @@ export function buildCellContainmentQuery(
       )
     : '';
 
+  const primaryTransportColumnCount =
+    columnCount + (metadataUsesTrailer ? 0 : 1) + projectedRawTextColumnIndices.length;
+  // Clipping never changes a REAL, so the source value's SQLite text is the
+  // transported value's. Only value columns can hold one: metadata and raw
+  // TEXT companions are always TEXT or NULL.
+  const realTextColumnCount = includeRealTextSidecar
+    && !metadataUsesTrailer
+    && primaryTransportColumnCount + columnCount <= SQLITE_MAX_RESULT_COLUMNS
+    ? columnCount
+    : 0;
+  const realTextNames = Array.from({ length: realTextColumnCount }, (_, index) => (
+    `${CELL_REAL_TEXT_PREFIX}${index}`
+  ));
+  const realTextProjection = realTextNames.map((name, index) => (
+    `, CASE WHEN typeof(${quotedValues[index]}) = 'real' ` +
+    `THEN CAST(${quotedValues[index]} AS TEXT) END AS ${escapeIdentifier(name)}`
+  )).join('');
+  const sql =
+    sourceCte +
+    `SELECT ${projectedValues.join(', ')}` +
+    `${primaryMetadataProjection}${privateProjection}${realTextProjection} ` +
+    `FROM ${quotedSource}` +
+    metadataTrailerProjection;
+  const transportColumns = [
+    ...valueNames,
+    ...(metadataUsesTrailer ? [] : [CELL_METADATA_ALIAS]),
+    ...projectedRawTextColumnIndices.map((_, keyIndex) => `${CELL_RAW_TEXT_PREFIX}${keyIndex}`),
+    ...realTextNames
+  ];
+
   return {
     // OFFSET prevents query flattening. At the width ceiling, MATERIALIZED
     // lets the value rows and their one-row metadata trailer scan the same
     // ephemeral result instead of evaluating a volatile source twice.
-    sql:
-      sourceCte +
-      `SELECT ${projectedValues.join(', ')}` +
-      `${primaryMetadataProjection}${privateProjection} ` +
-      `FROM ${quotedSource}` +
-      metadataTrailerProjection,
+    sql,
     metadataTrailer: metadataUsesTrailer,
-    primaryTransportColumnCount:
-      columnCount + (metadataUsesTrailer ? 0 : 1) + projectedRawTextColumnIndices.length,
+    primaryTransportColumnCount,
     valueColumnCount: columnCount,
     metadataColumnIndex: columnCount,
     transportColumnCount: columnCount + 1 + projectedRawTextColumnIndices.length,
@@ -253,7 +295,15 @@ export function buildCellContainmentQuery(
     rawTextTransport,
     rawTextColumnIndices: projectedRawTextColumnIndices,
     rawTextValidationUnavailable,
-    effectiveInlineCellBytes
+    effectiveInlineCellBytes,
+    numericTransport: realTextColumnCount > 0
+      ? {
+          sql,
+          transportColumns,
+          valueColumnCount: primaryTransportColumnCount,
+          realTextColumnCount
+        }
+      : { sql, transportColumns }
   };
 }
 

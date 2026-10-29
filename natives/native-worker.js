@@ -1534,16 +1534,20 @@ function assertMainConnectionCellReadSessionAllows(method) {
 }
 
 /** Compact generated numeric metadata before crossing the V8 RPC boundary. */
-function compactExactNumericResult(result, transportColumns, valueColumnCount) {
+function compactExactNumericResult(result, transportColumns, valueColumnCount, realTextColumnCount = valueColumnCount) {
   if (!Array.isArray(transportColumns) || transportColumns.length < 1) {
     throw new Error('Invalid exact numeric transport column list');
   }
   const hasRealTextSidecar = valueColumnCount !== undefined;
   const logicalColumnCount = hasRealTextSidecar ? valueColumnCount : transportColumns.length;
+  // A sidecar may cover only the leading columns; it follows all of them.
+  const sidecarColumnCount = hasRealTextSidecar ? realTextColumnCount : 0;
   if (
     !Number.isInteger(logicalColumnCount) ||
     logicalColumnCount < 1 ||
-    transportColumns.length !== logicalColumnCount * (hasRealTextSidecar ? 2 : 1)
+    !Number.isInteger(sidecarColumnCount) ||
+    (hasRealTextSidecar && (sidecarColumnCount < 1 || sidecarColumnCount > logicalColumnCount)) ||
+    transportColumns.length !== logicalColumnCount + sidecarColumnCount
   ) {
     throw new Error('Invalid exact numeric transport column list');
   }
@@ -1568,7 +1572,7 @@ function compactExactNumericResult(result, transportColumns, valueColumnCount) {
     const orderedRow = inOrder ? sourceRow : mapping.map(index => sourceRow[index]);
     values.push(orderedRow.slice(0, logicalColumnCount));
     if (!hasRealTextSidecar) continue;
-    for (let columnIndex = 0; columnIndex < logicalColumnCount; columnIndex++) {
+    for (let columnIndex = 0; columnIndex < sidecarColumnCount; columnIndex++) {
       const exactText = orderedRow[logicalColumnCount + columnIndex];
       if (exactText === null || exactText === undefined) continue;
       if (typeof exactText !== 'string') {
@@ -2173,12 +2177,13 @@ async function handleRequest(request) {
       }
 
       case "queryNumeric": {
-        const [sql, params, transportColumns, valueColumnCount] = args;
+        const [sql, params, transportColumns, valueColumnCount, realTextColumnCount] = args;
         if (!db) throw new Error("Database not open");
         result = compactExactNumericResult(
           executeQuery(db, sql, params),
           transportColumns,
-          valueColumnCount
+          valueColumnCount,
+          realTextColumnCount ?? valueColumnCount
         );
         break;
       }
