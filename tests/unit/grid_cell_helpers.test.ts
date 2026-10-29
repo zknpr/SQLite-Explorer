@@ -26,6 +26,13 @@ const TEXT_BYTES = [
     '8080' + '61'.repeat(400), 'c3' + '80'.repeat(400), '61'.repeat(100) + '00' + '62'.repeat(300)
 ];
 
+// Both sides of every edge the UTF-8 check draws. Plain bytes skip the
+// decoder's byte comparison, so a wrong "plain" would let a lossy string
+// stand for the stored bytes.
+const NOT_PLAIN_UTF8 = ['c1bf', 'e09fbf', 'edbfbf', 'f08fbfbf', 'f5808080', 'f09f98', '41c3'];
+const PLAIN_UTF8 = ['c280', 'dfbf', 'e0a080', 'ed9fbf', 'ee8080', 'efbfbd', 'f0908080', 'f48fbfbf', 'efb790', 'f09fbfbe'];
+TEXT_BYTES.push(...NOT_PLAIN_UTF8, ...PLAIN_UTF8);
+
 const ROWID_FIXTURE_SQL = [
     'CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT, t TEXT, b BLOB, r REAL, i INTEGER, u)',
     ...TEXT_BYTES.map((hex, index) => {
@@ -171,7 +178,8 @@ describe('grid cell helpers on sql.js', () => {
         };
         const fragments = [[0x41], [0x00], [0xc3, 0xa9], [0xe2, 0x82, 0xac], [0xf0, 0x9f, 0x98, 0x80],
             [0xef, 0xbb, 0xbf], [0xed, 0xa0, 0x80], [0xc0, 0x80], [0xe0, 0x82, 0x80], [0xf4, 0x90, 0x80, 0x80],
-            [0xef, 0xbf, 0xbe], [0xef, 0xbf, 0xbf], [0xe4, 0xb8], [0x80], [0xff], [0x7f], [0x0a]];
+            [0xef, 0xbf, 0xbe], [0xef, 0xbf, 0xbf], [0xe4, 0xb8], [0x80], [0xff], [0x7f], [0x0a],
+            ...[...NOT_PLAIN_UTF8, ...PLAIN_UTF8].map(hex => [...Buffer.from(hex, 'hex')])];
         const strict = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
         const plainUtf8 = (bytes: Uint8Array) => {
             if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return false;
@@ -219,6 +227,13 @@ describe('grid cell helpers on sql.js', () => {
                 const row = Array.from({ length: 5 }, () => values[next(values.length)]);
                 const [sqlTokens, helperTokens] = one(metadataSql, [...row, next(16)]);
                 assert.equal(helperTokens, sqlTokens === '||||' ? null : sqlTokens);
+            }
+
+            for (const [hex, plain] of [...NOT_PLAIN_UTF8.map(hex => [hex, false] as const),
+                ...PLAIN_UTF8.map(hex => [hex, true] as const)]) {
+                const bytes = new Uint8Array(Buffer.from(hex, 'hex'));
+                const [check] = one('SELECT sqlite_explorer_cell_text_check(CAST(?1 AS TEXT), 100)', [bytes]);
+                assert.deepEqual(check, plain ? null : bytes, `${hex} should ${plain ? '' : 'not '}be plain UTF-8`);
             }
 
             for (const [label, value, limit] of [['a negative limit', "'x'", '-1'], ['a REAL limit', "'x'", '1.5']]) {

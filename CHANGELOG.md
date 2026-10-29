@@ -6,7 +6,7 @@
 
 - CSV and JSON imports insert up to 500 rows per engine call instead of one, and the native engine sends each step for those rows to its worker in one message. In a local test a 100,000-row import took 9 seconds instead of 89 on the native engine and 6 seconds instead of 21 on WebAssembly. Undoing and redoing an import is 1.5 to 5 times faster, and native undo and redo of deleted rows use the same batched path.
 - An import writes one line per batch to the SQLite Explorer output channel. It wrote one line per row, with the row's values.
-- Table pages load about twice as fast on both engines. Three functions in the bundled SQLite runtime now clip oversized cells, report their sizes and check that TEXT is plain UTF-8, where the page query used several SQL expressions per cell. The page also computes exact REAL text for value columns only, and the native engine converts rows in one pass instead of two. In a local test against 1.8.3, a 5,000-row page took 26 ms instead of 53 at 11 columns and 112 ms instead of 288 at 51 columns on WebAssembly, and 42 ms instead of 88 and 165 ms instead of 391 on the native engine. Databases stored as UTF-16 keep the previous SQL.
+- Fetching a table page from the database takes about half as long on both engines. Three functions in the bundled SQLite runtime now clip oversized cells, report their sizes and check that TEXT is plain UTF-8, where the page query used several SQL expressions per cell. The page also computes exact REAL text for value columns only, and the native engine converts rows in one pass instead of two. In a local test against 1.8.3, fetching a 5,000-row page took 26 ms instead of 53 at 11 columns and 112 ms instead of 288 at 51 columns on WebAssembly, and 42 ms instead of 88 and 165 ms instead of 391 on the native engine. These times end when the extension host has the page, before it reaches the grid. Databases stored as UTF-16 keep the previous SQL.
 - After a Tab-committed edit, an inserted row, deleted rows or cleared cells, the grid requests its page once instead of twice. VS Code already reloads the grid after each edit, and the editor loaded the same page again.
 
 ### Fixes
@@ -19,7 +19,7 @@
 - Stop building and packaging the browser worker bundle. VS Code Web runs SQLite in the extension host, so nothing loaded it.
 - Ship the extension icon at 256 by 256 pixels, the size VS Code asks for, instead of 500 by 500. With the removed bundle, each VSIX is 210 KB smaller.
 - Fail the build when the web demo viewer cannot be bundled. The build used to report success and keep the previous viewer.
-- Rebuild the WebAssembly runtime and the five native query-plan libraries from `src/runtime/query-plan.c` with the grid cell functions. The native engine now loads its library when it reads the first table page, not at the first Explain. SQL still cannot load extensions, and schema code such as views and triggers cannot call the new functions.
+- Rebuild the WebAssembly runtime and the five native query-plan libraries from `src/runtime/query-plan.c` with the grid cell functions. The native engine now loads its library when it reads the first table page, not at the first Explain. Schema code such as views and triggers cannot call the new functions.
 
 ## 1.8.3
 
