@@ -111,8 +111,14 @@ function bundledNativeBinary(): string | undefined {
         : process.platform === 'linux'
             ? (process.arch === 'arm64' ? 'aarch64-linux-gnu' : 'x86_64-linux-gnu')
             : process.platform === 'win32' && process.arch === 'x64' ? 'x86_64-windows' : undefined;
+    // The five-target CI workflow names the runtime each runner must use.
+    const expected = process.env.FUZZ_EXPECT_TARGET;
+    if (expected && expected !== platformDir) {
+        throw new Error(`Expected native target ${expected}, resolved ${platformDir ?? 'none'}`);
+    }
     if (!platformDir) return undefined;
     const binary = path.join('natives', platformDir, process.platform === 'win32' ? 'tjs.exe' : 'tjs');
+    if (expected && !fs.existsSync(binary)) throw new Error(`Missing native runtime ${binary}`);
     return fs.existsSync(binary) ? binary : undefined;
 }
 
@@ -131,7 +137,8 @@ async function openNative(image: Uint8Array): Promise<PageBackend> {
         dispose: () => {
             nativeHelpersEnabled = true;
             native.workerMethods[Symbol.dispose]();
-            fs.rmSync(directory, { recursive: true, force: true });
+            // Windows can hold the file briefly after the worker exits.
+            fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         }
     };
 }

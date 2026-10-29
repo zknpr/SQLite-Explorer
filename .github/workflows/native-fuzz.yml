@@ -1,8 +1,8 @@
 name: Native fuzz
 
-# Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/) against the
-# bundled native worker on all five shipped txiki.js targets (CI's native lanes
-# run on Linux x64 only). Opt-in: manual, or on dev pushes and pull requests to
+# Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/) and the grid page
+# differential against the bundled native worker on all five shipped txiki.js
+# targets (CI's native lanes run on Linux x64 only). Opt-in: manual, or on dev pushes and pull requests to
 # dev that change the harness, the runtimes, the worker client it drives, the
 # toolchain or this workflow.
 on:
@@ -11,6 +11,7 @@ on:
     branches: [dev]
     paths:
       - 'tests/fuzz/**'
+      - 'tests/unit/grid_cell_helpers.test.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
@@ -23,6 +24,7 @@ on:
     branches: [dev]
     paths:
       - 'tests/fuzz/**'
+      - 'tests/unit/grid_cell_helpers.test.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
@@ -84,6 +86,15 @@ jobs:
         run: |
           set -o pipefail
           npm run test:native-fuzz 2>&1 | tee native-fuzz.log
+
+      # Grid pages with the runtime's cell helpers on and off, through the
+      # production worker. No other CI lane loads natives/<target>'s
+      # query-plan library.
+      - name: Native grid pages
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts
 
       - name: Summary
         if: always()
