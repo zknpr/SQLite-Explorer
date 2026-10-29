@@ -953,7 +953,9 @@ function executeQuery(db, sql, params) {
       const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
       lastResult = {
         columns,
-        values: (rows || []).map(row => columns.map(column => row[column])),
+        // Every row object has the same keys in the same order, so its values
+        // line up with `columns`; one native call beats a lookup per cell.
+        values: (rows || []).map(row => Object.values(row)),
         rowCount: rows?.length ?? 0
       };
       if (columns.length > 0) resultSets.push(lastResult);
@@ -1556,10 +1558,14 @@ function compactExactNumericResult(result, transportColumns, valueColumnCount) {
   if (mapping.some(index => index < 0)) {
     throw new Error('Native query result omitted exact numeric transport metadata');
   }
+  // Generated transport aliases normally arrive in projection order. Rows are
+  // then used as they are, cut to the logical columns after the sidecar check.
+  const inOrder = result.columns.length === mapping.length
+    && mapping.every((index, position) => index === position);
 
   for (let rowIndex = 0; rowIndex < result.values.length; rowIndex++) {
     const sourceRow = result.values[rowIndex];
-    const orderedRow = mapping.map(index => sourceRow[index]);
+    const orderedRow = inOrder ? sourceRow : mapping.map(index => sourceRow[index]);
     values.push(orderedRow.slice(0, logicalColumnCount));
     if (!hasRealTextSidecar) continue;
     for (let columnIndex = 0; columnIndex < logicalColumnCount; columnIndex++) {
