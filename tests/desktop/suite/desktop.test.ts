@@ -787,7 +787,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
         assertFileBytes(
           sqlPath,
           'INSERT INTO "export_cases" ("id", "payload", "nul_text") VALUES ' +
-          '(1, X\'000102fdfeff\', CAST(X\'6265666f7265006166746572\' AS TEXT));'
+          '(1, X\'000102fdfeff\', (\'before\' || char(0) || \'after\'));'
         );
         assert.equal(
           fs.readdirSync(fixtureRoot).some(name => /^\.export-.*\.tmp$/.test(name)),
