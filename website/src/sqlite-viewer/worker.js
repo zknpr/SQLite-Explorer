@@ -43,7 +43,6 @@ import {
   assertUsableSqlIdentifier,
   escapeIdentifier,
   escapeMainIdentifier,
-  escapeLikePattern,
   validateRowId
 } from '../../../src/core/sql-utils.ts';
 import {
@@ -137,13 +136,17 @@ import {
 } from '../../../src/core/cell-containment.ts';
 import {
   assembleKeysetSelect,
+  buildRowIdLookupSelect,
   computeKeysetKey,
   computeKeysetQueryTag,
   keysetFallbackOrder,
   mintKeysetAnchors,
   ordersBySyntheticRowId,
-  resolveKeysetPlan
+  resolveKeysetPlan,
+  ROW_ID_LOOKUP_ROW,
+  rowIdLookupApplies
 } from '../../../src/core/keyset-pagination.ts';
+import { buildFilterConditions } from '../../../src/core/query-builder.ts';
 import { normalizeTablePageOptions } from '../../../src/core/table-pagination.ts';
 import {
   decodeCellMetadata,
@@ -559,6 +562,37 @@ function getCellTextEncoding() {
 
 /** Per open database: whether the runtime's cell helpers are callable. */
 const cellHelperDatabases = new WeakMap();
+/** Per open database: whether the runtime has sqlite_explorer_like_any. */
+const likeAnyDatabases = new WeakMap();
+
+/** Whether a global filter can call sqlite_explorer_like_any: the cell helpers' UTF-8 rule, then a probe. */
+function likeAnyApplies() {
+  if (!cellHelpersApply()) return false;
+  let available = likeAnyDatabases.get(db);
+  if (available === undefined) {
+    try {
+      db.exec("SELECT sqlite_explorer_like_any('a', 'A')");
+      available = true;
+    } catch (error) {
+      available = false;
+      console.warn("[Worker] The runtime's filter function is unavailable; filters use one LIKE per column:", getErrorMessage(error));
+    }
+    likeAnyDatabases.set(db, available);
+  }
+  return available;
+}
+
+/** Filters for a page or count, as the extension's engines build them. */
+function buildDemoFilterConditions(filters, globalFilter, columns, globalFilterColumns) {
+  const globalFilterActive = getActiveFilterValue(globalFilter) !== undefined;
+  return buildFilterConditions(
+    // An entry without a column name has never filtered anything.
+    (filters ?? []).filter(filter => filter.column),
+    globalFilter,
+    globalFilterActive ? resolveGlobalFilterColumns(columns, globalFilterColumns) : [],
+    { likeAny: globalFilterActive && likeAnyApplies() }
+  );
+}
 const cellHelperEncodingLogged = new WeakSet();
 
 /**
@@ -1904,6 +1938,7 @@ async function fetchTableData(table, options = {}) {
   let primaryKeyContext;
   let tableIdentity;
   let isRowIdTable = false;
+  let rowIdTableType;
   if (columns?.[0]?.toLowerCase() === 'rowid') {
     tableIdentity = await findTableIdentity(table);
     if (tableIdentity?.kind === 'primaryKey') {
@@ -1925,6 +1960,7 @@ async function fetchTableData(table, options = {}) {
       // so this early read matches the fetch below.
       const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
       isRowIdTable = (authority[0]?.values.length ?? 0) > 0;
+      rowIdTableType = authority[0]?.values[0]?.[0];
     }
   }
   const keysetIdentity = tableIdentity?.kind === 'primaryKey'
@@ -1950,39 +1986,12 @@ async function fetchTableData(table, options = {}) {
   }
 
   // Build WHERE clause from filters array and globalFilter
-  const whereClauses = [];
-  let params = [];
+  const { conditions: whereClauses, params: filterParams } = buildDemoFilterConditions(
+    filters, globalFilter, columns, globalFilterColumns
+  );
+  let params;
 
-  // Column-specific filters: [{column: 'name', value: 'foo'}, ...]
-  if (filters && filters.length > 0) {
-    for (const f of filters) {
-      const filterValue = getActiveFilterValue(f.value);
-      if (f.column && filterValue !== undefined) {
-        whereClauses.push(`${escapeIdentifier(f.column)} LIKE ? ESCAPE '\\'`);
-        params.push(`%${escapeLikePattern(filterValue)}%`);
-      }
-    }
-  }
-
-  // Global filter: search across all text columns
-  const activeGlobalFilter = getActiveFilterValue(globalFilter);
-  if (activeGlobalFilter !== undefined) {
-    // Get column names to search
-    const searchCols = resolveGlobalFilterColumns(columns, globalFilterColumns);
-    if (searchCols.length > 0) {
-      const globalClauses = searchCols.map(c => (
-        `${escapeIdentifier(c)} LIKE ? ESCAPE '\\'`
-      ));
-      whereClauses.push(`(${globalClauses.join(' OR ')})`);
-      // Add the global filter parameter for each column in the OR clause
-      for (let i = 0; i < searchCols.length; i++) {
-        params.push(`%${escapeLikePattern(activeGlobalFilter)}%`);
-      }
-    }
-  }
-
-  const filterParams = params;
-  const buildPageQuery = selectListSql => {
+  const buildPageQuery = (selectListSql, rowIdLookupSelectListSql) => {
     if (keysetPlan) {
       // Validated seek: the shared assembly owns WHERE, ORDER BY, and LIMIT so
       // this worker cannot drift from the extension engines. Any invalid or
@@ -1992,14 +2001,13 @@ async function fetchTableData(table, options = {}) {
         escapedTable: escapeMainIdentifier(table),
         whereClauses,
         filterParams,
-        plan: keysetPlan
+        plan: keysetPlan,
+        rowIdLookupSelectListSql
       });
     }
 
-    let querySql = `SELECT ${selectListSql} FROM ${escapeMainIdentifier(table)}`;
-    if (whereClauses.length > 0) {
-      querySql += ` WHERE ${whereClauses.join(' AND ')}`;
-    }
+    const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
+    let querySql = `SELECT ${selectListSql} FROM ${escapeMainIdentifier(table)}${whereSql}`;
 
     // Add ordering. One total order for both paths: an anchorable query's
     // OFFSET fallback adopts the exact keyset ORDER BY (full key columns,
@@ -2011,23 +2019,46 @@ async function fetchTableData(table, options = {}) {
     const orderedColumns = fallbackOrder
       ? fallbackOrder.orderByColumns
       : (identityOrderBy ?? (effectiveOrderBy ? [effectiveOrderBy] : []));
+    const direction = fallbackOrder
+      ? fallbackOrder.orderDir
+      : (orderDir === 'DESC' ? 'DESC' : 'ASC');
+    const pageSql = ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
+    if (rowIdLookupSelectListSql !== undefined && rowIdLookupApplies(orderedColumns)) {
+      return {
+        sql: buildRowIdLookupSelect({
+          selectListSql: rowIdLookupSelectListSql,
+          escapedTable: escapeMainIdentifier(table),
+          whereSql,
+          keyColumns: orderedColumns,
+          innerDirection: direction,
+          outerDirection: direction,
+          pageSql
+        }),
+        params: filterParams
+      };
+    }
     if (orderedColumns.length > 0) {
-      const direction = fallbackOrder
-        ? fallbackOrder.orderDir
-        : (orderDir === 'DESC' ? 'DESC' : 'ASC');
       querySql += ` ORDER BY ${orderedColumns
         .map(column => `${escapeIdentifier(column)} ${direction}`)
         .join(', ')}`;
     }
 
     // Add pagination
-    querySql += ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
+    querySql += pageSql;
     return { sql: querySql, params: filterParams };
   };
-  const { sql, params: pageParams } = buildPageQuery(columnList);
+  // An ordinary rowid table's sorted page sorts only its keys and reads its
+  // rows by rowid, as the extension's engines do (buildRowIdLookupSelect).
+  // A virtual table need not serve rowid IN without a scan.
+  const rowIdLookup = isRowIdTable && rowIdTableType !== 'virtual';
+  const lookupColumn = column => `${ROW_ID_LOOKUP_ROW}.${escapeIdentifier(column)}`;
+  const lookupColumnList = !rowIdLookup ? undefined
+    : columnList === '*' ? `${ROW_ID_LOOKUP_ROW}.*`
+      : valueProjectionColumns.map(lookupColumn).join(', ');
+  const { sql, params: pageParams } = buildPageQuery(columnList, lookupColumnList);
   params = pageParams;
   const rowIdQuery = splitSyntheticRowId
-    ? buildPageQuery(escapeIdentifier('rowid'))
+    ? buildPageQuery(escapeIdentifier('rowid'), rowIdLookup ? lookupColumn('rowid') : undefined)
     : undefined;
 
   const sourceStatement = db.prepare(sql, params);
@@ -2274,35 +2305,9 @@ async function fetchTableCount(table, options = {}) {
   let sql = `SELECT COUNT(*) FROM ${escapeMainIdentifier(table)}`;
 
   // Build WHERE clause from filters array and globalFilter
-  const whereClauses = [];
-  const params = [];
-
-  // Column-specific filters
-  if (filters && filters.length > 0) {
-    for (const f of filters) {
-      const filterValue = getActiveFilterValue(f.value);
-      if (f.column && filterValue !== undefined) {
-        whereClauses.push(`${escapeIdentifier(f.column)} LIKE ? ESCAPE '\\'`);
-        params.push(`%${escapeLikePattern(filterValue)}%`);
-      }
-    }
-  }
-
-  // Global filter
-  const activeGlobalFilter = getActiveFilterValue(globalFilter);
-  if (activeGlobalFilter !== undefined) {
-    const searchCols = resolveGlobalFilterColumns(columns, globalFilterColumns);
-    if (searchCols.length > 0) {
-      const globalClauses = searchCols.map(c => (
-        `${escapeIdentifier(c)} LIKE ? ESCAPE '\\'`
-      ));
-      whereClauses.push(`(${globalClauses.join(' OR ')})`);
-      // Add the global filter parameter for each column in the OR clause
-      for (let i = 0; i < searchCols.length; i++) {
-        params.push(`%${escapeLikePattern(activeGlobalFilter)}%`);
-      }
-    }
-  }
+  const { conditions: whereClauses, params } = buildDemoFilterConditions(
+    filters, globalFilter, columns, globalFilterColumns
+  );
 
   if (whereClauses.length > 0) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;

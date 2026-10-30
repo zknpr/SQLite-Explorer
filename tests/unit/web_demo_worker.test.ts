@@ -3540,10 +3540,11 @@ describe('web demo view worker', () => {
             options(2, { mode: 'after', anchor: offsetPages[1].keysetAnchors.last })
         );
         assert.deepStrictEqual(Array.from(next.rows), Array.from(offsetPages[2].rows));
-        // The fallback SELECT itself carries the full deterministic key order.
+        // The fallback SELECT itself carries the full deterministic key order,
+        // in the rowid lookup's inner query that sorts the page's keys.
         assert.ok(
             observed.some(sql => sql.includes(
-                'FROM main."demo_ties" ORDER BY "s" DESC, "rowid" DESC LIMIT 4 OFFSET 4'
+                'FROM main."demo_ties" ORDER BY main."demo_ties"."s" DESC, main."demo_ties"."rowid" DESC LIMIT 4 OFFSET 4'
             )),
             `expected the deterministic fallback ORDER BY, saw:\n${observed.join('\n')}`
         );
@@ -5657,5 +5658,71 @@ describe('web demo view worker', () => {
             ),
             'kept'
         );
+    });
+});
+
+describe('web demo filters and sorts through the runtime and the rowid lookup', () => {
+    const plainOrder = (column: string, dir: string) => `"${column}" ${dir}, rowid ${dir}`;
+    async function expectedIds(worker: WorkerHarness, sql: string, params: unknown[] = []) {
+        const result = await worker.invoke('executeReadQuery', sql, JSON.stringify(params));
+        return Array.from(result.rows, (row: unknown[]) => row[0]);
+    }
+
+    it('matches the LIKE chain for global filters, through sqlite_explorer_like_any', async () => {
+        const observed: string[] = [];
+        const worker = await createWorkerHarness({ onSql: (kind, sql) => { if (kind === 'prepare') observed.push(sql); } });
+        await worker.invoke('runQuery',
+            'CREATE TABLE demo_filter (a, b, c); INSERT INTO demo_filter VALUES ' +
+            "('John Smith', 1.5, 9999), ('é', 'É', NULL), (CAST(x'c3a9a9' AS TEXT), 19999, -1.0e+20), " +
+            "(x'616263', 'abc', 0), (CAST(x'ffc3a9' AS TEXT), 'x', 1e999), ('nothing', 'here', 7)");
+        const columns = ['rowid', 'a', 'b', 'c'];
+        for (const needle of ['john', 'JOHN', 'é', 'É', '99', '1.5', 'e+', 'inf', 'abc', '%', 'zzz']) {
+            observed.length = 0;
+            const page = await worker.invoke('fetchTableData', 'demo_filter', {
+                columns, globalFilterColumns: ['a', 'b', 'c'], globalFilter: needle, limit: 100, offset: 0
+            });
+            assert.ok(observed.some(sql => sql.includes('sqlite_explorer_like_any(')), needle);
+            const pattern = `%${needle.replace(/[\\%_]/g, character => `\\${character}`)}%`;
+            const expected = await expectedIds(worker,
+                "SELECT rowid FROM demo_filter WHERE a LIKE ? ESCAPE '\\' OR b LIKE ? ESCAPE '\\' OR c LIKE ? ESCAPE '\\' ORDER BY rowid",
+                [pattern, pattern, pattern]);
+            assert.deepStrictEqual(Array.from(page.rows, (row: unknown[]) => row[0]), expected, needle);
+            const count = await worker.invoke('fetchTableCount', 'demo_filter', {
+                columns, globalFilterColumns: ['a', 'b', 'c'], globalFilter: needle
+            });
+            assert.strictEqual(count.count, expected.length, needle);
+        }
+    });
+
+    it('pages sorted tables in the plain order, through the rowid lookup', async () => {
+        const observed: string[] = [];
+        const worker = await createWorkerHarness({ onSql: (kind, sql) => { if (kind === 'prepare') observed.push(sql); } });
+        await worker.invoke('runQuery',
+            'CREATE TABLE demo_sort (k1, s TEXT COLLATE NOCASE); ' +
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 53) ' +
+            "INSERT INTO demo_sort SELECT (x * 37) % 11, CASE x % 3 WHEN 0 THEN 'b' WHEN 1 THEN 'B' ELSE 'a' END || (x % 5) FROM n; " +
+            'CREATE VIRTUAL TABLE demo_sort_fts USING fts5(s); INSERT INTO demo_sort_fts (rowid, s) SELECT rowid, s FROM demo_sort');
+        for (const [table, column] of [['demo_sort', 'k1'], ['demo_sort', 's'], ['demo_sort_fts', 's']] as const) {
+            for (const dir of ['ASC', 'DESC']) {
+                const expected = await expectedIds(worker, `SELECT rowid FROM ${table} ORDER BY ${plainOrder(column, dir)}`);
+                const options = (page: number, keyset?: object) => ({
+                    columns: ['rowid', column], orderBy: column, orderDir: dir, limit: 10, offset: page * 10,
+                    ...(keyset ? { keyset } : {})
+                });
+                observed.length = 0;
+                const pages: unknown[][] = [];
+                let page = await worker.invoke('fetchTableData', table, options(0, { mode: 'first' }));
+                pages.push(Array.from(page.rows, (row: unknown[]) => row[0]));
+                for (let index = 1; index * 10 < expected.length; index++) {
+                    page = await worker.invoke('fetchTableData', table, options(index, { mode: 'after', anchor: page.keysetAnchors.last }));
+                    pages.push(Array.from(page.rows, (row: unknown[]) => row[0]));
+                }
+                assert.deepStrictEqual(pages.flat(), expected, `${table}.${column} ${dir} keyset`);
+                const offsetPage = await worker.invoke('fetchTableData', table, options(2));
+                assert.deepStrictEqual(Array.from(offsetPage.rows, (row: unknown[]) => row[0]), expected.slice(20, 30), `${table}.${column} ${dir} OFFSET`);
+                const lookup = observed.some(sql => sql.includes('AS "page_keys" CROSS JOIN'));
+                assert.strictEqual(lookup, table === 'demo_sort', `${table} lookup`);
+            }
+        }
     });
 });

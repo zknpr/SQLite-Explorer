@@ -181,8 +181,9 @@ const LIKE_ANY_CHUNK = 100;
 
 /**
  * Helper to build WHERE conditions for column filters and global search.
+ * The web demo's worker builds its pages and counts with it too.
  */
-function buildFilterConditions(
+export function buildFilterConditions(
   filters: { column: string; value: string }[] = [],
   globalFilter: string | undefined,
   searchColumns: string[],
