@@ -936,19 +936,33 @@ function executeQuery(db, sql, params) {
     throw new Error('SQL query parameters must be an array');
   }
 
+  const rowsResult = rows => {
+    const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
+    return {
+      columns,
+      // Every row object has the same keys in the same order, so its values
+      // line up with `columns`; one native call beats a lookup per cell.
+      values: (rows || []).map(row => Object.values(row)),
+      rowCount: rows?.length ?? 0
+    };
+  };
+
   const hasParameters = Array.isArray(params) && params.length > 0;
   if (hasParameters) {
     const boundary = '/*sqlite_explorer_parameterized_query_boundary*/';
-    const validation = db.prepare(`${sql}\n${boundary}`);
+    // The checked statement is the one that runs. Preparing the query again
+    // without the boundary doubled the prepare cost of every bound query.
+    const statement = db.prepare(`${sql}\n${boundary}`);
     try {
-      const validatedSql = typeof validation.toString === 'function'
-        ? validation.toString().trimEnd()
+      const validatedSql = typeof statement.toString === 'function'
+        ? statement.toString().trimEnd()
         : '';
       if (!validatedSql.endsWith(boundary)) {
         throw new Error('Bound parameters require exactly one SQL statement');
       }
+      return rowsResult(statement.all(bindableParams(params)));
     } finally {
-      if (typeof validation.finalize === 'function') validation.finalize();
+      if (typeof statement.finalize === 'function') statement.finalize();
     }
   }
 
@@ -966,7 +980,7 @@ function executeQuery(db, sql, params) {
     try {
       preparedSql = typeof stmt.toString === 'function' ? stmt.toString() : '';
       if (preparedSql.length === 0) break;
-      if (!hasParameters && !remaining.startsWith(preparedSql)) {
+      if (!remaining.startsWith(preparedSql)) {
         throw new Error(
           'Native SQLite did not preserve the prepared SQL prefix: ' +
           `input=${JSON.stringify(remaining.slice(0, 160))}, ` +
@@ -974,23 +988,13 @@ function executeQuery(db, sql, params) {
         );
       }
 
-      const rows = statementCount === 0 && params && params.length > 0
-        ? stmt.all(bindableParams(params))
-        : stmt.all();
-      const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
-      lastResult = {
-        columns,
-        // Every row object has the same keys in the same order, so its values
-        // line up with `columns`; one native call beats a lookup per cell.
-        values: (rows || []).map(row => Object.values(row)),
-        rowCount: rows?.length ?? 0
-      };
-      if (columns.length > 0) resultSets.push(lastResult);
+      lastResult = rowsResult(stmt.all());
+      if (lastResult.columns.length > 0) resultSets.push(lastResult);
       statementCount++;
     } finally {
       if (typeof stmt.finalize === 'function') stmt.finalize();
     }
-    remaining = hasParameters ? '' : remaining.slice(preparedSql.length);
+    remaining = remaining.slice(preparedSql.length);
   }
 
   return statementCount > 1

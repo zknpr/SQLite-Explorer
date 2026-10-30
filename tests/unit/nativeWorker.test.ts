@@ -503,6 +503,29 @@ describe('native statement fallback integrity', () => {
         );
         assert.strictEqual(prepares, 0);
     });
+
+    it('runs a bound query through the one statement that checked it', () => {
+        const executeQuery = loadNativeWorkerFunction(
+            'executeQuery',
+            ['db', 'sql', 'params'],
+            { MAX_QUERY_STATEMENTS: 32 }
+        );
+        const prepared: string[] = [];
+        let runs = 0;
+        const db = {
+            prepare(sql: string) {
+                prepared.push(sql);
+                // txiki's toString() returns the first statement's SQL.
+                const first = sql.includes(';') ? sql.slice(0, sql.indexOf(';') + 1) : sql;
+                return { toString: () => first, all: () => { runs++; return [{ v: 1 }]; }, finalize() {} };
+            }
+        };
+
+        assert.deepStrictEqual(executeQuery(db, 'SELECT ? AS v', [1]), { columns: ['v'], values: [[1]], rowCount: 1 });
+        assert.deepStrictEqual(prepared, ['SELECT ? AS v\n/*sqlite_explorer_parameterized_query_boundary*/']);
+        assert.throws(() => executeQuery(db, 'SELECT ?; SELECT 2', [1]), /exactly one SQL statement/);
+        assert.strictEqual(runs, 1);
+    });
 });
 
 describe('isNativeAvailable', () => {
