@@ -220,11 +220,11 @@ export class WebviewMessageHandler {
               data: result
             }
           };
-          const { needsSerialization } = measureWebviewTransportPayload(rawResponse, {
+          const { needsRewrite } = measureWebviewTransportPayload(rawResponse, {
             surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
           });
           // postMessage serializes the message before anything can change it.
-          const serializedResult = needsSerialization ? serializeAssertedValue(result) : result;
+          const serializedResult = needsRewrite ? serializeAssertedValue(result) : result;
           // postMessage can reject asynchronously (for example during JSON
           // serialization). Keep it in this chain so the caller gets a failure.
           return this.postMessage({
@@ -294,14 +294,14 @@ export class WebviewMessageHandler {
     Promise.resolve()
       .then(() => fn.apply(hostBridge, deserializedArgs))
       .then(result => {
-        const { needsSerialization } = measureWebviewTransportPayload({
+        const { needsRewrite } = measureWebviewTransportPayload({
           type: 'rpc-response',
           id: responseId,
           result
         }, {
           surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
         });
-        const serializedResult = needsSerialization ? serializeAssertedValue(result) : result;
+        const serializedResult = needsRewrite ? serializeAssertedValue(result) : result;
         return this.postMessage({
           type: 'rpc-response',
           id: responseId,

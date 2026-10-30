@@ -181,20 +181,21 @@ export function assertWebviewTransportPayload(
 }
 
 /**
- * assertWebviewTransportPayload, also saying whether serializeValue would
- * change anything in `value`. When it would not, the caller can post the
- * value itself instead of walking it again to copy it unchanged.
+ * assertWebviewTransportPayload, also saying whether the host's serializeValue
+ * or the webview's deserializeValue could rewrite anything in `value`. When
+ * neither would, the receiver can use the value itself instead of walking it
+ * again to copy it unchanged.
  */
 export function measureWebviewTransportPayload(
   value: unknown,
   options: WebviewTransportLimits
-): { bytes: number; needsSerialization: boolean } {
+): { bytes: number; needsRewrite: boolean } {
   const limits = resolveLimits(options);
   const ancestors = new WeakSet<object>();
   let aggregateBytes = 0;
-  // Set where serializeValue rewrites a value: binary views, non-finite
-  // numbers, escaped strings, and marker objects this walk does not enter.
-  let needsSerialization = false;
+  // Set at every value either side rewrites: binary values and markers,
+  // non-finite numbers, '~' strings, and objects this walk does not enter.
+  let needsRewrite = false;
 
   const rejectBinary = (actualBytes: number): never => {
     throw new WebviewPayloadLimitError({
@@ -229,16 +230,17 @@ export function measureWebviewTransportPayload(
       );
     }
     if (candidate instanceof Uint8Array) {
-      needsSerialization = true;
+      needsRewrite = true;
       addBinary(candidate.byteLength, encodedBase64Bytes(candidate.byteLength));
       return;
     }
     if (ArrayBuffer.isView(candidate)) {
-      needsSerialization = true;
+      needsRewrite = true;
       addBinary(candidate.byteLength, encodedBase64Bytes(candidate.byteLength));
       return;
     }
     if (candidate instanceof ArrayBuffer) {
+      needsRewrite = true;
       addBinary(candidate.byteLength, candidate.byteLength);
       return;
     }
@@ -246,12 +248,13 @@ export function measureWebviewTransportPayload(
       SharedArrayBufferConstructor !== undefined
       && candidate instanceof SharedArrayBufferConstructor
     ) {
+      needsRewrite = true;
       addBinary(candidate.byteLength, candidate.byteLength);
       return;
     }
     if (typeof candidate === 'string') {
       const expansion = jsonSafeNumberStringExpansionBytes(candidate);
-      if (expansion) needsSerialization = true;
+      if (expansion) needsRewrite = true;
       add(escapedJsonStringByteLength(candidate) + expansion);
       return;
     }
@@ -259,7 +262,7 @@ export function measureWebviewTransportPayload(
       if (Number.isFinite(candidate)) {
         add(8);
       } else {
-        needsSerialization = true;
+        needsRewrite = true;
         add(JSON_SAFE_NON_FINITE_NUMBER_MAX_WIRE_BYTES);
       }
       return;
@@ -289,6 +292,7 @@ export function measureWebviewTransportPayload(
         return;
       }
       if (!isPlainObject(candidate)) {
+        needsRewrite = true;
         add(16);
         return;
       }
@@ -301,7 +305,7 @@ export function measureWebviewTransportPayload(
         && keys.includes('base64')
         && typeof candidate.base64 === 'string'
       ) {
-        needsSerialization = true;
+        needsRewrite = true;
         addBinary(decodedBase64Bytes(candidate.base64), candidate.base64.length);
         return;
       }
@@ -312,6 +316,7 @@ export function measureWebviewTransportPayload(
         && keys.includes('data')
         && Array.isArray(candidate.data)
       ) {
+        needsRewrite = true;
         if (candidate.data.length > limits.maxBinaryBytes) rejectBinary(candidate.data.length);
       }
 
@@ -326,7 +331,7 @@ export function measureWebviewTransportPayload(
   };
 
   visit(value);
-  return { bytes: aggregateBytes, needsSerialization };
+  return { bytes: aggregateBytes, needsRewrite };
 }
 
 export function isWebviewPayloadLimitError(error: unknown): error is WebviewPayloadLimitError {

@@ -504,11 +504,13 @@ describe('web demo iframe transport guards', () => {
     });
 });
 
-describe('measureWebviewTransportPayload serialization flag', () => {
-    it('says serializeValue changes a payload exactly when it does', async () => {
+describe('measureWebviewTransportPayload rewrite flag', () => {
+    it('says serializeValue or deserializeValue could change a payload exactly when one would', async () => {
         const { measureWebviewTransportPayload } = await import('../../src/core/webview-transport');
         const { serializeValue } = await import('../../src/core/serialization');
         const { escapeJsonSafeNumberString } = await import('../../src/core/json-safe-numbers');
+        const transportModulePath = '../../core/ui/modules/transport.js';
+        const { deserializeValue } = await import(transportModulePath);
         const needsEscape = (() => {
             for (let code = 0; code < 0x80; code++) {
                 const candidate = `${String.fromCharCode(code)}value`;
@@ -518,26 +520,30 @@ describe('measureWebviewTransportPayload serialization flag', () => {
         })();
         const unchanged: unknown[] = [
             { headers: ['a', 'b'], rows: [[1, 'x', null, true], [2, 'y', 3.5, false]], keysetAnchors: { first: 'f', last: 'l' } },
-            [[], {}, '', 0, -0, Number.MAX_VALUE],
-            { buffer: new ArrayBuffer(4) },
-            { when: new Date(0) },
+            [[], {}, '', 0, -0, Number.MAX_VALUE, 'not ~ first'],
+            { __type: 'Uint8Array', base64: 'aGk=', extra: 1 },
             JSON.parse('{"__proto__":{"inherited":"top"},"later":[1]}')
         ];
         const changed: unknown[] = [
             { rows: [[1, new Uint8Array([1, 2])]] },
             { rows: [[1, new DataView(new ArrayBuffer(2))]] },
+            { rows: [[new ArrayBuffer(2)]] },
             { rows: [[Infinity]] },
             { rows: [[Number.NaN]] },
             { rows: [[needsEscape]] },
             { blob: { __type: 'Uint8Array', base64: 'aGk=' } },
+            { legacy: { __type: 'Uint8Array', data: [104, 105] } },
+            { when: new Date(0) },
             { deep: [[[{ value: -Infinity }]]] }
         ];
         for (const payload of unchanged) {
-            assert.strictEqual(measureWebviewTransportPayload(payload, { surface: 'test' }).needsSerialization, false, JSON.stringify(payload));
+            assert.strictEqual(measureWebviewTransportPayload(payload, { surface: 'test' }).needsRewrite, false, JSON.stringify(payload));
             assert.deepStrictEqual(serializeValue(payload, { surface: 'test' }), payload);
+            const delivered = JSON.parse(JSON.stringify(payload));
+            assert.deepStrictEqual(deserializeValue(delivered, { surface: 'test' }), delivered);
         }
         for (const payload of changed) {
-            assert.strictEqual(measureWebviewTransportPayload(payload, { surface: 'test' }).needsSerialization, true);
+            assert.strictEqual(measureWebviewTransportPayload(payload, { surface: 'test' }).needsRewrite, true);
         }
     });
 });

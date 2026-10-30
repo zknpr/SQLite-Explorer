@@ -7,6 +7,7 @@ import { RPC_TIMEOUT_MS, getRpcTimeoutMs } from './rpc-constants.js';
 import {
     WEBVIEW_TRANSPORT_SURFACES,
     assertWebviewTransportPayload,
+    measureWebviewTransportPayload,
     decodeJsonSafeNumberString,
     encodeJsonSafeNonFiniteNumber,
     errorFromRpcResponse,
@@ -248,11 +249,12 @@ export function handleRpcResponse(message) {
         pendingRpcCalls.delete(message.messageId);
 
         try {
-            assertWebviewTransportPayload(message, {
+            const { needsRewrite } = measureWebviewTransportPayload(message, {
                 surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
             });
             if (message.success) {
-                const deserializedData = deserializeValue(message.data);
+                // A reply with nothing to decode is used as delivered.
+                const deserializedData = needsRewrite ? deserializeValue(message.data) : message.data;
                 pending.resolve(deserializedData);
             } else {
                 pending.reject(errorFromRpcResponse(message));
