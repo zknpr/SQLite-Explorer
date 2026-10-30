@@ -18,7 +18,7 @@ import type { DatabaseOperations, LabeledModification, ModificationEntry } from 
 const LITERALS = [
     '5.0', '-0.0', '1.5', '7', '3000000000', '1730000000000', '9007199254740993', '-9223372036854775808',
     "CAST(X'FF61' AS TEXT)", "CAST(X'EFBBBF61' AS TEXT)", 'char(55296)', "'a' || char(0) || 'b'", "'12'",
-    "X'00FF'", 'NULL'
+    "X'00FF'", "''", "X''", 'NULL'
 ];
 
 async function seed(ops: DatabaseOperations) {

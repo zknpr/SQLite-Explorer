@@ -210,6 +210,8 @@ export function buildStoredCellWrite(
         ? { sql: '-0.0', params: [] }
         : { sql: 'CAST(? AS REAL)', params: [state.value] };
     case 'text':
+      // substr() of a zero-length BLOB is NULL, so empty bytes write ''.
+      if (state.rawTextBytes?.length === 0) return { sql: "''", params: [] };
       return {
         // Binding a BLOB directly through CAST(? AS TEXT) transcodes it from
         // the connection encoding in UTF-16 databases. substr(BLOB, 1) keeps
