@@ -161,8 +161,16 @@ import {
   prependCellContainmentColumn,
   remapShadowedRowIdContainment,
   SQLITE_MAX_RESULT_COLUMNS,
-  remapPrimaryKeyContainment
+  remapPrimaryKeyContainment,
+  type CellContainmentQuery
 } from './core/cell-containment';
+import {
+  buildCellPackWrappedQuery,
+  cellPackApplies,
+  CellPackDecoder,
+  decodeCellPackRows
+} from './core/cell-pack';
+import { parsePackedRealTexts } from './core/integer-utils';
 import { serializeOperations } from './core/operation-serializer';
 import { DatabaseFileChangedError } from './core/database-file-changed';
 import { type DatabaseConnectionInvalidatedError, DatabaseTransactionRecoveryError } from './core/database-connection-invalidated';
@@ -861,6 +869,10 @@ interface NativeGridPagePreparation {
   cellHelpers: boolean;
   /** Present once per connection, when the runtime library failed to load. */
   cellHelperError?: string;
+  /** Whether the loaded library serves packed grid pages. */
+  cellPack: boolean;
+  /** Present once per connection, when the library loaded without a usable pack function. */
+  cellPackError?: string;
 }
 
 interface NativeCompileBatchResult {
@@ -898,6 +910,71 @@ export async function isNativeAvailable(extensionPath: string): Promise<boolean>
     return false;
   }
   return (await getNativeBinaryPath(extensionPath)) !== null;
+}
+
+/**
+ * Native grid pages that take 'checked' transport read one
+ * sqlite_explorer_cell_pack() BLOB per 100 values of each row and decode it
+ * on the host. Every packed cell carries a fixed-size descriptor, so a page of
+ * many short values can be several times its queryNumeric size: past
+ * maxBytes of packed data the worker returns nothing and the page is read
+ * through queryNumeric, well inside MAX_NATIVE_WORKER_RESPONSE_BYTES.
+ */
+export const nativeGridRowPack = { enabled: true, maxBytes: 32 * 1024 * 1024 };
+
+/**
+ * Fetch a packed page and decode it on the host into what queryNumeric
+ * returns: transport rows cut before the REAL text columns, REAL text that
+ * differs from the number in exactIntegerTexts, and txiki's integer types
+ * (a Number when safe, BigInt only beyond 2^53). Returns why the page must be
+ * read through queryNumeric instead, when it must.
+ */
+async function fetchNativePackedPage(
+  worker: NativeWorkerProcess,
+  sourceSql: string,
+  params: CellValue[],
+  containmentQuery: CellContainmentQuery
+): Promise<{ result: NativeQueryResult } | { fallback: string }> {
+  const packed = await worker.call<{ values?: unknown[][]; tooLarge?: true }>('queryPacked', [
+    buildCellPackWrappedQuery(sourceSql, containmentQuery, true),
+    params,
+    nativeGridRowPack.maxBytes
+  ]);
+  if (packed.tooLarge) return { fallback: `packs to more than ${nativeGridRowPack.maxBytes} bytes` };
+  if (!packed.values) throw new Error('Packed page response has no rows');
+  const decoder = new CellPackDecoder(containmentQuery);
+  const decoded = decodeCellPackRows(packed.values, containmentQuery, decoder);
+  // The host decodes non-plain TEXT as sql.js does, not as txiki's binding,
+  // so such a page is read again; only that read's rows are returned.
+  if (decoder.nonPlainTextValues > 0) return { fallback: 'holds TEXT that is not plain UTF-8' };
+  const logicalColumnCount = containmentQuery.primaryTransportColumnCount;
+  const realColumns = containmentQuery.numericTransport.packedRealTextColumnCount ?? 0;
+  let exactIntegerTexts: Record<number, Record<number, string>> | undefined;
+  const values = decoded.map((row, rowIndex) => {
+    const out = row.slice(0, logicalColumnCount);
+    for (let column = 0; column < out.length; column++) {
+      const value = out[column];
+      if (typeof value === 'bigint' && Number.isSafeInteger(Number(value))) out[column] = Number(value);
+    }
+    if (realColumns > 0) {
+      const texts = parsePackedRealTexts(row.slice(logicalColumnCount), logicalColumnCount, rowIndex);
+      if (texts) {
+        for (const [column, text] of texts) {
+          if (text === String(out[column])) continue;
+          ((exactIntegerTexts ??= {})[rowIndex] ??= {})[column] = text;
+        }
+      }
+    }
+    return out as CellValue[];
+  });
+  return {
+    result: {
+      columns: containmentQuery.numericTransport.transportColumns.slice(0, logicalColumnCount),
+      values,
+      rowCount: values.length,
+      ...(exactIntegerTexts ? { exactIntegerTexts } : {})
+    } as NativeQueryResult
+  };
 }
 
 /**
@@ -1752,16 +1829,27 @@ export async function createNativeDatabaseConnection(
       };
 
       let nativeCellHelperEncodingLogged = false;
+      // Each reason a packed page was read again is logged once per connection.
+      const nativePackFallbacksLogged = new Set<string>();
       // One round trip before a table page or query result: the database
       // encoding, and the runtime's cell helpers, which the worker loads once
       // per connection and whose load failure it reports once. The helpers
       // read TEXT as stored, which is UTF-8 only in a UTF-8 database.
-      const prepareNativeCellHelpers = async (): Promise<{ textEncoding: CellTextEncoding; cellHelpers: boolean }> => {
+      const prepareNativeCellHelpers = async (): Promise<{
+        textEncoding: CellTextEncoding;
+        cellHelpers: boolean;
+        cellPack: boolean;
+      }> => {
         const preparation = await worker.call<NativeGridPagePreparation>('prepareGridPage', [queryPlanLibrary]);
         if (preparation.cellHelperError) {
           outputChannel?.appendLine(
             `[NativeWorker] Grid cell helpers are unavailable; table pages and query results use SQL containment: ` +
             preparation.cellHelperError
+          );
+        }
+        if (preparation.cellPackError) {
+          outputChannel?.appendLine(
+            `[NativeWorker] Packed grid pages are unavailable; table pages use the cell helpers: ${preparation.cellPackError}`
           );
         }
         const textEncoding = normalizeCellTextEncoding(preparation.encoding);
@@ -1772,7 +1860,8 @@ export async function createNativeDatabaseConnection(
             `and query results use SQL containment`
           );
         }
-        return { textEncoding, cellHelpers: preparation.cellHelpers && textEncoding === 'utf-8' };
+        const cellHelpers = preparation.cellHelpers && textEncoding === 'utf-8';
+        return { textEncoding, cellHelpers, cellPack: cellHelpers && preparation.cellPack };
       };
 
       const readNativePrimaryKeyRecordId = async (
@@ -4390,7 +4479,8 @@ export async function createNativeDatabaseConnection(
                 : identityContainmentRawTextColumnIndices;
             const {
               textEncoding: databaseTextEncoding,
-              cellHelpers: checkedTransport
+              cellHelpers: checkedTransport,
+              cellPack
             } = await prepareNativeCellHelpers();
             const containmentQuery = buildCellContainmentQuery(
               sql,
@@ -4404,14 +4494,26 @@ export async function createNativeDatabaseConnection(
             const transportQuery = containmentQuery.numericTransport;
             const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
               && hasRowIdShape;
-            const primaryResult = await worker.call<NativeQueryResult>('queryNumeric', [
-              transportQuery.sql,
-              params,
-              transportQuery.transportColumns,
-              transportQuery.valueColumnCount,
-              transportQuery.realTextColumnCount,
-              transportQuery.packedRealTextColumnCount
-            ]);
+            let packedResult: NativeQueryResult | undefined;
+            if (nativeGridRowPack.enabled && cellPack && !splitSyntheticRowId && cellPackApplies(containmentQuery)) {
+              const packed = await fetchNativePackedPage(worker, sql, params, containmentQuery);
+              if ('result' in packed) packedResult = packed.result;
+              else if (!nativePackFallbacksLogged.has(packed.fallback)) {
+                nativePackFallbacksLogged.add(packed.fallback);
+                outputChannel?.appendLine(
+                  `[NativeWorker] A packed grid page ${packed.fallback}, so it was read again without packing. ` +
+                  `Later pages that do the same are not logged.`
+                );
+              }
+            }
+            const primaryResult = packedResult ?? await worker.call<NativeQueryResult>('queryNumeric', [
+                  transportQuery.sql,
+                  params,
+                  transportQuery.transportColumns,
+                  transportQuery.valueColumnCount,
+                  transportQuery.realTextColumnCount,
+                  transportQuery.packedRealTextColumnCount
+                ]);
             const valueSourceRows = mergeCellContainmentMetadataRows(
               primaryResult.values,
               undefined,

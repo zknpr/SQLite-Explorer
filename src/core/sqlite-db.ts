@@ -45,7 +45,9 @@ import {
   type DatabaseFileGeneration
 } from '../atomicDatabaseWrite';
 import {
+  registerWasmPackHeap,
   WasmDatabaseEngine,
+  type WasmPackHeap,
   type WasmDatabaseInstance,
   type WasmEngineModule,
   type WasmEngineLogHandler,
@@ -104,6 +106,10 @@ export async function createDatabaseEngine(
   }
 
   const SqlJsModule = await loadEngine(engineConfig) as unknown as WasmEngineModule;
+  // Spike: the runtime build exports the heap view, so packed grid rows can
+  // be read in place. A glue without it keeps the cell helper transport.
+  const heapModule = SqlJsModule as unknown as WasmPackHeap['module'];
+  if (heapModule.HEAPU8 instanceof Uint8Array) registerWasmPackHeap(SqlJsModule.Database, { module: heapModule });
   return createEngineFromModule(SqlJsModule, config, logger);
 }
 

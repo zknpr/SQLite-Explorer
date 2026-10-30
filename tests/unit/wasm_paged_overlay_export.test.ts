@@ -140,8 +140,10 @@ describe('WasmDatabaseEngine paged overlay export', () => {
     engine.exportPagedWritableOverlay();
     engine.exportPagedWritableOverlay();
 
-    assert.strictEqual(warnings.length, 1);
-    assert.match(warnings[0], /atomic save.*rewrites the full.*1073741824 bytes/i);
+    // The fake instance also has no packed page support, which warns once.
+    const saveWarnings = warnings.filter(warning => /atomic save/i.test(warning));
+    assert.strictEqual(saveWarnings.length, 1);
+    assert.match(saveWarnings[0], /atomic save.*rewrites the full.*1073741824 bytes/i);
     engine.shutdown();
   });
 });

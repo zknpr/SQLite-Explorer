@@ -9,7 +9,7 @@ import vm from 'node:vm';
 import * as vscode from 'vscode';
 import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import { createNativeDatabaseConnection, NativeWorkerProcess } from '../../src/nativeWorker';
+import { createNativeDatabaseConnection, nativeGridRowPack, NativeWorkerProcess } from '../../src/nativeWorker';
 import { buildCellContainmentQuery } from '../../src/core/cell-containment';
 import { buildExactNumericTextQuery } from '../../src/core/integer-utils';
 import { prepareReadQuery, SQL_RESULT_BYTES, SQL_RESULT_ROWS } from '../../src/core/sql-workspace';
@@ -130,6 +130,9 @@ async function openWasm(image: Uint8Array): Promise<PageBackend> {
     const opened = await createDatabaseEngine({ content: image, maxSize: 0, readOnlyMode: false },
         (_level, ...args) => { logs.push(args.map(String).join(' ')); });
     const engine = opened.operations as WasmDatabaseEngine;
+    // These pages hold the helpers to SQL containment; grid_cell_pack.test.ts
+    // holds packed pages to the helpers.
+    engine.gridRowPackTransport = 'off';
     const pageSql: string[] = [];
     const instance = (engine as any).instance;
     const prepare = instance.prepare.bind(instance);
@@ -179,6 +182,9 @@ async function openNative(image: Uint8Array): Promise<PageBackend> {
     const outputChannel = { appendLine: (line: string) => { logs.push(line); } } as unknown as vscode.OutputChannel;
     const native = await createNativeDatabaseConnection(vscode.Uri.file(process.cwd()), undefined, outputChannel);
     const connection = await native.establishConnection(vscode.Uri.file(file), 'grid-cell-helpers', false);
+    // These pages hold the helpers to SQL containment; grid_cell_pack.test.ts
+    // holds packed pages to the helpers.
+    nativeGridRowPack.enabled = false;
     nativePageSql.length = 0;
     return {
         ops: connection.databaseOps,
@@ -187,6 +193,7 @@ async function openNative(image: Uint8Array): Promise<PageBackend> {
         logs,
         dispose: () => {
             nativeHelpersEnabled = true;
+            nativeGridRowPack.enabled = true;
             native.workerMethods[Symbol.dispose]();
             // Windows can hold the file briefly after the worker exits.
             fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

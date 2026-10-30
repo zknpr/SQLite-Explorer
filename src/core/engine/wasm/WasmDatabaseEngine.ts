@@ -66,7 +66,8 @@ import {
   keysetFallbackOrder,
   mintKeysetAnchors,
   ordersBySyntheticRowId,
-  resolveKeysetPlan
+  resolveKeysetPlan,
+  type ResolvedKeysetPlan
 } from '../../keyset-pagination';
 import {
   applyMergePatch,
@@ -115,8 +116,15 @@ import {
   prependCellContainmentColumn,
   remapShadowedRowIdContainment,
   SQLITE_MAX_RESULT_COLUMNS,
-  remapPrimaryKeyContainment
+  remapPrimaryKeyContainment,
+  type CellContainmentQuery
 } from '../../cell-containment';
+import {
+  buildCellPackSelectList,
+  buildCellPackWrappedQuery,
+  cellPackApplies,
+  CellPackDecoder
+} from '../../cell-pack';
 import { getNodeFs } from '../../platform/fs';
 import { assertDatabaseFileGenerationCurrent, writeDatabaseSnapshotAtomically, type DatabaseFileGeneration } from '../../../atomicDatabaseWrite';
 import { VIEW_SOURCE_CHANGED_MESSAGE } from '../../view-utils';
@@ -257,6 +265,8 @@ interface WasmPreparedStatement {
   free(): boolean;
   getColumnNames(): string[];
   getSQL(): string;
+  /** The sqlite3_stmt pointer; the runtime build adds this accessor. */
+  sqliteExplorerPointer?(): number;
 }
 
 export interface WasmDatabaseInstance {
@@ -292,6 +302,30 @@ export interface WasmEngineModule {
     /** Copy-on-write paged open, present in stage 3 fork builds. */
     openPagedWritable?: (hostIo: WasmPagedHostIo) => WasmDatabaseInstance;
   };
+}
+
+/**
+ * The sql.js heap and the C column readers, for reading a packed row in
+ * place. The runtime build exports HEAPU8, which the glue replaces when
+ * memory grows, and a Statement accessor for the statement pointer.
+ */
+export interface WasmPackHeap {
+  module: {
+    HEAPU8: Uint8Array;
+    _sqlite3_column_count(statement: number): number;
+    _sqlite3_column_type(statement: number, column: number): number;
+    _sqlite3_column_blob(statement: number, column: number): number;
+    _sqlite3_column_bytes(statement: number, column: number): number;
+    _sqlite3_sql(statement: number): number;
+    UTF8ToString(pointer: number): string;
+  };
+}
+
+// Keyed by the module's Database class: every engine on one module shares it.
+const wasmPackHeaps = new WeakMap<object, WasmPackHeap>();
+
+export function registerWasmPackHeap(databaseClass: object, heap: WasmPackHeap): void {
+  wasmPackHeaps.set(databaseClass, heap);
 }
 
 export type WasmEngineLogHandler = (
@@ -443,6 +477,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /** Whether the runtime registered its grid cell helpers on this connection. */
   private readonly hasCellHelpers: boolean;
   private cellHelperEncodingLogged = false;
+  /**
+   * Transport for grid pages that take 'checked' transport: 'wrapped' reads
+   * one sqlite_explorer_cell_pack() BLOB per 100 values through the same
+   * co-routine; 'off' keeps the four per-cell helpers; 'direct' puts the pack
+   * calls in the base SELECT when its plan has no sorter, else wraps. Direct
+   * decides from EXPLAIN QUERY PLAN wording, which SQLite may change, so it
+   * stays opt-in.
+   */
+  gridRowPackTransport: 'off' | 'wrapped' | 'direct' = 'wrapped';
+  /** Whether this module's runtime can serve packed pages (probeCellPack). */
+  private readonly hasCellPack: boolean;
   private readonly cellReadSessionIdleTimeoutMs: number;
   private readonly cellReadSessionAbsoluteTimeoutMs: number;
   private cellReadSession: WasmCellReadSessionState | undefined;
@@ -510,6 +555,42 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.hasCellHelpers = false;
       this.logger('warn', 'Grid cell helpers are unavailable; table pages and query results use SQL containment:', error);
     }
+    this.hasCellPack = this.hasCellHelpers && this.probeCellPack();
+  }
+
+  /**
+   * Packed pages need the runtime's heap export, its statement accessor and
+   * sqlite_explorer_cell_pack. Without any of them pages keep the helpers.
+   */
+  private probeCellPack(): boolean {
+    const heap = this.packHeap();
+    let reason = 'the sql.js build does not export its heap';
+    if (heap) {
+      const sql = 'SELECT sqlite_explorer_cell_pack(1, 1, 2)';
+      let probe: WasmPreparedStatement | undefined;
+      try {
+        probe = this.instance.prepare(sql);
+        const pointer = probe.sqliteExplorerPointer?.();
+        if (typeof pointer !== 'number') reason = 'the sql.js build has no statement pointer accessor';
+        else if (heap.module.UTF8ToString(heap.module._sqlite3_sql(pointer)) !== sql) reason = 'the statement pointer accessor names another statement';
+        else if (!probe.step() || heap.module._sqlite3_column_type(pointer, 0) !== 4) reason = 'sqlite_explorer_cell_pack did not return a BLOB';
+        else return true;
+      } catch (error) {
+        reason = `sqlite_explorer_cell_pack failed: ${error instanceof Error ? error.message : String(error)}`;
+      } finally {
+        probe?.free();
+      }
+    }
+    this.logger('warn', `Packed grid pages are unavailable (${reason}); table pages use the cell helpers`);
+    return false;
+  }
+
+  /**
+   * Looked up per use, so the engine holds no reference to the module and
+   * its heap view.
+   */
+  private packHeap(): WasmPackHeap | undefined {
+    return wasmPackHeaps.get((this.instance as object).constructor);
   }
 
   /**
@@ -4658,22 +4739,37 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           true
         );
         const transportQuery = containmentQuery.numericTransport;
-        const stmt = this.instance.prepare(transportQuery.sql, bindParams);
+        // Packed rows are read in place from the heap; without heap access
+        // the page keeps the helpers rather than copy one BLOB per row.
+        const packAccess = this.gridRowPackTransport !== 'off'
+          && !splitSyntheticRowId
+          && cellPackApplies(containmentQuery)
+          && this.hasCellPack
+          ? this.packHeap()
+          : undefined;
+        const packSql = packAccess
+          ? this.buildGridRowPackSql(table, valueQueryOptions, keysetPlan, sql, bindParams, containmentQuery)
+          : undefined;
+        const stmt = this.instance.prepare(packSql ?? transportQuery.sql, bindParams);
         executionState.stmt = stmt;
-        const primaryRows: Array<Array<CellValue | bigint>> = [];
-
-        while (stmt.step()) {
-            // We know a row exists because step() returned true
-            const row = stmt.get(null, { useBigInt: true });
-            if (row) {
-                primaryRows.push(row);
-            }
+        let valueSourceRows: Array<Array<CellValue | bigint>>;
+        if (packAccess) {
+          valueSourceRows = this.readPackedRows(stmt, packSql!, packAccess, containmentQuery);
+        } else {
+          const primaryRows: Array<Array<CellValue | bigint>> = [];
+          while (stmt.step()) {
+              // We know a row exists because step() returned true
+              const row = stmt.get(null, { useBigInt: true });
+              if (row) {
+                  primaryRows.push(row);
+              }
+          }
+          valueSourceRows = mergeCellContainmentMetadataRows(
+            primaryRows,
+            undefined,
+            containmentQuery
+          ) as Array<Array<CellValue | bigint>>;
         }
-        const valueSourceRows = mergeCellContainmentMetadataRows(
-          primaryRows,
-          undefined,
-          containmentQuery
-        ) as Array<Array<CellValue | bigint>>;
         let rowIdRows: Array<Array<CellValue | bigint>> | undefined;
         if (rowIdQuery) {
           const rowIdStmt = this.instance.prepare(
@@ -4866,6 +4962,87 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       executionState.stmt?.free();
       executionState.rowIdStmt?.free();
     }
+  }
+
+  /**
+   * Step a packed statement and decode each row from the heap while its
+   * column BLOBs are still valid, so no row gets a copied backing store.
+   */
+  private readPackedRows(
+    stmt: WasmPreparedStatement,
+    sql: string,
+    heap: WasmPackHeap,
+    containmentQuery: CellContainmentQuery
+  ): Array<Array<CellValue | bigint>> {
+    const { module } = heap;
+    const pointer = stmt.sqliteExplorerPointer?.();
+    const decoder = new CellPackDecoder(containmentQuery);
+    if (typeof pointer !== 'number' || module.UTF8ToString(module._sqlite3_sql(pointer)) !== sql) {
+      throw new Error('Packed page statement pointer does not name the prepared page statement');
+    }
+    if (module._sqlite3_column_count(pointer) !== decoder.chunkCount) {
+      throw new Error('Packed page statement does not have one column per value chunk');
+    }
+    const starts = new Array<number>(decoder.chunkCount);
+    const lengths = new Array<number>(decoder.chunkCount);
+    let bytes = module.HEAPU8;
+    let view = new DataView(bytes.buffer);
+    const rows: Array<Array<CellValue | bigint>> = [];
+    while (stmt.step()) {
+      for (let chunk = 0; chunk < decoder.chunkCount; chunk++) {
+        // SQLITE_BLOB; sqlite3_column_blob before sqlite3_column_bytes.
+        if (module._sqlite3_column_type(pointer, chunk) !== 4) {
+          throw new Error(`Packed page row ${rows.length}, chunk ${chunk} is not a BLOB`);
+        }
+        starts[chunk] = module._sqlite3_column_blob(pointer, chunk) >>> 0;
+        lengths[chunk] = module._sqlite3_column_bytes(pointer, chunk);
+      }
+      // A step can grow the memory, which detaches the previous view's
+      // buffer; the glue then exports a view of the new one.
+      if (module.HEAPU8 !== bytes) {
+        bytes = module.HEAPU8;
+        view = new DataView(bytes.buffer);
+      }
+      rows.push(decoder.decodeRow(bytes, view, starts, lengths, rows.length));
+    }
+    return rows;
+  }
+
+  /**
+   * The row-packed page statement. The direct form evaluates the pack calls
+   * in the base SELECT, so it is used only when SQLite emits rows in order
+   * without a sorter: a sorter computes the select list for every candidate
+   * row before the LIMIT cut, not only for the page.
+   */
+  private buildGridRowPackSql(
+    table: string,
+    options: TableQueryOptions,
+    keysetPlan: ResolvedKeysetPlan | undefined,
+    sourceSql: string,
+    bindParams: ReturnType<typeof normalizeWasmBindParams>,
+    containmentQuery: CellContainmentQuery
+  ): string {
+    const columns = options.columns;
+    if (
+      this.gridRowPackTransport === 'direct'
+      && columns && columns.length === containmentQuery.valueColumnCount
+      && !columns.includes('*')
+      && keysetPlan?.mode !== 'before' && keysetPlan?.mode !== 'last'
+    ) {
+      const direct = buildSelectQuery(table, options, keysetPlan,
+        expressions => buildCellPackSelectList(expressions, containmentQuery)).sql;
+      let sorts = false;
+      const plan = this.instance.prepare(`EXPLAIN QUERY PLAN ${direct}`, bindParams);
+      try {
+        while (plan.step()) {
+          if (String(plan.get()?.[3]).startsWith('USE TEMP B-TREE')) sorts = true;
+        }
+      } finally {
+        plan.free();
+      }
+      if (!sorts) return direct;
+    }
+    return buildCellPackWrappedQuery(sourceSql, containmentQuery, true);
   }
 
   /**

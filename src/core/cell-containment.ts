@@ -40,8 +40,8 @@ const RAW_TEXT_DECODE_SLAB_BYTES = 64 * 1024;
 const METADATA_CHUNK_COLUMNS = 400;
 // Arguments per sqlite_explorer_cell_metadata() call, far below SQLite's
 // function-argument limit.
-const HELPER_METADATA_CHUNK_COLUMNS = 100;
-const MAX_UTF8_BYTES_PER_CODE_POINT = 4;
+export const HELPER_METADATA_CHUNK_COLUMNS = 100;
+export const MAX_UTF8_BYTES_PER_CODE_POINT = 4;
 // Both bundled SQLite builds use SQLite's default SQLITE_MAX_COLUMN. Private
 // raw-TEXT companions must never turn an otherwise valid grid projection into
 // a statement that exceeds this result-column ceiling.

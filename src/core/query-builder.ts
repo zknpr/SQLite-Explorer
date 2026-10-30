@@ -24,7 +24,14 @@ export { MAX_TABLE_PAGE_ROWS } from './table-pagination';
 export function buildSelectQuery(
   table: string,
   options: TableQueryOptions,
-  keysetPlan?: ResolvedKeysetPlan
+  keysetPlan?: ResolvedKeysetPlan,
+  /**
+   * Replaces the select list with expressions over the requested columns,
+   * one per column in order. WHERE, ORDER BY and LIMIT are unchanged, so a
+   * row-packed grid page reads the base table with no co-routine. A reversed
+   * keyset page re-sorts its inner SELECT by name and cannot take one.
+   */
+  selectList?: (columnExpressions: string[]) => string
 ): { sql: string; params: CellValue[] } {
   const {
     columns = ['*'],
@@ -39,11 +46,17 @@ export function buildSelectQuery(
   } = options;
 
   const escapedTable = escapeMainIdentifier(table);
-  const escapedColumns = columns.map(col => {
-    if (col === '*') return '*';
-    if (col === 'rowid') return '"rowid" AS "rowid"';
-    return escapeIdentifier(col);
-  }).join(', ');
+  if (selectList && (columns.includes('*')
+    || keysetPlan?.mode === 'before' || keysetPlan?.mode === 'last')) {
+    throw new Error('A replaced select list needs named columns and a forward page');
+  }
+  const escapedColumns = selectList
+    ? selectList(columns.map(escapeIdentifier))
+    : columns.map(col => {
+        if (col === '*') return '*';
+        if (col === 'rowid') return '"rowid" AS "rowid"';
+        return escapeIdentifier(col);
+      }).join(', ');
 
   let sql = `SELECT ${escapedColumns} FROM ${escapedTable}`;
   const whereClauses: string[] = [];

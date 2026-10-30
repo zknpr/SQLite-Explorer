@@ -297,6 +297,8 @@ const activeOperations = new Map();
 const queryPlanDatabases = new WeakSet();
 // Connections whose runtime library failed to load; the error is reported once.
 const runtimeLoadFailures = new WeakSet();
+// Connections whose loaded runtime library serves packed grid pages.
+const cellPackDatabases = new WeakSet();
 
 /** TEMP export spools owned by the interruptible secondary connection. */
 const exportSpools = new Set();
@@ -2236,10 +2238,17 @@ async function handleRequest(request) {
         if (!db) throw new Error("Database not open");
         if (typeof library !== 'string') throw new Error('Invalid runtime library path');
         let cellHelperError;
+        let cellPackError;
         if (!queryPlanDatabases.has(db) && !runtimeLoadFailures.has(db)) {
           try {
             db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
             queryPlanDatabases.add(db);
+            try {
+              executeQuery(db, 'SELECT sqlite_explorer_cell_pack(1, 1, 2)', []);
+              cellPackDatabases.add(db);
+            } catch (error) {
+              cellPackError = error instanceof Error ? error.message : String(error);
+            }
           } catch (error) {
             runtimeLoadFailures.add(db);
             cellHelperError = error instanceof Error ? error.message : String(error);
@@ -2248,7 +2257,9 @@ async function handleRequest(request) {
         result = {
           encoding: executeQuery(db, 'PRAGMA encoding', []).values[0]?.[0],
           cellHelpers: queryPlanDatabases.has(db),
-          ...(cellHelperError ? { cellHelperError } : {})
+          cellPack: cellPackDatabases.has(db),
+          ...(cellHelperError ? { cellHelperError } : {}),
+          ...(cellPackError ? { cellPackError } : {})
         };
         break;
       }
@@ -2263,6 +2274,27 @@ async function handleRequest(request) {
           realTextColumnCount ?? valueColumnCount,
           packedRealTextColumnCount ?? undefined
         );
+        break;
+      }
+
+      // A packed grid page: one BLOB per 100-value chunk of each row. Every
+      // packed cell carries a fixed-size descriptor, so a page of many short
+      // values can be several times its queryNumeric size; past maxBytes the
+      // host reads it through queryNumeric instead of receiving a frame near
+      // the response cap.
+      case "queryPacked": {
+        const [sql, params, maxBytes] = args;
+        if (!db) throw new Error("Database not open");
+        if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('Invalid packed page byte limit');
+        const values = executeQuery(db, sql, params).values;
+        let bytes = 0;
+        for (const row of values) {
+          for (const chunk of row) {
+            if (!(chunk instanceof Uint8Array)) throw new Error('Packed page chunk is not a BLOB');
+            bytes += chunk.byteLength;
+          }
+        }
+        result = bytes > maxBytes ? { tooLarge: true } : { values };
         break;
       }
 
