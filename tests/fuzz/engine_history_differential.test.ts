@@ -16,7 +16,9 @@ import type { CellValue, DatabaseOperations, ModificationEntry, RecordId } from 
 // batch edits, key edits, JSON patches, deletes, imports, undos and redos run
 // on WebAssembly and on the native engine in lockstep. After every step both
 // must have succeeded or both failed, and every cell must have the same
-// storage class and stored bytes. Seeded so a failure reproduces. Opt-in
+// storage class and stored bytes. A successful undo must also restore the
+// exact contents from before its entry, and a redo those after it, which
+// catches a bug both engines share. Seeded so a failure reproduces. Opt-in
 // (`npm run test:history-fuzz`); .github/workflows/native-fuzz.yml runs it on
 // every bundled target.
 //
@@ -52,7 +54,7 @@ const VALUES: ReadonlyArray<readonly [string, () => CellValue]> = [
     ['int32max', () => 2147483647], ['int32min', () => -2147483648], ['int32over', () => 2147483648],
     ['int3e9', () => 3000000000], ['safemax', () => Number.MAX_SAFE_INTEGER], ['safemin', () => -Number.MAX_SAFE_INTEGER],
     ['big2^53+1', () => 9007199254740993n], ['bigmin', () => -9223372036854775808n], ['bigmax', () => 9223372036854775807n],
-    ['big5', () => 5n], ['big-5', () => -5n],
+    ['big5', () => 5n], ['big-5', () => -5n], ['big3e9', () => 3000000000n],
     ['half', () => 0.5], ['-2.25', () => -2.25], ['third', () => 1 / 3], ['1e300', () => 1e300], ['-1e-300', () => -1e-300],
     ['0.1+0.2', () => 0.1 + 0.2], ['1e16', () => 1e16], ['2^63', () => 2 ** 63],
     ['empty', () => ''], ['a', () => 'a'], ['A', () => 'A'], ['unicode', () => 'ünï'], ['emoji', () => '😀'],
@@ -62,6 +64,16 @@ const VALUES: ReadonlyArray<readonly [string, () => CellValue]> = [
     ['blob0', () => new Uint8Array([])], ['blob2', () => new Uint8Array([0, 255])], ['blob-digits', () => new Uint8Array([49, 50])],
     ['null', () => null]
 ];
+// SQL literals for stored values no bound parameter produces: integral and
+// negative-zero REALs, large integers next to fractional ones, TEXT that is
+// not plain UTF-8. The literal step writes them outside history, so history
+// meets them only as prior states.
+const LITERALS: ReadonlyArray<readonly [string, string]> = [
+    ['real5', '5.0'], ['real100', '100.0'], ['real-0', '-0.0'], ['big', '9007199254740993'], ['int3e9', '3000000000'],
+    ['msTimestamp', '1730000000000'], ['int-2^31-1', '-2147483649'], ['invalidUtf8', "CAST(X'FF61' AS TEXT)"],
+    ['bom', "CAST(X'EFBBBF61' AS TEXT)"], ['surrogate', 'char(55296)'], ['nul', "'a' || char(0) || 'b'"],
+    ['lead', "CAST(X'C0' AS TEXT)"], ['1e300', '1e300'], ['blob', "X'00'"], ['text12', "'12'"], ['null', 'NULL']
+];
 const PATCHES: ReadonlyArray<readonly [string, string]> = [
     ['set', '{"b":2}'], ['remove', '{"a":null}'], ['nested', '{"a":{"y":2}}'], ['array', '{"c":[1,2]}'], ['malformed', 'not json']
 ];
@@ -69,7 +81,7 @@ const KINDS = ['alias', 'plain', 'withoutRowid', 'textKey'] as const;
 type Kind = typeof KINDS[number];
 const TYPES = ['', 'INTEGER', 'REAL', 'TEXT', 'NUMERIC', 'BLOB', 'INT', 'VARCHAR(10)', 'DOUBLE', 'BOOLEAN'];
 const COLUMNS = ['c0', 'c1', 'c2', 'c3'];
-const OPERATIONS = ['insert', 'insert', 'batch', 'batch', 'keyEdit', 'patch', 'delete', 'import', 'undo', 'undo', 'redo'] as const;
+const OPERATIONS = ['insert', 'insert', 'literal', 'batch', 'batch', 'keyEdit', 'patch', 'delete', 'import', 'undo', 'undo', 'redo'] as const;
 type Engine = 'wasm' | 'native';
 type Outcome = { ok: true } | { ok: false; error: string };
 
@@ -145,6 +157,10 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                 const ddl = tableSql(kind, random);
                 for (const ops of Object.values(engines)) await ops.executeQuery(ddl);
                 const history: Record<Engine, ModificationEntry[]> = { wasm: [], native: [] };
+                // Contents around each entry, for the undo and redo oracle.
+                const around = new WeakMap<ModificationEntry, { before: string; after?: string }>();
+                let current = await contents(wasm, kind);
+                const pending: ModificationEntry[] = [];
                 const redo: Record<Engine, ModificationEntry[]> = { wasm: [], native: [] };
                 const log = [ddl];
                 let nextId = 1;
@@ -173,10 +189,37 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                     const record = (engine: Engine, entry: ModificationEntry) => {
                         history[engine].push(entry);
                         redo[engine].length = 0;
+                        around.set(entry, { before: current });
+                        pending.push(entry);
                     };
+                    let replayed: { entry: ModificationEntry; operation: 'undo' | 'redo' } | undefined;
                     const outcomes = {} as Record<Engine, Outcome>;
                     let description: string = operation;
-                    if (operation === 'insert') {
+                    if (operation === 'literal') {
+                        const columns: string[] = [];
+                        const literals: string[] = [];
+                        const id = nextId++;
+                        if (kind !== 'alias' || random() < 0.7) { columns.push('id'); literals.push(String(id)); }
+                        if (kind === 'textKey') { columns.push('k'); literals.push(`'k${id}'`); }
+                        for (const column of COLUMNS) {
+                            if (random() < 0.8) {
+                                const [name, literal] = pick(LITERALS);
+                                values.get(kind)!.add(`literal:${name}`);
+                                columns.push(column); literals.push(literal); description += ` ${column}=${name}`;
+                            }
+                        }
+                        const sql = columns.length > 0
+                            ? `INSERT INTO t (${columns.join(', ')}) VALUES (${literals.join(', ')})`
+                            : 'INSERT INTO t DEFAULT VALUES';
+                        for (const engine of ['wasm', 'native'] as const) {
+                            outcomes[engine] = await attempt(async () => {
+                                await engines[engine].executeQuery(sql);
+                                // Outside history: later entries start from here.
+                                history[engine].length = 0;
+                                redo[engine].length = 0;
+                            });
+                        }
+                    } else if (operation === 'insert') {
                         const { data, names } = newRow();
                         description += ` ${names.join(' ')}`;
                         for (const engine of ['wasm', 'native'] as const) {
@@ -252,6 +295,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                                 await (operation === 'undo' ? engines[engine].undoModification(entry) : engines[engine].redoModification(entry));
                                 from.pop();
                                 to.push(entry);
+                                if (engine === 'wasm') replayed = { entry, operation };
                             });
                         }
                     } else {
@@ -262,9 +306,25 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                     log.push(`${step}: ${description} -> wasm ${status(outcomes.wasm)}; native ${status(outcomes.native)}`);
                     if (outcomes.wasm.ok) successes.set(`${kind}:${operation}`, (successes.get(`${kind}:${operation}`) ?? 0) + 1);
                     const [wasmCells, nativeCells] = [await contents(wasm, kind), await contents(nativeOps, kind)];
-                    const trail = () => `seed ${seed} (${kind}) step ${step}\n  ${log.join('\n  ')}`;
+                    const trail = () => `seed ${seed} (${kind}) step ${step}\n  ${log.join('\n  ')}\n  contents before the step: ${current}`;
                     assert.equal(outcomes.native.ok, outcomes.wasm.ok, `outcomes differ\n${trail()}`);
                     assert.equal(nativeCells, wasmCells, `cells differ\n${trail()}`);
+                    for (const entry of pending.splice(0)) {
+                        const snapshot = around.get(entry);
+                        if (snapshot && history.wasm.includes(entry)) snapshot.after = wasmCells;
+                    }
+                    // Only history writes here, and literal steps restart it, so a
+                    // replay can fail on a constraint mid-batch but never conflict.
+                    if ((operation === 'undo' || operation === 'redo') && !outcomes.wasm.ok) {
+                        assert.match(outcomes.wasm.error, /constraint failed/, `${operation} failed\n${trail()}`);
+                    }
+                    if (replayed && outcomes.native.ok) {
+                        const snapshot = around.get(replayed.entry);
+                        const expected = replayed.operation === 'undo' ? snapshot?.before : snapshot?.after;
+                        assert.ok(expected !== undefined, `no recorded contents for the ${replayed.operation}\n${trail()}`);
+                        assert.equal(wasmCells, expected, `${replayed.operation} did not restore the contents\n${trail()}`);
+                    }
+                    current = wasmCells;
                 }
             } finally {
                 wasm.shutdown();
