@@ -43,6 +43,7 @@
 
 ### Maintenance
 
+- Run the same inserts, edits, deletes, imports, undos and redos on WebAssembly and the native engine side by side on every bundled target (`npm run test:history-fuzz`), and fail if any step's outcome, storage class or stored bytes differ. It found both native binding fixes above.
 - Stop building and packaging the browser worker bundle. VS Code Web runs SQLite in the extension host, so nothing loaded it.
 - Ship the extension icon at 256 by 256 pixels, the size VS Code asks for, instead of 500 by 500. With the removed bundle, each VSIX is 210 KB smaller.
 - Ship only the 25 codicons the viewer uses. The build cuts the icon font and its stylesheet down to those icons, which makes each VSIX 63 KB smaller, and fails if the viewer names an icon the font does not have.
