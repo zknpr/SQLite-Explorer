@@ -312,6 +312,98 @@ static void cell_text_check(sqlite3_context *context, int argc, sqlite3_value **
     else if (!is_plain_utf8(text, length)) sqlite3_result_blob(context, text, length, SQLITE_TRANSIENT);
 }
 
+static unsigned char fold_ascii(unsigned char c) {
+    return c >= 'A' && c <= 'Z' ? (unsigned char) (c | 0x20) : c;
+}
+
+static int contains_folded(const unsigned char *text, int length, const unsigned char *needle, int size) {
+    for (int start = 0; start + size <= length; start++) {
+        int index = 0;
+        while (index < size && fold_ascii(text[start + index]) == fold_ascii(needle[index])) index++;
+        if (index == size) return 1;
+    }
+    return 0;
+}
+
+/* An ASCII needle in NUL-terminated text, stopping at the first NUL as LIKE
+ * does. The needle holds no NUL, so a compare never passes the text's. */
+static int contains_ascii(const unsigned char *text, const unsigned char *needle, int size) {
+    if (!size) return 1;
+    unsigned char first = fold_ascii(needle[0]);
+    for (const unsigned char *at = text; *at; at++) {
+        if (fold_ascii(*at) != first) continue;
+        int index = 1;
+        while (index < size && fold_ascii(at[index]) == fold_ascii(needle[index])) index++;
+        if (index == size) return 1;
+    }
+    return 0;
+}
+
+/* Whether any argument after the first matches LIKE '%needle%' ESCAPE '\'
+ * with the first argument as the literal needle: 1, 0, or NULL when only
+ * SQLite's LIKE can tell. LIKE folds ASCII case only and stops at a NUL.
+ * Its UTF-8 reader returns every byte below 0x80 as itself and never decodes
+ * other bytes to one, so an ASCII needle is searched in any text's bytes. A
+ * non-ASCII needle is compared byte by byte only with plain UTF-8
+ * (is_plain_utf8); other TEXT gives NULL unless a plain value matched. A
+ * needle that is not plain, or that LIKE could refuse as too long, always
+ * gives NULL. BLOBs never match LIKE in a LIKE_DOESNT_MATCH_BLOBS build and
+ * are text in any other. INTEGER and REAL text holds only digits, '-', '+',
+ * '.', 'e' and "Inf", so a needle with any other character never matches one
+ * and skips its conversion. The caller must not use this under
+ * PRAGMA case_sensitive_like. */
+static void like_any(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    if (argc < 2) {
+        sqlite3_result_error(context, "sqlite_explorer_like_any needs a needle and a value", -1);
+        return;
+    }
+    if (sqlite3_value_type(argv[0]) != SQLITE_TEXT) return;
+    const unsigned char *needle = sqlite3_value_text(argv[0]);
+    int size = sqlite3_value_bytes(argv[0]);
+    if (!needle) { sqlite3_result_error_nomem(context); return; }
+    /* Escaping at most doubles the needle inside its two '%'. */
+    int pattern_limit = sqlite3_limit(sqlite3_context_db_handle(context), SQLITE_LIMIT_LIKE_PATTERN_LENGTH, -1);
+    if ((sqlite3_int64) size * 2 + 2 > pattern_limit) return;
+    int ascii = 1, integer_text = 1, real_text = 1;
+    for (int index = 0; index < size; index++) {
+        unsigned char c = fold_ascii(needle[index]);
+        int digit = c >= '0' && c <= '9';
+        if (!c || c >= 0x80) ascii = 0;
+        if (!digit && c != '-') integer_text = 0;
+        if (!digit && c != '-' && c != '+' && c != '.' && c != 'e' && c != 'i' && c != 'n' && c != 'f') real_text = 0;
+    }
+    if (!ascii && !is_plain_utf8(needle, size)) return;
+    int blobs_match = sqlite3_user_data(context) != 0;
+    int undecided = 0;
+    for (int index = 1; index < argc; index++) {
+        int type = sqlite3_value_type(argv[index]);
+        if (type == SQLITE_NULL
+            || (type == SQLITE_INTEGER && !integer_text)
+            || (type == SQLITE_FLOAT && !real_text)
+            || (type == SQLITE_BLOB && !blobs_match)) continue;
+        const unsigned char *text = sqlite3_value_text(argv[index]);
+        int length = sqlite3_value_bytes(argv[index]);
+        if (!text) {
+            if (length) { sqlite3_result_error_nomem(context); return; }
+            text = (const unsigned char *) "";
+        }
+        int found;
+        if (ascii) {
+            found = contains_ascii(text, needle, size);
+        } else if ((type == SQLITE_TEXT || type == SQLITE_BLOB) && !is_plain_utf8(text, length)) {
+            undecided = 1;
+            continue;
+        } else {
+            found = contains_folded(text, length, needle, size);
+        }
+        if (found) {
+            sqlite3_result_int(context, 1);
+            return;
+        }
+    }
+    if (!undecided) sqlite3_result_int(context, 0);
+}
+
 /* SQLite's text for each REAL argument after the first, as "index:text"
  * joined by '|', where index counts from the first argument's value. NULL
  * when no argument is REAL. The text comes from a copy of the value, so it is
@@ -539,6 +631,10 @@ int sqlite3_sqliteexplorer_init(sqlite3 *db, char **error, const sqlite3_api_rou
         SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, real_texts, 0, 0, 0);
     if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_cell_pack", -1,
         SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, cell_pack, 0, 0, 0);
+    /* Non-NULL user data: this SQLite's LIKE can match a BLOB. */
+    if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_like_any", -1,
+        SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC,
+        sqlite3_compileoption_used("LIKE_DOESNT_MATCH_BLOBS") ? 0 : (void *) db, like_any, 0, 0, 0);
     return rc;
 }
 

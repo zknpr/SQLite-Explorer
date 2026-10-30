@@ -31,7 +31,8 @@ export function buildSelectQuery(
    * row-packed grid page reads the base table with no co-routine. A reversed
    * keyset page re-sorts its inner SELECT by name and cannot take one.
    */
-  selectList?: (columnExpressions: string[]) => string
+  selectList?: (columnExpressions: string[]) => string,
+  functions: QueryRuntimeFunctions = {}
 ): { sql: string; params: CellValue[] } {
   const {
     columns = ['*'],
@@ -65,7 +66,8 @@ export function buildSelectQuery(
   const { conditions, params: filterParams } = buildFilterConditions(
     filters,
     globalFilter,
-    globalFilterColumns
+    globalFilterColumns,
+    functions
   );
   whereClauses.push(...conditions);
   params.push(...filterParams);
@@ -111,7 +113,11 @@ export function buildSelectQuery(
 /**
  * Build a COUNT query from options.
  */
-export function buildCountQuery(table: string, options: TableCountOptions): { sql: string; params: CellValue[] } {
+export function buildCountQuery(
+  table: string,
+  options: TableCountOptions,
+  functions: QueryRuntimeFunctions = {}
+): { sql: string; params: CellValue[] } {
   const {
     columns = [],
     globalFilterColumns = columns,
@@ -127,7 +133,8 @@ export function buildCountQuery(table: string, options: TableCountOptions): { sq
   const { conditions, params: filterParams } = buildFilterConditions(
     filters,
     globalFilter,
-    globalFilterColumns
+    globalFilterColumns,
+    functions
   );
   whereClauses.push(...conditions);
   params.push(...filterParams);
@@ -139,13 +146,23 @@ export function buildCountQuery(table: string, options: TableCountOptions): { sq
   return { sql, params };
 }
 
+/** Runtime functions the engine's connection has registered (src/runtime/query-plan.c). */
+export interface QueryRuntimeFunctions {
+  /** sqlite_explorer_like_any, on a UTF-8 database. */
+  likeAny?: boolean;
+}
+
+/** Values per sqlite_explorer_like_any call, as for the cell pack. */
+const LIKE_ANY_CHUNK = 100;
+
 /**
  * Helper to build WHERE conditions for column filters and global search.
  */
 function buildFilterConditions(
   filters: { column: string; value: string }[] = [],
   globalFilter: string | undefined,
-  searchColumns: string[]
+  searchColumns: string[],
+  functions: QueryRuntimeFunctions = {}
 ): { conditions: string[]; params: CellValue[] } {
   const conditions: string[] = [];
   const params: CellValue[] = [];
@@ -162,13 +179,25 @@ function buildFilterConditions(
   // Global filter
   const activeGlobalFilter = getActiveFilterValue(globalFilter);
   if (activeGlobalFilter !== undefined && searchColumns.length > 0) {
-    const globalConditions = searchColumns
-      .map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`)
-      .join(' OR ');
-
-    conditions.push(`(${globalConditions})`);
-    for (let i = 0; i < searchColumns.length; i++) {
-      params.push(`%${escapeLikePattern(activeGlobalFilter)}%`);
+    const pattern = `%${escapeLikePattern(activeGlobalFilter)}%`;
+    const likeChain = (columns: string[]) => {
+      for (let i = 0; i < columns.length; i++) params.push(pattern);
+      return `(${columns.map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`).join(' OR ')})`;
+    };
+    if (functions.likeAny) {
+      // One call per row and chunk instead of one LIKE per column. The LIKE
+      // chain decides only rows the function leaves NULL, and the constant
+      // test keeps PRAGMA case_sensitive_like on SQLite's own LIKE.
+      const chunks: string[] = [];
+      for (let start = 0; start < searchColumns.length; start += LIKE_ANY_CHUNK) {
+        const columns = searchColumns.slice(start, start + LIKE_ANY_CHUNK);
+        params.push(activeGlobalFilter);
+        const call = `sqlite_explorer_like_any(?, ${columns.map(escapeIdentifier).join(', ')})`;
+        chunks.push(`COALESCE(CASE WHEN 'a' LIKE 'A' THEN ${call} END, ${likeChain(columns)})`);
+      }
+      conditions.push(`(${chunks.join(' OR ')})`);
+    } else {
+      conditions.push(likeChain(searchColumns));
     }
   }
 

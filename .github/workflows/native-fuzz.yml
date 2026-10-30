@@ -14,7 +14,9 @@ on:
       - 'tests/unit/grid_cell_helpers.test.ts'
       - 'tests/unit/grid_cell_pack.test.ts'
       - 'tests/unit/native_memory_map.test.ts'
+      - 'tests/unit/global_filter_like_any.test.ts'
       - 'src/core/cell-pack.ts'
+      - 'src/core/query-builder.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
@@ -30,7 +32,9 @@ on:
       - 'tests/unit/grid_cell_helpers.test.ts'
       - 'tests/unit/grid_cell_pack.test.ts'
       - 'tests/unit/native_memory_map.test.ts'
+      - 'tests/unit/global_filter_like_any.test.ts'
       - 'src/core/cell-pack.ts'
+      - 'src/core/query-builder.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
@@ -93,14 +97,15 @@ jobs:
           set -o pipefail
           npm run test:native-fuzz 2>&1 | tee native-fuzz.log
 
-      # Grid pages with the runtime's cell helpers on and off, and packed
-      # pages against the helpers, through the production worker. No other
+      # Grid pages with the runtime's cell helpers on and off, packed pages
+      # against the helpers, and global filters against LIKE, through the
+      # production worker. No other
       # CI lane loads natives/<target>'s query-plan library.
       - name: Native grid pages
         shell: bash
         env:
           FUZZ_EXPECT_TARGET: ${{ matrix.target }}
-        run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts tests/unit/grid_cell_pack.test.ts
+        run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts tests/unit/grid_cell_pack.test.ts tests/unit/global_filter_like_any.test.ts
 
       # Which databases the worker reads through a memory map, and that reading
       # one leaves its ctime unchanged. Only Linux maps.

@@ -5,19 +5,19 @@
   "zig": "0.16.0",
   "zigClang": "clang version 21.1.0",
   "inputs": {
-    "src/runtime/query-plan.c": "1f58051394058f7a4a2f3bae3e43dc9da489c01359e07c35f18743a3c2cd9745",
+    "src/runtime/query-plan.c": "f52444ab3cff5da820a8b1c3f1354e336426e22bc3094dfaa1350bb7dba4cd2d",
     "scripts/build-query-plan.mjs": "b2a87a29990f8410911e6ffd1ff4af09641481a09734912f84391e179ffdc24d"
   },
   "outputs": {
-    "natives/aarch64-macos/query-plan.dylib": "65c720bf680440177b54796c0e699a7e3abfb0db041b0f998923d73d31b607cc",
-    "natives/x86_64-macos/query-plan.dylib": "996eae154681135d8d0152298f35f499bceedd4d846d11bc70f43b3bf26040a0",
-    "natives/x86_64-linux-gnu/query-plan.so": "78d4b677811824fdcb43fe11a739be7965d6e1ea8f4d81f90f554e453b5070b8",
-    "natives/aarch64-linux-gnu/query-plan.so": "d97a4537a67f904f6a59cc49794332df33994c9b961ed5f9da7436e46cd1866d",
-    "natives/x86_64-windows/query-plan.dll": "6d182c276bc6008a5e4176dacbd822da2157736376e30e7769ef4dce76d281dc",
+    "natives/aarch64-macos/query-plan.dylib": "b44696206acfe38f9f3e510a495a50da170d804f90f8c83bbcf925729694b6f4",
+    "natives/x86_64-macos/query-plan.dylib": "75a7e5c9ef7c365b09a942ed96639da7b60e4672a9ac70e21db4db82a38b3ffa",
+    "natives/x86_64-linux-gnu/query-plan.so": "839d0539926757ae4f466b9a35c6377080867ecbfd30cd2de171f3cd967629fc",
+    "natives/aarch64-linux-gnu/query-plan.so": "0b488c137e4da96d1b242ca027e395ae405f58ca919445269f949d5b81908e07",
+    "natives/x86_64-windows/query-plan.dll": "99873662bf1a4468ace99709e9ac9c13d95dbe543449423060d1cc225f0e95ca",
     "vendor/sql.js/sql-wasm.js": "466d8b6ec0ac6022fe79b12c7ef55bd2c8b618f7194317713aca6cf482172b8d",
     "website/public/sqlite-viewer/sql-wasm.js": "466d8b6ec0ac6022fe79b12c7ef55bd2c8b618f7194317713aca6cf482172b8d",
-    "vendor/sql.js/sql-wasm.wasm": "2e85d56e4210b4a13a0923fd959274cccb5ffcc66be0093d017a5fbee181cac6",
-    "assets/sqlite3.wasm": "2e85d56e4210b4a13a0923fd959274cccb5ffcc66be0093d017a5fbee181cac6",
-    "website/public/sqlite-viewer/sql-wasm.wasm": "2e85d56e4210b4a13a0923fd959274cccb5ffcc66be0093d017a5fbee181cac6"
+    "vendor/sql.js/sql-wasm.wasm": "2fc426d6357dae659c9854e10a884d1c10fea956d806240e5069f6cf595f724c",
+    "assets/sqlite3.wasm": "2fc426d6357dae659c9854e10a884d1c10fea956d806240e5069f6cf595f724c",
+    "website/public/sqlite-viewer/sql-wasm.wasm": "2fc426d6357dae659c9854e10a884d1c10fea956d806240e5069f6cf595f724c"
   }
 }

@@ -73,6 +73,7 @@ import {
   resolveIndexDependencyColumns
 } from './core/schema-ddl';
 import { buildSelectQuery, buildCountQuery } from './core/query-builder';
+import { getActiveFilterValue } from './core/filter-utils';
 import { normalizeTablePageOptions } from './core/table-pagination';
 import {
   computeKeysetKey,
@@ -918,6 +919,10 @@ interface NativeGridPagePreparation {
   cellPack: boolean;
   /** Present once per connection, when the library loaded without a usable pack function. */
   cellPackError?: string;
+  /** Whether the loaded library has sqlite_explorer_like_any for global filters. */
+  likeAny?: boolean;
+  /** Present once per connection, when the library loaded without a usable like_any. */
+  likeAnyError?: string;
 }
 
 interface NativeCompileBatchResult {
@@ -1893,6 +1898,7 @@ export async function createNativeDatabaseConnection(
         textEncoding: CellTextEncoding;
         cellHelpers: boolean;
         cellPack: boolean;
+        likeAny: boolean;
       }> => {
         const preparation = await worker.call<NativeGridPagePreparation>('prepareGridPage', [queryPlanLibrary]);
         if (preparation.cellHelperError) {
@@ -1906,6 +1912,11 @@ export async function createNativeDatabaseConnection(
             `[NativeWorker] Packed grid pages are unavailable; table pages use the cell helpers: ${preparation.cellPackError}`
           );
         }
+        if (preparation.likeAnyError) {
+          outputChannel?.appendLine(
+            `[NativeWorker] The runtime's filter function is unavailable; filters use one LIKE per column: ${preparation.likeAnyError}`
+          );
+        }
         const textEncoding = normalizeCellTextEncoding(preparation.encoding);
         if (preparation.cellHelpers && textEncoding !== 'utf-8' && !nativeCellHelperEncodingLogged) {
           nativeCellHelperEncodingLogged = true;
@@ -1915,7 +1926,12 @@ export async function createNativeDatabaseConnection(
           );
         }
         const cellHelpers = preparation.cellHelpers && textEncoding === 'utf-8';
-        return { textEncoding, cellHelpers, cellPack: cellHelpers && preparation.cellPack };
+        return {
+          textEncoding,
+          cellHelpers,
+          cellPack: cellHelpers && preparation.cellPack,
+          likeAny: cellHelpers && preparation.likeAny === true
+        };
       };
 
       const readNativePrimaryKeyRecordId = async (
@@ -4497,12 +4513,20 @@ export async function createNativeDatabaseConnection(
             const valueQueryOptions = splitSyntheticRowId
               ? { ...queryOptions, columns: valueColumns }
               : queryOptions;
-            const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan);
+            const {
+              textEncoding: databaseTextEncoding,
+              cellHelpers: checkedTransport,
+              cellPack,
+              likeAny
+            } = await prepareNativeCellHelpers();
+            const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan, undefined, { likeAny });
             const rowIdQuery = splitSyntheticRowId
               ? buildSelectQuery(
                   table,
                   { ...queryOptions, columns: ['rowid'] },
-                  keysetPlan
+                  keysetPlan,
+                  undefined,
+                  { likeAny }
                 )
               : undefined;
             const primaryKeyColumnIndices = primaryKeyContext
@@ -4531,11 +4555,6 @@ export async function createNativeDatabaseConnection(
               valueColumns.length * 2 + 1 <= SQLITE_MAX_RESULT_COLUMNS
                 ? valueColumns.map((_, index) => index)
                 : identityContainmentRawTextColumnIndices;
-            const {
-              textEncoding: databaseTextEncoding,
-              cellHelpers: checkedTransport,
-              cellPack
-            } = await prepareNativeCellHelpers();
             const containmentQuery = buildCellContainmentQuery(
               sql,
               valueColumns.length,
@@ -4773,7 +4792,10 @@ export async function createNativeDatabaseConnection(
          * Fetch table row count.
          */
         fetchTableCount: async (table: string, options: TableCountOptions) => {
-          const { sql, params } = buildCountQuery(table, options);
+          // Only a global filter can use the runtime, so others skip its round trip.
+          const likeAny = getActiveFilterValue(options.globalFilter) !== undefined
+            && (await prepareNativeCellHelpers()).likeAny;
+          const { sql, params } = buildCountQuery(table, options, { likeAny });
           const result = await worker.call<NativeQueryResult>('query', [sql, params]);
           if (result && result.values && result.values.length > 0) {
             const val = result.values[0][0];

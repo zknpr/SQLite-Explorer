@@ -58,7 +58,8 @@ import {
   resolveIndexDependencyColumns
 } from '../../schema-ddl';
 import { crypto } from '../../../platform/cryptoShim';
-import { buildSelectQuery, buildCountQuery } from '../../query-builder';
+import { buildSelectQuery, buildCountQuery, type QueryRuntimeFunctions } from '../../query-builder';
+import { getActiveFilterValue } from '../../filter-utils';
 import { normalizeTablePageOptions } from '../../table-pagination';
 import {
   computeKeysetKey,
@@ -488,6 +489,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   gridRowPackTransport: 'off' | 'wrapped' | 'direct' = 'wrapped';
   /** Whether this module's runtime can serve packed pages (probeCellPack). */
   private readonly hasCellPack: boolean;
+  /** Whether the runtime registered sqlite_explorer_like_any for global filters. */
+  private readonly hasLikeAny: boolean;
   private readonly cellReadSessionIdleTimeoutMs: number;
   private readonly cellReadSessionAbsoluteTimeoutMs: number;
   private cellReadSession: WasmCellReadSessionState | undefined;
@@ -556,6 +559,24 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.logger('warn', 'Grid cell helpers are unavailable; table pages and query results use SQL containment:', error);
     }
     this.hasCellPack = this.hasCellHelpers && this.probeCellPack();
+    this.hasLikeAny = this.hasCellHelpers && this.probeLikeAny();
+  }
+
+  private probeLikeAny(): boolean {
+    try {
+      this.instance.exec("SELECT sqlite_explorer_like_any('a', 'A')");
+      return true;
+    } catch (error) {
+      this.logger('warn', "The runtime's filter function is unavailable; filters use one LIKE per column:", error);
+      return false;
+    }
+  }
+
+  /** Runtime functions a table page or count may call: only a global filter uses one. */
+  private queryRuntimeFunctions(globalFilter: string | undefined): QueryRuntimeFunctions {
+    return {
+      likeAny: this.hasLikeAny && getActiveFilterValue(globalFilter) !== undefined && this.cellHelpersApply()
+    };
   }
 
   /**
@@ -4681,12 +4702,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const valueQueryOptions = splitSyntheticRowId
         ? { ...queryOptions, columns: queryOptions.columns!.slice(1) }
         : queryOptions;
-      const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan);
+      const functions = this.queryRuntimeFunctions(queryOptions.globalFilter);
+      const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan, undefined, functions);
       const rowIdQuery = splitSyntheticRowId
         ? buildSelectQuery(
             table,
             { ...queryOptions, columns: ['rowid'] },
-            keysetPlan
+            keysetPlan,
+            undefined,
+            functions
           )
         : undefined;
 
@@ -4748,7 +4772,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           ? this.packHeap()
           : undefined;
         const packSql = packAccess
-          ? this.buildGridRowPackSql(table, valueQueryOptions, keysetPlan, sql, bindParams, containmentQuery)
+          ? this.buildGridRowPackSql(table, valueQueryOptions, keysetPlan, sql, bindParams, containmentQuery, functions)
           : undefined;
         const stmt = this.instance.prepare(packSql ?? transportQuery.sql, bindParams);
         executionState.stmt = stmt;
@@ -5020,7 +5044,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     keysetPlan: ResolvedKeysetPlan | undefined,
     sourceSql: string,
     bindParams: ReturnType<typeof normalizeWasmBindParams>,
-    containmentQuery: CellContainmentQuery
+    containmentQuery: CellContainmentQuery,
+    functions: QueryRuntimeFunctions
   ): string {
     const columns = options.columns;
     if (
@@ -5029,8 +5054,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       && !columns.includes('*')
       && keysetPlan?.mode !== 'before' && keysetPlan?.mode !== 'last'
     ) {
+      // The same functions as the source SQL, so bindParams still fit.
       const direct = buildSelectQuery(table, options, keysetPlan,
-        expressions => buildCellPackSelectList(expressions, containmentQuery)).sql;
+        expressions => buildCellPackSelectList(expressions, containmentQuery), functions).sql;
       let sorts = false;
       const plan = this.instance.prepare(`EXPLAIN QUERY PLAN ${direct}`, bindParams);
       try {
@@ -5052,7 +5078,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const queryOptions = { ...options };
     queryOptions.columns = await this.resolveQueryColumns(table, queryOptions.columns, queryOptions.globalFilter);
 
-    const { sql, params } = buildCountQuery(table, queryOptions);
+    const { sql, params } = buildCountQuery(table, queryOptions, this.queryRuntimeFunctions(queryOptions.globalFilter));
     // Shared paged count policy (see src/core/paged-count.ts): large paged
     // opens answer unfiltered counts without a complete b-tree scan — rowid
     // tables use their span, while WITHOUT ROWID tables use a capped probe.

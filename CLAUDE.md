@@ -343,6 +343,19 @@ At each open, `nativeMemoryMapBytes()` in `nativeWorker.ts` decides whether the 
 
 Don't add network, FUSE, 9p or removable-media types to the allowlist.
 
+### Global Filter Function
+
+On a UTF-8 database with the runtime registered, the global filter calls `sqlite_explorer_like_any(needle, col1..col100)` once per row for each chunk of up to 100 columns (`buildFilterConditions` in `query-builder.ts`). The call sits inside `COALESCE(CASE WHEN 'a' LIKE 'A' THEN … END, <the LIKE chain>)`. The function returns 1 or 0 only when LIKE `'%needle%'` must agree, and NULL otherwise, which hands that row to the chain. The constant `'a' LIKE 'A'` keeps it out of the way under `PRAGMA case_sensitive_like`.
+
+Rules it relies on, read from SQLite 3.54.1's `patternCompare` and `sqlite3Utf8Read`:
+- LIKE folds ASCII case only and stops at the first NUL.
+- Bytes below 0x80 always decode as themselves, and no other bytes decode to one, so an ASCII needle is matched against raw bytes.
+- A non-ASCII needle is compared only with plain UTF-8; other TEXT is undecided.
+- Both builds set `LIKE_DOESNT_MATCH_BLOBS`.
+- INTEGER and REAL text uses only `0-9 . + - e Inf`.
+
+`global_filter_like_any.test.ts` compares both forms over every value class on both engines and checks these rules. Re-run it after any SQLite upgrade.
+
 ### Keyset Pagination
 
 Grid page turns seek instead of scanning (deep page = first-page cost on every engine). Engines mint opaque anchor tokens (`ksa:` + canonical JSON, `src/core/keyset-pagination.ts`) for the first/last row of every page of an anchorable table (authority-confirmed unshadowed rowid, or WITHOUT ROWID primary key). The webview commits them atomically with the grid rows (inside the superseded-load gate in `grid-data.js`) and round-trips them verbatim with a navigation intent (`first`/`after`/`atOrAfter`/`before`/`last`). Engines strictly re-validate every received anchor — canonical decode, embedded query-identity tag (table, sort, filters, page size), key arity — and fall back to the LIMIT/OFFSET query on any legitimate staleness; structurally malformed tokens throw (engines never mint them, so they signal tampering, not staleness). Both paths emit one deterministic total order — the identity tiebreak is appended to sorts, and the OFFSET fallback adopts the full key ordering via `keysetFallbackOrder` — so mixed OFFSET/keyset sequences can never skip or duplicate rows. NULL sort boundaries decompose per direction (NULLs first ASC / last DESC); INTEGER-class anchor values bind through `CAST(? AS INTEGER)` so int64 beyond 2^53 seeks exactly even on NONE-affinity columns. Views and keyless objects always use OFFSET. `before`/`last` execute reversed with a bounded SQL-side re-sort so row-indexed sidecars (oversizedCells, exactIntegerTexts) stay aligned.

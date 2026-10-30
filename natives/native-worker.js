@@ -299,6 +299,8 @@ const queryPlanDatabases = new WeakSet();
 const runtimeLoadFailures = new WeakSet();
 // Connections whose loaded runtime library serves packed grid pages.
 const cellPackDatabases = new WeakSet();
+// Connections whose runtime has sqlite_explorer_like_any (global filters).
+const likeAnyDatabases = new WeakSet();
 
 /** TEMP export spools owned by the interruptible secondary connection. */
 const exportSpools = new Set();
@@ -2242,6 +2244,7 @@ async function handleRequest(request) {
         if (typeof library !== 'string') throw new Error('Invalid runtime library path');
         let cellHelperError;
         let cellPackError;
+        let likeAnyError;
         if (!queryPlanDatabases.has(db) && !runtimeLoadFailures.has(db)) {
           try {
             db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
@@ -2252,6 +2255,12 @@ async function handleRequest(request) {
             } catch (error) {
               cellPackError = error instanceof Error ? error.message : String(error);
             }
+            try {
+              executeQuery(db, "SELECT sqlite_explorer_like_any('a', 'A')", []);
+              likeAnyDatabases.add(db);
+            } catch (error) {
+              likeAnyError = error instanceof Error ? error.message : String(error);
+            }
           } catch (error) {
             runtimeLoadFailures.add(db);
             cellHelperError = error instanceof Error ? error.message : String(error);
@@ -2261,8 +2270,10 @@ async function handleRequest(request) {
           encoding: executeQuery(db, 'PRAGMA encoding', []).values[0]?.[0],
           cellHelpers: queryPlanDatabases.has(db),
           cellPack: cellPackDatabases.has(db),
+          likeAny: likeAnyDatabases.has(db),
           ...(cellHelperError ? { cellHelperError } : {}),
-          ...(cellPackError ? { cellPackError } : {})
+          ...(cellPackError ? { cellPackError } : {}),
+          ...(likeAnyError ? { likeAnyError } : {})
         };
         break;
       }
