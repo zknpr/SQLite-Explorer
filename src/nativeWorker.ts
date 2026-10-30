@@ -468,6 +468,51 @@ function sameNativeFileIdentity(left: NativeFileIdentity, right: NativeFileIdent
   return left.canonicalPath === right.canonicalPath && left.dev === right.dev && left.ino === right.ino;
 }
 
+/** Most of a main database file that the native worker reads through a memory map. */
+export const NATIVE_MMAP_BYTES = 256 * 1024 * 1024;
+
+/** Linux statfs magic numbers (linux/magic.h) of local disk and memory filesystems. */
+const LINUX_LOCAL_FILESYSTEM_TYPES = new Set<bigint>([
+  0xEF53n,     // ext2, ext3, ext4
+  0x58465342n, // xfs
+  0x9123683En, // btrfs
+  0xF2F52010n, // f2fs
+  0x2FC12FC1n, // zfs
+  0xCA451A4En, // bcachefs
+  0x01021994n, // tmpfs
+  0x794C7630n, // overlayfs
+]);
+
+/**
+ * How much of a native main database to read through a memory map.
+ *
+ * Mapped reads skip a copy per page: COUNT(*) over a 100 MB table takes 2 ms
+ * instead of 17. SQLite cannot catch a fault on a mapped page, so an I/O error,
+ * or another program truncating the file during a statement, kills the worker
+ * where read() would fail that one statement. So only Linux local disk and
+ * memory filesystems are mapped, named by statfs magic number. macOS is never
+ * mapped: on APFS, removing the mapping at close or exit changes the file's
+ * ctime even when the worker only read it, and the atomic save's target check
+ * then sees a change it did not make. Windows is never mapped: while the
+ * worker maps the file, other programs cannot truncate it.
+ */
+export async function nativeMemoryMapBytes(
+  canonicalPath: string,
+  platform: NodeJS.Platform = process.platform,
+  statfs: typeof fs.promises.statfs = fs.promises.statfs
+): Promise<number> {
+  if (platform !== 'linux') return 0;
+  let stats;
+  try {
+    stats = await statfs(canonicalPath, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    // SQLite creates a missing database in this directory.
+    stats = await statfs(path.dirname(canonicalPath), { bigint: true });
+  }
+  return LINUX_LOCAL_FILESYSTEM_TYPES.has(stats.type) ? NATIVE_MMAP_BYTES : 0;
+}
+
 // ============================================================================
 // Native Worker Communication
 // ============================================================================
@@ -1123,7 +1168,16 @@ export async function createNativeDatabaseConnection(
         }
         // Pin the resolved spelling too: SQLite's sidecar paths must not follow
         // a different symlink target from the identity we admitted.
-        await worker.call('open', [before?.canonicalPath ?? filePath, readOnly]);
+        const openPath = before?.canonicalPath ?? filePath;
+        let mmapBytes = 0;
+        try {
+          mmapBytes = await nativeMemoryMapBytes(openPath);
+        } catch (error) {
+          outputChannel?.appendLine(
+            `[NativeWorker] Reading ${displayName} without a memory map: its filesystem could not be identified (${error instanceof Error ? error.message : String(error)}).`
+          );
+        }
+        await worker.call('open', [openPath, readOnly, mmapBytes]);
         const after = await readNativeFileIdentity(filePath);
         if (before && !sameNativeFileIdentity(before, after)) return invalidateConnection();
         identity = after;

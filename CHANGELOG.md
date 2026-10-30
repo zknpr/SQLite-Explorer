@@ -13,6 +13,14 @@
 - The web demo's worker reads a table page about 40% faster. The demo now registers the bundled runtime's functions and uses them for pages as the extension does, so views and WITHOUT ROWID tables with more than 666 columns also show SQLite's exact text for REAL values there. Measured under Node against the same worker without the runtime functions, a 5,000-row page took 34 ms instead of 57 at 11 columns and 135 ms instead of 227 at 51 columns; a browser was not measured. Databases stored as UTF-16 keep the previous SQL.
 - The grid no longer counts rows separately when the first page holds all of them, as for a table smaller than a page or a filter that matches fewer rows. The page's own row count is exact there. A filter over 100,000 rows that matches a few spent 51 to 61 ms counting on WebAssembly and 28 to 31 ms on the native engine, about half of each filtered load in the extension host. The time saved in the grid itself was not measured.
 - Where the viewer is not cross-origin isolated, as in the web demo, its size check on each received page looks up a missing global once instead of once per value. In headless Chrome, checking a 5,000-row, 51-column page took 4 ms instead of 18. VS Code webviews were not measured.
+- On Linux, the native engine reads a database on a local disk through a memory map, up to its first 256 MB, instead of copying each page out of the operating system's file cache. In a local test in a Linux arm64 virtual machine, on a 99 MB table of a million rows:
+  - Counting the rows took 2 ms instead of 17.
+  - Showing the first page of a freshly opened database and counting it took 26 ms instead of 45.
+  - Reading a page 990,000 rows in by OFFSET took 23 ms instead of 32.
+  - Sorting on a column without an index took 82 ms instead of 95.
+  - Filtering across all columns took 254 ms instead of 271.
+
+  A 1 MB database was no faster. The mapped pages are the file cache that reads fill anyway, but tools that show a process's resident memory count them for the worker. Databases on network shares, FUSE mounts, 9p mounts and removable FAT, exFAT or NTFS drives are read as before. SQLite cannot recover from a read error on a mapped page, so the worker would stop instead of failing one query. macOS and Windows are unchanged. On macOS, unmapping a file changes its ctime even when it was only read.
 - After a Tab-committed edit, an inserted row, deleted rows or cleared cells, the grid requests its page once instead of twice. VS Code already reloads the grid after each edit, and the editor loaded the same page again.
 
 ### Fixes

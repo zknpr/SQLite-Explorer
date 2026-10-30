@@ -1978,14 +1978,17 @@ async function handleRequest(request) {
 
       case "open": {
         // Open a database file
-        // args: [path: string, readOnly?: boolean]
-        const [path, readOnly = false] = args;
+        // args: [path: string, readOnly?: boolean, mmapBytes?: number]
+        const [path, readOnly = false, mmapBytes = 0] = args;
+        if (!Number.isSafeInteger(mmapBytes) || mmapBytes < 0) throw new Error('Invalid memory map size');
         closeAllCellReadSessions();
         await closeAsyncDatabase();
         if (db) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
         db = new Database(path, { readOnly });
+        // The host maps only files on local disks (nativeMemoryMapBytes).
+        if (mmapBytes > 0) db.exec(`PRAGMA main.mmap_size = ${mmapBytes}`);
         databasePath = path;
         databaseReadOnly = readOnly;
         await openAsyncDatabase(path, readOnly);

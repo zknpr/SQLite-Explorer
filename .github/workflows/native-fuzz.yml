@@ -1,8 +1,8 @@
 name: Native fuzz
 
-# Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/) and the grid page
-# differential against the bundled native worker on all five shipped txiki.js
-# targets (CI's native lanes run on Linux x64 only). Opt-in: manual, or on dev pushes and pull requests to
+# Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/), the grid page
+# differential and the memory-map choice against the bundled native worker on
+# all five shipped txiki.js targets (CI's native lanes run on Linux x64 only). Opt-in: manual, or on dev pushes and pull requests to
 # dev that change the harness, the runtimes, the worker client it drives, the
 # toolchain or this workflow.
 on:
@@ -13,6 +13,7 @@ on:
       - 'tests/fuzz/**'
       - 'tests/unit/grid_cell_helpers.test.ts'
       - 'tests/unit/grid_cell_pack.test.ts'
+      - 'tests/unit/native_memory_map.test.ts'
       - 'src/core/cell-pack.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
@@ -28,6 +29,7 @@ on:
       - 'tests/fuzz/**'
       - 'tests/unit/grid_cell_helpers.test.ts'
       - 'tests/unit/grid_cell_pack.test.ts'
+      - 'tests/unit/native_memory_map.test.ts'
       - 'src/core/cell-pack.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
@@ -99,6 +101,12 @@ jobs:
         env:
           FUZZ_EXPECT_TARGET: ${{ matrix.target }}
         run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts tests/unit/grid_cell_pack.test.ts
+
+      # Which databases the worker reads through a memory map, and that reading
+      # one leaves its ctime unchanged. Only Linux maps.
+      - name: Native memory-mapped reads
+        shell: bash
+        run: node --import tsx --test tests/unit/native_memory_map.test.ts
 
       - name: Summary
         if: always()
