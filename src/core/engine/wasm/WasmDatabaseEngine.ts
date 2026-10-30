@@ -385,6 +385,9 @@ function normalizeWasmBindParams(
 }
 
 /** sql.js binds unsafe bigint as TEXT; cast only those captured INTEGER values. */
+/** Statements withHistoryStatements keeps for one call (prepareHistoryStatement). */
+const MAX_HISTORY_STATEMENTS = 32;
+
 function wasmBindPlaceholder(value: CellValue): string {
   return typeof value === 'bigint' && !Number.isSafeInteger(Number(value))
     ? 'CAST(? AS INTEGER)'
@@ -493,6 +496,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly hasCellPack: boolean;
   /** Whether the runtime registered sqlite_explorer_like_any for global filters. */
   private readonly hasLikeAny: boolean;
+  /**
+   * Statements prepared once per batched row-history call (withHistoryStatements).
+   * Its rows run the same few generated statements, and preparing each one
+   * per row was most of an import's time.
+   */
+  private historyStatements: Map<string, WasmPreparedStatement> | undefined;
   private readonly cellReadSessionIdleTimeoutMs: number;
   private readonly cellReadSessionAbsoluteTimeoutMs: number;
   private cellReadSession: WasmCellReadSessionState | undefined;
@@ -1701,7 +1710,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       await this.assertDeleteHasNoUntrackedPrograms(table);
-      this.mapInDeadlineChunks(snapshots, snapshot => {
+      this.withHistoryStatements(() => this.mapInDeadlineChunks(snapshots, snapshot => {
         const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
         const rowState = buildRowHistoryPredicate(snapshot, wasmBindPlaceholder);
         this.runHistoryStatement(
@@ -1710,7 +1719,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           [...rowIdentity.params, ...rowState.params]
         );
         if (this.readChangesCount() !== 1) throw new RowHistoryConflictError(table);
-      });
+      }));
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (error) {
       await this.safeRollbackSavepoint(savepointName, 'deleteRowHistorySnapshots');
@@ -1740,7 +1749,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         probedShapes.add(shape);
         await this.assertInsertHasNoUntrackedPrograms(table, columns);
       }
-      this.mapInDeadlineChunks(prepared, entry => {
+      this.withHistoryStatements(() => this.mapInDeadlineChunks(prepared, entry => {
         const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
         const existing = this.queryRaw(
           `SELECT 1 FROM ${escapeMainIdentifier(table)} ` +
@@ -1748,9 +1757,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           rowIdentity.params
         );
         if (existing.rows.length !== 0) throw new RowHistoryConflictError(table);
-      });
+      }));
 
-      this.mapInDeadlineChunks(prepared, entry => {
+      this.withHistoryStatements(() => this.mapInDeadlineChunks(prepared, entry => {
         const columns = entry.writes.map(item => item.column);
         const values = entry.writes.map(item => item.write.sql);
         const params = entry.writes.flatMap(item => item.write.params);
@@ -1777,7 +1786,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           [...rowIdentity.params, ...rowState.params]
         );
         if (verified.rows.length !== 1) throw new RowHistoryConflictError(table);
-      });
+      }));
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (error) {
       await this.safeRollbackSavepoint(savepointName, 'restoreRowHistorySnapshots');
@@ -2630,7 +2639,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       const textEncoding = this.getCellTextEncoding();
       let remainingSnapshotBytes = maxUndoSnapshotBytes;
-      const snapshots = this.mapInDeadlineChunks(rows, row => {
+      const snapshots = this.withHistoryStatements(() => this.mapInDeadlineChunks(rows, row => {
         const rowId = this.insertRowForHistory(table, identity, row, textEncoding);
         if (remainingSnapshotBytes !== undefined) {
           this.assertDeleteSnapshotWithinBudget(
@@ -2643,19 +2652,61 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             'Insert'
           );
         }
-        const snapshot = this.readRowHistorySnapshot(table, identity, rowId, insertableColumns);
+        const snapshot = this.readRowHistorySnapshot(table, identity, rowId, insertableColumns, textEncoding);
         if (remainingSnapshotBytes !== undefined) {
           remainingSnapshotBytes -= estimateUndoMemoryBytes(snapshot);
           if (remainingSnapshotBytes < 0) throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes!);
         }
         return snapshot;
-      });
+      }));
       await this.executeQuery(`RELEASE ${savepointName}`);
       return snapshots;
     } catch (error) {
       await this.safeRollbackSavepoint(savepointName, 'insertRowsWithHistory');
       throw error;
     }
+  }
+
+  /**
+   * Run synchronous row-history work with queryRaw and runHistoryStatement
+   * reusing one prepared statement per SQL text. The schema cannot change in
+   * the caller's savepoint, so a statement stays valid for the whole call.
+   */
+  private withHistoryStatements<R>(work: () => R): R {
+    if (this.historyStatements) return work();
+    const statements = new Map<string, WasmPreparedStatement>();
+    this.historyStatements = statements;
+    try {
+      return work();
+    } finally {
+      this.historyStatements = undefined;
+      for (const statement of statements.values()) statement.free();
+    }
+  }
+
+  /**
+   * A prepared statement for sql with params bound. Inside
+   * withHistoryStatements it is the call's cached statement (`owned` false);
+   * otherwise, or past the cache bound, the caller must free it.
+   */
+  private prepareHistoryStatement(
+    sql: string,
+    params: readonly CellValue[]
+  ): { statement: WasmPreparedStatement; owned: boolean } {
+    const statements = this.historyStatements;
+    const cached = statements?.get(sql);
+    if (cached) {
+      // bind() resets the statement and clears its bindings first.
+      cached.bind(normalizeWasmBindParams(params));
+      return { statement: cached, owned: false };
+    }
+    const statement = this.instance.prepare(sql);
+    if (params.length > 0) statement.bind(normalizeWasmBindParams(params));
+    // Generated SQL differs only by each row's storage classes, so a few
+    // texts recur; the bound keeps an unusual call from holding one per row.
+    if (!statements || statements.size >= MAX_HISTORY_STATEMENTS) return { statement, owned: true };
+    statements.set(sql, statement);
+    return { statement, owned: false };
   }
 
   /**
@@ -2683,14 +2734,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * executeWithProgressHandler, with executeQuery's error wording.
    */
   private runHistoryStatement(sql: string, params: readonly CellValue[]): void {
-    const statement = this.instance.prepare(sql);
+    let prepared: { statement: WasmPreparedStatement; owned: boolean } | undefined;
     try {
-      if (params.length > 0) statement.bind(normalizeWasmBindParams(params));
-      while (statement.step()) { /* generated writes return no rows */ }
+      prepared = this.prepareHistoryStatement(sql, params);
+      while (prepared.statement.step()) { /* generated writes return no rows */ }
     } catch (err) {
       throw new Error(`Query failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
-      statement.free();
+      if (prepared?.owned) prepared.statement.free();
     }
   }
 
@@ -3282,7 +3333,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     rows: Array<Array<CellValue | bigint>>;
   } {
     this.restorePendingExportPragmas();
-    const statement = this.instance.prepare(sql, normalizeWasmBindParams(params));
+    const { statement, owned } = this.historyStatements
+      ? this.prepareHistoryStatement(sql, params)
+      : { statement: this.instance.prepare(sql, normalizeWasmBindParams(params)), owned: true };
     try {
       const headers = statement.getColumnNames();
       const rows: Array<Array<CellValue | bigint>> = [];
@@ -3292,7 +3345,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       return { headers, rows };
     } finally {
-      statement.free();
+      if (owned) statement.free();
     }
   }
 
@@ -3435,7 +3488,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     table: string,
     identity: TableIdentity,
     rowId: RecordId,
-    insertableColumns: readonly string[]
+    insertableColumns: readonly string[],
+    textEncoding: CellTextEncoding = this.getCellTextEncoding()
   ): DeletedRow {
     const predicate = buildRecordIdentityPredicate(rowId, identity);
     const projections = insertableColumns.map(buildStoredCellStateProjection);
@@ -3445,7 +3499,6 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       predicate.params
     );
     if (result.rows.length !== 1) throw new RowHistoryConflictError(table);
-    const textEncoding = this.getCellTextEncoding();
     const states = insertableColumns.map((column, index) => parseStoredCellState(
       result.rows[0][index * 2],
       result.rows[0][index * 2 + 1],

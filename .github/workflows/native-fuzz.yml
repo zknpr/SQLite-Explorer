@@ -17,6 +17,7 @@ on:
       - 'tests/unit/global_filter_like_any.test.ts'
       - 'tests/unit/sorted_page_rowid_lookup.test.ts'
       - 'tests/unit/schema_trigger_presence.test.ts'
+      - 'tests/unit/history_statement_cache.test.ts'
       - 'src/core/cell-pack.ts'
       - 'src/core/query-builder.ts'
       - 'src/core/keyset-pagination.ts'
@@ -38,6 +39,7 @@ on:
       - 'tests/unit/global_filter_like_any.test.ts'
       - 'tests/unit/sorted_page_rowid_lookup.test.ts'
       - 'tests/unit/schema_trigger_presence.test.ts'
+      - 'tests/unit/history_statement_cache.test.ts'
       - 'src/core/cell-pack.ts'
       - 'src/core/query-builder.ts'
       - 'src/core/keyset-pagination.ts'
@@ -105,14 +107,15 @@ jobs:
 
       # Grid pages with the runtime's cell helpers on and off, packed pages
       # against the helpers, global filters against LIKE, sorted pages
-      # against the plain page SQL, and the schema batch's trigger answer,
-      # through the production worker. No other
+      # against the plain page SQL, the schema batch's trigger answer, and
+      # batched row history with reused statements, through the production
+      # worker. No other
       # CI lane loads natives/<target>'s query-plan library.
       - name: Native grid pages
         shell: bash
         env:
           FUZZ_EXPECT_TARGET: ${{ matrix.target }}
-        run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts tests/unit/grid_cell_pack.test.ts tests/unit/global_filter_like_any.test.ts tests/unit/sorted_page_rowid_lookup.test.ts tests/unit/schema_trigger_presence.test.ts
+        run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts tests/unit/grid_cell_pack.test.ts tests/unit/global_filter_like_any.test.ts tests/unit/sorted_page_rowid_lookup.test.ts tests/unit/schema_trigger_presence.test.ts tests/unit/history_statement_cache.test.ts
 
       # Which databases the worker reads through a memory map, and that reading
       # one leaves its ctime unchanged. Only Linux maps.

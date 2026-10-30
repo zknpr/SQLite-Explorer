@@ -977,6 +977,42 @@ function executeQuery(db, sql, params) {
     : lastResult;
 }
 
+/** Statements one queryHistoryBatch request keeps prepared (runCachedHistoryQuery). */
+const MAX_HISTORY_STATEMENTS = 32;
+
+/**
+ * executeQuery for one generated row-history statement, reusing a statement
+ * prepared earlier in the same request. A batch's rows repeat a few SQL texts,
+ * and executeQuery prepares a parameterized one twice per call. Anything but
+ * exactly one statement goes through executeQuery unchanged. A statement that
+ * failed is never run again: the error ends the request, whose caller
+ * finalizes every cached statement.
+ */
+function runCachedHistoryQuery(database, statements, sql, params) {
+  let statement = statements.get(sql);
+  if (statement === undefined) {
+    if (typeof sql !== 'string' || statements.size >= MAX_HISTORY_STATEMENTS) {
+      return executeQuery(database, sql, params);
+    }
+    // executeQuery's single-statement check: toString() is the expanded SQL
+    // of the first statement only, so it ends with the trailing comment
+    // exactly when nothing follows. The comment does not change what runs.
+    const boundary = '/*sqlite_explorer_parameterized_query_boundary*/';
+    statement = database.prepare(`${sql}\n${boundary}`);
+    const preparedSql = typeof statement.toString === 'function' ? statement.toString().trimEnd() : '';
+    if (!preparedSql.endsWith(boundary)) {
+      if (typeof statement.finalize === 'function') statement.finalize();
+      return executeQuery(database, sql, params);
+    }
+    statements.set(sql, statement);
+  }
+  const rows = Array.isArray(params) && params.length > 0 ? statement.all(params) : statement.all();
+  return {
+    values: (rows || []).map(row => Object.values(row)),
+    rowCount: rows?.length ?? 0
+  };
+}
+
 /** Upper-bound estimate of the serialized size of result rows. */
 function approximateValuesBytes(values) {
   let bytes = 0;
@@ -2471,19 +2507,28 @@ async function handleRequest(request) {
         const startedAt = Date.now();
         const results = [];
         let responseBytes = 0;
-        // One wrapper reports a timeout and clears the deadline; setting it
-        // again at each unit replaces the previous one.
-        runWithQueryDeadline(db, unitTimeoutMs, () => {
-          for (let start = 0; start < queries.length; start += stride) {
-            db.setQueryDeadline(unitTimeoutMs);
-            for (let index = start; index < start + stride; index++) {
-              const { values, rowCount } = executeQuery(db, queries[index].sql, queries[index].params);
-              responseBytes += approximateValuesBytes(values);
-              results.push({ columns: [], values, rowCount });
+        const statements = new Map();
+        try {
+          // One wrapper reports a timeout and clears the deadline; setting it
+          // again at each unit replaces the previous one.
+          runWithQueryDeadline(db, unitTimeoutMs, () => {
+            for (let start = 0; start < queries.length; start += stride) {
+              db.setQueryDeadline(unitTimeoutMs);
+              for (let index = start; index < start + stride; index++) {
+                const { values, rowCount } = runCachedHistoryQuery(
+                  db, statements, queries[index].sql, queries[index].params
+                );
+                responseBytes += approximateValuesBytes(values);
+                results.push({ columns: [], values, rowCount });
+              }
+              if (Date.now() - startedAt >= budgetMs || responseBytes >= budgetBytes) break;
             }
-            if (Date.now() - startedAt >= budgetMs || responseBytes >= budgetBytes) break;
+          });
+        } finally {
+          for (const statement of statements.values()) {
+            try { statement.finalize(); } catch { /* the request's own outcome is already decided */ }
           }
-        });
+        }
         result = { results };
         break;
       }
