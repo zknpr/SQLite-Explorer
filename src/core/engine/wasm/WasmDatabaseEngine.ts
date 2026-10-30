@@ -4751,7 +4751,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               rawTextRows,
               rawTextColumnIndices: sourceRawTextColumnIndices,
               textEncoding,
-              contained: decodedContained
+              contained: decodedContained,
+              decodedWithinBudget: !rowIdRows
             })
           : decodedContained;
         const { rows, oversizedCells, exactIntegerTexts } = contained;

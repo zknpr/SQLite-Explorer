@@ -4487,7 +4487,8 @@ export async function createNativeDatabaseConnection(
                   rawTextRows,
                   rawTextColumnIndices: sourceRawTextColumnIndices,
                   textEncoding,
-                  contained: decodedContained
+                  contained: decodedContained,
+                  decodedWithinBudget: !rowIdResult
                 })
               : decodedContained;
             const { rows, oversizedCells, exactIntegerTexts } = contained;

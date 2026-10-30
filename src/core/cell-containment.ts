@@ -449,7 +449,7 @@ export function decodeRawTextColumns(
   query: Pick<CellContainmentQuery,
     'rawTextColumnStart' | 'rawTextColumnCount' | 'transportColumnCount'
     | 'rawTextTransport' | 'effectiveInlineCellBytes'>
-): Array<Array<RawTextSlot>> {
+): Array<readonly RawTextSlot[]> {
   // Keep ownership per page, but allocate only small slabs as bytes arrive.
   // Hundreds of thousands of tiny sql.js BLOB ArrayBuffers otherwise trigger
   // long backing-store GC pauses in the Windows Electron worker. Large cells
@@ -495,9 +495,19 @@ export function decodeRawTextColumns(
     }
     return bytes;
   };
+  // In checked transport most rows hold only plain or non-TEXT cells; they
+  // share one read-only row of verified slots.
+  let verifiedRow: readonly RawTextSlot[] | undefined;
   return rows.map((row, rowIndex) => {
     if (row.length < query.transportColumnCount) {
       throw new Error(`Raw TEXT row ${rowIndex} is missing private transport columns`);
+    }
+    if (query.rawTextTransport === 'checked') {
+      let keyIndex = 0;
+      while (keyIndex < query.rawTextColumnCount && row[query.rawTextColumnStart + keyIndex] === null) keyIndex++;
+      if (keyIndex === query.rawTextColumnCount) {
+        return verifiedRow ??= Object.freeze(Array<RawTextSlot>(query.rawTextColumnCount).fill(VERIFIED_TEXT_BYTES));
+      }
     }
     return Array.from({ length: query.rawTextColumnCount }, (_, keyIndex) => {
       const value = row[query.rawTextColumnStart + keyIndex];
@@ -612,6 +622,8 @@ export function containUnrepresentableTextCells(input: {
   rawTextColumnIndices: readonly number[];
   textEncoding: CellTextEncoding;
   contained: DecodedCellContainment;
+  /** contained is decodeCellContainment's result unchanged, so its budget check holds. */
+  decodedWithinBudget?: boolean;
 }): DecodedCellContainment {
   if (
     input.sourceRows.length !== input.contained.rows.length
@@ -619,6 +631,17 @@ export function containUnrepresentableTextCells(input: {
   ) {
     throw new Error('Raw TEXT containment row count does not match the source page');
   }
+  // With every TEXT slot verified or size-contained there is nothing to
+  // replace, and decodeCellContainment already bounded this page.
+  const needsReplacementPass = !input.decodedWithinBudget || input.rawTextRows.some((rawRow, rowIndex) => {
+    if (!rawRow || rawRow.length !== input.rawTextColumnIndices.length) return true;
+    return input.rawTextColumnIndices.some((columnIndex, rawIndex) => (
+      rawRow[rawIndex] !== VERIFIED_TEXT_BYTES
+      && typeof input.sourceRows[rowIndex][columnIndex] === 'string'
+      && !input.contained.oversizedCells?.[rowIndex]?.[columnIndex]
+    ));
+  });
+  if (!needsReplacementPass) return input.contained;
   const rows = input.contained.rows.map(row => Array.from(row));
   let oversizedCells: OversizedCellMap | undefined;
   if (input.contained.oversizedCells) {
@@ -870,11 +893,11 @@ export function decodeCellContainment(
   let oversizedCells: OversizedCellMap | undefined;
   let inlineBytes = 0;
   let pageBudgetExhausted = false;
-  const retainedInlineCells: Array<{
-    rowIndex: number;
-    columnIndex: number;
-    metadata: { storageClass: 'text' | 'blob'; byteLength: number };
-  }> = [];
+  // Row and column index pairs of the previews kept inline, in page order.
+  const retainedInlineCells: number[] = [];
+  // estimateRowsWireBytes(rows), summed from each cell's final value so
+  // every string is measured once.
+  let rowsWireBytes = 2 + Math.max(0, transportedRows.length - 1);
 
   const recordOversizedCell = (
     rowIndex: number,
@@ -908,32 +931,39 @@ export function decodeCellContainment(
         `expected ${valueColumnCount}`
       );
     }
-    const values = Array.from(row.slice(0, valueColumnCount)) as CellValue[];
-    tokens.forEach((token, columnIndex) => {
-      const sqlMetadata = parseMetadataToken(token, rowIndex, columnIndex);
+    const values = row.slice(0, valueColumnCount) as CellValue[];
+    rowsWireBytes += 2 + Math.max(0, values.length - 1);
+    for (let columnIndex = 0; columnIndex < valueColumnCount; columnIndex++) {
+      const sqlMetadata = parseMetadataToken(tokens[columnIndex], rowIndex, columnIndex);
       if (sqlMetadata) recordOversizedCell(rowIndex, columnIndex, sqlMetadata);
 
       const value = values[columnIndex];
       const byteLength = inlineCellByteLength(value);
-      if (byteLength === undefined || byteLength === 0) return;
-      const metadata = sqlMetadata ?? {
-        storageClass: typeof value === 'string' ? 'text' as const : 'blob' as const,
-        byteLength
-      };
+      if (byteLength === undefined || byteLength === 0) {
+        rowsWireBytes += transportedCellWireBytes(value);
+        continue;
+      }
 
       if (
         pageBudgetExhausted
         || byteLength > pageByteBudget - inlineBytes
       ) {
         pageBudgetExhausted = true;
+        const metadata = sqlMetadata ?? {
+          storageClass: typeof value === 'string' ? 'text' as const : 'blob' as const,
+          byteLength
+        };
         recordOversizedCell(rowIndex, columnIndex, metadata);
-        values[columnIndex] = emptyInlinePreview(metadata.storageClass);
-        return;
+        const preview = emptyInlinePreview(metadata.storageClass);
+        values[columnIndex] = preview;
+        rowsWireBytes += transportedCellWireBytes(preview);
+        continue;
       }
 
       inlineBytes += byteLength;
-      retainedInlineCells.push({ rowIndex, columnIndex, metadata });
-    });
+      retainedInlineCells.push(rowIndex, columnIndex);
+      rowsWireBytes += typeof value === 'string' ? byteLength + 2 : transportedCellWireBytes(value);
+    }
     return values;
   });
 
@@ -957,28 +987,31 @@ export function decodeCellContainment(
   // while preserving its earliest cells.
   const aggregateBudget =
     DEFAULT_MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES - WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES;
-  let aggregateBytes = estimateRowsWireBytes(rows)
+  let aggregateBytes = rowsWireBytes
     + estimateOversizedCellsWireBytes(oversizedCells)
     + estimateExactIntegerTextsWireBytes(retainedExactIntegerTexts);
 
   for (
-    let index = retainedInlineCells.length - 1;
+    let index = retainedInlineCells.length - 2;
     index >= 0 && aggregateBytes > aggregateBudget;
-    index--
+    index -= 2
   ) {
-    const candidate = retainedInlineCells[index];
-    const currentValue = rows[candidate.rowIndex][candidate.columnIndex];
-    const emptyValue = emptyInlinePreview(candidate.metadata.storageClass);
+    const rowIndex = retainedInlineCells[index];
+    const columnIndex = retainedInlineCells[index + 1];
+    const currentValue = rows[rowIndex][columnIndex];
+    // A clipped preview's SQL metadata was recorded first; any other kept
+    // preview is still its whole value.
+    const metadata = oversizedCells?.[rowIndex]?.[columnIndex] ?? {
+      storageClass: typeof currentValue === 'string' ? 'text' as const : 'blob' as const,
+      byteLength: inlineCellByteLength(currentValue)!
+    };
+    const emptyValue = emptyInlinePreview(metadata.storageClass);
     const delta = transportedCellWireBytes(emptyValue)
       - transportedCellWireBytes(currentValue)
-      + oversizedMetadataInsertionWireBytes(
-        oversizedCells,
-        candidate.rowIndex,
-        candidate.columnIndex
-      );
+      + oversizedMetadataInsertionWireBytes(oversizedCells, rowIndex, columnIndex);
     if (delta >= 0) continue;
-    recordOversizedCell(candidate.rowIndex, candidate.columnIndex, candidate.metadata);
-    rows[candidate.rowIndex][candidate.columnIndex] = emptyValue;
+    recordOversizedCell(rowIndex, columnIndex, metadata);
+    rows[rowIndex][columnIndex] = emptyValue;
     aggregateBytes += delta;
   }
 

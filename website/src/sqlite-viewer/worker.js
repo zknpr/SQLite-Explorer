@@ -2128,7 +2128,8 @@ async function fetchTableData(table, options = {}) {
         rawTextRows,
         rawTextColumnIndices: sourceRawTextColumnIndices,
         textEncoding,
-        contained: decodedContained
+        contained: decodedContained,
+        decodedWithinBudget: !rowIdRows
       })
     : decodedContained;
   const { rows, oversizedCells, exactIntegerTexts } = contained;
