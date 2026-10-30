@@ -192,6 +192,8 @@ import {
 import {
   assertNoNewBrokenSchemaDependencies,
   captureSchemaDependencySnapshot,
+  readHasTriggers,
+  SCHEMA_HAS_TRIGGERS_SQL,
   type SchemaDependencySnapshot
 } from '../../schema-dependency';
 import {
@@ -5159,11 +5161,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    * Fetch database schema.
    */
   async fetchSchema(): Promise<SchemaSnapshot> {
-    const [schemaResult, identityResult] = await Promise.all([
+    const [schemaResult, identityResult, triggerResult] = await Promise.all([
       this.executeQuery(
         "SELECT type, name, tbl_name, sql FROM main.sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
       ),
-      this.executeQuery(TABLE_IDENTITY_METADATA_SQL)
+      this.executeQuery(TABLE_IDENTITY_METADATA_SQL),
+      this.executeQuery(SCHEMA_HAS_TRIGGERS_SQL)
     ]);
 
     const rows = schemaResult[0]?.rows || [];
@@ -5186,7 +5189,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         .filter(r => r[0] === 'index')
         .map(r => ({ identifier: r[1] as string, parentTable: r[2] as string }));
 
-    return { tables, views, indexes };
+    return { tables, views, indexes, hasTriggers: readHasTriggers(triggerResult[0]?.rows) };
   }
 
   /**

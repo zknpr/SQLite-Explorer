@@ -288,6 +288,11 @@ export interface SchemaSnapshot {
   views: ViewMetadata[];
   /** All indexes in database */
   indexes: IndexMetadata[];
+  /**
+   * Whether main or TEMP holds a trigger. Without one, a cell edit cannot
+   * change any table's row count, so the webview keeps those counts.
+   */
+  hasTriggers?: boolean;
 }
 
 // ============================================================================

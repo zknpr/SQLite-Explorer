@@ -198,6 +198,8 @@ import {
 import {
   assertNoNewBrokenSchemaDependencies,
   captureSchemaDependencySnapshot,
+  readHasTriggers,
+  SCHEMA_HAS_TRIGGERS_SQL,
   type SchemaDependencySnapshot
 } from './core/schema-dependency';
 import { crypto } from './platform/cryptoShim';
@@ -4817,13 +4819,14 @@ export async function createNativeDatabaseConnection(
             { sql: "SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name" },
             { sql: "SELECT name FROM main.sqlite_schema WHERE type='view' ORDER BY name" },
             { sql: "SELECT name, tbl_name FROM main.sqlite_schema WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name" },
-            { sql: TABLE_IDENTITY_METADATA_SQL }
+            { sql: TABLE_IDENTITY_METADATA_SQL },
+            { sql: SCHEMA_HAS_TRIGGERS_SQL }
           ];
 
           const res = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
 
           // Validate the response — throw instead of silently returning empty schema
-          if (!res || !res.results || res.results.length < 4) {
+          if (!res || !res.results || res.results.length < 5) {
             throw new Error('Schema fetch failed: queryBatch returned incomplete results');
           }
 
@@ -4837,7 +4840,7 @@ export async function createNativeDatabaseConnection(
           const views = mapRowsByName<ViewMetadata>(res.results[1], { identifier: 'name' });
           const indexes = mapRowsByName<IndexMetadata>(res.results[2], { identifier: 'name', parentTable: 'tbl_name' });
 
-          return { tables, views, indexes } as SchemaSnapshot;
+          return { tables, views, indexes, hasTriggers: readHasTriggers(res.results[4].values) } as SchemaSnapshot;
         },
 
         /**

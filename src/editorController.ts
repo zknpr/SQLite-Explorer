@@ -27,6 +27,7 @@ import { WEBVIEW_TRANSPORT_SURFACES, assertWebviewTransportPayload } from './cor
 import { WebviewMessageHandler } from './webviewMessageHandler';
 import { HostBridge } from './hostBridge';
 import type { CellMaterializationService } from './cellMaterialization';
+import type { ModificationType } from './core/types';
 import { confirmFileReplacement } from './fileReplacementConfirmation';
 import { withPlainErrors } from './notificationText';
 
@@ -141,7 +142,9 @@ interface WebviewBridgeFunctions {
   updateCellEditBehavior(value: string): Promise<void>;
   refreshContent(
     filename: string,
-    connection?: { connected: boolean; readOnly: boolean; connectionGeneration: number; reloadRequiredReason?: string }
+    connection?: { connected: boolean; readOnly: boolean; connectionGeneration: number; reloadRequiredReason?: string },
+    /** The history entry type this change applied or undid, when there is one. */
+    change?: { modificationType: ModificationType }
   ): Promise<void>;
 }
 
@@ -535,6 +538,8 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
             ...(document.reloadRequiredReason ? { reloadRequiredReason: document.reloadRequiredReason } : {})
           }
         : undefined;
+      const modificationType = change.modification?.modificationType;
+      const contentChange = modificationType ? { modificationType } : undefined;
       for (const panel of this.webviews.get(document.uri)) {
         const bridge = this.webviewBridges.get(panel);
         // A suspended webview can hold an RPC open until its timeout. Dispatch
@@ -542,7 +547,7 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
         // visible editor from reflecting undo, redo, or an external change.
         void (async () => {
           try {
-            await bridge?.refreshContent(filename, connection);
+            await bridge?.refreshContent(filename, connection, contentChange);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             this.outputChannel?.appendLine(`[Webview refresh] ${message}`);

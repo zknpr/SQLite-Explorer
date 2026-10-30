@@ -282,13 +282,17 @@ it('shares one document, engine, and edit history across both editor view types 
         };
         const panels = [createPanel(), createPanel(), createPanel()];
         const refreshCounts = [0, 0, 0];
+        const refreshChanges: unknown[] = [];
         defaultProvider.webviews.add(uri, panels[0], 'default-one');
         defaultProvider.webviews.add(uri, panels[1], 'default-two');
         optionalProvider.webviews.add(uri, panels[2], 'optional-one');
         defaultProvider.webviewBridges.set(panels[0], {
             updateColorScheme: async () => {},
             updateCellEditBehavior: async () => {},
-            refreshContent: async () => { refreshCounts[0]++; }
+            refreshContent: async (_filename: string, _connection: unknown, change: unknown) => {
+                refreshCounts[0]++;
+                refreshChanges.push(change);
+            }
         });
         defaultProvider.webviewBridges.set(panels[1], {
             updateColorScheme: async () => {},
@@ -308,6 +312,8 @@ it('shares one document, engine, and edit history across both editor view types 
             [1, 1, 1],
             'both same-view panels and the optional-view panel must refresh once'
         );
+        // The webview keeps table row counts only for this entry type.
+        assert.deepStrictEqual(refreshChanges, [{ modificationType: 'cell_update' }]);
 
         await first.dispose();
         assert.strictEqual(workerDisposalCount, 0);

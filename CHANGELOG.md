@@ -27,6 +27,7 @@
   - Filtering across all columns took 254 ms instead of 271.
 
   A 1 MB database was no faster. The mapped pages are the file cache that reads fill anyway, but tools that show a process's resident memory count them for the worker. Databases on network shares, FUSE mounts, 9p mounts and removable FAT, exFAT or NTFS drives are read as before. SQLite cannot recover from a read error on a mapped page, so the worker would stop instead of failing one query. macOS and Windows are unchanged. On macOS, unmapping a file changes its ctime even when it was only read.
+- After a cell edit, or its undo or redo, the grid keeps each table's row count instead of counting the table again, when the database has no triggers. Such an edit cannot change how many rows any table has. A database with a trigger is counted again, since the trigger could insert or delete rows. Filtered counts and views are counted again too. On a million-row table, that count took 20 ms on the native engine on macOS, 2 ms on Linux and 5.5 ms on WebAssembly.
 - After a Tab-committed edit, an inserted row, deleted rows or cleared cells, the grid requests its page once instead of twice. VS Code already reloads the grid after each edit, and the editor loaded the same page again.
 
 ### Fixes

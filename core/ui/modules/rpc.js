@@ -6,7 +6,7 @@ import { clearSelection, loadTableData, loadTableColumns } from './grid.js';
 import { refreshSchema } from './sidebar.js';
 import { handleRpcResponse, sendRpcResult, sendRpcError } from './api.js';
 import { applyConnectionResult, updateMutationControlCapabilities } from './connection-state.js';
-import { invalidateAllCounts } from './count-cache.js';
+import { invalidateAllCounts, keepTableRowCounts } from './count-cache.js';
 import { clearContentStatus, showErrorState, showLoading, updateStatus, updateToolbarButtons } from './ui.js';
 import { closeDatabaseTargetModals } from './modals.js';
 import { getErrorMessage } from './utils.js';
@@ -16,8 +16,8 @@ export { backendApi } from './api.js';
 /**
  * Methods called by the extension host.
  */
-export async function refreshContent(filename, connectionResult) {
-    const refresh = refreshContentOnce(filename, connectionResult);
+export async function refreshContent(filename, connectionResult, contentChange) {
+    const refresh = refreshContentOnce(filename, connectionResult, contentChange);
     state.contentRefreshPromise = refresh;
     try {
         return await refresh;
@@ -26,12 +26,21 @@ export async function refreshContent(filename, connectionResult) {
     }
 }
 
-async function refreshContentOnce(filename, connectionResult) {
+async function refreshContentOnce(filename, connectionResult, contentChange) {
     // This broadcast means the document changed in a way this webview didn't
     // perform itself (undo/redo, another panel's edit, a VS Code cell-editor
     // write, revert — the host also echoes one after this webview's own
-    // edits). None of the cached counts can be trusted across it.
-    invalidateAllCounts();
+    // edits). Only a cell edit's echo, in a database whose last schema load
+    // found no trigger, keeps the tables' unfiltered counts.
+    if (!connectionResult && contentChange?.modificationType === 'cell_update'
+        && state.schemaCache.hasTriggers === false) {
+        keepTableRowCounts(state.schemaCache.tables.map(table => table.name));
+    } else {
+        invalidateAllCounts();
+    }
+    // That answer described the schema before this change; an overlapping
+    // refresh must not trust it until the reload below replaces it.
+    state.schemaCache.hasTriggers = undefined;
     // Undo can restore a dropped view while no object is selected, so no grid
     // load will replace its old completion message. Expire only completed
     // schema feedback, before awaits can admit newer status or operation replies.

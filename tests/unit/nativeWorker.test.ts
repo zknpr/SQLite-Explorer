@@ -784,7 +784,8 @@ describe('createNativeDatabaseConnection', () => {
                             },
                             { columns: ['name'], values: [] },
                             { columns: ['name', 'tbl_name'], values: [] },
-                            ...(queries.length > 3 ? [identityMetadata] : [])
+                            ...(queries.length > 3 ? [identityMetadata] : []),
+                            ...(queries.length > 4 ? [{ columns: ['has_triggers'], values: [[0]] }] : [])
                         ]
                     }
                 };
@@ -814,8 +815,9 @@ describe('createNativeDatabaseConnection', () => {
                     }]
                 ]
             );
+            assert.strictEqual(schema.hasTriggers, false);
             assert.deepStrictEqual(connection.calls.map(call => call.method), ['queryBatch']);
-            assert.strictEqual((connection.calls[0].args[0] as unknown[]).length, 4);
+            assert.strictEqual((connection.calls[0].args[0] as unknown[]).length, 5);
         } finally {
             connection.dispose();
         }
