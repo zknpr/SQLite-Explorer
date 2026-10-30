@@ -772,6 +772,10 @@ function openAsyncDatabase(path, readOnly) {
  * Every bind of message parameters goes through here. -0 stays a float, as
  * before: txiki binds it as REAL -0.0, which cell history writes back and
  * compares exactly, where sql.js binds INTEGER 0.
+ *
+ * txiki also refuses a BigInt in the int32 range, which QuickJS tags apart
+ * from larger ones. WebAssembly history reads every INTEGER as a BigInt, and
+ * a hot-exit backup carries that history to whichever engine opens the file.
  */
 function bindableParams(params) {
   if (!Array.isArray(params)) return params;
@@ -780,6 +784,8 @@ function bindableParams(params) {
     if (typeof value === 'number') {
       const integer = value | 0;
       if (integer === value && (integer !== 0 || 1 / value > 0)) params[index] = integer;
+    } else if (typeof value === 'bigint' && value >= -2147483648n && value <= 2147483647n) {
+      params[index] = Number(value) | 0;
     }
   }
   return params;
