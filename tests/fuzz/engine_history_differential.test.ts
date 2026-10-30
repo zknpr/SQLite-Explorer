@@ -171,19 +171,25 @@ it('keeps in-memory, paged and native history-tracked mutations identical', asyn
             const file = path.join(directory, `seed-${seed}.db`);
             fs.closeSync(fs.openSync(file, 'w'));
             const ddl = tableSql(kind, random);
+            // One database in seven stores TEXT as UTF-16LE.
+            const encoding = seed % 7 === 0 ? "PRAGMA encoding = 'UTF-16le'; " : '';
             const { databaseOps: nativeOps } = await native.establishConnection(vscode.Uri.file(file), `seed-${seed}`, false);
             const wasm = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
-            const paged = await openPaged(ddl, path.join(directory, `seed-${seed}-paged.db`));
+            const paged = await openPaged(encoding + ddl, path.join(directory, `seed-${seed}-paged.db`));
             const engines: Record<Engine, DatabaseOperations> = { wasm, paged, native: nativeOps };
             try {
-                for (const engine of ['wasm', 'native'] as const) await engines[engine].executeQuery(ddl);
+                for (const engine of ['wasm', 'native'] as const) await engines[engine].executeQuery(encoding + ddl);
+                for (const engine of ENGINES) {
+                    const actual = (await engines[engine].executeQuery('PRAGMA encoding'))[0]?.rows[0]?.[0];
+                    assert.equal(actual, encoding ? 'UTF-16le' : 'UTF-8', `${engine} encoding`);
+                }
                 const history: Record<Engine, ModificationEntry[]> = { wasm: [], paged: [], native: [] };
                 // Contents around each entry, for the undo and redo oracle.
                 const around = new WeakMap<ModificationEntry, { before: string; after?: string }>();
                 let current = await contents(wasm, kind);
                 const pending: ModificationEntry[] = [];
                 const redo: Record<Engine, ModificationEntry[]> = { wasm: [], paged: [], native: [] };
-                const log = [ddl];
+                const log = [encoding + ddl];
                 let nextId = 1;
                 for (let step = 0; step < STEPS; step++) {
                     const rows = {} as Record<Engine, RecordId[]>;
