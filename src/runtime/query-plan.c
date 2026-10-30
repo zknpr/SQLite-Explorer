@@ -305,6 +305,47 @@ static void cell_text_check(sqlite3_context *context, int argc, sqlite3_value **
     else if (!is_plain_utf8(text, length)) sqlite3_result_blob(context, text, length, SQLITE_TRANSIENT);
 }
 
+/* SQLite's text for each REAL argument after the first, as "index:text"
+ * joined by '|', where index counts from the first argument's value. NULL
+ * when no argument is REAL. The text comes from a copy of the value, so it is
+ * exactly what CAST(value AS TEXT) produces. One packed column per row costs
+ * a native row object far less than one mostly-NULL column per value. */
+static void real_texts(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    sqlite3_int64 base;
+    if (argc < 2) {
+        sqlite3_result_error(context, "REAL text packing requires a base index and at least one value.", -1);
+        return;
+    }
+    if (!byte_limit(context, argv[0], &base)) return;
+    sqlite3_str *output = 0;
+    for (int index = 1; index < argc; index++) {
+        if (sqlite3_value_type(argv[index]) != SQLITE_FLOAT) continue;
+        sqlite3_value *copy = sqlite3_value_dup(argv[index]);
+        const unsigned char *text = copy ? sqlite3_value_text(copy) : 0;
+        if (!text) {
+            sqlite3_value_free(copy);
+            sqlite3_free(output ? sqlite3_str_finish(output) : 0);
+            sqlite3_result_error_nomem(context);
+            return;
+        }
+        if (!output) output = sqlite3_str_new(0);
+        else sqlite3_str_appendchar(output, 1, '|');
+        sqlite3_str_appendf(output, "%lld:%s", base + index - 1, (const char *) text);
+        sqlite3_value_free(copy);
+    }
+    if (!output) return;
+    int rc = sqlite3_str_errcode(output);
+    int length = sqlite3_str_length(output);
+    char *packed = sqlite3_str_finish(output);
+    if (rc != SQLITE_OK || !packed) {
+        sqlite3_free(packed);
+        if (rc == SQLITE_TOOBIG) sqlite3_result_error_toobig(context);
+        else sqlite3_result_error_nomem(context);
+        return;
+    }
+    sqlite3_result_text(context, packed, length, sqlite3_free);
+}
+
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
@@ -321,6 +362,8 @@ int sqlite3_sqliteexplorer_init(sqlite3 *db, char **error, const sqlite3_api_rou
         SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, cell_metadata, 0, 0, 0);
     if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_cell_text_check", 2,
         SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, cell_text_check, 0, 0, 0);
+    if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_real_texts", -1,
+        SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, real_texts, 0, 0, 0);
     return rc;
 }
 

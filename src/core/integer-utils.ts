@@ -113,6 +113,47 @@ export interface ExactNumericTextQuery {
    * The companions follow all valueColumnCount columns.
    */
   realTextColumnCount?: number;
+  /**
+   * Instead of one companion per value, this many columns after the values
+   * hold sqlite_explorer_real_texts() output: "index:text" joined by '|'.
+   */
+  packedRealTextColumnCount?: number;
+}
+
+/**
+ * Read one row's packed REAL text columns into column index -> SQLite text.
+ * Indices must be canonical, in range and strictly increasing.
+ */
+export function parsePackedRealTexts(
+  packedColumns: readonly unknown[],
+  valueColumnCount: number,
+  rowIndex: number
+): Map<number, string> | undefined {
+  let texts: Map<number, string> | undefined;
+  let previous = -1;
+  for (const packed of packedColumns) {
+    if (packed === null || packed === undefined) continue;
+    if (typeof packed !== 'string' || packed === '') {
+      throw new Error(`Packed REAL text at row ${rowIndex} is not text`);
+    }
+    for (const entry of packed.split('|')) {
+      const separator = entry.indexOf(':');
+      const indexText = entry.slice(0, separator);
+      const columnIndex = Number(indexText);
+      if (
+        separator < 1
+        || separator === entry.length - 1
+        || !/^(?:0|[1-9][0-9]*)$/.test(indexText)
+        || columnIndex >= valueColumnCount
+        || columnIndex <= previous
+      ) {
+        throw new Error(`Packed REAL text at row ${rowIndex} has an invalid entry`);
+      }
+      previous = columnIndex;
+      (texts ??= new Map()).set(columnIndex, entry.slice(separator + 1));
+    }
+  }
+  return texts;
 }
 
 export interface RowIdExactRealTextQuery {
@@ -339,15 +380,22 @@ export function normalizeIntegerRowsForTransport(
   valueColumnCount?: number,
   transportedExactTexts?: ExactIntegerTextMap,
   exactIntegerIdentityColumn?: number,
-  realTextColumnCount = valueColumnCount
+  realTextColumnCount = valueColumnCount,
+  packedRealTextColumnCount?: number
 ): { rows: CellValue[][]; exactIntegerTexts?: ExactIntegerTextMap } {
-  if (
+  if (packedRealTextColumnCount !== undefined) {
+    if (valueColumnCount === undefined || !Number.isInteger(packedRealTextColumnCount) || packedRealTextColumnCount < 1) {
+      throw new Error(`Invalid packed REAL text column count: ${packedRealTextColumnCount}`);
+    }
+    realTextColumnCount = 0;
+  } else if (
     valueColumnCount !== undefined
     && (!Number.isInteger(realTextColumnCount) || realTextColumnCount! < 1
       || realTextColumnCount! > valueColumnCount)
   ) {
     throw new Error(`Invalid exact numeric text column count: ${realTextColumnCount}`);
   }
+  const sidecarColumnCount = packedRealTextColumnCount ?? realTextColumnCount ?? 0;
   let exactIntegerTexts: ExactIntegerTextMap | undefined;
   const setExactText = (rowIndex: number, columnIndex: number, text: string) => {
     exactIntegerTexts ??= {};
@@ -357,12 +405,19 @@ export function normalizeIntegerRowsForTransport(
 
   const rows = sourceRows.map((sourceRow, rowIndex) => {
     const logicalColumnCount = valueColumnCount ?? sourceRow.length;
-    if (valueColumnCount !== undefined && sourceRow.length < valueColumnCount + realTextColumnCount!) {
+    if (valueColumnCount !== undefined && sourceRow.length < valueColumnCount + sidecarColumnCount) {
       throw new Error(
         `Exact numeric text row ${rowIndex} has ${sourceRow.length} values; ` +
-        `expected at least ${valueColumnCount + realTextColumnCount!}`
+        `expected at least ${valueColumnCount + sidecarColumnCount}`
       );
     }
+    const packedTexts = packedRealTextColumnCount !== undefined
+      ? parsePackedRealTexts(
+          sourceRow.slice(valueColumnCount, valueColumnCount! + packedRealTextColumnCount),
+          valueColumnCount!,
+          rowIndex
+        )
+      : undefined;
 
     return sourceRow.slice(0, logicalColumnCount).map((value, columnIndex) => {
       let normalizedValue = value as CellValue | bigint;
@@ -384,8 +439,10 @@ export function normalizeIntegerRowsForTransport(
         }
       }
 
-      if (valueColumnCount !== undefined && columnIndex < realTextColumnCount!) {
-        const exactRealText = sourceRow[valueColumnCount + columnIndex];
+      if (valueColumnCount !== undefined && (packedTexts || columnIndex < realTextColumnCount!)) {
+        const exactRealText = packedTexts
+          ? packedTexts.get(columnIndex)
+          : sourceRow[valueColumnCount + columnIndex];
         if (exactRealText !== null && exactRealText !== undefined) {
           if (typeof exactRealText !== 'string') {
             throw new Error(

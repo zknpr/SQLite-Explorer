@@ -245,6 +245,39 @@ describe('grid cell helpers on sql.js', () => {
         }
     });
 
+    it('pack the same REAL text CAST produces, for every argument chunk', async () => {
+        const { parsePackedRealTexts } = await import('../../src/core/integer-utils.ts');
+        const opened = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+        const engine = opened.operations as WasmDatabaseEngine;
+        const instance = (engine as any).instance;
+        try {
+            const reals = ['0.1', '1.0 / 3', '1e300', '-0.0', '2.0', '-2.5e-308', '4.9e-324', '1e999', '-1e999',
+                '9007199254740993.0', '123456789012345678.0', '0.000001', '1.7976931348623157e308', 'CAST(5 AS REAL)'];
+            const others = ['NULL', '7', "'text'", "x'00'", "CAST('1.5' AS TEXT)"];
+            let seed = 0x7ea1;
+            const next = (bound: number) => {
+                seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+                return seed % bound;
+            };
+            for (let round = 0; round < 300; round++) {
+                const values = Array.from({ length: 1 + next(6) }, () => next(3) ? reals[next(reals.length)] : others[next(others.length)]);
+                const base = next(50);
+                const [packed, ...casts] = instance.exec(
+                    `SELECT sqlite_explorer_real_texts(${base}, ${values.join(', ')}), ` +
+                    values.map(value => `CASE WHEN typeof(${value}) = 'real' THEN CAST(${value} AS TEXT) END`).join(', ')
+                )[0].values[0];
+                const expected = casts.flatMap((text: string | null, index: number) => text === null ? [] : [`${base + index}:${text}`]);
+                assert.equal(packed, expected.length ? expected.join('|') : null, values.join(', '));
+            }
+            for (const bad of ['1', ':1', '1:', '01:1', '2:1|1:1', '1:1|1:1', '9:1']) {
+                assert.throws(() => parsePackedRealTexts([bad], 5, 0), /Packed REAL text/, bad);
+            }
+            assert.deepEqual([...parsePackedRealTexts(['0:0.1|4:2.0', null], 5, 0)!], [[0, '0.1'], [4, '2.0']]);
+        } finally {
+            engine.shutdown();
+        }
+    });
+
     it('cannot be called from schema code', async () => {
         const opened = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
         const engine = opened.operations as WasmDatabaseEngine;

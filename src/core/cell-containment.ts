@@ -35,6 +35,7 @@ const CELL_VALUE_PREFIX = '__sqlite_explorer_cell_value_';
 const CELL_METADATA_ALIAS = '__sqlite_explorer_cell_metadata';
 const CELL_RAW_TEXT_PREFIX = '__sqlite_explorer_cell_raw_text_';
 const CELL_REAL_TEXT_PREFIX = '__sqlite_explorer_cell_real_text_';
+const CELL_REAL_TEXTS_PREFIX = '__sqlite_explorer_cell_real_texts_';
 const RAW_TEXT_DECODE_SLAB_BYTES = 64 * 1024;
 const METADATA_CHUNK_COLUMNS = 400;
 // Arguments per sqlite_explorer_cell_metadata() call, far below SQLite's
@@ -302,18 +303,32 @@ export function buildCellContainmentQuery(
   // Clipping never changes a REAL, so the source value's SQLite text is the
   // transported value's. Only value columns can hold one: metadata and raw
   // TEXT companions are always TEXT or NULL.
+  // The helper packs a row's REAL text into one column per argument chunk; a
+  // native row object pays for every column, even NULL ones.
+  const packedChunkCount = Math.ceil(columnCount / HELPER_METADATA_CHUNK_COLUMNS);
+  const packedRealTextColumnCount = usesCellHelpers && includeRealTextSidecar && !metadataUsesTrailer
+    && primaryTransportColumnCount + packedChunkCount <= SQLITE_MAX_RESULT_COLUMNS
+    ? packedChunkCount
+    : 0;
   const realTextColumnCount = includeRealTextSidecar
+    && !usesCellHelpers
     && !metadataUsesTrailer
     && primaryTransportColumnCount + columnCount <= SQLITE_MAX_RESULT_COLUMNS
     ? columnCount
     : 0;
-  const realTextNames = Array.from({ length: realTextColumnCount }, (_, index) => (
-    `${CELL_REAL_TEXT_PREFIX}${index}`
-  ));
-  const realTextProjection = realTextNames.map((name, index) => (
-    `, CASE WHEN typeof(${quotedValues[index]}) = 'real' ` +
-    `THEN CAST(${quotedValues[index]} AS TEXT) END AS ${escapeIdentifier(name)}`
-  )).join('');
+  const realTextNames = packedRealTextColumnCount > 0
+    ? Array.from({ length: packedRealTextColumnCount }, (_, index) => `${CELL_REAL_TEXTS_PREFIX}${index}`)
+    : Array.from({ length: realTextColumnCount }, (_, index) => `${CELL_REAL_TEXT_PREFIX}${index}`);
+  const realTextProjection = packedRealTextColumnCount > 0
+    ? realTextNames.map((name, index) => {
+        const offset = index * HELPER_METADATA_CHUNK_COLUMNS;
+        const chunk = quotedValues.slice(offset, offset + HELPER_METADATA_CHUNK_COLUMNS);
+        return `, sqlite_explorer_real_texts(${offset}, ${chunk.join(', ')}) AS ${escapeIdentifier(name)}`;
+      }).join('')
+    : realTextNames.map((name, index) => (
+        `, CASE WHEN typeof(${quotedValues[index]}) = 'real' ` +
+        `THEN CAST(${quotedValues[index]} AS TEXT) END AS ${escapeIdentifier(name)}`
+      )).join('');
   const sql =
     sourceCte +
     `SELECT ${projectedValues.join(', ')}` +
@@ -344,14 +359,21 @@ export function buildCellContainmentQuery(
     rawTextValidationUnavailable,
     effectiveInlineCellBytes,
     metadataMayBeNull,
-    numericTransport: realTextColumnCount > 0
+    numericTransport: packedRealTextColumnCount > 0
       ? {
           sql,
           transportColumns,
           valueColumnCount: primaryTransportColumnCount,
-          realTextColumnCount
+          packedRealTextColumnCount
         }
-      : { sql, transportColumns }
+      : realTextColumnCount > 0
+        ? {
+            sql,
+            transportColumns,
+            valueColumnCount: primaryTransportColumnCount,
+            realTextColumnCount
+          }
+        : { sql, transportColumns }
   };
 }
 

@@ -4720,7 +4720,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           transportQuery.valueColumnCount,
           splitSyntheticRowId ? undefined : companionExactTexts,
           !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined,
-          transportQuery.realTextColumnCount
+          transportQuery.realTextColumnCount,
+          transportQuery.packedRealTextColumnCount
         );
         const valueContained = decodeCellContainment(
           normalized.rows,

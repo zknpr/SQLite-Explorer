@@ -1535,20 +1535,56 @@ function assertMainConnectionCellReadSessionAllows(method) {
   }
 }
 
+/**
+ * Read one row's sqlite_explorer_real_texts() columns ("index:text" joined by
+ * '|') into column index -> SQLite text. Mirrors parsePackedRealTexts in
+ * src/core/integer-utils.ts.
+ */
+function parsePackedRealTexts(packedColumns, valueColumnCount, rowIndex) {
+  let texts;
+  let previous = -1;
+  for (const packed of packedColumns) {
+    if (packed === null || packed === undefined) continue;
+    if (typeof packed !== 'string' || packed === '') {
+      throw new Error(`Packed REAL text at row ${rowIndex} is not text`);
+    }
+    for (const entry of packed.split('|')) {
+      const separator = entry.indexOf(':');
+      const indexText = entry.slice(0, separator);
+      const columnIndex = Number(indexText);
+      if (
+        separator < 1 ||
+        separator === entry.length - 1 ||
+        !/^(?:0|[1-9][0-9]*)$/.test(indexText) ||
+        columnIndex >= valueColumnCount ||
+        columnIndex <= previous
+      ) {
+        throw new Error(`Packed REAL text at row ${rowIndex} has an invalid entry`);
+      }
+      previous = columnIndex;
+      (texts ??= new Map()).set(columnIndex, entry.slice(separator + 1));
+    }
+  }
+  return texts;
+}
+
 /** Compact generated numeric metadata before crossing the V8 RPC boundary. */
-function compactExactNumericResult(result, transportColumns, valueColumnCount, realTextColumnCount = valueColumnCount) {
+function compactExactNumericResult(result, transportColumns, valueColumnCount, realTextColumnCount = valueColumnCount, packedRealTextColumnCount) {
   if (!Array.isArray(transportColumns) || transportColumns.length < 1) {
     throw new Error('Invalid exact numeric transport column list');
   }
   const hasRealTextSidecar = valueColumnCount !== undefined;
   const logicalColumnCount = hasRealTextSidecar ? valueColumnCount : transportColumns.length;
-  // A sidecar may cover only the leading columns; it follows all of them.
-  const sidecarColumnCount = hasRealTextSidecar ? realTextColumnCount : 0;
+  const packed = packedRealTextColumnCount !== undefined && packedRealTextColumnCount !== null;
+  // A sidecar may cover only the leading columns, or be packed into a few
+  // columns; either way it follows all of them.
+  const sidecarColumnCount = !hasRealTextSidecar ? 0 : packed ? packedRealTextColumnCount : realTextColumnCount;
   if (
     !Number.isInteger(logicalColumnCount) ||
     logicalColumnCount < 1 ||
     !Number.isInteger(sidecarColumnCount) ||
-    (hasRealTextSidecar && (sidecarColumnCount < 1 || sidecarColumnCount > logicalColumnCount)) ||
+    (packed && !hasRealTextSidecar) ||
+    (hasRealTextSidecar && (sidecarColumnCount < 1 || (!packed && sidecarColumnCount > logicalColumnCount))) ||
     transportColumns.length !== logicalColumnCount + sidecarColumnCount
   ) {
     throw new Error('Invalid exact numeric transport column list');
@@ -1574,6 +1610,21 @@ function compactExactNumericResult(result, transportColumns, valueColumnCount, r
     const orderedRow = inOrder ? sourceRow : mapping.map(index => sourceRow[index]);
     values.push(orderedRow.slice(0, logicalColumnCount));
     if (!hasRealTextSidecar) continue;
+    if (packed) {
+      const texts = parsePackedRealTexts(
+        orderedRow.slice(logicalColumnCount, logicalColumnCount + sidecarColumnCount),
+        logicalColumnCount,
+        rowIndex
+      );
+      if (!texts) continue;
+      for (const [columnIndex, exactText] of texts) {
+        if (exactText === String(orderedRow[columnIndex])) continue;
+        exactIntegerTexts ??= {};
+        exactIntegerTexts[rowIndex] ??= {};
+        exactIntegerTexts[rowIndex][columnIndex] = exactText;
+      }
+      continue;
+    }
     for (let columnIndex = 0; columnIndex < sidecarColumnCount; columnIndex++) {
       const exactText = orderedRow[logicalColumnCount + columnIndex];
       if (exactText === null || exactText === undefined) continue;
@@ -2203,13 +2254,14 @@ async function handleRequest(request) {
       }
 
       case "queryNumeric": {
-        const [sql, params, transportColumns, valueColumnCount, realTextColumnCount] = args;
+        const [sql, params, transportColumns, valueColumnCount, realTextColumnCount, packedRealTextColumnCount] = args;
         if (!db) throw new Error("Database not open");
         result = compactExactNumericResult(
           executeQuery(db, sql, params),
           transportColumns,
           valueColumnCount,
-          realTextColumnCount ?? valueColumnCount
+          realTextColumnCount ?? valueColumnCount,
+          packedRealTextColumnCount ?? undefined
         );
         break;
       }

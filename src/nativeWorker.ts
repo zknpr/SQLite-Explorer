@@ -4389,7 +4389,8 @@ export async function createNativeDatabaseConnection(
               params,
               transportQuery.transportColumns,
               transportQuery.valueColumnCount,
-              transportQuery.realTextColumnCount
+              transportQuery.realTextColumnCount,
+              transportQuery.packedRealTextColumnCount
             ]);
             const valueSourceRows = mergeCellContainmentMetadataRows(
               primaryResult.values,
