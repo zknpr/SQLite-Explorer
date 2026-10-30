@@ -472,9 +472,11 @@ describe('grid cell containment limits', () => {
                 layered.valueColumnCount
             );
             assert.deepStrictEqual(fromMerged, fromLayered);
+            // SQLite 3.53 prints 1/3 with 17 digits where 3.50 printed 15.
+            const third = (database.prepare('SELECT CAST(1.0 / 3 AS TEXT) AS t').get() as { t: string }).t;
             assert.deepStrictEqual(fromMerged.exactIntegerTexts, {
                 0: { 1: '9007199254740993' },
-                1: { 0: '0.333333333333333' },
+                1: { 0: third },
                 2: { 0: '1.0e+300', 4: '0.0' },
                 3: { 0: '2.0' }
             });
