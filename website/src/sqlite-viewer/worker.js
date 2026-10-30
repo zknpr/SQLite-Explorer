@@ -1052,7 +1052,7 @@ async function executeReadQuery(sql, parameterText = '[]', cancellationFlag) {
       while (rows.length <= SQL_RESULT_ROWS && statement.step()) {
         rows.push(statement.get(null, { useBigInt: true }));
       }
-      return decodeReadTransport(headers, rows, transport.valueColumnCount);
+      return decodeReadTransport(headers, rows, transport);
     } finally { statement.free(); }
   }, cancellationFlag);
 }

@@ -442,6 +442,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private readonly hasJsonPatch: boolean;
   /** Whether the runtime registered its grid cell helpers on this connection. */
   private readonly hasCellHelpers: boolean;
+  private cellHelperEncodingLogged = false;
   private readonly cellReadSessionIdleTimeoutMs: number;
   private readonly cellReadSessionAbsoluteTimeoutMs: number;
   private cellReadSession: WasmCellReadSessionState | undefined;
@@ -507,7 +508,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       this.hasCellHelpers = true;
     } catch (error) {
       this.hasCellHelpers = false;
-      this.logger('warn', 'Grid cell helpers are unavailable; table pages use SQL containment:', error);
+      this.logger('warn', 'Grid cell helpers are unavailable; table pages and query results use SQL containment:', error);
     }
   }
 
@@ -713,13 +714,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
     }
     return this.executeWithProgressHandler(() => {
-      const transport = buildReadTransport(prepared.sql, headers.length);
+      const transport = buildReadTransport(prepared.sql, headers.length, this.cellHelpersApply());
       const statement = this.prepareSingleStatement(transport.sql);
       try {
         statement.bind(normalizeWasmBindParams(params));
         const rows: Array<Array<CellValue | bigint>> = [];
         while (rows.length <= SQL_RESULT_ROWS && statement.step()) rows.push(statement.get(null, { useBigInt: true })!);
-        return decodeReadTransport(headers, rows, transport.valueColumnCount);
+        return decodeReadTransport(headers, rows, transport);
       } finally { statement.free(); }
     }, cancellation);
   }
@@ -807,6 +808,22 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private getCellTextEncoding(): CellTextEncoding {
     const encoding = this.instance.exec('PRAGMA encoding')[0]?.values?.[0]?.[0];
     return normalizeCellTextEncoding(encoding);
+  }
+
+  /**
+   * The cell helpers read TEXT as stored, which is UTF-8 only in a UTF-8
+   * database. Missing helpers are logged at construction, another encoding
+   * once here.
+   */
+  private cellHelpersApply(textEncoding?: CellTextEncoding): boolean {
+    if (!this.hasCellHelpers) return false;
+    const encoding = textEncoding ?? this.getCellTextEncoding();
+    if (encoding === 'utf-8') return true;
+    if (!this.cellHelperEncodingLogged) {
+      this.cellHelperEncodingLogged = true;
+      this.logger('log', `Grid cell helpers read UTF-8 only; this ${encoding} database's table pages and query results use SQL containment`);
+    }
+    return false;
   }
 
   private async resolveCellReadSqlTarget(target: CellReadTarget): Promise<CellReadSqlTarget> {
@@ -4626,9 +4643,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const textEncoding = containmentRawTextColumnIndices.length > 0
           ? this.getCellTextEncoding()
           : undefined;
-        // The helpers read TEXT as stored, which is UTF-8 only in a UTF-8 database.
-        const checkedTransport = this.hasCellHelpers
-          && (textEncoding ?? this.getCellTextEncoding()) === 'utf-8';
+        const checkedTransport = this.cellHelpersApply(textEncoding);
         const containmentQuery = buildCellContainmentQuery(
           sql,
           valueHeaders.length,

@@ -1751,6 +1751,30 @@ export async function createNativeDatabaseConnection(
         return nativeCellTextEncoding;
       };
 
+      let nativeCellHelperEncodingLogged = false;
+      // One round trip before a table page or query result: the database
+      // encoding, and the runtime's cell helpers, which the worker loads once
+      // per connection and whose load failure it reports once. The helpers
+      // read TEXT as stored, which is UTF-8 only in a UTF-8 database.
+      const prepareNativeCellHelpers = async (): Promise<{ textEncoding: CellTextEncoding; cellHelpers: boolean }> => {
+        const preparation = await worker.call<NativeGridPagePreparation>('prepareGridPage', [queryPlanLibrary]);
+        if (preparation.cellHelperError) {
+          outputChannel?.appendLine(
+            `[NativeWorker] Grid cell helpers are unavailable; table pages and query results use SQL containment: ` +
+            preparation.cellHelperError
+          );
+        }
+        const textEncoding = normalizeCellTextEncoding(preparation.encoding);
+        if (preparation.cellHelpers && textEncoding !== 'utf-8' && !nativeCellHelperEncodingLogged) {
+          nativeCellHelperEncodingLogged = true;
+          outputChannel?.appendLine(
+            `[NativeWorker] Grid cell helpers read UTF-8 only; this ${textEncoding} database's table pages ` +
+            `and query results use SQL containment`
+          );
+        }
+        return { textEncoding, cellHelpers: preparation.cellHelpers && textEncoding === 'utf-8' };
+      };
+
       const readNativePrimaryKeyRecordId = async (
         table: string,
         identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
@@ -2963,14 +2987,17 @@ export async function createNativeDatabaseConnection(
           const savepointName = createSavepointName('sp_workspace_read');
           await beginNativeSavepoint(savepointName);
           try {
+            // The console may run before any table page loads the helpers.
+            const { cellHelpers } = await prepareNativeCellHelpers();
+            signal?.throwIfAborted();
             // Metadata and execution use the primary handle under one read
             // snapshot, so external DDL cannot relabel a different row layout.
             const headers = await worker.call<string[]>('describeReadQuery', [prepared.sql, prepared.metadataSql, boundary, SQL_MAX_COLUMNS, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
             signal?.throwIfAborted();
-            const transport = buildReadTransport(prepared.sql, headers.length);
+            const transport = buildReadTransport(prepared.sql, headers.length, cellHelpers);
             const result = await worker.call<NativeQueryResult>('workspaceQuery', [transport.sql, boundary, params, transport.transportColumns, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
             signal?.throwIfAborted();
-            const decoded = decodeReadTransport(headers, result.values, transport.valueColumnCount);
+            const decoded = decodeReadTransport(headers, result.values, transport);
             await releaseNativeSavepoint(savepointName);
             return decoded;
           } catch (error) {
@@ -4361,20 +4388,10 @@ export async function createNativeDatabaseConnection(
               valueColumns.length * 2 + 1 <= SQLITE_MAX_RESULT_COLUMNS
                 ? valueColumns.map((_, index) => index)
                 : identityContainmentRawTextColumnIndices;
-            // One round trip: the encoding the raw TEXT decoder needs, and the
-            // runtime's grid cell helpers, loaded once per connection.
-            const pagePreparation = await worker.call<NativeGridPagePreparation>('prepareGridPage', [
-              queryPlanLibrary
-            ]);
-            if (pagePreparation.cellHelperError) {
-              outputChannel?.appendLine(
-                `[NativeWorker] Grid cell helpers are unavailable; table pages use SQL containment: ` +
-                pagePreparation.cellHelperError
-              );
-            }
-            const databaseTextEncoding = normalizeCellTextEncoding(pagePreparation.encoding);
-            // The helpers read TEXT as stored, which is UTF-8 only in a UTF-8 database.
-            const checkedTransport = pagePreparation.cellHelpers && databaseTextEncoding === 'utf-8';
+            const {
+              textEncoding: databaseTextEncoding,
+              cellHelpers: checkedTransport
+            } = await prepareNativeCellHelpers();
             const containmentQuery = buildCellContainmentQuery(
               sql,
               valueColumns.length,

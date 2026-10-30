@@ -3,15 +3,19 @@ import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import * as vscode from 'vscode';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { createNativeDatabaseConnection, NativeWorkerProcess } from '../../src/nativeWorker';
-import type { DatabaseOperations, TableQueryOptions } from '../../src/core/types';
+import { buildCellContainmentQuery } from '../../src/core/cell-containment';
+import { buildExactNumericTextQuery } from '../../src/core/integer-utils';
+import { prepareReadQuery, SQL_RESULT_BYTES, SQL_RESULT_ROWS } from '../../src/core/sql-workspace';
+import type { CellValue, DatabaseOperations, QueryResultSet, TableQueryOptions } from '../../src/core/types';
 
 // The runtime's grid cell helpers (src/runtime/query-plan.c) replace per-cell
-// SQL in the grid page. These tests hold them to the SQL they replace: the C
-// functions directly on sql.js, and whole pages on both real engines with the
-// helpers on and off.
+// SQL in grid pages and query console results. These tests hold them to the
+// SQL they replace: the C functions directly on sql.js, and whole pages and
+// results on both real engines with the helpers on and off.
 
 const HELPER_NAME = 'sqlite_explorer_cell_preview';
 
@@ -68,6 +72,30 @@ const PAGES: Array<[string, string, TableQueryOptions]> = [
     ['an identityless view', 'vt', { columns: ['label', 't', 'b'], limit: 100, offset: 0, maxInlineCellBytes: 300 }]
 ];
 
+// Fourteen result columns narrow the console's cell window to 299 bytes, so
+// the fixture's 400-byte TEXT and BLOB values clip.
+const CONSOLE_QUERIES: Array<[string, string, CellValue[]]> = [
+    ['clipped TEXT and BLOB cells, REAL and big integers',
+        'SELECT id, label, t, b, r, i, u, t AS t2, b AS b2, u AS u2, r AS r2, i AS i2, t AS t3, b AS b3 FROM t ORDER BY id', []],
+    ['a WITHOUT ROWID TEXT key', 'SELECT k, v FROM p ORDER BY v', []],
+    ['the row cap with clipped multibyte TEXT',
+        'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1200) ' +
+        "SELECT x, zeroblob(x % 7 * 1000) AS b, replace(hex(zeroblob(x % 5 * 300)), '0', 'é') AS t, x * 0.1 AS r FROM n", []],
+    ['bound parameters', 'SELECT ? AS a, CAST(? AS INTEGER) AS big, ? AS r, t FROM t WHERE id <= ? ORDER BY id',
+        ['x', '9223372036854775807', 0.1, 5]],
+    // REAL text packs one column per 100 values, so this spans two.
+    ['REAL text past the first 100 columns',
+        `SELECT ${Array.from({ length: 120 }, (_, index) => `${['r', 't', 'i', 'b'][index % 4]} AS c${index}`).join(', ')} FROM t ORDER BY id`, []]
+];
+
+/** The console's transport SQL before the helpers, which the fallback keeps. */
+function legacyReadTransportSql(sql: string, columnCount: number): string {
+    const containment = buildCellContainmentQuery(prepareReadQuery(sql).sql, columnCount, {
+        limit: SQL_RESULT_ROWS + 1, maxInlineCellBytes: 64 * 1024, maxPageResponseBytes: SQL_RESULT_BYTES
+    });
+    return buildExactNumericTextQuery(containment.sql, containment.primaryTransportColumnCount).sql;
+}
+
 async function buildImage(sql: string, encoding?: string): Promise<Uint8Array> {
     const opened = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
     const engine = opened.operations as WasmDatabaseEngine;
@@ -84,11 +112,14 @@ interface PageBackend {
     ops: DatabaseOperations;
     setHelpers(enabled: boolean): void;
     pageSql: string[];
+    logs: string[];
     dispose(): void;
 }
 
 async function openWasm(image: Uint8Array): Promise<PageBackend> {
-    const opened = await createDatabaseEngine({ content: image, maxSize: 0, readOnlyMode: false });
+    const logs: string[] = [];
+    const opened = await createDatabaseEngine({ content: image, maxSize: 0, readOnlyMode: false },
+        (_level, ...args) => { logs.push(args.map(String).join(' ')); });
     const engine = opened.operations as WasmDatabaseEngine;
     const pageSql: string[] = [];
     const instance = (engine as any).instance;
@@ -98,6 +129,7 @@ async function openWasm(image: Uint8Array): Promise<PageBackend> {
         ops: engine,
         setHelpers: enabled => { (engine as any).hasCellHelpers = enabled; },
         pageSql,
+        logs,
         dispose: () => engine.shutdown()
     };
 }
@@ -106,7 +138,7 @@ const originalCall = NativeWorkerProcess.prototype.call;
 let nativeHelpersEnabled = true;
 const nativePageSql: string[] = [];
 (NativeWorkerProcess.prototype as any).call = async function (method: string, args: unknown[] = [], ...rest: unknown[]) {
-    if (method === 'queryNumeric') nativePageSql.push(String(args[0]));
+    if (method === 'queryNumeric' || method === 'workspaceQuery') nativePageSql.push(String(args[0]));
     const result = await (originalCall as any).call(this, method, args, ...rest);
     return method === 'prepareGridPage' && !nativeHelpersEnabled ? { ...result, cellHelpers: false } : result;
 };
@@ -134,13 +166,16 @@ async function openNative(image: Uint8Array): Promise<PageBackend> {
     const directory = fs.mkdtempSync(path.resolve('.tmp/grid-cell-helpers-'));
     const file = path.join(directory, 'fixture.db');
     fs.writeFileSync(file, image);
-    const native = await createNativeDatabaseConnection(vscode.Uri.file(process.cwd()));
+    const logs: string[] = [];
+    const outputChannel = { appendLine: (line: string) => { logs.push(line); } } as unknown as vscode.OutputChannel;
+    const native = await createNativeDatabaseConnection(vscode.Uri.file(process.cwd()), undefined, outputChannel);
     const connection = await native.establishConnection(vscode.Uri.file(file), 'grid-cell-helpers', false);
     nativePageSql.length = 0;
     return {
         ops: connection.databaseOps,
         setHelpers: enabled => { nativeHelpersEnabled = enabled; },
         pageSql: nativePageSql,
+        logs,
         dispose: () => {
             nativeHelpersEnabled = true;
             native.workerMethods[Symbol.dispose]();
@@ -290,6 +325,8 @@ describe('grid cell helpers on sql.js', () => {
     });
 });
 
+const openBackend = { wasm: openWasm, native: openNative };
+
 for (const backendName of ['wasm', 'native'] as const) {
     describe(`${backendName} grid pages with and without the cell helpers`, () => {
         for (const [label, table, options] of PAGES) {
@@ -299,7 +336,7 @@ for (const backendName of ['wasm', 'native'] as const) {
                     return;
                 }
                 const image = await buildImage(FIXTURE_SQL);
-                const backend = backendName === 'wasm' ? await openWasm(image) : await openNative(image);
+                const backend = await openBackend[backendName](image);
                 try {
                     const { sqlPage, helperPage, sqlUsedHelpers, helperUsedHelpers } = await fetchBoth(backend, table, options);
                     assert.equal(sqlUsedHelpers, false);
@@ -317,12 +354,103 @@ for (const backendName of ['wasm', 'native'] as const) {
                 return;
             }
             const image = await buildImage(ROWID_FIXTURE_SQL, 'UTF-16le');
-            const backend = backendName === 'wasm' ? await openWasm(image) : await openNative(image);
+            const backend = await openBackend[backendName](image);
             try {
                 const [, table, options] = PAGES[0];
                 const { sqlPage, helperPage, helperUsedHelpers } = await fetchBoth(backend, table, options);
                 assert.equal(helperUsedHelpers, false);
                 assert.deepStrictEqual(helperPage, sqlPage);
+                assert.equal(backend.logs.filter(line => line.includes('read UTF-8 only')).length, 1, backend.logs.join('\n'));
+            } finally {
+                backend.dispose();
+            }
+        });
+    });
+}
+
+// assert's diff of two 1,001-row results takes minutes to render, so a
+// mismatch is reported at its first differing row or sidecar entry.
+function assertSameResult(actual: QueryResultSet, expected: QueryResultSet) {
+    if (isDeepStrictEqual(actual, expected)) return;
+    for (let index = 0; index < Math.max(actual.rows.length, expected.rows.length); index++) {
+        assert.deepStrictEqual(actual.rows[index], expected.rows[index], `row ${index}`);
+    }
+    const fields = actual as unknown as Record<string, Record<string, unknown> | undefined>;
+    const expectedFields = expected as unknown as Record<string, Record<string, unknown> | undefined>;
+    for (const key of new Set([...Object.keys(actual), ...Object.keys(expected)])) {
+        const entries = new Set([...Object.keys(fields[key] ?? {}), ...Object.keys(expectedFields[key] ?? {})]);
+        for (const entry of entries) assert.deepStrictEqual(fields[key]?.[entry], expectedFields[key]?.[entry], `${key}[${entry}]`);
+    }
+    assert.fail('results differ outside their rows and sidecars');
+}
+
+async function readBoth(backend: PageBackend, sql: string, params: CellValue[]) {
+    backend.setHelpers(false);
+    backend.pageSql.length = 0;
+    const sqlResult = await backend.ops.executeReadQuery!(sql, params);
+    const sqlRun = [...backend.pageSql];
+    backend.setHelpers(true);
+    backend.pageSql.length = 0;
+    const helperResult = await backend.ops.executeReadQuery!(sql, params);
+    const helperRun = [...backend.pageSql];
+    // WASM appends a boundary comment to the statement it prepares.
+    const legacy = legacyReadTransportSql(sql, sqlResult.headers.length);
+    const ranLegacy = (run: string[]) => run.some(text => text === legacy || text.startsWith(`${legacy}\n/*sqlite_explorer_boundary_`));
+    return {
+        sqlResult,
+        helperResult,
+        sqlRanLegacy: ranLegacy(sqlRun),
+        sqlUsedHelpers: sqlRun.some(text => text.includes(HELPER_NAME)),
+        helperUsedHelpers: helperRun.some(text => text.includes(HELPER_NAME))
+    };
+}
+
+for (const backendName of ['wasm', 'native'] as const) {
+    describe(`${backendName} query console results with and without the cell helpers`, () => {
+        for (const [label, sql, params] of CONSOLE_QUERIES) {
+            it(`match for ${label}`, async (context) => {
+                if (backendName === 'native' && !bundledNativeBinary()) {
+                    context.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
+                    return;
+                }
+                const backend = await openBackend[backendName](await buildImage(FIXTURE_SQL));
+                try {
+                    const result = await readBoth(backend, sql, params);
+                    assert.equal(result.sqlRanLegacy, true, 'the fallback keeps the SQL it had before the helpers');
+                    assert.equal(result.sqlUsedHelpers, false);
+                    assert.equal(result.helperUsedHelpers, true);
+                    assertSameResult(result.helperResult, result.sqlResult);
+                    if (label.startsWith('clipped') || label.startsWith('the row cap')) {
+                        assert.ok(Object.keys(result.sqlResult.oversizedCells ?? {}).length > 0, 'the query clips cells');
+                    }
+                    if (label.startsWith('the row cap')) assert.equal(result.sqlResult.rows.length, SQL_RESULT_ROWS + 1);
+                    if (label.startsWith('REAL text past')) {
+                        const columns = Object.values(result.sqlResult.exactIntegerTexts ?? {}).flatMap(row => Object.keys(row).map(Number));
+                        assert.ok(columns.some(column => column >= 100), 'the result has exact REAL text past column 100');
+                    }
+                } finally {
+                    backend.dispose();
+                }
+            });
+        }
+
+        it('keep SQL containment for a UTF-16 database', async (context) => {
+            if (backendName === 'native' && !bundledNativeBinary()) {
+                context.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
+                return;
+            }
+            const backend = await openBackend[backendName](await buildImage(ROWID_FIXTURE_SQL, 'UTF-16le'));
+            try {
+                const [, sql, params] = CONSOLE_QUERIES[0];
+                const first = await readBoth(backend, sql, params);
+                const second = await readBoth(backend, sql, params);
+                for (const result of [first, second]) {
+                    assert.equal(result.sqlRanLegacy, true);
+                    assert.equal(result.helperUsedHelpers, false);
+                    assertSameResult(result.helperResult, result.sqlResult);
+                }
+                assert.ok(Object.keys(first.sqlResult.oversizedCells ?? {}).length > 0, 'the query clips cells');
+                assert.equal(backend.logs.filter(line => line.includes('read UTF-8 only')).length, 1, backend.logs.join('\n'));
             } finally {
                 backend.dispose();
             }

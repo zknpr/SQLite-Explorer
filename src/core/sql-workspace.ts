@@ -1,7 +1,7 @@
 import type { CellValue, QueryResultSet } from './types';
 import { normalizeViewSelectSql } from './view-utils';
 import { buildCellContainmentQuery, decodeCellContainment } from './cell-containment';
-import { buildExactNumericTextQuery, normalizeIntegerRowsForTransport } from './integer-utils';
+import { buildExactNumericTextQuery, normalizeIntegerRowsForTransport, type ExactNumericTextQuery } from './integer-utils';
 import { createCsvTextInspection, inspectCsvTextChunk } from './export-encoding';
 
 export const SQL_RESULT_ROWS = 1000;
@@ -94,17 +94,41 @@ export function parseQueryParameters(text: string): CellValue[] {
     return value;
 }
 
-export function buildReadTransport(sql: string, columnCount: number) {
-    if (columnCount < 1 || columnCount > SQL_MAX_COLUMNS) throw new Error('Queries support 1 to 128 result columns.');
-    const containment = buildCellContainmentQuery(sql, columnCount, {
-        limit: SQL_RESULT_ROWS + 1, maxInlineCellBytes: 64 * 1024, maxPageResponseBytes: SQL_RESULT_BYTES
-    });
-    return buildExactNumericTextQuery(containment.sql, containment.primaryTransportColumnCount);
+export interface ReadTransport extends ExactNumericTextQuery {
+    metadataMayBeNull: boolean;
 }
 
-export function decodeReadTransport(headers: string[], values: Array<Array<CellValue | bigint>>, valueColumnCount?: number): QueryResultSet {
-    const normalized = normalizeIntegerRowsForTransport(values, valueColumnCount);
-    return { headers, ...decodeCellContainment(normalized.rows, headers.length, normalized.exactIntegerTexts, SQL_RESULT_BYTES) };
+/**
+ * cellHelpers: the connection registered the runtime's cell helpers and its
+ * database is UTF-8. The statement then packs the value columns' REAL text
+ * into its own projection, as the grid page does.
+ */
+export function buildReadTransport(sql: string, columnCount: number, cellHelpers = false): ReadTransport {
+    if (columnCount < 1 || columnCount > SQL_MAX_COLUMNS) throw new Error('Queries support 1 to 128 result columns.');
+    const options = { limit: SQL_RESULT_ROWS + 1, maxInlineCellBytes: 64 * 1024, maxPageResponseBytes: SQL_RESULT_BYTES };
+    if (cellHelpers) {
+        const containment = buildCellContainmentQuery(sql, columnCount, options, [], 'checked', true);
+        return { ...containment.numericTransport, metadataMayBeNull: containment.metadataMayBeNull };
+    }
+    const containment = buildCellContainmentQuery(sql, columnCount, options);
+    return {
+        ...buildExactNumericTextQuery(containment.sql, containment.primaryTransportColumnCount),
+        metadataMayBeNull: false
+    };
+}
+
+export function decodeReadTransport(
+    headers: string[],
+    values: Array<Array<CellValue | bigint>>,
+    transport: Pick<ReadTransport, 'valueColumnCount' | 'realTextColumnCount' | 'packedRealTextColumnCount' | 'metadataMayBeNull'>
+): QueryResultSet {
+    const normalized = normalizeIntegerRowsForTransport(values, transport.valueColumnCount, undefined, undefined,
+        transport.realTextColumnCount, transport.packedRealTextColumnCount);
+    return {
+        headers,
+        ...decodeCellContainment(normalized.rows, headers.length, normalized.exactIntegerTexts, SQL_RESULT_BYTES,
+            transport.metadataMayBeNull)
+    };
 }
 
 /** CSV stays positional and text-only; exact numbers and clipped-cell notices survive export. */
