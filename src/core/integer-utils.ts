@@ -23,10 +23,11 @@ export const SQLITE_MAX_VARIABLE_NUMBER = 32766;
  * PK-origin index and is therefore rejected with every other shadowing column.
  * The `pragma` schema prevents same-named user tables from shadowing the
  * metadata virtual tables themselves.
- * Binds the table name twice.
+ * Binds the table name twice. The one row it returns holds the table's
+ * pragma_table_list type: 'table', 'shadow' or 'virtual'.
  */
 export const ROWID_TABLE_AUTHORITY_SQL =
-  `SELECT 1 FROM pragma.pragma_table_list AS target ` +
+  `SELECT "type" FROM pragma.pragma_table_list AS target ` +
   `WHERE "schema" = 'main' AND "name" = ? AND (` +
   `("type" IN ('table', 'shadow') AND "wr" = 0) OR "type" = 'virtual') ` +
   `AND (NOT EXISTS (SELECT 1 FROM pragma.pragma_table_info(?, 'main') ` +

@@ -4462,6 +4462,7 @@ export async function createNativeDatabaseConnection(
 
           try {
             let isRowIdTable = false;
+            let rowIdTableType: unknown;
             if (hasRowIdShape) {
               // This authority read fixes the WAL snapshot before the main data
               // read, so both exact identities and any companion text describe
@@ -4475,6 +4476,7 @@ export async function createNativeDatabaseConnection(
                 [table, table]
               ]);
               isRowIdTable = authority.values.length > 0;
+              rowIdTableType = authority.values[0]?.[0];
             }
 
             // Keyset eligibility: a declared WITHOUT ROWID key (needs no
@@ -4519,14 +4521,16 @@ export async function createNativeDatabaseConnection(
               cellPack,
               likeAny
             } = await prepareNativeCellHelpers();
-            const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan, undefined, { likeAny });
+            // A virtual table need not serve rowid IN (...) without a scan.
+            const engineOptions = { likeAny, rowIdLookup: isRowIdTable && rowIdTableType !== 'virtual' };
+            const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan, undefined, engineOptions);
             const rowIdQuery = splitSyntheticRowId
               ? buildSelectQuery(
                   table,
                   { ...queryOptions, columns: ['rowid'] },
                   keysetPlan,
                   undefined,
-                  { likeAny }
+                  engineOptions
                 )
               : undefined;
             const primaryKeyColumnIndices = primaryKeyContext

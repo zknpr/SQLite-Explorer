@@ -5,7 +5,13 @@
  */
 import { escapeIdentifier, escapeLikePattern, escapeMainIdentifier } from './sql-utils';
 import { getActiveFilterValue } from './filter-utils';
-import { assembleKeysetSelect, type ResolvedKeysetPlan } from './keyset-pagination';
+import {
+  assembleKeysetSelect,
+  buildRowIdLookupSelect,
+  ROW_ID_LOOKUP_ROW,
+  rowIdLookupApplies,
+  type ResolvedKeysetPlan
+} from './keyset-pagination';
 import type { CellValue, TableQueryOptions, TableCountOptions } from './types';
 import {
   normalizeTablePageLimit,
@@ -32,7 +38,7 @@ export function buildSelectQuery(
    * keyset page re-sorts its inner SELECT by name and cannot take one.
    */
   selectList?: (columnExpressions: string[]) => string,
-  functions: QueryRuntimeFunctions = {}
+  engine: EngineQueryOptions = {}
 ): { sql: string; params: CellValue[] } {
   const {
     columns = ['*'],
@@ -51,13 +57,15 @@ export function buildSelectQuery(
     || keysetPlan?.mode === 'before' || keysetPlan?.mode === 'last')) {
     throw new Error('A replaced select list needs named columns and a forward page');
   }
-  const escapedColumns = selectList
-    ? selectList(columns.map(escapeIdentifier))
+  const selectListSql = (qualifier: string) => selectList
+    ? selectList(columns.map(col => qualifier + escapeIdentifier(col)))
     : columns.map(col => {
-        if (col === '*') return '*';
-        if (col === 'rowid') return '"rowid" AS "rowid"';
-        return escapeIdentifier(col);
+        if (col === '*') return `${qualifier}*`;
+        if (col === 'rowid') return `${qualifier}"rowid" AS "rowid"`;
+        return qualifier + escapeIdentifier(col);
       }).join(', ');
+  const escapedColumns = selectListSql('');
+  const rowIdLookupSelectListSql = engine.rowIdLookup ? selectListSql(`${ROW_ID_LOOKUP_ROW}.`) : undefined;
 
   let sql = `SELECT ${escapedColumns} FROM ${escapedTable}`;
   const whereClauses: string[] = [];
@@ -67,7 +75,7 @@ export function buildSelectQuery(
     filters,
     globalFilter,
     globalFilterColumns,
-    functions
+    engine
   );
   whereClauses.push(...conditions);
   params.push(...filterParams);
@@ -81,33 +89,42 @@ export function buildSelectQuery(
       plan: {
         ...keysetPlan,
         limit: normalizeTablePageLimit(keysetPlan.limit)
-      }
+      },
+      rowIdLookupSelectListSql
     });
   }
 
-  if (whereClauses.length > 0) {
-    sql += ` WHERE ${whereClauses.join(' AND ')}`;
-  }
-
+  const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
   const orderedColumns = orderByColumns?.length
     ? orderByColumns
     : (orderBy ? [orderBy] : []);
-  if (orderedColumns.length > 0) {
-    const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
-    sql += ` ORDER BY ${orderedColumns
-      .map(column => `${escapeIdentifier(column)} ${direction}`)
-      .join(', ')}`;
-  }
-
+  const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
+  const orderSql = orderedColumns.length > 0
+    ? ` ORDER BY ${orderedColumns.map(column => `${escapeIdentifier(column)} ${direction}`).join(', ')}`
+    : '';
+  let pageSql = '';
   if (limit !== undefined) {
-    sql += ` LIMIT ${normalizeTablePageLimit(limit)}`;
+    pageSql += ` LIMIT ${normalizeTablePageLimit(limit)}`;
   }
-
   if (offset !== undefined) {
-    sql += ` OFFSET ${normalizeTablePageOffset(offset)}`;
+    pageSql += ` OFFSET ${normalizeTablePageOffset(offset)}`;
   }
 
-  return { sql, params };
+  if (rowIdLookupSelectListSql !== undefined && limit !== undefined && rowIdLookupApplies(orderedColumns)) {
+    return {
+      sql: buildRowIdLookupSelect({
+        selectListSql: rowIdLookupSelectListSql,
+        escapedTable,
+        whereSql,
+        keyColumns: orderedColumns,
+        innerDirection: direction,
+        outerDirection: direction,
+        pageSql
+      }),
+      params
+    };
+  }
+  return { sql: sql + whereSql + orderSql + pageSql, params };
 }
 
 /**
@@ -116,7 +133,7 @@ export function buildSelectQuery(
 export function buildCountQuery(
   table: string,
   options: TableCountOptions,
-  functions: QueryRuntimeFunctions = {}
+  engine: EngineQueryOptions = {}
 ): { sql: string; params: CellValue[] } {
   const {
     columns = [],
@@ -134,7 +151,7 @@ export function buildCountQuery(
     filters,
     globalFilter,
     globalFilterColumns,
-    functions
+    engine
   );
   whereClauses.push(...conditions);
   params.push(...filterParams);
@@ -146,10 +163,17 @@ export function buildCountQuery(
   return { sql, params };
 }
 
-/** Runtime functions the engine's connection has registered (src/runtime/query-plan.c). */
-export interface QueryRuntimeFunctions {
-  /** sqlite_explorer_like_any, on a UTF-8 database. */
+/** What the engine knows about the connection and table, which page options cannot say. */
+export interface EngineQueryOptions {
+  /** The runtime's sqlite_explorer_like_any is registered, on a UTF-8 database (query-plan.c). */
   likeAny?: boolean;
+  /**
+   * The table is an authority-confirmed ordinary rowid table, so a sorted page
+   * can take buildRowIdLookupSelect (keyset-pagination.ts). Without an index
+   * on the sort, SQLite otherwise builds a sorter record of every column for
+   * every row.
+   */
+  rowIdLookup?: boolean;
 }
 
 /** Values per sqlite_explorer_like_any call, as for the cell pack. */
@@ -162,7 +186,7 @@ function buildFilterConditions(
   filters: { column: string; value: string }[] = [],
   globalFilter: string | undefined,
   searchColumns: string[],
-  functions: QueryRuntimeFunctions = {}
+  engine: EngineQueryOptions = {}
 ): { conditions: string[]; params: CellValue[] } {
   const conditions: string[] = [];
   const params: CellValue[] = [];
@@ -184,7 +208,7 @@ function buildFilterConditions(
       for (let i = 0; i < columns.length; i++) params.push(pattern);
       return `(${columns.map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`).join(' OR ')})`;
     };
-    if (functions.likeAny) {
+    if (engine.likeAny) {
       // One call per row and chunk instead of one LIKE per column. The LIKE
       // chain decides only rows the function leaves NULL, and the constant
       // test keeps PRAGMA case_sensitive_like on SQLite's own LIKE.

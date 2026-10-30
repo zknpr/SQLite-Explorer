@@ -58,7 +58,7 @@ import {
   resolveIndexDependencyColumns
 } from '../../schema-ddl';
 import { crypto } from '../../../platform/cryptoShim';
-import { buildSelectQuery, buildCountQuery, type QueryRuntimeFunctions } from '../../query-builder';
+import { buildSelectQuery, buildCountQuery, type EngineQueryOptions } from '../../query-builder';
 import { getActiveFilterValue } from '../../filter-utils';
 import { normalizeTablePageOptions } from '../../table-pagination';
 import {
@@ -573,7 +573,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   }
 
   /** Runtime functions a table page or count may call: only a global filter uses one. */
-  private queryRuntimeFunctions(globalFilter: string | undefined): QueryRuntimeFunctions {
+  private queryRuntimeFunctions(globalFilter: string | undefined): EngineQueryOptions {
     return {
       likeAny: this.hasLikeAny && getActiveFilterValue(globalFilter) !== undefined && this.cellHelpersApply()
     };
@@ -4669,9 +4669,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       // companion reads it authorizes.
       const firstColumn = queryOptions.columns?.[0]?.toLowerCase();
       let isRowIdTable = false;
+      let rowIdTableType: CellValue | undefined;
       if (firstColumn === undefined || firstColumn === '*' || firstColumn === 'rowid') {
         const authority = await this.executeQuery(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
         isRowIdTable = (authority[0]?.rows.length ?? 0) > 0;
+        rowIdTableType = authority[0]?.rows[0]?.[0];
       }
 
       // Keyset eligibility: a declared WITHOUT ROWID key, or an authority-
@@ -4702,7 +4704,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const valueQueryOptions = splitSyntheticRowId
         ? { ...queryOptions, columns: queryOptions.columns!.slice(1) }
         : queryOptions;
-      const functions = this.queryRuntimeFunctions(queryOptions.globalFilter);
+      const functions: EngineQueryOptions = {
+        ...this.queryRuntimeFunctions(queryOptions.globalFilter),
+        // A virtual table need not serve rowid IN (...) without a scan.
+        rowIdLookup: isRowIdTable && rowIdTableType !== 'virtual'
+      };
       const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan, undefined, functions);
       const rowIdQuery = splitSyntheticRowId
         ? buildSelectQuery(
@@ -5045,7 +5051,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     sourceSql: string,
     bindParams: ReturnType<typeof normalizeWasmBindParams>,
     containmentQuery: CellContainmentQuery,
-    functions: QueryRuntimeFunctions
+    functions: EngineQueryOptions
   ): string {
     const columns = options.columns;
     if (

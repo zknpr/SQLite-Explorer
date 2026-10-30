@@ -2976,11 +2976,8 @@ describe('createNativeDatabaseConnection', () => {
             ) {
                 return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
             }
-            if (
-                call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
-            ) {
-                return { result: { columns: ['1'], values: [[1]] } };
+            if (call.method === 'query' && call.args[0] === ROWID_TABLE_AUTHORITY_SQL) {
+                return { result: { columns: ['type'], values: [['table']] } };
             }
             if (call.method === 'query' && call.args[0] === 'PRAGMA encoding') {
                 return { result: { columns: ['encoding'], values: [['UTF-8']] } };
@@ -3035,8 +3032,7 @@ describe('createNativeDatabaseConnection', () => {
             ));
             const mainReadIndex = connection.calls.findIndex(call => call.method === 'queryNumeric');
             const authorityReadIndex = connection.calls.findIndex(call => (
-                call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
+                call.method === 'query' && call.args[0] === ROWID_TABLE_AUTHORITY_SQL
             ));
             const companionBatchIndices = connection.calls
                 .map((call, index) => ({ call, index }))
@@ -3079,11 +3075,8 @@ describe('createNativeDatabaseConnection', () => {
             ) {
                 return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
             }
-            if (
-                call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
-            ) {
-                return { result: { columns: ['1'], values: [[1]] } };
+            if (call.method === 'query' && call.args[0] === ROWID_TABLE_AUTHORITY_SQL) {
+                return { result: { columns: ['type'], values: [['table']] } };
             }
             if (call.method === 'queryBatch') {
                 throw new Error('companion read failed');

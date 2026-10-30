@@ -440,12 +440,54 @@ function buildKeysetPredicate(plan: ResolvedKeysetPlan): { sql: string; params: 
     : { sql: `(${rowValueCompare} OR ${sortColumn} IS NULL)`, params: values };
 }
 
+/** The alias buildRowIdLookupSelect gives the page's rows; its select list qualifies columns with it. */
+export const ROW_ID_LOOKUP_ROW = '"page_row"';
+
+/**
+ * Whether an ORDER BY can take buildRowIdLookupSelect: a sort beyond the
+ * table's own rowid order that ends in the rowid tiebreak, so it is total.
+ */
+export function rowIdLookupApplies(orderedColumns: readonly string[]): boolean {
+  return orderedColumns.length > 1
+    && orderedColumns[orderedColumns.length - 1].toLowerCase() === 'rowid';
+}
+
+/**
+ * A sorted page of an authority-confirmed rowid table. The inner query sorts
+ * only the key columns, the join reads each page row by rowid, and the outer
+ * ORDER BY over the inner columns is the display order. Over an index SQLite
+ * keeps the inner order and adds no sort; without one it sorts key records
+ * instead of every column of every row. A forward page needs no outer sort,
+ * and a reversed one sorts at most a page. The trailing OFFSET keeps SQLite
+ * from flattening this into a wrapping query and dropping its ORDER BY.
+ */
+export function buildRowIdLookupSelect(input: {
+  /** Columns qualified with ROW_ID_LOOKUP_ROW. */
+  selectListSql: string;
+  escapedTable: string;
+  whereSql: string;
+  keyColumns: readonly string[];
+  innerDirection: 'ASC' | 'DESC';
+  outerDirection: 'ASC' | 'DESC';
+  /** The inner query's LIMIT and OFFSET. */
+  pageSql: string;
+}): string {
+  const keys = input.keyColumns.map((column, index) => `${escapeIdentifier(column)} AS "k${index}"`).join(', ');
+  const innerOrder = input.keyColumns.map(column => `${escapeIdentifier(column)} ${input.innerDirection}`).join(', ');
+  const outerOrder = input.keyColumns.map((_, index) => `"page_keys"."k${index}" ${input.outerDirection}`).join(', ');
+  return `SELECT ${input.selectListSql} FROM (SELECT ${keys} FROM ${input.escapedTable}${input.whereSql} ` +
+    `ORDER BY ${innerOrder}${input.pageSql}) AS "page_keys" CROSS JOIN ${input.escapedTable} AS ${ROW_ID_LOOKUP_ROW} ` +
+    `ON ${ROW_ID_LOOKUP_ROW}."rowid" = "page_keys"."k${input.keyColumns.length - 1}" ` +
+    `ORDER BY ${outerOrder} LIMIT -1 OFFSET 0`;
+}
+
 /**
  * Assemble the complete keyset SELECT from the caller's projection and filter
  * clauses. The predicate lands inside this WHERE, so the containment and
  * exact-numeric wrappers compose around the result unchanged. 'before' and
  * 'last' run reversed with a bounded (≤ one page) outer re-sort back to
- * display order, keeping every row-indexed sidecar aligned downstream. Every
+ * display order, keeping every row-indexed sidecar aligned downstream. With
+ * rowIdLookupSelectListSql a sorted page takes buildRowIdLookupSelect. Every
  * form ends with an OFFSET clause, so SQLite never flattens it into the query
  * that wraps it.
  */
@@ -455,6 +497,8 @@ export function assembleKeysetSelect(input: {
   whereClauses: readonly string[];
   filterParams: readonly CellValue[];
   plan: ResolvedKeysetPlan;
+  /** The select list over ROW_ID_LOOKUP_ROW, when the table takes buildRowIdLookupSelect. */
+  rowIdLookupSelectListSql?: string;
 }): { sql: string; params: CellValue[] } {
   const { plan } = input;
   const reversedExecution = plan.mode === 'before' || plan.mode === 'last';
@@ -474,11 +518,23 @@ export function assembleKeysetSelect(input: {
   const orderBySql = (direction: 'ASC' | 'DESC') =>
     escapedKeyColumns.map(column => `${column} ${direction}`).join(', ');
 
-  let sql = `SELECT ${input.selectListSql} FROM ${input.escapedTable}`;
-  if (whereClauses.length > 0) {
-    sql += ` WHERE ${whereClauses.join(' AND ')}`;
+  const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
+  if (input.rowIdLookupSelectListSql !== undefined && rowIdLookupApplies(plan.keyColumns)) {
+    return {
+      sql: buildRowIdLookupSelect({
+        selectListSql: input.rowIdLookupSelectListSql,
+        escapedTable: input.escapedTable,
+        whereSql,
+        keyColumns: plan.keyColumns,
+        innerDirection: executionDirection,
+        outerDirection: plan.direction,
+        pageSql: ` LIMIT ${plan.limit} OFFSET 0`
+      }),
+      params
+    };
   }
-  sql += ` ORDER BY ${orderBySql(executionDirection)} LIMIT ${plan.limit} OFFSET 0`;
+  let sql = `SELECT ${input.selectListSql} FROM ${input.escapedTable}${whereSql}` +
+    ` ORDER BY ${orderBySql(executionDirection)} LIMIT ${plan.limit} OFFSET 0`;
   if (reversedExecution) {
     sql = `SELECT * FROM (${sql}) ORDER BY ${orderBySql(plan.direction)} LIMIT -1 OFFSET 0`;
   }
