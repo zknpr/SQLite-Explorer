@@ -133,6 +133,20 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     const exported = JSON.parse(readFileSync(exportsPath, 'utf8'));
     exported.push('_sqlite_explorer_register_query_plan');
     writeFileSync(exportsPath, JSON.stringify(exported));
+    // Packed grid rows are read in place, which needs the heap view; the
+    // glue reassigns an exported view whenever memory grows.
+    const runtimeMethodsPath = path.join(source, 'src/exported_runtime_methods.json');
+    const runtimeMethods = JSON.parse(readFileSync(runtimeMethodsPath, 'utf8'));
+    runtimeMethods.push('HEAPU8');
+    writeFileSync(runtimeMethodsPath, JSON.stringify(runtimeMethods));
+    // The reader also needs each statement's pointer, which sql.js keeps in a
+    // property Closure renames; export an accessor beside its own methods.
+    const apiPath = path.join(source, 'src/api.js');
+    const api = readFileSync(apiPath, 'utf8');
+    const freeExport = '    Statement.prototype["free"] = Statement.prototype.free;\n';
+    if (api.split(freeExport).length !== 2) throw new Error('sql.js src/api.js no longer exports Statement.prototype["free"] exactly once');
+    writeFileSync(apiPath, api.replace(freeExport,
+      `${freeExport}    Statement.prototype["sqliteExplorerPointer"] = function () { return this.stmt; };\n`));
     // The Makefile's object prerequisites download tools that are unnecessary
     // here: all three upstream sources were verified and compiled above.
     run('make', ['dist/sql-wasm.js', `EMCC=${options.emcc}`, 'BITCODE_FILES=out/sqlite3.o out/extension-functions.o out/vfs.o out/query-plan.o',

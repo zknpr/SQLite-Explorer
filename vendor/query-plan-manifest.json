@@ -5,19 +5,19 @@
   "zig": "0.16.0",
   "zigClang": "clang version 21.1.0",
   "inputs": {
-    "src/runtime/query-plan.c": "58a0a82613b4c4bd8b6551c5b4b6f58ab00eae24463c88507d9db884f78588df",
-    "scripts/build-query-plan.mjs": "38f7f4b77fcef551788d7e807fec17ca1ea2770c41e74e76a3c8c05ef7c3c50d"
+    "src/runtime/query-plan.c": "1f58051394058f7a4a2f3bae3e43dc9da489c01359e07c35f18743a3c2cd9745",
+    "scripts/build-query-plan.mjs": "b2a87a29990f8410911e6ffd1ff4af09641481a09734912f84391e179ffdc24d"
   },
   "outputs": {
-    "natives/aarch64-macos/query-plan.dylib": "8f7afe4c1ec7f8990eb4ca08e65ec566bf8dc1fbd7f26650e51adc41774d5b0a",
-    "natives/x86_64-macos/query-plan.dylib": "64baa47d1b1c85bf6426531b73695cca7fb0b084f703b59b4a9d55e676f64db6",
-    "natives/x86_64-linux-gnu/query-plan.so": "b91ac32939ced6c3feb4aeacb3aab5e167f9f5d119419fbc5451f797a4aeb968",
-    "natives/aarch64-linux-gnu/query-plan.so": "d656f259ee2d4ed04de2663857bdb3fdcc5f20ebfaae279270abe7fb60814908",
-    "natives/x86_64-windows/query-plan.dll": "6b8a2712099ca1e16e7443050b4f966bff0476144ca77cba0132e2ee6703989a",
-    "vendor/sql.js/sql-wasm.js": "5e68997539968392caf70207e26b78486ef2e9b1a50c04cdefa966030b782106",
-    "website/public/sqlite-viewer/sql-wasm.js": "5e68997539968392caf70207e26b78486ef2e9b1a50c04cdefa966030b782106",
-    "vendor/sql.js/sql-wasm.wasm": "088131120f9b1f62b1748cd83fbbb807ef189fb5215975d06d37e56fd2c8a428",
-    "assets/sqlite3.wasm": "088131120f9b1f62b1748cd83fbbb807ef189fb5215975d06d37e56fd2c8a428",
-    "website/public/sqlite-viewer/sql-wasm.wasm": "088131120f9b1f62b1748cd83fbbb807ef189fb5215975d06d37e56fd2c8a428"
+    "natives/aarch64-macos/query-plan.dylib": "65c720bf680440177b54796c0e699a7e3abfb0db041b0f998923d73d31b607cc",
+    "natives/x86_64-macos/query-plan.dylib": "996eae154681135d8d0152298f35f499bceedd4d846d11bc70f43b3bf26040a0",
+    "natives/x86_64-linux-gnu/query-plan.so": "78d4b677811824fdcb43fe11a739be7965d6e1ea8f4d81f90f554e453b5070b8",
+    "natives/aarch64-linux-gnu/query-plan.so": "d97a4537a67f904f6a59cc49794332df33994c9b961ed5f9da7436e46cd1866d",
+    "natives/x86_64-windows/query-plan.dll": "6d182c276bc6008a5e4176dacbd822da2157736376e30e7769ef4dce76d281dc",
+    "vendor/sql.js/sql-wasm.js": "466d8b6ec0ac6022fe79b12c7ef55bd2c8b618f7194317713aca6cf482172b8d",
+    "website/public/sqlite-viewer/sql-wasm.js": "466d8b6ec0ac6022fe79b12c7ef55bd2c8b618f7194317713aca6cf482172b8d",
+    "vendor/sql.js/sql-wasm.wasm": "2e85d56e4210b4a13a0923fd959274cccb5ffcc66be0093d017a5fbee181cac6",
+    "assets/sqlite3.wasm": "2e85d56e4210b4a13a0923fd959274cccb5ffcc66be0093d017a5fbee181cac6",
+    "website/public/sqlite-viewer/sql-wasm.wasm": "2e85d56e4210b4a13a0923fd959274cccb5ffcc66be0093d017a5fbee181cac6"
   }
 }

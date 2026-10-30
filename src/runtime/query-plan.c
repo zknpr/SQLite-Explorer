@@ -262,32 +262,39 @@ static void cell_metadata(sqlite3_context *context, int argc, sqlite3_value **ar
 
 /* Shortest-form UTF-8 scalar values with no NUL, no leading BOM and neither
  * U+FFFE nor U+FFFF. Both engines decode such bytes to a string that encodes
- * back to them; anything else needs the stored bytes. */
-static int is_plain_utf8(const unsigned char *text, int length) {
-    if (length >= 3 && text[0] == 0xef && text[1] == 0xbb && text[2] == 0xbf) return 0;
-    int index = 0;
+ * back to them; anything else needs the stored bytes. Returns the string's
+ * UTF-16 length, or -1 when the bytes are not plain. */
+static int plain_utf8_units(const unsigned char *text, int length) {
+    if (length >= 3 && text[0] == 0xef && text[1] == 0xbb && text[2] == 0xbf) return -1;
+    int index = 0, units = 0;
     while (index < length) {
         unsigned lead = text[index];
         if (lead < 0x80) {
-            if (!lead) return 0;
+            if (!lead) return -1;
             index++;
+            units++;
             continue;
         }
         int extra = lead >= 0xc2 && lead <= 0xdf ? 1
             : lead >= 0xe0 && lead <= 0xef ? 2
             : lead >= 0xf0 && lead <= 0xf4 ? 3 : 0;
-        if (!extra || length - index <= extra) return 0;
+        if (!extra || length - index <= extra) return -1;
         unsigned point = lead & (0x3fu >> extra);
         for (int offset = 1; offset <= extra; offset++) {
             unsigned next = text[index + offset];
-            if ((next & 0xc0) != 0x80) return 0;
+            if ((next & 0xc0) != 0x80) return -1;
             point = (point << 6) | (next & 0x3f);
         }
-        if (extra == 2 && (point < 0x800 || (point >= 0xd800 && point <= 0xdfff) || point >= 0xfffe)) return 0;
-        if (extra == 3 && (point < 0x10000 || point > 0x10ffff)) return 0;
+        if (extra == 2 && (point < 0x800 || (point >= 0xd800 && point <= 0xdfff) || point >= 0xfffe)) return -1;
+        if (extra == 3 && (point < 0x10000 || point > 0x10ffff)) return -1;
         index += extra + 1;
+        units += extra == 3 ? 2 : 1;
     }
-    return 1;
+    return units;
+}
+
+static int is_plain_utf8(const unsigned char *text, int length) {
+    return plain_utf8_units(text, length) >= 0;
 }
 
 /* For TEXT of at most limit bytes: NULL when is_plain_utf8, else its bytes as
@@ -346,6 +353,172 @@ static void real_texts(sqlite3_context *context, int argc, sqlite3_value **argv)
     sqlite3_result_text(context, packed, length, sqlite3_free);
 }
 
+/*
+ * One BLOB per row chunk of at most 100 values carrying what the four helpers
+ * above return for each value: cell_preview's value, cell_metadata's
+ * oversized length, cell_text_check's verdict or bytes, and real_texts' text.
+ * Every number is little-endian.
+ *
+ *   u8 version (1), u8 value count, u32 offset of the text area
+ *   per value: u8 tag, then
+ *     0 NULL
+ *     1 INTEGER   i64
+ *     2 REAL      f64, u8 length, SQLite's text for it
+ *     3 TEXT      u32 UTF-16 length, u32 byte length; bytes in the text area
+ *     4 TEXT      u32 byte length, bytes (not plain UTF-8)
+ *     5 TEXT      u32 stored byte length, u32 UTF-16 length, u32 preview byte
+ *                 length; preview bytes in the text area (oversized)
+ *     6 TEXT      u32 stored byte length, u32 preview byte length, preview
+ *                 bytes (oversized, preview not plain UTF-8)
+ *     7 BLOB      u32 byte length, bytes
+ *     8 BLOB      u32 stored byte length, u32 preview byte length, bytes
+ *   text area: the plain UTF-8 bytes of tags 3 and 5, in value order, which
+ *   the reader decodes with one call per chunk
+ */
+#define PACK_MAX_VALUES 100
+#define PACK_MAX_REAL_TEXT 255
+
+struct pack_cell {
+    int tag;
+    const unsigned char *bytes;
+    int length;   /* bytes carried: whole value or preview */
+    int stored;   /* stored byte length of an oversized value */
+    int units;    /* UTF-16 length of plain text */
+    sqlite3_value *copy;
+};
+
+static unsigned char *put_u32(unsigned char *out, sqlite3_uint64 value) {
+    for (int index = 0; index < 4; index++) out[index] = (unsigned char) (value >> (8 * index));
+    return out + 4;
+}
+
+static unsigned char *put_u64(unsigned char *out, sqlite3_uint64 value) {
+    for (int index = 0; index < 8; index++) out[index] = (unsigned char) (value >> (8 * index));
+    return out + 8;
+}
+
+static unsigned char *put_bytes(unsigned char *out, const unsigned char *bytes, int length) {
+    for (int index = 0; index < length; index++) out[index] = bytes[index];
+    return out + length;
+}
+
+static void cell_pack(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    sqlite3_int64 limit, characters;
+    struct pack_cell cells[PACK_MAX_VALUES];
+    int count = argc - 2;
+    if (count < 1 || count > PACK_MAX_VALUES) {
+        sqlite3_result_error(context, "Grid cell packing requires two limits and 1 to 100 values.", -1);
+        return;
+    }
+    if (!byte_limit(context, argv[0], &limit) || !byte_limit(context, argv[1], &characters)) return;
+    sqlite3_uint64 descriptors = 0, area = 0;
+    int ready = 0, failed = 0;
+    for (; ready < count; ready++) {
+        sqlite3_value *value = argv[ready + 2];
+        struct pack_cell *cell = &cells[ready];
+        cell->copy = 0;
+        int type = sqlite3_value_type(value);
+        if (type == SQLITE_INTEGER) {
+            cell->tag = 1;
+            descriptors += 9;
+        } else if (type == SQLITE_FLOAT) {
+            /* real_texts' conversion, on a copy so the argument stays REAL. */
+            cell->tag = 2;
+            cell->copy = sqlite3_value_dup(value);
+            cell->bytes = cell->copy ? sqlite3_value_text(cell->copy) : 0;
+            if (!cell->bytes) { failed = SQLITE_NOMEM; ready++; break; }
+            cell->length = sqlite3_value_bytes(cell->copy);
+            if (cell->length < 1 || cell->length > PACK_MAX_REAL_TEXT) { failed = SQLITE_ERROR; ready++; break; }
+            descriptors += 10 + (sqlite3_uint64) cell->length;
+        } else if (type == SQLITE_TEXT) {
+            const unsigned char *text = sqlite3_value_text(value);
+            int length = sqlite3_value_bytes(value);
+            if (!text) { failed = SQLITE_NOMEM; break; }
+            cell->bytes = text;
+            if (length > limit) {
+                cell->stored = length;
+                cell->length = text_prefix_bytes(text, length, characters);
+                cell->units = plain_utf8_units(text, cell->length);
+                cell->tag = cell->units >= 0 ? 5 : 6;
+            } else {
+                cell->length = length;
+                cell->units = plain_utf8_units(text, length);
+                cell->tag = cell->units >= 0 ? 3 : 4;
+            }
+            if (cell->tag == 3) { descriptors += 9; area += (sqlite3_uint64) cell->length; }
+            else if (cell->tag == 4) descriptors += 5 + (sqlite3_uint64) cell->length;
+            else if (cell->tag == 5) { descriptors += 13; area += (sqlite3_uint64) cell->length; }
+            else descriptors += 9 + (sqlite3_uint64) cell->length;
+        } else if (type == SQLITE_BLOB) {
+            const unsigned char *blob = sqlite3_value_blob(value);
+            int length = sqlite3_value_bytes(value);
+            if (!blob && length > 0) { failed = SQLITE_NOMEM; break; }
+            cell->bytes = blob;
+            if (length > limit) {
+                cell->tag = 8;
+                cell->stored = length;
+                cell->length = (int) limit;
+                descriptors += 9 + (sqlite3_uint64) limit;
+            } else {
+                cell->tag = 7;
+                cell->length = length;
+                descriptors += 5 + (sqlite3_uint64) length;
+            }
+        } else {
+            cell->tag = 0;
+            descriptors += 1;
+        }
+    }
+    unsigned char *output = 0;
+    sqlite3_uint64 total = 6 + descriptors + area;
+    if (!failed && total > 0x7fffffff) failed = SQLITE_TOOBIG;
+    if (!failed) {
+        output = sqlite3_malloc64(total);
+        if (!output) failed = SQLITE_NOMEM;
+    }
+    if (!failed) {
+        unsigned char *out = output, *text = output + 6 + descriptors;
+        *out++ = 1;
+        *out++ = (unsigned char) count;
+        out = put_u32(out, 6 + descriptors);
+        for (int index = 0; index < count; index++) {
+            struct pack_cell *cell = &cells[index];
+            sqlite3_value *value = argv[index + 2];
+            *out++ = (unsigned char) cell->tag;
+            if (cell->tag == 1) {
+                out = put_u64(out, (sqlite3_uint64) sqlite3_value_int64(value));
+            } else if (cell->tag == 2) {
+                union { double real; sqlite3_uint64 bits; } number;
+                number.real = sqlite3_value_double(value);
+                out = put_u64(out, number.bits);
+                *out++ = (unsigned char) cell->length;
+                out = put_bytes(out, cell->bytes, cell->length);
+            } else if (cell->tag == 3) {
+                out = put_u32(out, (sqlite3_uint64) cell->units);
+                out = put_u32(out, (sqlite3_uint64) cell->length);
+                text = put_bytes(text, cell->bytes, cell->length);
+            } else if (cell->tag == 4 || cell->tag == 7) {
+                out = put_u32(out, (sqlite3_uint64) cell->length);
+                out = put_bytes(out, cell->bytes, cell->length);
+            } else if (cell->tag == 5) {
+                out = put_u32(out, (sqlite3_uint64) cell->stored);
+                out = put_u32(out, (sqlite3_uint64) cell->units);
+                out = put_u32(out, (sqlite3_uint64) cell->length);
+                text = put_bytes(text, cell->bytes, cell->length);
+            } else if (cell->tag == 6 || cell->tag == 8) {
+                out = put_u32(out, (sqlite3_uint64) cell->stored);
+                out = put_u32(out, (sqlite3_uint64) cell->length);
+                out = put_bytes(out, cell->bytes, cell->length);
+            }
+        }
+    }
+    for (int index = 0; index < ready; index++) sqlite3_value_free(cells[index].copy);
+    if (failed == SQLITE_NOMEM) sqlite3_result_error_nomem(context);
+    else if (failed == SQLITE_TOOBIG) sqlite3_result_error_toobig(context);
+    else if (failed) sqlite3_result_error(context, "Grid cell packing received unsupported REAL text.", -1);
+    else sqlite3_result_blob64(context, output, total, sqlite3_free);
+}
+
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
@@ -364,6 +537,8 @@ int sqlite3_sqliteexplorer_init(sqlite3 *db, char **error, const sqlite3_api_rou
         SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, cell_text_check, 0, 0, 0);
     if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_real_texts", -1,
         SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, real_texts, 0, 0, 0);
+    if (rc == SQLITE_OK) rc = sqlite3_create_function_v2(db, "sqlite_explorer_cell_pack", -1,
+        SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC, 0, cell_pack, 0, 0, 0);
     return rc;
 }
 
