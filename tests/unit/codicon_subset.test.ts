@@ -353,4 +353,19 @@ describe('built codicon assets', () => {
         assert.equal(shippedCss, fresh.css, 'assets/codicons/codicon.css is stale; rebuild');
         assert.ok(fs.readFileSync(fontPath).equals(fresh.font), 'assets/codicons/codicon.ttf is stale; rebuild');
     });
+
+    it('serve the same subset beside the web demo viewer, which names no class beyond it', () => {
+        // Tracked like the rest of website/public/sqlite-viewer, so a stale copy is a diff.
+        const demoDirectory = path.resolve('website/public/sqlite-viewer');
+        const demoViewer = fs.readFileSync(path.join(demoDirectory, 'viewer.html'), 'utf8');
+        const fresh = build();
+        assert.equal(fs.readFileSync(path.join(demoDirectory, 'codicon.css'), 'utf8'), fresh.css);
+        assert.ok(fs.readFileSync(path.join(demoDirectory, 'codicon.ttf')).equals(fresh.font));
+        assert.match(demoViewer, /<link rel="stylesheet" href="codicon\.css">/);
+        assert.doesNotMatch(demoViewer, /unpkg\.com|@vscode\/codicons@/);
+        assert.deepEqual(lib.collectCodiconClasses([
+            ...lib.readCodiconSources(process.cwd()),
+            { file: 'website/public/sqlite-viewer/viewer.html', text: demoViewer }
+        ]), usedClasses);
+    });
 });

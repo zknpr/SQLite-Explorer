@@ -25,6 +25,7 @@
 - Stop building and packaging the browser worker bundle. VS Code Web runs SQLite in the extension host, so nothing loaded it.
 - Ship the extension icon at 256 by 256 pixels, the size VS Code asks for, instead of 500 by 500. With the removed bundle, each VSIX is 210 KB smaller.
 - Ship only the 25 codicons the viewer uses. The build cuts the icon font and its stylesheet down to those icons, which makes each VSIX 63 KB smaller, and fails if the viewer names an icon the font does not have.
+- The web demo serves the same icon subset from its own origin. It loaded the full codicon stylesheet and font, about 160 KB, from unpkg.com, and the browser fetched the font without an integrity check.
 - Fail the build when the web demo viewer cannot be bundled. The build used to report success and keep the previous viewer.
 - Rebuild the WebAssembly runtime and the five native query-plan libraries from `src/runtime/query-plan.c` with the grid cell functions. The native engine now loads its library when it reads the first table page or query result, not at the first Explain. Schema code such as views and triggers cannot call the new functions.
 

@@ -6,7 +6,7 @@ import { describe, it, type TestContext } from 'node:test';
 
 const requireConfig = createRequire(import.meta.url);
 const website = path.resolve('website');
-const assets = ['worker.js', 'viewer.html', 'sql-wasm.js', 'sql-wasm.wasm'];
+const assets = ['worker.js', 'viewer.html', 'sql-wasm.js', 'sql-wasm.wasm', 'codicon.css', 'codicon.ttf'];
 
 function fixture(t: TestContext) {
     const root = path.resolve('.tmp/unit-demo-assets');

@@ -261,6 +261,11 @@ const copyAssets = async () => {
   );
   fs.copyFileSync(wasmSrc, resolve(demoAssetsDir, 'sql-wasm.wasm'));
   console.log('Copied vendored sql.js runtime to website/public/sqlite-viewer/');
+  // The demo viewer runs the same UI, so it serves the same subset itself
+  // instead of fetching the full font and stylesheet from a CDN.
+  fs.writeFileSync(resolve(demoAssetsDir, 'codicon.css'), codicons.css);
+  fs.writeFileSync(resolve(demoAssetsDir, 'codicon.ttf'), codicons.font);
+  console.log('Wrote the codicon subset to website/public/sqlite-viewer/');
 };
 
 /**
@@ -411,8 +416,9 @@ const bundleWebDemoViewer = async () => {
   }
 
   // Bundle: replace placeholders with actual content
-  // Inject Codicon font for web demo (VS Code extension handles this via local resources or CSP-friendly URI)
-  const codiconLink = '<link rel="stylesheet" href="https://unpkg.com/@vscode/codicons@0.0.44/dist/codicon.css" integrity="sha384-sVpT0iPTciRIsuV1JVtIodkJ0guQ/8vFWf8PaazFqcSmJfWptKd00bCziqfui3Ir" crossorigin="anonymous">';
+  // The web demo serves the codicon subset beside this page (copyAssets);
+  // the VS Code extension injects its local copy through the webview URI.
+  const codiconLink = '<link rel="stylesheet" href="codicon.css">';
 
   const bundled = template
     .replace('<!--HEAD-->', () => codiconLink)
