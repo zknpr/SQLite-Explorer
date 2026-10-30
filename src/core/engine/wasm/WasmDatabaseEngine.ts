@@ -84,7 +84,8 @@ import {
   CellHistoryConflictError,
   LegacyCellHistoryError,
   parseStoredCellState,
-  storedCellStatesEqual
+  storedCellStatesEqual,
+  type StoredCellSqlFragment
 } from '../../cell-history';
 import {
   buildRowHistoryPredicate,
@@ -231,6 +232,7 @@ import {
   COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT,
   COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT,
   COLUMN_DROP_TABLE_STATE_SQL,
+  columnDropValueStates,
   executeSchemaPreservingColumnDrop,
   mapColumnDropTableState,
   normalizeColumnDropForeignKeyViolation
@@ -2002,34 +2004,47 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     deletedColumns: NonNullable<ModificationEntry['deletedColumns']>,
     identity: TableIdentity
   ): Promise<void> {
-    const rowUpdates = new Map<RecordId, Map<string, CellValue | null>>();
+    const rowUpdates = new Map<RecordId, Map<string, StoredCellSqlFragment>>();
     for (const column of deletedColumns) {
-      for (const cell of column.data) {
+      // Exact class and bytes when the history kept them; older history
+      // restores each value as its JS type binds.
+      const states = columnDropValueStates(column);
+      column.data.forEach((cell, index) => {
         const rowId = identity.kind === 'rowid'
           ? validateRowId(cell.rowId)
           : cell.rowId;
-        const values = rowUpdates.get(rowId) ?? new Map<string, CellValue | null>();
-        values.set(column.name, cell.value ?? null);
-        rowUpdates.set(rowId, values);
-      }
+        const writes = rowUpdates.get(rowId) ?? new Map<string, StoredCellSqlFragment>();
+        const value = cell.value ?? null;
+        writes.set(column.name, states
+          ? buildStoredCellWrite(states[index], wasmBindPlaceholder)
+          : { sql: wasmBindPlaceholder(value), params: [value] });
+        rowUpdates.set(rowId, writes);
+      });
     }
 
+    // Storage classes multiply the statement shapes; keep a bounded few.
     const statements = new Map<string, WasmPreparedStatement>();
     try {
-      for (const [rowId, values] of rowUpdates) {
-        const params: CellValue[] = deletedColumns.map(column => values.get(column.name) ?? null);
+      for (const [rowId, writes] of rowUpdates) {
+        const columnWrites = deletedColumns.map(column => writes.get(column.name) ?? { sql: '?', params: [null] });
         const setClause = deletedColumns.map((column, index) => (
-          `${escapeIdentifier(column.name)} = ${wasmBindPlaceholder(params[index])}`
+          `${escapeIdentifier(column.name)} = ${columnWrites[index].sql}`
         )).join(', ');
         const predicate = buildRecordIdentityPredicate(rowId, identity);
         const sql =
           `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${predicate.sql}`;
         let statement = statements.get(sql);
+        let owned = false;
         if (!statement) {
           statement = this.instance.prepare(sql);
-          statements.set(sql, statement);
+          if (statements.size < MAX_HISTORY_STATEMENTS) statements.set(sql, statement);
+          else owned = true;
         }
-        statement.run(normalizeWasmBindParams([...params, ...predicate.params]));
+        try {
+          statement.run(normalizeWasmBindParams([...columnWrites.flatMap(write => write.params), ...predicate.params]));
+        } finally {
+          if (owned) statement.free();
+        }
       }
     } finally {
       for (const statement of statements.values()) statement.free();

@@ -424,6 +424,12 @@ export interface ModificationEntry {
       name: string;
       type: string;
       data: { rowId: RecordId; value: CellValue }[];
+      /**
+       * One storage-class letter per data entry (columnDropValueStates); a
+       * TEXT value is then its bytes when they are not plain UTF-8. History
+       * from older versions has none and restores values as given.
+       */
+      storageClasses?: string;
   }[];
   /** Exact guarded schema transition for positional column-drop undo. */
   columnDropSnapshot?: ColumnDropSnapshot;

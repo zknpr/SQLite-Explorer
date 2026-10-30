@@ -1,9 +1,12 @@
 import type {
+  CellStorageClass,
   CellValue,
   ColumnDropSnapshot,
   ColumnDropTableState,
+  StoredCellState,
   TableIdentity
 } from './types';
+import { parseStoredCellState } from './cell-history';
 import { encodePrimaryKeyRecordId } from './row-identity';
 import { qualifyMainCreateIndexSql } from './schema-ddl';
 import { escapeIdentifier, escapeMainIdentifier, validateSqlType } from './sql-utils';
@@ -25,7 +28,82 @@ export const COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT = 2 * 1024 * 1024;
 export const COLUMN_DROP_FOREIGN_KEY_FIELD_BYTES_LIMIT = 64 * 1024;
 
 const COLUMN_DROP_HISTORY_COLUMN_CHUNK_SIZE = 64;
-const COLUMN_DROP_VALUE_ENTRY_STRUCTURAL_BYTES = 28;
+// A { rowId, value } entry, plus its letter in the column's storageClasses.
+const COLUMN_DROP_VALUE_ENTRY_STRUCTURAL_BYTES = 30;
+
+const STORAGE_CLASS_CODES: Record<CellStorageClass, string> = {
+  null: 'n', integer: 'i', real: 'r', text: 't', blob: 'b'
+};
+const STORAGE_CLASSES_BY_CODE = new Map(
+  Object.entries(STORAGE_CLASS_CODES).map(([storageClass, code]) => [code, storageClass as CellStorageClass])
+);
+
+/**
+ * A dropped column's cells as executeQuery can return them exactly: the
+ * storage class, then INTEGER as decimal text (WebAssembly rounds int64 past
+ * 2^53) and TEXT as its stored bytes. Undo restores each cell's class and
+ * bytes from these, not the class its JS value would bind as.
+ */
+export function buildColumnDropValueProjection(column: string): string {
+  const escaped = escapeIdentifier(column);
+  return (
+    `typeof(${escaped}), CASE typeof(${escaped}) WHEN 'text' THEN CAST(${escaped} AS BLOB) ` +
+    `WHEN 'integer' THEN CAST(${escaped} AS TEXT) ELSE ${escaped} END`
+  );
+}
+
+/**
+ * One cell from buildColumnDropValueProjection: its class letter and the
+ * value history keeps. TEXT stays as its stored bytes, which restore writes
+ * back in any database encoding and which cost less undo memory than a string.
+ */
+export function readColumnDropValue(
+  storageClass: unknown,
+  raw: unknown,
+  context: string
+): { code: string; value: CellValue } {
+  if (storageClass === 'text') {
+    if (!(raw instanceof Uint8Array)) throw new Error(`SQLite returned invalid TEXT bytes for ${context}`);
+    return { code: STORAGE_CLASS_CODES.text, value: raw };
+  }
+  let value = raw;
+  if (storageClass === 'integer') {
+    if (typeof raw !== 'string' || !/^-?\d+$/.test(raw)) {
+      throw new Error(`SQLite returned an invalid integer text for ${context}`);
+    }
+    const exact = BigInt(raw);
+    value = Number.isSafeInteger(Number(exact)) ? Number(exact) : exact;
+  }
+  const state = parseStoredCellState(storageClass, value, context);
+  return { code: STORAGE_CLASS_CODES[state.storageClass], value: state.value };
+}
+
+/**
+ * Each captured cell's exact state, or undefined for history recorded before
+ * storage classes were kept, whose values restore as given.
+ */
+export function columnDropValueStates(column: {
+  name: string;
+  data: readonly { value: CellValue }[];
+  storageClasses?: string;
+}): StoredCellState[] | undefined {
+  const codes = column.storageClasses;
+  if (codes === undefined) return undefined;
+  if (typeof codes !== 'string' || codes.length !== column.data.length) {
+    throw new Error(`Column-drop history for ${column.name} has inconsistent storage classes`);
+  }
+  return column.data.map((cell, index) => {
+    const storageClass = STORAGE_CLASSES_BY_CODE.get(codes[index]);
+    if (!storageClass) throw new Error(`Column-drop history for ${column.name} has an invalid storage class`);
+    const rawTextBytes = storageClass === 'text' && cell.value instanceof Uint8Array ? cell.value : undefined;
+    return parseStoredCellState(
+      storageClass,
+      rawTextBytes ? '' : cell.value,
+      `dropped column ${column.name}`,
+      { rawTextBytes }
+    );
+  });
+}
 
 export interface ColumnDropHistorySizeQuery {
   kind: 'values' | 'identity';

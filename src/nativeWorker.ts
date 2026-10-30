@@ -232,6 +232,7 @@ import {
   COLUMN_DROP_FOREIGN_KEY_VIOLATION_BYTES_LIMIT,
   COLUMN_DROP_FOREIGN_KEY_VIOLATION_LIMIT,
   COLUMN_DROP_TABLE_STATE_SQL,
+  columnDropValueStates,
   executeSchemaPreservingColumnDrop,
   mapColumnDropTableState
 } from './core/column-drop';
@@ -1727,25 +1728,30 @@ export async function createNativeDatabaseConnection(
         deletedColumns: NonNullable<ModificationEntry['deletedColumns']>,
         identity: TableIdentity
       ): Promise<void> => {
-        const batch = deletedColumns.map(column => {
+        const batch: { sql: string; paramsList: CellValue[][] }[] = [];
+        for (const column of deletedColumns) {
           const escapedColumn = escapeIdentifier(column.name);
-          let predicateSql: string | undefined;
-          const paramsList = column.data.map(cell => {
+          // Exact class and bytes when the history kept them; older history
+          // restores each value as its JS type binds.
+          const states = columnDropValueStates(column);
+          column.data.forEach((cell, index) => {
             const rowId = identity.kind === 'rowid'
               ? validateRowId(cell.rowId)
               : cell.rowId;
             const predicate = buildRecordIdentityPredicate(rowId, identity);
-            if (predicateSql !== undefined && predicateSql !== predicate.sql) {
-              throw new Error(`Inconsistent row identity while restoring ${table}.${column.name}`);
-            }
-            predicateSql = predicate.sql;
-            return [cell.value ?? null, ...predicate.params];
+            const write = states
+              ? buildStoredCellWrite(states[index])
+              : { sql: '?', params: [cell.value ?? null] };
+            const sql =
+              `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${write.sql} ` +
+              `WHERE ${predicate.sql}`;
+            const params = [...write.params, ...predicate.params];
+            // Adjacent cells of one shape share a statement.
+            const last = batch[batch.length - 1];
+            if (last?.sql === sql) last.paramsList.push(params);
+            else batch.push({ sql, paramsList: [params] });
           });
-          const sql =
-            `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ? ` +
-            `WHERE ${predicateSql ?? (identity.kind === 'rowid' ? 'rowid = ?' : '0')}`;
-          return { sql, paramsList };
-        }).filter(item => item.paramsList.length > 0);
+        }
         if (batch.length > 0) await worker.call('execBatch', [batch]);
       };
 

@@ -34,8 +34,10 @@ import {
   assertColumnDropHistoryFitsUndoBudget,
   assertTableSchemaStateCurrent,
   buildColumnDropHistorySizePreflight,
+  buildColumnDropValueProjection,
   COLUMN_DROP_TABLE_STATE_SQL,
-  mapColumnDropTableState
+  mapColumnDropTableState,
+  readColumnDropValue
 } from './core/column-drop';
 import { runReadSnapshot } from './core/operation-serializer';
 import {
@@ -954,7 +956,9 @@ export class HostBridge implements ToastService {
         deletedColumns: columns.map(column => ({
           name: column,
           type: colMap.get(column)!,
-          data: [] as { rowId: RecordId; value: CellValue }[]
+          data: [] as { rowId: RecordId; value: CellValue }[],
+          // Its letters are counted per entry by the preflight.
+          storageClasses: ''
         })),
         // A drop removes schema text and objects. A separately owned copy of
         // the pre-drop state is therefore a conservative post-drop reserve.
@@ -975,6 +979,7 @@ export class HostBridge implements ToastService {
       }
 
       const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
+      const storageClasses = columns.map(() => [] as string[]);
       if (columns.length > 0) {
         const preflight = buildColumnDropHistorySizePreflight(
           table,
@@ -1000,7 +1005,7 @@ export class HostBridge implements ToastService {
         const identityProjection = identityBefore.kind === 'rowid'
           ? ['CAST(rowid AS TEXT)']
           : identityColumns.map(escapeIdentifier);
-        const valueProjection = columns.map(escapeIdentifier);
+        const valueProjection = columns.map(buildColumnDropValueProjection);
         const result = await snapshotOps.executeQuery(
           `SELECT ${[...identityProjection, ...valueProjection].join(', ')} ` +
           `FROM ${escapeMainIdentifier(table)}`
@@ -1014,17 +1019,18 @@ export class HostBridge implements ToastService {
                 row.slice(0, identityWidth)
               );
           for (let index = 0; index < columns.length; index++) {
-            colsData[index].push({
-              rowId,
-              value: row[identityWidth + index]
-            });
+            const offset = identityWidth + index * 2;
+            const cell = readColumnDropValue(row[offset], row[offset + 1], `${table}.${columns[index]}`);
+            colsData[index].push({ rowId, value: cell.value });
+            storageClasses[index].push(cell.code);
           }
         }
       }
       const deletedColumnsData = columns.map((column, index) => ({
         name: column,
         type: colMap.get(column)!,
-        data: colsData[index]
+        data: colsData[index],
+        storageClasses: storageClasses[index].join('')
       }));
       // Defend the DDL boundary even if a backend returns malformed aggregate
       // metadata. This exact check still runs before deleteColumns' savepoint.
