@@ -234,7 +234,8 @@ async function openDemoWorker(image: Uint8Array, helpers: boolean, pageSql: stri
         return response.content.data;
     };
     await invoke('initializeDatabase', 'fixture.db', {
-        content: image, wasmBinary: new Uint8Array(fs.readFileSync('assets/sqlite3.wasm'))
+        // The tracked runtime; assets/sqlite3.wasm is a build output the native CI lane lacks.
+        content: image, wasmBinary: new Uint8Array(fs.readFileSync('vendor/sql.js/sql-wasm.wasm'))
     });
     return invoke;
 }
