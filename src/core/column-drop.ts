@@ -1,12 +1,15 @@
 import type {
   CellStorageClass,
+  CellTextEncoding,
   CellValue,
   ColumnDropSnapshot,
   ColumnDropTableState,
+  RecordId,
   StoredCellState,
   TableIdentity
 } from './types';
 import { parseStoredCellState } from './cell-history';
+import { encodeByteFaithfulPrimaryKeyRecordId } from './cell-containment';
 import { encodePrimaryKeyRecordId } from './row-identity';
 import { qualifyMainCreateIndexSql } from './schema-ddl';
 import { escapeIdentifier, escapeMainIdentifier, validateSqlType } from './sql-utils';
@@ -76,6 +79,35 @@ export function readColumnDropValue(
   }
   const state = parseStoredCellState(storageClass, value, context);
   return { code: STORAGE_CLASS_CODES[state.storageClass], value: state.value };
+}
+
+/**
+ * The record identity of a row read with buildColumnDropValueProjection per
+ * primary-key column. An INTEGER key keeps every digit, and a TEXT key that
+ * its decoded string cannot reproduce byte for byte is refused, as editable
+ * WITHOUT ROWID identities are, so undo cannot write into another row.
+ */
+export function columnDropPrimaryKeyRecordId(
+  identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
+  projected: readonly unknown[],
+  textEncoding: CellTextEncoding,
+  context: string
+): RecordId {
+  const values: unknown[] = [];
+  const rawText: unknown[] = [];
+  identity.columns.forEach((column, index) => {
+    const storageClass = projected[index * 2];
+    const raw = projected[index * 2 + 1];
+    if (storageClass === 'text') {
+      if (!(raw instanceof Uint8Array)) throw new Error(`SQLite returned invalid TEXT bytes for ${context}`);
+      values.push(new TextDecoder(textEncoding, { ignoreBOM: true }).decode(raw));
+      rawText.push(raw);
+    } else {
+      values.push(readColumnDropValue(storageClass, raw, `${context} key ${column.identifier}`).value);
+      rawText.push(undefined);
+    }
+  });
+  return encodeByteFaithfulPrimaryKeyRecordId(identity, [...values, ...rawText], textEncoding, context);
 }
 
 /**

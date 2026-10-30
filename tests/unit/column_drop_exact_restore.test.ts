@@ -146,3 +146,48 @@ describe('column drop undo restores each cell exactly', () => {
         }
     });
 });
+
+/**
+ * WITHOUT ROWID keys an engine's executeQuery cannot return exactly: int64
+ * past 2^53 and TEXT with a byte order mark restore into their own rows, and
+ * TEXT that no string reproduces refuses the drop before changing anything.
+ */
+async function assertPrimaryKeyIdentities(ops: DatabaseOperations) {
+    await ops.executeQuery('CREATE TABLE ki (k INTEGER PRIMARY KEY, v) WITHOUT ROWID');
+    await ops.executeQuery('INSERT INTO ki VALUES (9007199254740993, 1), (9007199254740992, 2), (-9223372036854775808, 3)');
+    await ops.executeQuery('CREATE TABLE kt (k TEXT PRIMARY KEY, v) WITHOUT ROWID');
+    await ops.executeQuery("INSERT INTO kt VALUES (CAST(X'EFBBBF61' AS TEXT), 1), ('a', 2), ('ünï', 3)");
+    await ops.executeQuery('CREATE TABLE kx (k TEXT PRIMARY KEY, v) WITHOUT ROWID');
+    await ops.executeQuery("INSERT INTO kx VALUES (CAST(X'FF61' AS TEXT), 1), ('a', 2)");
+    const read = async (table: string) => (await ops.executeQuery(
+        `SELECT hex(CAST(k AS BLOB)) AS k, typeof(v) AS t, v AS v FROM ${table} ORDER BY k`
+    ))[0].rows;
+    for (const table of ['ki', 'kt']) {
+        const before = await read(table);
+        const { bridge, recorded } = bridgeFor(ops);
+        await bridge.deleteColumns(table, ['v']);
+        await ops.undoModification(recorded[0]);
+        assert.deepEqual(await read(table), before, table);
+    }
+    const before = await read('kx');
+    const { bridge, recorded } = bridgeFor(ops);
+    await assert.rejects(bridge.deleteColumns('kx', ['v']), /byte-faithful editable identity cannot be minted/);
+    assert.equal(recorded.length, 0);
+    assert.deepEqual(await read('kx'), before);
+}
+
+describe('column drop undo finds each WITHOUT ROWID row by its exact key', () => {
+    it('on WebAssembly', async () => {
+        const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+        try {
+            await assertPrimaryKeyIdentities(engine);
+        } finally {
+            engine.shutdown();
+        }
+    });
+
+    it('on the native engine', async (context) => {
+        if (!await nativeOrSkip(context)) return;
+        await withNative(undefined, assertPrimaryKeyIdentities);
+    });
+});

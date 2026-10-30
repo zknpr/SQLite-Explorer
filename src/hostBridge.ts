@@ -35,6 +35,7 @@ import {
   assertTableSchemaStateCurrent,
   buildColumnDropHistorySizePreflight,
   buildColumnDropValueProjection,
+  columnDropPrimaryKeyRecordId,
   COLUMN_DROP_TABLE_STATE_SQL,
   mapColumnDropTableState,
   readColumnDropValue
@@ -1004,19 +1005,25 @@ export class HostBridge implements ToastService {
           : [];
         const identityProjection = identityBefore.kind === 'rowid'
           ? ['CAST(rowid AS TEXT)']
-          : identityColumns.map(escapeIdentifier);
+          : identityColumns.map(buildColumnDropValueProjection);
         const valueProjection = columns.map(buildColumnDropValueProjection);
         const result = await snapshotOps.executeQuery(
           `SELECT ${[...identityProjection, ...valueProjection].join(', ')} ` +
           `FROM ${escapeMainIdentifier(table)}`
         );
-        const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length;
+        const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length * 2;
+        // A TEXT key is decoded in the database encoding and must reproduce its bytes.
+        const keyEncoding = identityBefore.kind === 'primaryKey'
+          ? normalizeCellTextEncoding((await snapshotOps.executeQuery('PRAGMA encoding'))[0]?.rows[0]?.[0])
+          : undefined;
         for (const row of result[0]?.rows ?? []) {
           const rowId = identityBefore.kind === 'rowid'
             ? validateRowId(row[0] as RecordId)
-            : encodePrimaryKeyRecordId(
-                identityBefore.columns,
-                row.slice(0, identityWidth)
+            : columnDropPrimaryKeyRecordId(
+                identityBefore,
+                row.slice(0, identityWidth),
+                keyEncoding!,
+                `Cannot record undo for dropping ${columns.join(', ')} from ${table}`
               );
           for (let index = 0; index < columns.length; index++) {
             const offset = identityWidth + index * 2;
