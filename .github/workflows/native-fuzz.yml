@@ -19,6 +19,7 @@ on:
       - 'tests/unit/schema_trigger_presence.test.ts'
       - 'tests/unit/history_statement_cache.test.ts'
       - 'tests/unit/native_number_binding.test.ts'
+      - 'tests/unit/native_cell_history_batch.test.ts'
       - 'src/core/cell-pack.ts'
       - 'src/core/query-builder.ts'
       - 'src/core/keyset-pagination.ts'
@@ -42,6 +43,7 @@ on:
       - 'tests/unit/schema_trigger_presence.test.ts'
       - 'tests/unit/history_statement_cache.test.ts'
       - 'tests/unit/native_number_binding.test.ts'
+      - 'tests/unit/native_cell_history_batch.test.ts'
       - 'src/core/cell-pack.ts'
       - 'src/core/query-builder.ts'
       - 'src/core/keyset-pagination.ts'
@@ -126,6 +128,14 @@ jobs:
         env:
           FUZZ_EXPECT_TARGET: ${{ matrix.target }}
         run: node --import tsx --test tests/unit/native_number_binding.test.ts
+
+      # Batched cell undo and redo: set reads by rowid, chunk bounds and
+      # guarded writes, through the production worker.
+      - name: Native cell history batches
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/native_cell_history_batch.test.ts
 
       # Which databases the worker reads through a memory map, and that reading
       # one leaves its ctime unchanged. Only Linux maps.

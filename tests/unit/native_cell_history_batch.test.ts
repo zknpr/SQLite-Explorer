@@ -11,7 +11,10 @@ import type { ModificationEntry } from '../../src/core/types';
 
 async function fixture(t: TestContext, rows = 300) {
   const root = process.cwd();
-  if (!await isNativeAvailable(root)) { t.skip('Bundled native runtime unavailable'); return; }
+  if (!await isNativeAvailable(root)) {
+    if (process.env.FUZZ_EXPECT_TARGET) throw new Error(`Missing native runtime for ${process.env.FUZZ_EXPECT_TARGET}`);
+    t.skip('Bundled native runtime unavailable'); return;
+  }
   fs.mkdirSync(path.join(root, '.tmp'), { recursive: true });
   const directory = fs.mkdtempSync(path.join(root, '.tmp', 'native-history-batch-'));
   const file = path.join(directory, 'history.sqlite');
