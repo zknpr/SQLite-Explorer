@@ -177,9 +177,24 @@ export function assertWebviewTransportPayload(
   value: unknown,
   options: WebviewTransportLimits
 ): number {
+  return measureWebviewTransportPayload(value, options).bytes;
+}
+
+/**
+ * assertWebviewTransportPayload, also saying whether serializeValue would
+ * change anything in `value`. When it would not, the caller can post the
+ * value itself instead of walking it again to copy it unchanged.
+ */
+export function measureWebviewTransportPayload(
+  value: unknown,
+  options: WebviewTransportLimits
+): { bytes: number; needsSerialization: boolean } {
   const limits = resolveLimits(options);
   const ancestors = new WeakSet<object>();
   let aggregateBytes = 0;
+  // Set where serializeValue rewrites a value: binary views, non-finite
+  // numbers, escaped strings, and marker objects this walk does not enter.
+  let needsSerialization = false;
 
   const rejectBinary = (actualBytes: number): never => {
     throw new WebviewPayloadLimitError({
@@ -214,10 +229,12 @@ export function assertWebviewTransportPayload(
       );
     }
     if (candidate instanceof Uint8Array) {
+      needsSerialization = true;
       addBinary(candidate.byteLength, encodedBase64Bytes(candidate.byteLength));
       return;
     }
     if (ArrayBuffer.isView(candidate)) {
+      needsSerialization = true;
       addBinary(candidate.byteLength, encodedBase64Bytes(candidate.byteLength));
       return;
     }
@@ -233,14 +250,18 @@ export function assertWebviewTransportPayload(
       return;
     }
     if (typeof candidate === 'string') {
-      add(
-        escapedJsonStringByteLength(candidate)
-        + jsonSafeNumberStringExpansionBytes(candidate)
-      );
+      const expansion = jsonSafeNumberStringExpansionBytes(candidate);
+      if (expansion) needsSerialization = true;
+      add(escapedJsonStringByteLength(candidate) + expansion);
       return;
     }
     if (typeof candidate === 'number') {
-      add(Number.isFinite(candidate) ? 8 : JSON_SAFE_NON_FINITE_NUMBER_MAX_WIRE_BYTES);
+      if (Number.isFinite(candidate)) {
+        add(8);
+      } else {
+        needsSerialization = true;
+        add(JSON_SAFE_NON_FINITE_NUMBER_MAX_WIRE_BYTES);
+      }
       return;
     }
     if (
@@ -280,6 +301,7 @@ export function assertWebviewTransportPayload(
         && keys.includes('base64')
         && typeof candidate.base64 === 'string'
       ) {
+        needsSerialization = true;
         addBinary(decodedBase64Bytes(candidate.base64), candidate.base64.length);
         return;
       }
@@ -304,7 +326,7 @@ export function assertWebviewTransportPayload(
   };
 
   visit(value);
-  return aggregateBytes;
+  return { bytes: aggregateBytes, needsSerialization };
 }
 
 export function isWebviewPayloadLimitError(error: unknown): error is WebviewPayloadLimitError {
