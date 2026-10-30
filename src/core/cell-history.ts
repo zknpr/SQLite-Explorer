@@ -180,6 +180,19 @@ export interface StoredCellSqlFragment {
 
 type BindPlaceholder = (value: CellValue) => string;
 
+/**
+ * Both engines bind a whole number past int32 as a double (sql.js's rule, and
+ * V8's serialization to txiki), which a column without INTEGER affinity keeps
+ * as REAL. CAST gives the INTEGER back exactly: such a double is integral, and
+ * an int64 past 2^53 arrives as a BigInt or as decimal text.
+ */
+function integerPlaceholder(value: CellValue, bindPlaceholder: BindPlaceholder): string {
+  const int32 = typeof value === 'number'
+    ? value === (value | 0)
+    : typeof value === 'bigint' && value >= -2147483648n && value <= 2147483647n;
+  return int32 ? bindPlaceholder(value) : 'CAST(? AS INTEGER)';
+}
+
 /** Bind a value so a typeless column regains the recorded storage class. */
 export function buildStoredCellWrite(
   state: StoredCellState,
@@ -190,9 +203,12 @@ export function buildStoredCellWrite(
     case 'null':
       return { sql: 'NULL', params: [] };
     case 'integer':
-      return { sql: bindPlaceholder(state.value), params: [state.value] };
+      return { sql: integerPlaceholder(state.value, bindPlaceholder), params: [state.value] };
     case 'real':
-      return { sql: 'CAST(? AS REAL)', params: [state.value] };
+      // sql.js binds -0 as INTEGER 0, which CAST makes +0.0.
+      return Object.is(state.value, -0)
+        ? { sql: '-0.0', params: [] }
+        : { sql: 'CAST(? AS REAL)', params: [state.value] };
     case 'text':
       return {
         // Binding a BLOB directly through CAST(? AS TEXT) transcodes it from
@@ -220,7 +236,7 @@ export function buildStoredCellPredicate(
     case 'null':
       return { sql: `typeof(${escaped}) = 'null'`, params: [] };
     case 'integer': {
-      const placeholder = bindPlaceholder(state.value);
+      const placeholder = integerPlaceholder(state.value, bindPlaceholder);
       return {
         sql: `typeof(${escaped}) = 'integer' AND ${escaped} IS ${placeholder}`,
         params: [state.value]

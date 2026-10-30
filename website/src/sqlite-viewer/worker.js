@@ -362,8 +362,10 @@ function normalizeBindParams(params) {
   });
 }
 
+// A bigint past int32 binds as a double when safe (normalizeBindParams) and
+// as decimal text when not; cast it back so it stays INTEGER in any column.
 function bindPlaceholder(value) {
-  return typeof value === 'bigint' && !Number.isSafeInteger(Number(value))
+  return typeof value === 'bigint' && (value < -2147483648n || value > 2147483647n)
     ? 'CAST(? AS INTEGER)'
     : '?';
 }

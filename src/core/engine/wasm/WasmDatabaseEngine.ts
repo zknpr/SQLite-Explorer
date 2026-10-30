@@ -384,12 +384,16 @@ function normalizeWasmBindParams(
   });
 }
 
-/** sql.js binds unsafe bigint as TEXT; cast only those captured INTEGER values. */
 /** Statements withHistoryStatements keeps for one call (prepareHistoryStatement). */
 const MAX_HISTORY_STATEMENTS = 32;
 
+/**
+ * A bigint past int32 reaches sql.js as a double when safe (see
+ * normalizeWasmBindParams) and as decimal text when not; either way a column
+ * without INTEGER affinity would keep it as REAL or TEXT, so cast it back.
+ */
 function wasmBindPlaceholder(value: CellValue): string {
-  return typeof value === 'bigint' && !Number.isSafeInteger(Number(value))
+  return typeof value === 'bigint' && (value < -2147483648n || value > 2147483647n)
     ? 'CAST(? AS INTEGER)'
     : '?';
 }
