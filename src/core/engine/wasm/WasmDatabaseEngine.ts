@@ -3461,11 +3461,20 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     });
   }
 
-  /** Columns SQLite permits in an INSERT; generated columns have hidden 2/3. */
+  /**
+   * Columns SQLite permits in an INSERT; generated columns have hidden 2/3.
+   * FTS3, FTS4 and FTS5 declare a hidden column named like the table: a
+   * command column, not data (FTS5 reads it as a changing integer, and
+   * writing it runs a command). Their docid is FTS3/4's rowid alias, which
+   * SQLite refuses to write beside the rowid, and rank is FTS5's per-query
+   * score. Other hidden columns, such as FTS4's language column, are data.
+   */
   private async getInsertableColumnNames(table: string): Promise<string[]> {
     const result = await this.executeQuery(
-      "SELECT name FROM pragma.pragma_table_xinfo(?, 'main') " +
-      'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+      "SELECT name FROM pragma.pragma_table_xinfo(?1, 'main') WHERE hidden NOT IN (2, 3) " +
+      "AND NOT (hidden = 1 AND (name = ?1 COLLATE NOCASE OR name COLLATE NOCASE IN ('docid', 'rank')) " +
+      "AND EXISTS (SELECT 1 FROM pragma.pragma_table_xinfo(?1, 'main') WHERE hidden = 1 AND name = ?1 COLLATE NOCASE)) " +
+      'ORDER BY cid',
       [table]
     );
     return (result[0]?.rows ?? []).map(row => {

@@ -21,6 +21,7 @@ on:
       - 'tests/unit/native_number_binding.test.ts'
       - 'tests/unit/native_cell_history_batch.test.ts'
       - 'tests/unit/native_history_shared_texts.test.ts'
+      - 'tests/unit/fts_row_history.test.ts'
       - 'src/core/cell-pack.ts'
       - 'src/core/query-builder.ts'
       - 'src/core/keyset-pagination.ts'
@@ -52,6 +53,7 @@ on:
       - 'tests/unit/native_number_binding.test.ts'
       - 'tests/unit/native_cell_history_batch.test.ts'
       - 'tests/unit/native_history_shared_texts.test.ts'
+      - 'tests/unit/fts_row_history.test.ts'
       - 'src/core/cell-pack.ts'
       - 'src/core/query-builder.ts'
       - 'src/core/keyset-pagination.ts'
@@ -149,7 +151,7 @@ jobs:
         shell: bash
         env:
           FUZZ_EXPECT_TARGET: ${{ matrix.target }}
-        run: node --import tsx --test tests/unit/native_cell_history_batch.test.ts tests/unit/native_history_shared_texts.test.ts
+        run: node --import tsx --test tests/unit/native_cell_history_batch.test.ts tests/unit/native_history_shared_texts.test.ts tests/unit/fts_row_history.test.ts
 
       # The same history-tracked mutations, and column adds and drops through
       # HostBridge, on WebAssembly and native in lockstep: outcomes, schema,

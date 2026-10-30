@@ -2463,10 +2463,14 @@ async function getTableInfo(table) {
     }));
 }
 
+// Row-history columns, as getInsertableColumnNames in the WASM engine: no
+// generated columns, and no FTS command, docid or rank column.
 function getInsertableColumnNames(table) {
   const result = db.exec(
-    'SELECT name FROM pragma.pragma_table_xinfo(?) ' +
-    'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+    'SELECT name FROM pragma.pragma_table_xinfo(?1) WHERE hidden NOT IN (2, 3) ' +
+    "AND NOT (hidden = 1 AND (name = ?1 COLLATE NOCASE OR name COLLATE NOCASE IN ('docid', 'rank')) " +
+    'AND EXISTS (SELECT 1 FROM pragma.pragma_table_xinfo(?1) WHERE hidden = 1 AND name = ?1 COLLATE NOCASE)) ' +
+    'ORDER BY cid',
     [table]
   );
   return (result[0]?.values ?? []).map(row => {

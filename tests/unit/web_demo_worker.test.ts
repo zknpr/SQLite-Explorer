@@ -3235,6 +3235,40 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('replays demo row history on FTS5 and language-id FTS4 tables', async () => {
+        const worker = await createWorkerHarness();
+        for (const [ddl, table, row, columns] of [
+            ['CREATE VIRTUAL TABLE demo_fts5 USING fts5(body)', 'demo_fts5', { body: 'alpha' }, 'body'],
+            ['CREATE VIRTUAL TABLE demo_fts4 USING fts4(body, languageid="lid")', 'demo_fts4', { body: 'beta', lid: 7 }, 'body, lid']
+        ] as const) {
+            await worker.invoke('runQuery', ddl);
+            const contents = async () => (await worker.invoke(
+                'runQuery',
+                `SELECT rowid, ${columns} FROM ${table}`
+            ))[0]?.rows.map((values: unknown[]) => Array.from(values)) ?? [];
+            const insertedRow = await worker.invoke('insertRowWithHistory', table, row);
+            const one = await contents();
+            assert.strictEqual(one.length, 1);
+            const insertion = {
+                modificationType: 'row_insert', targetTable: table, targetRowId: insertedRow.rowId,
+                description: `Insert into ${table}`, rowData: insertedRow.row, insertedRow
+            };
+            await worker.invoke('undoModification', insertion);
+            assert.deepStrictEqual(await contents(), []);
+            await worker.invoke('redoModification', insertion);
+            assert.deepStrictEqual(await contents(), one);
+            const deletedRows = await worker.invoke('deleteRows', table, [insertedRow.rowId]);
+            const deletion = {
+                modificationType: 'row_delete', targetTable: table,
+                description: `Delete from ${table}`, deletedRows
+            };
+            await worker.invoke('undoModification', deletion);
+            assert.deepStrictEqual(await contents(), one);
+            await worker.invoke('redoModification', deletion);
+            assert.deepStrictEqual(await contents(), []);
+        }
+    });
+
     it('replays demo malformed UTF-16LE TEXT without transcoding', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(

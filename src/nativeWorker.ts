@@ -1550,10 +1550,14 @@ export async function createNativeDatabaseConnection(
         return validateRowId(result.values[0][0] as RecordId);
       };
 
+      // Row-history columns, as getInsertableColumnNames in the WASM engine:
+      // no generated columns, and no FTS command, docid or rank column.
       const getNativeInsertableColumnNames = async (table: string): Promise<string[]> => {
         const result = await worker.call<NativeQueryResult>('query', [
-          "SELECT name FROM pragma.pragma_table_xinfo(?, 'main') " +
-          'WHERE hidden NOT IN (2, 3) ORDER BY cid',
+          "SELECT name FROM pragma.pragma_table_xinfo(?1, 'main') WHERE hidden NOT IN (2, 3) " +
+          "AND NOT (hidden = 1 AND (name = ?1 COLLATE NOCASE OR name COLLATE NOCASE IN ('docid', 'rank')) " +
+          "AND EXISTS (SELECT 1 FROM pragma.pragma_table_xinfo(?1, 'main') WHERE hidden = 1 AND name = ?1 COLLATE NOCASE)) " +
+          'ORDER BY cid',
           [table]
         ]);
         return (result.values ?? []).map(row => {
