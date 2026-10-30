@@ -656,6 +656,29 @@ describe('streamTableExport golden parity', () => {
 });
 
 describe('streamTableExport wide and selected-row batching', () => {
+    it('keeps cell order when a streamed cell sits between inline cells', async () => {
+        const database = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+        const operations = database.operations!;
+        const big = 'L'.repeat(70 * 1024);
+        await operations.executeQuery('CREATE TABLE mixed_cells (a TEXT, big TEXT, b INTEGER, payload BLOB)');
+        await operations.executeQuery(
+            "INSERT INTO mixed_cells VALUES ('x,y', ?, 5, x'0102'), ('plain', 'short', 6, zeroblob(70000))",
+            [big]
+        );
+        const columns = ['a', 'big', 'b', 'payload'];
+        const zeros = 'A'.repeat(Math.floor(70000 / 3) * 4) + 'AA==';
+        const csv = await collectStreamingExport(operations, 'mixed_cells', columns, { format: 'csv', header: true } as ExportOptions);
+        assert.strictEqual(csv.content, `a,big,b,payload\n"x,y",${big},5,[BLOB]\nplain,short,6,[BLOB]`);
+        const json = await collectStreamingExport(operations, 'mixed_cells', columns, { format: 'json' } as ExportOptions);
+        assert.strictEqual(json.content,
+            `[\n  {\n    "a": "x,y",\n    "big": "${big}",\n    "b": 5,\n    "payload": "AQI="\n  },` +
+            `\n  {\n    "a": "plain",\n    "big": "short",\n    "b": 6,\n    "payload": "${zeros}"\n  }\n]`);
+        const sql = await collectStreamingExport(operations, 'mixed_cells', columns, { format: 'sql', includeTableName: true } as ExportOptions);
+        assert.strictEqual(sql.content,
+            `INSERT INTO "mixed_cells" ("a", "big", "b", "payload") VALUES ('x,y', '${big}', 5, X'0102');\n` +
+            `INSERT INTO "mixed_cells" ("a", "big", "b", "payload") VALUES ('plain', 'short', 6, X'${'00'.repeat(70000)}');`);
+    });
+
     it('bounds packed inline bytes before a stable export query reaches the host', async () => {
         const database = await createDatabaseEngine({
             content: null,

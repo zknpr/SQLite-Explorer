@@ -47,6 +47,9 @@ const EXPORT_PACKED_INLINE_BATCH_BYTES = 16 * 1024 * 1024;
 // Covers the packed type/length prefix, scalar payloads, row identity, and
 // array/string framing which accompany each worst-case hex-encoded cell.
 const EXPORT_PACKED_CELL_OVERHEAD_BYTES = 64;
+// Formatted cells that need no read session collect into one write of about
+// this many UTF-16 units instead of one awaited write per cell and separator.
+const EXPORT_TEXT_BATCH_UNITS = 64 * 1024;
 
 export interface AsyncExportSink {
   /** Resolves only after the sink has accepted this emission. */
@@ -210,19 +213,42 @@ function buildCellProjection(
   }).join(', ');
 }
 
+function hexDigit(code: number): number {
+  if (code >= 48 && code <= 57) return code - 48;
+  const lowerCase = code | 32;
+  return lowerCase >= 97 && lowerCase <= 102 ? lowerCase - 87 : -1;
+}
+
 function decodePackedHex(
   payload: string,
   expectedBytes: number,
   context: string
 ): Uint8Array {
-  if (payload.length !== expectedBytes * 2 || /[^0-9a-f]/i.test(payload)) {
+  if (payload.length !== expectedBytes * 2) {
     throw new Error(`SQLite returned invalid packed bytes for ${context}`);
   }
   const bytes = new Uint8Array(expectedBytes);
   for (let index = 0; index < expectedBytes; index++) {
-    bytes[index] = Number.parseInt(payload.slice(index * 2, index * 2 + 2), 16);
+    const high = hexDigit(payload.charCodeAt(index * 2));
+    const low = hexDigit(payload.charCodeAt(index * 2 + 1));
+    if (high < 0 || low < 0) {
+      throw new Error(`SQLite returned invalid packed bytes for ${context}`);
+    }
+    bytes[index] = high * 16 + low;
   }
   return bytes;
+}
+
+// decode() without { stream: true } starts fresh on every call, so one strict
+// decoder per encoding serves every cell.
+const strictTextDecoders = new Map<CellTextEncoding, TextDecoder>();
+function strictTextDecoder(textEncoding: CellTextEncoding): TextDecoder {
+  let decoder = strictTextDecoders.get(textEncoding);
+  if (!decoder) {
+    decoder = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true });
+    strictTextDecoders.set(textEncoding, decoder);
+  }
+  return decoder;
 }
 
 function parsePackedCell(
@@ -272,9 +298,8 @@ function parsePackedCell(
     if (payload !== '') throw new Error(`SQLite returned a value for NULL cell ${context}`);
     value = null;
   } else if (storageClass === 'integer') {
-    try {
-      if (BigInt(payload).toString() !== payload) throw new Error();
-    } catch {
+    // Exactly the strings BigInt(payload).toString() reproduces.
+    if (!/^(?:0|-?[1-9][0-9]*)$/.test(payload)) {
       throw new Error(`SQLite returned non-canonical INTEGER text for ${context}`);
     }
     value = payload;
@@ -291,7 +316,7 @@ function parsePackedCell(
     if (sourceBytes <= inlineBytes) {
       const bytes = decodePackedHex(payload, sourceBytes, context);
       try {
-        value = new TextDecoder(textEncoding, { fatal: true, ignoreBOM: true }).decode(bytes);
+        value = strictTextDecoder(textEncoding).decode(bytes);
       } catch {
         value = bytes;
         unrepresentableTextBytes = bytes;
@@ -307,18 +332,13 @@ function parsePackedCell(
     value = null;
   }
 
-  return {
-    table,
-    column,
-    rowId,
-    ...(snapshotPosition ? { snapshotPosition } : {}),
-    storageClass,
-    byteLength: sourceBytes,
-    value,
-    ...(unrepresentableTextBytes === undefined
-      ? {}
-      : { unrepresentableTextBytes, textEncoding })
-  };
+  const cell: ExportCell = { table, column, rowId, storageClass, byteLength: sourceBytes, value };
+  if (snapshotPosition) cell.snapshotPosition = snapshotPosition;
+  if (unrepresentableTextBytes !== undefined) {
+    cell.unrepresentableTextBytes = unrepresentableTextBytes;
+    cell.textEncoding = textEncoding;
+  }
+  return cell;
 }
 
 function parseCells(
@@ -1583,16 +1603,30 @@ async function writeCsvRows(
   if (includeHeader) {
     await emit(sink, columns.map(encodeCsvExportText).join(','), cancellation);
   }
+  let text = '';
   for await (const row of rows) {
-    if (includeHeader || rowCount > 0) {
-      await emit(sink, '\n', cancellation);
-    }
+    if (includeHeader || rowCount > 0) text += '\n';
     for (let index = 0; index < row.cells.length; index++) {
-      if (index > 0) await emit(sink, ',', cancellation);
-      await writeCsvCell(operations, row.cells[index], sink, cancellation);
+      if (index > 0) text += ',';
+      const cell = row.cells[index];
+      if (cell.storageClass === 'blob') {
+        // CSV intentionally exposes only the established placeholder.
+        text += '[BLOB]';
+      } else if (!needsCellStream(cell)) {
+        text += encodeCsvExportCell(cell);
+      } else {
+        await emit(sink, text, cancellation);
+        text = '';
+        await writeCsvCell(operations, cell, sink, cancellation);
+      }
     }
     rowCount++;
+    if (text.length >= EXPORT_TEXT_BATCH_UNITS) {
+      await emit(sink, text, cancellation);
+      text = '';
+    }
   }
+  await emit(sink, text, cancellation);
   return rowCount;
 }
 
@@ -1604,25 +1638,33 @@ async function writeJsonRows(
   cancellation?: ExportCancellation
 ): Promise<number> {
   const properties = jsonPropertyIndices(columns);
+  const propertyPrefixes = properties.map((property, propertyIndex) => (
+    `${propertyIndex > 0 ? ',\n' : ''}    ${JSON.stringify(property.name)}: `
+  ));
   let rowCount = 0;
-  await emit(sink, '[', cancellation);
+  let text = '[';
   for await (const row of rows) {
-    await emit(sink, rowCount === 0 ? '\n  {\n' : ',\n  {\n', cancellation);
+    text += rowCount === 0 ? '\n  {\n' : ',\n  {\n';
     for (let propertyIndex = 0; propertyIndex < properties.length; propertyIndex++) {
-      const property = properties[propertyIndex];
-      if (propertyIndex > 0) await emit(sink, ',\n', cancellation);
-      await emit(sink, `    ${JSON.stringify(property.name)}: `, cancellation);
-      await writeJsonCell(
-        operations,
-        row.cells[property.index],
-        sink,
-        cancellation
-      );
+      text += propertyPrefixes[propertyIndex];
+      const cell = row.cells[properties[propertyIndex].index];
+      if (!needsCellStream(cell)) {
+        text += encodeJsonExportCell(cell);
+      } else {
+        await emit(sink, text, cancellation);
+        text = '';
+        await writeJsonCell(operations, cell, sink, cancellation);
+      }
     }
-    await emit(sink, '\n  }', cancellation);
+    text += '\n  }';
     rowCount++;
+    if (text.length >= EXPORT_TEXT_BATCH_UNITS) {
+      await emit(sink, text, cancellation);
+      text = '';
+    }
   }
-  await emit(sink, rowCount === 0 ? ']' : '\n]', cancellation);
+  text += rowCount === 0 ? ']' : '\n]';
+  await emit(sink, text, cancellation);
   return rowCount;
 }
 
@@ -1637,21 +1679,31 @@ async function writeSqlRows(
 ): Promise<number> {
   const targetTable = includeTableName ? escapeIdentifier(table) : 'table_name';
   const columnList = columns.map(escapeIdentifier).join(', ');
+  const statementPrefix = `INSERT INTO ${targetTable} (${columnList}) VALUES (`;
   let rowCount = 0;
+  let text = '';
   for await (const row of rows) {
-    if (rowCount > 0) await emit(sink, '\n', cancellation);
-    await emit(
-      sink,
-      `INSERT INTO ${targetTable} (${columnList}) VALUES (`,
-      cancellation
-    );
+    if (rowCount > 0) text += '\n';
+    text += statementPrefix;
     for (let index = 0; index < row.cells.length; index++) {
-      if (index > 0) await emit(sink, ', ', cancellation);
-      await writeSqlCell(operations, row.cells[index], sink, cancellation);
+      if (index > 0) text += ', ';
+      const cell = row.cells[index];
+      if (!needsCellStream(cell)) {
+        text += encodeSqlExportCell(cell);
+      } else {
+        await emit(sink, text, cancellation);
+        text = '';
+        await writeSqlCell(operations, cell, sink, cancellation);
+      }
     }
-    await emit(sink, ');', cancellation);
+    text += ');';
     rowCount++;
+    if (text.length >= EXPORT_TEXT_BATCH_UNITS) {
+      await emit(sink, text, cancellation);
+      text = '';
+    }
   }
+  await emit(sink, text, cancellation);
   return rowCount;
 }
 
