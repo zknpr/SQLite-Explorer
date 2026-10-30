@@ -12,6 +12,8 @@ on:
     paths:
       - 'tests/fuzz/**'
       - 'tests/unit/grid_cell_helpers.test.ts'
+      - 'tests/unit/grid_cell_pack.test.ts'
+      - 'src/core/cell-pack.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
@@ -25,6 +27,8 @@ on:
     paths:
       - 'tests/fuzz/**'
       - 'tests/unit/grid_cell_helpers.test.ts'
+      - 'tests/unit/grid_cell_pack.test.ts'
+      - 'src/core/cell-pack.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
@@ -87,14 +91,14 @@ jobs:
           set -o pipefail
           npm run test:native-fuzz 2>&1 | tee native-fuzz.log
 
-      # Grid pages with the runtime's cell helpers on and off, through the
-      # production worker. No other CI lane loads natives/<target>'s
-      # query-plan library.
+      # Grid pages with the runtime's cell helpers on and off, and packed
+      # pages against the helpers, through the production worker. No other
+      # CI lane loads natives/<target>'s query-plan library.
       - name: Native grid pages
         shell: bash
         env:
           FUZZ_EXPECT_TARGET: ${{ matrix.target }}
-        run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts
+        run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts tests/unit/grid_cell_pack.test.ts
 
       - name: Summary
         if: always()
