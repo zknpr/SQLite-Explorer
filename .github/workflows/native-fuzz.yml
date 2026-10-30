@@ -18,6 +18,7 @@ on:
       - 'tests/unit/sorted_page_rowid_lookup.test.ts'
       - 'tests/unit/schema_trigger_presence.test.ts'
       - 'tests/unit/history_statement_cache.test.ts'
+      - 'tests/unit/native_number_binding.test.ts'
       - 'src/core/cell-pack.ts'
       - 'src/core/query-builder.ts'
       - 'src/core/keyset-pagination.ts'
@@ -40,6 +41,7 @@ on:
       - 'tests/unit/sorted_page_rowid_lookup.test.ts'
       - 'tests/unit/schema_trigger_presence.test.ts'
       - 'tests/unit/history_statement_cache.test.ts'
+      - 'tests/unit/native_number_binding.test.ts'
       - 'src/core/cell-pack.ts'
       - 'src/core/query-builder.ts'
       - 'src/core/keyset-pagination.ts'
@@ -116,6 +118,14 @@ jobs:
         env:
           FUZZ_EXPECT_TARGET: ${{ matrix.target }}
         run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts tests/unit/grid_cell_pack.test.ts tests/unit/global_filter_like_any.test.ts tests/unit/sorted_page_rowid_lookup.test.ts tests/unit/schema_trigger_presence.test.ts tests/unit/history_statement_cache.test.ts
+
+      # Integers bound beside fractional numbers keep the INTEGER class, as
+      # on WebAssembly, through the production worker.
+      - name: Native number binding
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/native_number_binding.test.ts
 
       # Which databases the worker reads through a memory map, and that reading
       # one leaves its ctime unchanged. Only Linux maps.

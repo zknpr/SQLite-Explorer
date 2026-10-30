@@ -58,6 +58,13 @@ function loadNativeWorkerFunction(
             { MAX_NATIVE_ERROR_MESSAGE_LENGTH: 8192 }
         );
     }
+    if (
+        functionName !== 'bindableParams'
+        && functionSource.includes('bindableParams(')
+        && !Object.prototype.hasOwnProperty.call(resolvedDependencies, 'bindableParams')
+    ) {
+        resolvedDependencies.bindableParams = loadNativeWorkerFunction('bindableParams', ['params']);
+    }
     const dependencyNames = Object.keys(resolvedDependencies);
     return Function(
         ...dependencyNames,

@@ -411,6 +411,7 @@ Settings in `package.json` → `contributes.configuration`:
 ### RPC Serialization
 - **Uint8Array becomes `{}`**: Never send raw Uint8Array via postMessage - use the marker format
 - **Transfer for blobs**: Large binary data should use `Transfer` wrapper for zero-copy
+- **Native integer binding**: V8 serializes a whole number in a double-typed array, such as `[28, 2.5]`, as a double, and txiki binds a double as REAL. Pass every parameter array the native worker binds through `bindableParams()` in `natives/native-worker.js`; `native_number_binding.test.ts` compares the stored classes with WebAssembly
 
 ### Testing
 - **VS Code mocks required**: Unit tests need `tests/unit/vscode_mock_setup.ts` imported first (path-mapped via `tsconfig.test.json`)

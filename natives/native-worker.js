@@ -765,6 +765,27 @@ function openAsyncDatabase(path, readOnly) {
 // ============================================================================
 
 /**
+ * V8 writes every number of a double-typed array as a double, integral or
+ * not, so [28, 2.5] arrives here as two floats, and txiki binds a float as
+ * REAL. `| 0` gives an int32 value txiki's integer tag, which binds INTEGER:
+ * sql.js's rule (`num === (num | 0)`), so both engines store the same class.
+ * Every bind of message parameters goes through here. -0 stays a float, as
+ * before: txiki binds it as REAL -0.0, which cell history writes back and
+ * compares exactly, where sql.js binds INTEGER 0.
+ */
+function bindableParams(params) {
+  if (!Array.isArray(params)) return params;
+  for (let index = 0; index < params.length; index++) {
+    const value = params[index];
+    if (typeof value === 'number') {
+      const integer = value | 0;
+      if (integer === value && (integer !== 0 || 1 / value > 0)) params[index] = integer;
+    }
+  }
+  return params;
+}
+
+/**
  * Execute a statement with parameters.
  *
  * @param {object} db - Database instance
@@ -785,7 +806,7 @@ function executeStatement(db, sql, params) {
     if (typeof stmt.run === 'function') {
       // txiki treats one object argument as a bindings container. Spreading
       // [null] or [Uint8Array] confuses a SQL value with that container.
-      const runResult = stmt.run(params ?? []);
+      const runResult = stmt.run(bindableParams(params ?? []));
       if (runResult && typeof runResult === 'object') {
         result.changes = runResult.changes !== undefined ? runResult.changes : 0;
         result.lastInsertRowId = runResult.lastInsertRowId !== undefined ? runResult.lastInsertRowId : 0;
@@ -795,7 +816,7 @@ function executeStatement(db, sql, params) {
         if (typeof stmt.bind !== 'function') {
           throw new Error('Native SQLite statement does not support parameter binding');
         }
-        stmt.bind(...params);
+        stmt.bind(...bindableParams(params));
       }
       stmt.step();
     } else if (typeof stmt.execute === 'function') {
@@ -803,7 +824,7 @@ function executeStatement(db, sql, params) {
         if (typeof stmt.bind !== 'function') {
           throw new Error('Native SQLite statement does not support parameter binding');
         }
-        stmt.bind(...params);
+        stmt.bind(...bindableParams(params));
       }
       stmt.execute();
     } else {
@@ -811,7 +832,7 @@ function executeStatement(db, sql, params) {
         if (typeof stmt.bind !== 'function') {
           throw new Error('Native SQLite statement does not support parameter binding');
         }
-        stmt.bind(...params);
+        stmt.bind(...bindableParams(params));
       }
       for (const _ of stmt) {}
     }
@@ -954,7 +975,7 @@ function executeQuery(db, sql, params) {
       }
 
       const rows = statementCount === 0 && params && params.length > 0
-        ? stmt.all(params)
+        ? stmt.all(bindableParams(params))
         : stmt.all();
       const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
       lastResult = {
@@ -1006,7 +1027,7 @@ function runCachedHistoryQuery(database, statements, sql, params) {
     }
     statements.set(sql, statement);
   }
-  const rows = Array.isArray(params) && params.length > 0 ? statement.all(params) : statement.all();
+  const rows = Array.isArray(params) && params.length > 0 ? statement.all(bindableParams(params)) : statement.all();
   return {
     values: (rows || []).map(row => Object.values(row)),
     rowCount: rows?.length ?? 0
@@ -1698,10 +1719,10 @@ function executeSingleQuery(db, sql, params, requiredSuffix) {
     }
 
     if (typeof stmt.all === 'function') {
-      rows = stmt.all(params ?? []);
+      rows = stmt.all(bindableParams(params ?? []));
     } else {
       if (params && params.length > 0 && typeof stmt.bind === 'function') {
-        stmt.bind(...params);
+        stmt.bind(...bindableParams(params));
       }
       for (const row of stmt) rows.push(row);
     }
@@ -1952,7 +1973,7 @@ function executeExportSpoolQuery(asyncDatabase, validationDb, requestId, markedS
       if (statement.kind === 'read') {
         const rows = await asyncDatabase.all(
           validatedSql,
-          params || [],
+          bindableParams(params || []),
           { signal: operation.controller.signal }
         );
         const columns = Array.isArray(rows) && rows.length > 0
@@ -1967,7 +1988,7 @@ function executeExportSpoolQuery(asyncDatabase, validationDb, requestId, markedS
 
       await asyncDatabase.run(
         validatedSql,
-        params || [],
+        bindableParams(params || []),
         { signal: operation.controller.signal }
       );
       if (statement.kind === 'create') exportSpools.add(statement.name);
@@ -2395,7 +2416,7 @@ async function handleRequest(request) {
         // bundled C reader bounds compilation and extraction on that handle.
         result = await runWithQueryDeadline(db, timeoutMs, () => (
           executeInterruptibleAsyncOperation(id, timeoutMs, async signal => {
-            const rows = await db.allAsync(sql, params ?? [], { signal });
+            const rows = await db.allAsync(sql, bindableParams(params ?? []), { signal });
             return rows[0].plan;
           })
         ));
@@ -2413,7 +2434,7 @@ async function handleRequest(request) {
         // on this handle without blocking delivery of the cancellation RPC.
         const rows = await runWithQueryDeadline(db, timeoutMs, () => (
           executeInterruptibleAsyncOperation(id, timeoutMs, signal => (
-            db.allAsync(sql, params ?? [], { signal })
+            db.allAsync(sql, bindableParams(params ?? []), { signal })
           ))
         ));
         const names = columns;
@@ -2640,7 +2661,7 @@ async function handleRequest(request) {
                  const stmt = db.prepare(item.sql);
                  try {
                      for (const params of item.paramsList) {
-                         stmt.run(params ?? []);
+                         stmt.run(bindableParams(params ?? []));
                          assertChanges();
                      }
                  } finally {
@@ -2689,7 +2710,7 @@ async function handleRequest(request) {
         }
         // The bundled Statement run/all methods reset and bind on each call;
         // there is no separate reset/bind API on this runtime.
-        stmt.run(params ?? []);
+        stmt.run(bindableParams(params ?? []));
         result = readRunFallbackResult(db);
         break;
       }
@@ -2701,7 +2722,7 @@ async function handleRequest(request) {
         if (params !== undefined && params !== null && !Array.isArray(params)) {
           throw new Error('SQL query parameters must be an array');
         }
-        const rows = stmt.all(params ?? []);
+        const rows = stmt.all(bindableParams(params ?? []));
         let columns = [];
         if (rows.length > 0) {
           columns = Object.keys(rows[0]);
