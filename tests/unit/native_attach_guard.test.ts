@@ -246,6 +246,10 @@ it('refuses ATTACH and DETACH at every SQL entry point of the native worker', as
         ['queryHistoryBatch: 2nd unit', (p, a) => worker.call('queryHistoryBatch', [
             [{ sql: 'SELECT 1', params: [] }, { sql: `ATTACH ${sqlLiteral(p)} AS ${a}`, params: [] }], 1, 5000, 1000, 1 << 20
         ])],
+        ['queryHistoryBatch: shared text', (p, a) => worker.call('queryHistoryBatch', [
+            [{ sql: 0, params: [] }, { sql: 1, params: [] }], 1, 5000, 1000, 1 << 20,
+            ['SELECT 1', `ATTACH ${sqlLiteral(p)} AS ${a}`]
+        ])],
         ['querySingle', (p, a) => worker.call('querySingle', [`ATTACH ${sqlLiteral(p)} AS ${a}\n${BOUNDARY}`, [], BOUNDARY])],
         ['run', (p, a) => worker.call('run', [`ATTACH ${sqlLiteral(p)} AS ${a}`])],
         ['runSingle', (p, a) => {

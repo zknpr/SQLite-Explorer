@@ -505,9 +505,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   /**
    * Statements prepared once per batched row-history call (withHistoryStatements).
    * Its rows run the same few generated statements, and preparing each one
-   * per row was most of an import's time.
+   * per row was most of an import's time. Rows build their SQL afresh, and a
+   * Map would hash every new text; comparing it with === to the few cached
+   * texts costs about a tenth of that.
    */
-  private historyStatements: Map<string, WasmPreparedStatement> | undefined;
+  private historyStatements: Array<{ sql: string; statement: WasmPreparedStatement }> | undefined;
   private readonly cellReadSessionIdleTimeoutMs: number;
   private readonly cellReadSessionAbsoluteTimeoutMs: number;
   private cellReadSession: WasmCellReadSessionState | undefined;
@@ -1712,15 +1714,15 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     snapshots: readonly DeletedRow[]
   ): Promise<void> {
     if (snapshots.length === 0) throw new LegacyRowHistoryError();
-    snapshots.forEach(rowHistoryStates);
+    const rows = snapshots.map(snapshot => ({ snapshot, states: rowHistoryStates(snapshot) }));
     const identity = await this.resolveTableIdentity(table);
     const savepointName = this.createSavepointName('sp_history_delete_rows');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       await this.assertDeleteHasNoUntrackedPrograms(table);
-      this.withHistoryStatements(() => this.mapInDeadlineChunks(snapshots, snapshot => {
+      this.withHistoryStatements(() => this.mapInDeadlineChunks(rows, ({ snapshot, states }) => {
         const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
-        const rowState = buildRowHistoryPredicate(snapshot, wasmBindPlaceholder);
+        const rowState = buildRowHistoryPredicate(snapshot, wasmBindPlaceholder, states);
         this.runHistoryStatement(
           `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
           `(${rowIdentity.sql}) AND (${rowState.sql})`,
@@ -1756,12 +1758,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         probedShapes.add(shape);
         await this.assertInsertHasNoUntrackedPrograms(table, columns);
       }
-      this.withHistoryStatements(() => this.mapInDeadlineChunks(prepared, entry => {
-        const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
+      const identityChunks = buildRecordIdentityPredicateChunks(
+        prepared.map(entry => entry.snapshot.rowId),
+        identity
+      );
+      this.withHistoryStatements(() => this.mapInDeadlineChunks(identityChunks, chunk => {
         const existing = this.queryRaw(
-          `SELECT 1 FROM ${escapeMainIdentifier(table)} ` +
-          `WHERE ${rowIdentity.sql} LIMIT 1`,
-          rowIdentity.params
+          `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ${chunk.sql} LIMIT 1`,
+          chunk.params
         );
         if (existing.rows.length !== 0) throw new RowHistoryConflictError(table);
       }));
@@ -2694,13 +2698,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   private withHistoryStatements<R>(work: () => R): R {
     if (this.historyStatements) return work();
-    const statements = new Map<string, WasmPreparedStatement>();
+    const statements: Array<{ sql: string; statement: WasmPreparedStatement }> = [];
     this.historyStatements = statements;
     try {
       return work();
     } finally {
       this.historyStatements = undefined;
-      for (const statement of statements.values()) statement.free();
+      for (const { statement } of statements) statement.free();
     }
   }
 
@@ -2714,7 +2718,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     params: readonly CellValue[]
   ): { statement: WasmPreparedStatement; owned: boolean } {
     const statements = this.historyStatements;
-    const cached = statements?.get(sql);
+    const cached = statements?.find(entry => entry.sql === sql)?.statement;
     if (cached) {
       // bind() resets the statement and clears its bindings first.
       cached.bind(normalizeWasmBindParams(params));
@@ -2724,8 +2728,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     if (params.length > 0) statement.bind(normalizeWasmBindParams(params));
     // Generated SQL differs only by each row's storage classes, so a few
     // texts recur; the bound keeps an unusual call from holding one per row.
-    if (!statements || statements.size >= MAX_HISTORY_STATEMENTS) return { statement, owned: true };
-    statements.set(sql, statement);
+    if (!statements || statements.length >= MAX_HISTORY_STATEMENTS) return { statement, owned: true };
+    statements.push({ sql, statement });
     return { statement, owned: false };
   }
 

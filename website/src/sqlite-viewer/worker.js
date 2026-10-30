@@ -3760,15 +3760,15 @@ async function deleteRowHistorySnapshots(table, snapshots) {
   if (!Array.isArray(snapshots) || snapshots.length === 0) {
     throw new LegacyRowHistoryError();
   }
-  snapshots.forEach(rowHistoryStates);
+  const states = snapshots.map(rowHistoryStates);
   const identity = await resolveTableIdentity(table);
   const savepointName = createViewSavepointName('sp_history_delete_rows');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
     assertMutationHasNoUntrackedPrograms('DELETE', table);
-    for (const snapshot of snapshots) {
+    for (const [index, snapshot] of snapshots.entries()) {
       const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
-      const rowState = buildRowHistoryPredicate(snapshot, bindPlaceholder);
+      const rowState = buildRowHistoryPredicate(snapshot, bindPlaceholder, states[index]);
       db.run(
         `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
         `(${rowIdentity.sql}) AND (${rowState.sql})`,
@@ -3801,11 +3801,15 @@ async function restoreRowHistorySnapshots(table, snapshots) {
         table,
         entry.states.map(state => state.column)
       );
-      const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
+    }
+    const identityChunks = buildRecordIdentityPredicateChunks(
+      prepared.map(entry => entry.snapshot.rowId),
+      identity
+    );
+    for (const chunk of identityChunks) {
       const existing = db.exec(
-        `SELECT 1 FROM ${escapeMainIdentifier(table)} ` +
-        `WHERE ${rowIdentity.sql} LIMIT 1`,
-        normalizeBindParams(rowIdentity.params)
+        `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ${chunk.sql} LIMIT 1`,
+        normalizeBindParams(chunk.params)
       );
       if ((existing[0]?.values.length ?? 0) !== 0) {
         throw new RowHistoryConflictError(table);

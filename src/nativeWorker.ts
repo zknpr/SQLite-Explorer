@@ -351,6 +351,8 @@ const NATIVE_HISTORY_BATCH_BYTES = 8 * 1024 * 1024;
 const NATIVE_HISTORY_BATCH_ITEMS = 512;
 const NATIVE_HISTORY_REQUEST_BUDGET_MS = 1000;
 const NATIVE_HISTORY_RESPONSE_BUDGET_BYTES = 8 * 1024 * 1024;
+/** Distinct texts one queryHistoryBatch call sends once; the worker caches 32 statements. */
+const NATIVE_HISTORY_SHARED_TEXTS = 32;
 
 function approximateParamBytes(params: readonly CellValue[]): number {
   let bytes = 0;
@@ -2863,12 +2865,21 @@ export async function createNativeDatabaseConnection(
         queries: Array<{ sql: string; params: CellValue[] }>,
         stride: number = 1
       ): Promise<NativeQueryResult[]> => {
+        // Rows repeat a few long texts: send each once and refer to it by
+        // index. === against the few texts so far is far cheaper than hashing
+        // every row's new string; past the bound, texts go inline.
+        const texts: string[] = [];
+        const shared = queries.map(query => {
+          let index = texts.indexOf(query.sql);
+          if (index < 0 && texts.length < NATIVE_HISTORY_SHARED_TEXTS) index = texts.push(query.sql) - 1;
+          return index < 0 ? query : { sql: index, params: query.params };
+        });
         const results: NativeQueryResult[] = [];
-        while (results.length < queries.length) {
-          const pending = results.length === 0 ? queries : queries.slice(results.length);
+        while (results.length < shared.length) {
+          const pending = results.length === 0 ? shared : shared.slice(results.length);
           const batch = await worker.call<NativeQueryBatchResult>(
             'queryHistoryBatch',
-            [pending, stride, QUERY_TIMEOUT, NATIVE_HISTORY_REQUEST_BUDGET_MS, NATIVE_HISTORY_RESPONSE_BUDGET_BYTES],
+            [pending, stride, QUERY_TIMEOUT, NATIVE_HISTORY_REQUEST_BUDGET_MS, NATIVE_HISTORY_RESPONSE_BUDGET_BYTES, texts],
             QUERY_TIMEOUT + NATIVE_HISTORY_REQUEST_BUDGET_MS + BOUNDED_QUERY_TRANSPORT_MARGIN_MS
           );
           const completed = batch?.results;
@@ -3057,15 +3068,15 @@ export async function createNativeDatabaseConnection(
         snapshots: readonly DeletedRow[]
       ): Promise<void> => {
         if (snapshots.length === 0) throw new LegacyRowHistoryError();
-        snapshots.forEach(rowHistoryStates);
+        const states = snapshots.map(rowHistoryStates);
         const identity = await resolveNativeTableIdentity(table);
         const savepointName = createSavepointName('sp_history_delete_rows');
         await beginNativeSavepoint(savepointName);
         try {
           await assertNativeMutationHasNoUntrackedPrograms('DELETE', table);
-          const deletes = snapshots.map(snapshot => {
+          const deletes = snapshots.map((snapshot, index) => {
             const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
-            const rowState = buildRowHistoryPredicate(snapshot);
+            const rowState = buildRowHistoryPredicate(snapshot, undefined, states[index]);
             return {
               sql: `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
                 `(${rowIdentity.sql}) AND (${rowState.sql})`,
@@ -3073,6 +3084,8 @@ export async function createNativeDatabaseConnection(
             };
           });
           // Deletes keep their order (undo removes imported children first).
+          // SQLite refuses RETURNING on a DELETE from a virtual table, so
+          // changes() checks each row.
           for (const group of groupConsecutive(deletes, approximateQueryBytes)) {
             const results = await queryNativeBatch(group.flatMap(item => [
               item,
@@ -3110,14 +3123,13 @@ export async function createNativeDatabaseConnection(
             probedShapes.add(shape);
             await assertNativeMutationHasNoUntrackedPrograms('INSERT', table, columns);
           }
-          const existenceChecks = prepared.map(entry => {
-            const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
-            return {
-              sql: `SELECT 1 FROM ${escapeMainIdentifier(table)} ` +
-                `WHERE ${rowIdentity.sql} LIMIT 1`,
-              params: rowIdentity.params
-            };
-          });
+          const existenceChecks = buildRecordIdentityPredicateChunks(
+            prepared.map(entry => entry.snapshot.rowId),
+            identity
+          ).map(chunk => ({
+            sql: `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ${chunk.sql} LIMIT 1`,
+            params: chunk.params
+          }));
           for (const group of groupConsecutive(existenceChecks, approximateQueryBytes)) {
             const results = await queryNativeBatch(group);
             if (results.some(result => result.values.length !== 0)) throw new RowHistoryConflictError(table);
@@ -3140,9 +3152,11 @@ export async function createNativeDatabaseConnection(
             const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
             const rowState = buildRowHistoryPredicate(entry.snapshot, undefined, entry.states);
             return {
+              // RETURNING reports the inserted row, as changes() did; SQLite
+              // allows it on an INSERT into a virtual table.
               insert: {
                 sql: `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} ` +
-                  `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
+                  `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')}) RETURNING 1`,
                 params
               },
               verify: {
@@ -3156,14 +3170,10 @@ export async function createNativeDatabaseConnection(
             approximateQueryBytes(item.insert) + approximateQueryBytes(item.verify)
           );
           for (const group of groupConsecutive(restores, restoreBytes)) {
-            const results = await queryNativeBatch(group.flatMap(item => [
-              item.insert,
-              { sql: 'SELECT changes()', params: [] },
-              item.verify
-            ]), 3);
-            for (let index = 0; index < results.length; index += 3) {
-              if (Number(results[index + 1].values?.[0]?.[0]) !== 1) throw new RowHistoryConflictError(table);
-              if (results[index + 2].values.length !== 1) throw new RowHistoryConflictError(table);
+            const results = await queryNativeBatch(group.flatMap(item => [item.insert, item.verify]), 2);
+            for (let index = 0; index < results.length; index += 2) {
+              if (results[index].values.length !== 1) throw new RowHistoryConflictError(table);
+              if (results[index + 1].values.length !== 1) throw new RowHistoryConflictError(table);
             }
           }
           await releaseNativeSavepoint(savepointName);

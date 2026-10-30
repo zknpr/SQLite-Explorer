@@ -95,6 +95,8 @@ export function parseRowIdAliasColumn(
 
 /** SQLite folds ASCII identifier case but leaves non-ASCII bytes alone. */
 export function foldSqliteIdentifier(identifier: string): string {
+  // Row history folds every column of every row; most names have no capital.
+  if (!/[A-Z]/.test(identifier)) return identifier;
   return identifier.replace(/[A-Z]/g, character => (
     String.fromCharCode(character.charCodeAt(0) + 0x20)
   ));

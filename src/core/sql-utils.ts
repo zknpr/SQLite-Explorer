@@ -18,7 +18,11 @@ import type { CellValue, RecordId } from './types';
  * @returns Safely escaped identifier wrapped in double quotes
  */
 export function escapeIdentifier(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`;
+  // History SQL escapes each column once per row; skip the replace when there
+  // is no quote to double.
+  return identifier.includes('"')
+    ? `"${identifier.replace(/"/g, '""')}"`
+    : `"${identifier}"`;
 }
 
 /** Qualify a persistent object so a same-named TEMP object cannot intercept DDL/DML. */

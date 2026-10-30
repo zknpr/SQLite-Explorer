@@ -1017,10 +1017,11 @@ const MAX_HISTORY_STATEMENTS = 32;
  * and executeQuery prepares a parameterized one twice per call. Anything but
  * exactly one statement goes through executeQuery unchanged. A statement that
  * failed is never run again: the error ends the request, whose caller
- * finalizes every cached statement.
+ * finalizes every cached statement. `key` is the request's index of a shared
+ * text, or the text itself, so a long text is not hashed once per row.
  */
-function runCachedHistoryQuery(database, statements, sql, params) {
-  let statement = statements.get(sql);
+function runCachedHistoryQuery(database, statements, key, sql, params) {
+  let statement = statements.get(key);
   if (statement === undefined) {
     if (typeof sql !== 'string' || statements.size >= MAX_HISTORY_STATEMENTS) {
       return executeQuery(database, sql, params);
@@ -1035,7 +1036,7 @@ function runCachedHistoryQuery(database, statements, sql, params) {
       if (typeof statement.finalize === 'function') statement.finalize();
       return executeQuery(database, sql, params);
     }
-    statements.set(sql, statement);
+    statements.set(key, statement);
   }
   const rows = Array.isArray(params) && params.length > 0 ? statement.all(bindableParams(params)) : statement.all();
   return {
@@ -2527,11 +2528,14 @@ async function handleRequest(request) {
         // response budget the completed prefix is returned and the host sends
         // the rest again, so one request is bounded by a budget plus a unit.
         // Callers read values positionally; column names are not returned.
-        const [queries, stride, unitTimeoutMs, budgetMs, budgetBytes] = args;
+        // A query whose sql is a number names one of `texts`: rows repeat a
+        // few long texts, which would otherwise cross the pipe once per row.
+        const [queries, stride, unitTimeoutMs, budgetMs, budgetBytes, texts = []] = args;
         if (!db) throw new Error("Database not open");
         if (
           !Array.isArray(queries) || !Number.isSafeInteger(stride) || stride < 1 ||
-          queries.length % stride !== 0 || !(budgetMs >= 0) || !(budgetBytes >= 0)
+          queries.length % stride !== 0 || !(budgetMs >= 0) || !(budgetBytes >= 0) ||
+          !Array.isArray(texts) || !texts.every(text => typeof text === 'string')
         ) {
           throw new Error("Invalid row-history batch");
         }
@@ -2546,9 +2550,12 @@ async function handleRequest(request) {
             for (let start = 0; start < queries.length; start += stride) {
               db.setQueryDeadline(unitTimeoutMs);
               for (let index = start; index < start + stride; index++) {
-                const { values, rowCount } = runCachedHistoryQuery(
-                  db, statements, queries[index].sql, queries[index].params
-                );
+                const { sql, params } = queries[index];
+                const text = typeof sql === 'number' ? texts[sql] : sql;
+                if (typeof sql === 'number' && typeof text !== 'string') {
+                  throw new Error("Invalid row-history batch");
+                }
+                const { values, rowCount } = runCachedHistoryQuery(db, statements, sql, text, params);
                 responseBytes += approximateValuesBytes(values);
                 results.push({ columns: [], values, rowCount });
               }
