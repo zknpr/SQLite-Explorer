@@ -3751,6 +3751,34 @@ describe('NativeWorkerProcess', () => {
         assert.strictEqual((worker as any).pendingRequests.size, 0);
     });
 
+    it('ignores stdout that a retired child still delivers', async () => {
+        const childProcess = require('node:child_process');
+        const fakeChild = new EventEmitter() as any;
+        fakeChild.stdout = new EventEmitter();
+        fakeChild.stderr = new EventEmitter();
+        fakeChild.stdin = new EventEmitter();
+        fakeChild.stdin.write = () => true;
+        fakeChild.kill = () => {};
+        mock.method(childProcess, 'spawn', () => fakeChild);
+        const errors: string[] = [];
+        mock.method(console, 'error', (message: unknown) => { errors.push(String(message)); });
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        const starting = worker.start();
+        fakeChild.stdout.emit('data', encodeNativeMessage({ ready: true }));
+        await starting;
+        const pending = worker.call('query', [], 1000);
+        const hostileHeader = Buffer.alloc(4);
+        hostileHeader.writeUInt32BE(0xffff_ffff, 0);
+
+        fakeChild.stdout.emit('data', hostileHeader);
+        await assert.rejects(pending, /native worker response frame.*limit/i);
+        // The rest of the oversized frame arrives after the worker retired it.
+        fakeChild.stdout.emit('data', Buffer.from([0xff, 0x00, 0x00, 0x7f, 0x01, 0x02]));
+
+        assert.strictEqual(errors.filter(message => /response frame/.test(message)).length, 1, errors.join('\n'));
+        assert.strictEqual((worker as any).chunksTotalLength, 0);
+    });
+
     it('retires the worker and clears request state when an IPC write fails', async () => {
         const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
         let killCount = 0;

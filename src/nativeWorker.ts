@@ -540,8 +540,10 @@ export class NativeWorkerProcess {
         reject(error);
       };
 
-      // Handle stdout (message responses)
+      // Handle stdout (message responses). A retired child can still deliver
+      // the rest of a frame; parsing it would report a second, bogus frame.
       child.stdout?.on('data', (chunk: Buffer) => {
+        if (this.process !== child) return;
         try {
           this.handleData(chunk);
         } catch (cause) {
