@@ -539,11 +539,18 @@ describe('measureWebviewTransportPayload rewrite flag', () => {
         for (const payload of unchanged) {
             assert.strictEqual(measureWebviewTransportPayload(payload, { surface: 'test' }).needsRewrite, false, JSON.stringify(payload));
             assert.deepStrictEqual(serializeValue(payload, { surface: 'test' }), payload);
-            const delivered = JSON.parse(JSON.stringify(payload));
+            // VS Code parses the host's JSON and posts a structured clone of it.
+            const delivered = structuredClone(JSON.parse(JSON.stringify(payload)));
             assert.deepStrictEqual(deserializeValue(delivered, { surface: 'test' }), delivered);
         }
         for (const payload of changed) {
             assert.strictEqual(measureWebviewTransportPayload(payload, { surface: 'test' }).needsRewrite, true);
         }
+        // An own __proto__ key survives the webview's delivery as data.
+        const delivered = structuredClone(JSON.parse('{"__proto__":{"inherited":"top"},"rows":[[1]]}'));
+        assert.strictEqual(measureWebviewTransportPayload(delivered, { surface: 'test' }).needsRewrite, false);
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(delivered, '__proto__'), true);
+        assert.deepStrictEqual(delivered['__proto__'], { inherited: 'top' });
+        assert.strictEqual(Object.getPrototypeOf(delivered), Object.prototype);
     });
 });
