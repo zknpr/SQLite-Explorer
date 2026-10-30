@@ -27,6 +27,8 @@ on:
       - 'src/core/cell-history.ts'
       - 'src/core/row-history.ts'
       - 'src/core/bulk-import.ts'
+      - 'src/core/column-drop.ts'
+      - 'src/hostBridge.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
@@ -55,6 +57,8 @@ on:
       - 'src/core/cell-history.ts'
       - 'src/core/row-history.ts'
       - 'src/core/bulk-import.ts'
+      - 'src/core/column-drop.ts'
+      - 'src/hostBridge.ts'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
@@ -145,8 +149,9 @@ jobs:
           FUZZ_EXPECT_TARGET: ${{ matrix.target }}
         run: node --import tsx --test tests/unit/native_cell_history_batch.test.ts
 
-      # The same history-tracked mutations on WebAssembly and native in
-      # lockstep: outcomes, storage classes and stored bytes must match.
+      # The same history-tracked mutations, and column adds and drops through
+      # HostBridge, on WebAssembly and native in lockstep: outcomes, schema,
+      # storage classes and stored bytes must match, and undo must restore.
       - name: Engine history differential fuzz
         shell: bash
         env:
