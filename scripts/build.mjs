@@ -18,6 +18,7 @@ import path from 'path';
 import fs from 'fs';
 import { createHash } from 'node:crypto';
 import { verifyQueryPlanArtifacts } from './build-query-plan.mjs';
+import { buildCodiconSubset, collectCodiconClasses, readCodiconSources } from './lib/codicon-subset.mjs';
 
 verifyQueryPlanArtifacts(undefined, { includeBuildAssets: false });
 
@@ -234,14 +235,23 @@ const copyAssets = async () => {
   // Ship only the two codicon runtime files (css + the ttf it @font-face's)
   // under assets/, so the .vsix never carries the 4.6MB @vscode/codicons
   // package (2.3MB src/ SVGs, a 1.2MB preview HTML, ...). The extension serves
-  // codicons from assets/codicons/ (editorController + hostBridge).
-  const codiconsSrc = resolve('node_modules', '@vscode', 'codicons', 'dist');
+  // codicons from assets/codicons/ (editorController). Both are subset to the
+  // classes the UI sources name, which the scan derives on every build so a
+  // new icon cannot ship without its glyph.
+  const codiconsPackage = resolve('node_modules', '@vscode', 'codicons');
+  const codiconsSrc = resolve(codiconsPackage, 'dist');
   const codiconsDst = resolve(assetsDir, 'codicons');
   fs.mkdirSync(codiconsDst, { recursive: true });
-  for (const file of ['codicon.css', 'codicon.ttf']) {
-    fs.copyFileSync(resolve(codiconsSrc, file), resolve(codiconsDst, file));
-  }
-  console.log('Copied codicon.css + codicon.ttf to assets/codicons/');
+  const usedCodicons = collectCodiconClasses(readCodiconSources(resolve()));
+  const codicons = buildCodiconSubset({
+    css: fs.readFileSync(resolve(codiconsSrc, 'codicon.css'), 'utf8'),
+    font: fs.readFileSync(resolve(codiconsSrc, 'codicon.ttf')),
+    usedClasses: usedCodicons,
+    sourceLabel: `@vscode/codicons ${JSON.parse(fs.readFileSync(resolve(codiconsPackage, 'package.json'), 'utf8')).version}`
+  });
+  fs.writeFileSync(resolve(codiconsDst, 'codicon.css'), codicons.css);
+  fs.writeFileSync(resolve(codiconsDst, 'codicon.ttf'), codicons.font);
+  console.log(`Subset codicons to ${usedCodicons.length} classes (${codicons.codePoints.length} code points) in assets/codicons/`);
 
   const demoAssetsDir = resolve('website', 'public', 'sqlite-viewer');
   fs.mkdirSync(demoAssetsDir, { recursive: true });
