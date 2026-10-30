@@ -278,6 +278,33 @@ describe('grid count cache', () => {
         }
     });
 
+    it('counts a view whose first page is full and not one whose first page is short', async () => {
+        installDocumentMock();
+        const { state, backendApi, loadTableData } = await loadHarness();
+        const originals = { fetchTableCount: backendApi.fetchTableCount, fetchTableData: backendApi.fetchTableData };
+        const { engine, countCalls } = await installTableEngine(backendApi, 30);
+        await engine.executeQuery('CREATE VIEW item_view AS SELECT value FROM items');
+        primeTableState(state, 'item_view');
+        state.selectedTableType = 'view';
+
+        try {
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.deepStrictEqual(countCalls, ['item_view']);
+            assert.strictEqual(state.gridData.length, 20);
+            assert.strictEqual(state.totalRecordCount, 30);
+
+            state.columnFilters = { value: 'row-2' };
+            assert.strictEqual(await loadTableData(false, false), true);
+            assert.deepStrictEqual(countCalls, ['item_view']);
+            // row-2 and row-20 through row-29.
+            assert.strictEqual(state.gridData.length, 11);
+            assert.strictEqual(state.totalRecordCount, 11);
+        } finally {
+            engine.shutdown?.();
+            resetHarness(state, backendApi, originals);
+        }
+    });
+
     it('still counts a first page that fills its limit', async () => {
         installDocumentMock();
         const { state, backendApi, loadTableData } = await loadHarness();

@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { MAX_TABLE_PAGE_ROWS } from '../../src/core/table-pagination';
 
 // Pins the 5000-row default introduced 2026-08-08 (unlocked by keyset
 // pagination, the count cache, and grid virtualization) across every layer
@@ -61,6 +62,14 @@ describe('default page size', () => {
 });
 
 describe('startup page size precedence', () => {
+    it('never exceeds the rows the host serves per page', async () => {
+        // A short first page counts its table only if the engine applied the
+        // limit the webview asked for.
+        const { resolveStartupPageSize } = await loadStateModule();
+        assert.strictEqual(resolveStartupPageSize(undefined, MAX_TABLE_PAGE_ROWS), MAX_TABLE_PAGE_ROWS);
+        assert.strictEqual(resolveStartupPageSize(String(MAX_TABLE_PAGE_ROWS + 1), MAX_TABLE_PAGE_ROWS + 1), EXPECTED_DEFAULT);
+    });
+
     it('falls back to the built-in default when nothing else is usable', async () => {
         const { resolveStartupPageSize } = await loadStateModule();
         assert.strictEqual(resolveStartupPageSize(undefined, undefined), EXPECTED_DEFAULT);

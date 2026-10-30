@@ -523,7 +523,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                     // Page 0 starts at the identity's first row, and engines
                     // clip cells rather than drop rows at the page budget, so
                     // a short first page holds every matching row. Its length
-                    // is the exact count a COUNT(*) scan would return.
+                    // is the exact count a COUNT(*) scan would return. Page
+                    // sizes stop at the host's 100,000-row limit, so the
+                    // engine applied this request's limit.
                     countOutcome = { status: 'fulfilled', value: { count: firstPageRowCount, isExact: true } };
                 } else {
                     state.totalRecordCount = 0;

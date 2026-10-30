@@ -16,6 +16,9 @@ import { prepareReadQuery, SQL_RESULT_BYTES, SQL_RESULT_ROWS } from '../../src/c
 import type { CellValue, DatabaseOperations, ExportOptions, QueryResultSet, TableQueryOptions } from '../../src/core/types';
 import { streamTableExport } from '../../src/tableExportStreaming';
 import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
+import { LoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
+import { connectWorkerPort, type WorkerPort } from '../../src/core/rpc';
+import { Worker } from 'node:worker_threads';
 
 // The runtime's grid cell helpers (src/runtime/query-plan.c) replace per-cell
 // SQL in grid pages and query console results. These tests hold them to the
@@ -636,3 +639,75 @@ for (const backendName of ['wasm', 'native'] as const) {
         });
     });
 }
+
+// The grid takes a short first page's length as its count, which holds only
+// if an exhausted page budget clips cells and keeps every row.
+const BUDGET_PAGES: Array<[string, string, TableQueryOptions]> = [
+    ['a rowid table', 't', { columns: ['rowid', 'id', 'label', 't', 'b', 'r', 'i', 'u'], keyset: { mode: 'first' } }],
+    ['a WITHOUT ROWID table', 'p', { columns: ['rowid', 'k', 'v'], keyset: { mode: 'first' } }],
+    ['an identityless view', 'vt', { columns: ['label', 't', 'b'] }]
+];
+
+for (const backendName of ['wasm', 'native', 'demo'] as const) {
+    describe(`${backendName} first pages with an exhausted page budget`, () => {
+        for (const [label, table, options] of BUDGET_PAGES) {
+            it(`keep every row of ${label}`, async (context) => {
+                if (backendName === 'native' && !bundledNativeBinary()) {
+                    context.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
+                    return;
+                }
+                const backend = await openBackend[backendName](await buildImage(FIXTURE_SQL));
+                try {
+                    const page = await backend.ops.fetchTableData!(table, { ...options, limit: 10, offset: 0, maxPageResponseBytes: 64 });
+                    assert.equal(page.rows.length, 10);
+                    assert.ok(Object.keys(page.oversizedCells ?? {}).length > 0, 'the budget clipped cells');
+                } finally {
+                    backend.dispose();
+                }
+            });
+        }
+    });
+}
+
+for (const backendName of ['wasm', 'native'] as const) {
+    it(`${backendName} exports through the logging wrapper with the cell helpers`, async (context) => {
+        if (backendName === 'native' && !bundledNativeBinary()) {
+            context.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
+            return;
+        }
+        const backend = await openBackend[backendName](await buildImage(EXPORT_FIXTURE_SQL));
+        try {
+            const statements: string[] = [];
+            const output = { appendLine() {} } as unknown as vscode.OutputChannel;
+            const operations = new LoggingDatabaseOperations(recordStatements(backend.ops, statements), 'fixture.db', output);
+            const sink = { write: async () => {}, writeBytes: async () => {} };
+            assert.ok(await streamTableExport(operations, 't', ['id', 't'], { format: 'csv' } as ExportOptions, sink) > 0);
+            assert.ok(statements.some(sql => sql.includes('sqlite_explorer_cell_text_check')));
+        } finally {
+            backend.dispose();
+        }
+    });
+}
+
+it('the WASM worker thread reports whether the cell helpers apply', async (context) => {
+    const workerPath = path.resolve('out/worker.cjs');
+    const wasmPath = path.resolve('assets/sqlite3.wasm');
+    if (!fs.existsSync(workerPath) || !fs.existsSync(wasmPath)) {
+        context.skip('worker build artifacts are missing; run node scripts/build.mjs');
+        return;
+    }
+    for (const [encoding, expected] of [['UTF-8', true], ['UTF-16le', false]] as const) {
+        const worker = new Worker(workerPath);
+        const proxy = connectWorkerPort<any>(worker as unknown as WorkerPort,
+            ['initializeDatabase', 'prepareCellHelpers'], undefined, 5000);
+        try {
+            await proxy.initializeDatabase('fixture.db', {
+                content: await buildImage('CREATE TABLE x (a)', encoding), maxSize: 0,
+                wasmBinary: new Uint8Array(fs.readFileSync(wasmPath)), readOnlyMode: false, queryTimeout: 2000
+            });
+            assert.equal(await proxy.prepareCellHelpers(), expected, encoding);
+        } finally {
+            await worker.terminate();
+        }
+    }
+});
