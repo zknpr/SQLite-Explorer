@@ -187,7 +187,9 @@ async function prepareState(columns: Array<{ name: string; type: string }>) {
     state.tableColumns = columns;
     state.gridData = [];
     state.currentPageIndex = 0;
-    state.rowsPerPage = 500;
+    // The mocks return one row, which fills a one-row first page, so each load
+    // still requests its count and holds the reload guard while counting.
+    state.rowsPerPage = 1;
     state.totalPageCount = 1;
     state.columnFilters = {};
     state.filterQuery = '';

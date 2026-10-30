@@ -517,27 +517,36 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                 // rows ahead of counting, then let the webview paint them first.
                 const firstPage = await backendApi.fetchTableData(requestedTable, speculativeOptions);
                 if (isSuperseded()) return;
-                state.totalRecordCount = 0;
-                state.totalRecordCountIsExact = false;
-                state.totalPageCount = 1;
-                state.currentPageIndex = 0;
-                state.countStatus = 'pending';
-                commitRows(firstPage, 0, container);
-                earlyDataResult = firstPage;
-                state.isLoadingData = false;
-                // Keep the existing reload guard until metadata settles so
-                // queued filters and edits retain their ordering contract.
-                updatePagination();
-                updateToolbarButtons();
-                updateStatus(`${state.gridData.length} records loaded; counting…`);
-                if (typeof requestAnimationFrame === 'function' && document.visibilityState !== 'hidden') {
-                    await new Promise(resolve => {
-                        requestAnimationFrame(() => setTimeout(resolve, 0));
-                    });
-                }
-                if (isSuperseded()) return;
-                countOutcome = { status: 'fulfilled', value: await backendApi.fetchTableCount(requestedTable, countOptions) };
                 dataOutcome = { status: 'fulfilled', value: firstPage };
+                const firstPageRowCount = (firstPage.rows || []).length;
+                if (firstPageRowCount < speculativeOptions.limit) {
+                    // Page 0 starts at the identity's first row, and engines
+                    // clip cells rather than drop rows at the page budget, so
+                    // a short first page holds every matching row. Its length
+                    // is the exact count a COUNT(*) scan would return.
+                    countOutcome = { status: 'fulfilled', value: { count: firstPageRowCount, isExact: true } };
+                } else {
+                    state.totalRecordCount = 0;
+                    state.totalRecordCountIsExact = false;
+                    state.totalPageCount = 1;
+                    state.currentPageIndex = 0;
+                    state.countStatus = 'pending';
+                    commitRows(firstPage, 0, container);
+                    earlyDataResult = firstPage;
+                    state.isLoadingData = false;
+                    // Keep the existing reload guard until metadata settles so
+                    // queued filters and edits retain their ordering contract.
+                    updatePagination();
+                    updateToolbarButtons();
+                    updateStatus(`${state.gridData.length} records loaded; counting…`);
+                    if (typeof requestAnimationFrame === 'function' && document.visibilityState !== 'hidden') {
+                        await new Promise(resolve => {
+                            requestAnimationFrame(() => setTimeout(resolve, 0));
+                        });
+                    }
+                    if (isSuperseded()) return;
+                    countOutcome = { status: 'fulfilled', value: await backendApi.fetchTableCount(requestedTable, countOptions) };
+                }
             } else {
                 // Observe both outcomes even if one fails while the other is pending.
                 [countOutcome, dataOutcome] = await Promise.allSettled([
