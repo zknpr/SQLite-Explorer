@@ -5726,3 +5726,20 @@ describe('web demo filters and sorts through the runtime and the rowid lookup', 
         }
     });
 });
+
+describe('web demo edits of whole numbers past int32', () => {
+    it('store INTEGER in untyped and BLOB columns, as the extension does', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', "CREATE TABLE demo_int (id INTEGER PRIMARY KEY, a, b BLOB); INSERT INTO demo_int VALUES (1, 'x', 'x'), (2, 'x', 'x')");
+        await worker.invoke('updateCell', 'demo_int', 1, 'a', 1730000000000);
+        await worker.invoke('updateCellBatch', 'demo_int', [
+            { rowId: 2, column: 'a', value: 1730000000000 },
+            { rowId: 2, column: 'b', value: -2147483649 }
+        ]);
+        await worker.invoke('insertRow', 'demo_int', { id: 3, a: 3000000000, b: 3000000000 });
+        assert.strictEqual(
+            await workerScalar(worker, "SELECT group_concat(kind, ',') FROM (SELECT typeof(a) || '/' || typeof(b) AS kind FROM demo_int ORDER BY id)"),
+            'integer/text,integer/integer,integer/integer'
+        );
+    });
+});

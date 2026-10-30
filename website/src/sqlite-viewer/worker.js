@@ -108,6 +108,7 @@ import {
   unresolvableTriggeredRowIdUpdateError
 } from '../../../src/core/row-identity.ts';
 import {
+  bindableIntegerValue,
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
   collectRowIdExactRealTexts,
@@ -2653,6 +2654,8 @@ async function updateCell(
   historyReplayToken
 ) {
   const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+  // An edit's whole number past int32 stores INTEGER, as in the extension.
+  if (!isHistoryReplay) value = bindableIntegerValue(value);
   const enforcePriorPolicy = !isHistoryReplay && maxEditValueBytes !== undefined;
   const editLimitBytes = isHistoryReplay
     ? 0
@@ -2821,6 +2824,7 @@ async function insertRowInternal(
   if (!db) throw new Error('No database initialized');
   assertWritableMutation('Row insertion');
   if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+    data = Object.fromEntries(Object.entries(data).map(([column, value]) => [column, bindableIntegerValue(value)]));
     assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
   }
 
@@ -4191,6 +4195,7 @@ async function updateCellBatch(
   if (updates.length === 0) return [];
   assertNoDuplicateBatchTargets(table, updates);
   const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+  if (!isHistoryReplay) updates = updates.map(update => ({ ...update, value: bindableIntegerValue(update.value) }));
   const editLimitBytes = isHistoryReplay
     ? 0
     : assertCellValuesWithinEditLimit(
