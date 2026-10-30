@@ -191,3 +191,51 @@ describe('column drop undo finds each WITHOUT ROWID row by its exact key', () =>
         await withNative(undefined, assertPrimaryKeyIdentities);
     });
 });
+
+// The same checks in a UTF-16LE database, where TEXT is captured as UTF-16
+// bytes and keys decode as UTF-16. X'00D8' is a lone surrogate, which no
+// string reproduces there.
+async function inUtf16(ops: DatabaseOperations, work: (ops: DatabaseOperations) => Promise<unknown>) {
+    await ops.executeQuery("PRAGMA encoding = 'UTF-16le'");
+    assert.equal((await ops.executeQuery('PRAGMA encoding'))[0].rows[0][0], 'UTF-16le');
+    await work(ops);
+}
+
+async function assertUtf16PrimaryKeyIdentities(ops: DatabaseOperations) {
+    await ops.executeQuery('CREATE TABLE kt (k TEXT PRIMARY KEY, v) WITHOUT ROWID');
+    await ops.executeQuery("INSERT INTO kt VALUES (char(65279) || 'a', 1), ('a', 2), ('ünï😀', 3)");
+    await ops.executeQuery('CREATE TABLE kx (k TEXT PRIMARY KEY, v) WITHOUT ROWID');
+    await ops.executeQuery("INSERT INTO kx VALUES (CAST(X'00D8' AS TEXT), 1), ('a', 2)");
+    const read = async (table: string) => (await ops.executeQuery(
+        `SELECT hex(CAST(k AS BLOB)) AS k, typeof(v) AS t, v AS v FROM ${table} ORDER BY k`
+    ))[0].rows;
+    const before = await read('kt');
+    const { bridge, recorded } = bridgeFor(ops);
+    await bridge.deleteColumns('kt', ['v']);
+    await ops.undoModification(recorded[0]);
+    assert.deepEqual(await read('kt'), before);
+    const refused = await read('kx');
+    const second = bridgeFor(ops);
+    await assert.rejects(second.bridge.deleteColumns('kx', ['v']), /byte-faithful editable identity cannot be minted/);
+    assert.deepEqual(await read('kx'), refused);
+}
+
+describe('column drop undo in a UTF-16 database', () => {
+    it('on WebAssembly', async () => {
+        for (const work of [dropAndUndo, assertUtf16PrimaryKeyIdentities]) {
+            const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+            try {
+                await inUtf16(engine, work);
+            } finally {
+                engine.shutdown();
+            }
+        }
+    });
+
+    it('on the native engine', async (context) => {
+        if (!await nativeOrSkip(context)) return;
+        for (const work of [dropAndUndo, assertUtf16PrimaryKeyIdentities]) {
+            await withNative(undefined, ops => inUtf16(ops, work));
+        }
+    });
+});
