@@ -4,7 +4,10 @@ import { after, describe, it } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { webcrypto } from 'node:crypto';
+import vm from 'node:vm';
 import * as vscode from 'vscode';
+import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { createNativeDatabaseConnection, NativeWorkerProcess } from '../../src/nativeWorker';
 import { buildCellContainmentQuery } from '../../src/core/cell-containment';
@@ -15,7 +18,8 @@ import type { CellValue, DatabaseOperations, QueryResultSet, TableQueryOptions }
 // The runtime's grid cell helpers (src/runtime/query-plan.c) replace per-cell
 // SQL in grid pages and query console results. These tests hold them to the
 // SQL they replace: the C functions directly on sql.js, and whole pages and
-// results on both real engines with the helpers on and off.
+// results on the real engines and the web demo worker with the helpers on and
+// off.
 
 const HELPER_NAME = 'sqlite_explorer_cell_preview';
 
@@ -185,6 +189,76 @@ async function openNative(image: Uint8Array): Promise<PageBackend> {
     };
 }
 
+// The demo worker probes each database once, so each arm is its own worker.
+// sql.js caches one module per process and the runtime registers with it as
+// an automatic extension, so the off arm fails the worker's probe instead.
+async function openDemoWorker(image: Uint8Array, helpers: boolean, pageSql: string[], logs: string[]) {
+    const responses: any[] = [];
+    const workerGlobal: any = {
+        initSqlJs: async (config: Parameters<typeof initSqlJs>[0]) => {
+            const sqlJs = await initSqlJs(config);
+            const Database = new Proxy(sqlJs.Database, {
+                construct(Target: any, args: any[]): object {
+                    const database = Reflect.construct(Target, args) as Record<string, any>;
+                    const exec = database.exec.bind(database);
+                    database.exec = (sql: string, ...rest: unknown[]) => {
+                        if (sql.includes('__sqlite_explorer_cell_source')) pageSql.push(sql);
+                        if (!helpers && sql.includes(HELPER_NAME)) throw new Error(`no such function: ${HELPER_NAME}`);
+                        return exec(sql, ...rest);
+                    };
+                    return database;
+                }
+            });
+            return { ...sqlJs, Database, ...(helpers ? {} : { _sqlite_explorer_register_query_plan: undefined }) };
+        },
+        postMessage(message: unknown) { responses.push(message); }
+    };
+    const log = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+    const context = vm.createContext({
+        self: workerGlobal, importScripts() {}, console: { log() {}, warn: log, error: log },
+        Uint8Array, Int32Array, ArrayBuffer, SharedArrayBuffer, Atomics, DataView, crypto: webcrypto,
+        TextEncoder, TextDecoder, Date, setTimeout, clearTimeout
+    });
+    // web_demo_worker.test.ts holds this bundle to the authored source.
+    new vm.Script(fs.readFileSync('website/public/sqlite-viewer/worker.js', 'utf8'), {
+        filename: 'website/public/sqlite-viewer/worker.js'
+    }).runInContext(context);
+    let messageId = 0;
+    const invoke = async (method: string, ...payload: unknown[]) => {
+        const id = `helpers_${++messageId}`;
+        await workerGlobal.onmessage({ data: { channel: 'rpc', content: { kind: 'invoke', messageId: id, targetMethod: method, payload } } });
+        const index = responses.findIndex(message => message.content?.messageId === id);
+        assert.notEqual(index, -1, `worker did not respond to ${method}`);
+        const [response] = responses.splice(index, 1);
+        if (!response.content.success) throw new Error(response.content.errorMessage);
+        return response.content.data;
+    };
+    await invoke('initializeDatabase', 'fixture.db', {
+        content: image, wasmBinary: new Uint8Array(fs.readFileSync('assets/sqlite3.wasm'))
+    });
+    return invoke;
+}
+
+async function openDemo(image: Uint8Array): Promise<PageBackend> {
+    const pageSql: string[] = [];
+    const logs: string[] = [];
+    const arms = {
+        on: await openDemoWorker(image, true, pageSql, logs),
+        off: await openDemoWorker(image, false, pageSql, logs)
+    };
+    let arm = arms.on;
+    return {
+        // Each worker has its own realm; cloning lets deepStrictEqual compare values, not prototypes.
+        ops: {
+            fetchTableData: async (table: string, options: TableQueryOptions) => structuredClone(await arm('fetchTableData', table, options))
+        } as DatabaseOperations,
+        setHelpers: enabled => { arm = enabled ? arms.on : arms.off; },
+        pageSql,
+        logs,
+        dispose: () => {}
+    };
+}
+
 async function fetchBoth(backend: PageBackend, table: string, options: TableQueryOptions) {
     backend.setHelpers(false);
     backend.pageSql.length = 0;
@@ -325,9 +399,9 @@ describe('grid cell helpers on sql.js', () => {
     });
 });
 
-const openBackend = { wasm: openWasm, native: openNative };
+const openBackend = { wasm: openWasm, native: openNative, demo: openDemo };
 
-for (const backendName of ['wasm', 'native'] as const) {
+for (const backendName of ['wasm', 'native', 'demo'] as const) {
     describe(`${backendName} grid pages with and without the cell helpers`, () => {
         for (const [label, table, options] of PAGES) {
             it(`match for ${label}`, async (context) => {
@@ -342,6 +416,10 @@ for (const backendName of ['wasm', 'native'] as const) {
                     assert.equal(sqlUsedHelpers, false);
                     assert.equal(helperUsedHelpers, true);
                     assert.deepStrictEqual(helperPage, sqlPage);
+                    if (backendName === 'demo') {
+                        assert.ok(backend.logs.some(line => line.includes('did not register')), backend.logs.join('\n'));
+                        assert.ok(backend.logs.some(line => line.includes('Grid cell helpers are unavailable')), backend.logs.join('\n'));
+                    }
                 } finally {
                     backend.dispose();
                 }

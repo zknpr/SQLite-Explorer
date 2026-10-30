@@ -4416,7 +4416,12 @@ describe('web demo view worker', () => {
             offset: 0
         });
         assert.strictEqual(result.rows[0].length, 1001);
-        assert.strictEqual(result.exactIntegerTexts?.[0]?.[1], undefined);
+        // The runtime's packed REAL text column fits where one sidecar
+        // column per value would exceed SQLite's result width.
+        assert.strictEqual(
+            result.exactIntegerTexts?.[0]?.[1],
+            DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION[BUNDLED_SQLJS_SQLITE_VERSION]
+        );
         assert.strictEqual(
             observedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
             0
@@ -4478,7 +4483,12 @@ describe('web demo view worker', () => {
             offset: 0
         });
         assert.strictEqual(result.rows[0].length, 1001);
-        assert.strictEqual(result.exactIntegerTexts?.[0]?.[1], undefined);
+        // The runtime's packed REAL text column fits where one sidecar
+        // column per value would exceed SQLite's result width.
+        assert.strictEqual(
+            result.exactIntegerTexts?.[0]?.[1],
+            DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION[BUNDLED_SQLJS_SQLITE_VERSION]
+        );
         assert.strictEqual(
             observedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
             0

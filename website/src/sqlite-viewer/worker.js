@@ -557,6 +557,36 @@ function getCellTextEncoding() {
   return normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]);
 }
 
+/** Per open database: whether the runtime's cell helpers are callable. */
+const cellHelperDatabases = new WeakMap();
+const cellHelperEncodingLogged = new WeakSet();
+
+/**
+ * The cell helpers read TEXT as stored, which is UTF-8 only in a UTF-8
+ * database. Missing helpers and another encoding are logged once per database.
+ */
+function cellHelpersApply(textEncoding) {
+  let available = cellHelperDatabases.get(db);
+  if (available === undefined) {
+    try {
+      db.exec('SELECT sqlite_explorer_cell_preview(NULL, 0, 0)');
+      available = true;
+    } catch (error) {
+      available = false;
+      console.warn('[Worker] Grid cell helpers are unavailable; table pages use SQL containment:', getErrorMessage(error));
+    }
+    cellHelperDatabases.set(db, available);
+  }
+  if (!available) return false;
+  const encoding = textEncoding ?? getCellTextEncoding();
+  if (encoding === 'utf-8') return true;
+  if (!cellHelperEncodingLogged.has(db)) {
+    cellHelperEncodingLogged.add(db);
+    console.warn(`[Worker] Grid cell helpers read UTF-8 only; this ${encoding} database's table pages use SQL containment`);
+  }
+  return false;
+}
+
 function queryCellMetadata(target, sqlTarget) {
   const query = buildMainCellMetadataQuery(sqlTarget);
   const result = db.exec(
@@ -847,6 +877,17 @@ async function initializeDatabase(filename, config) {
     }
 
     SQL = await self.initSqlJs(sqlConfig);
+    // The runtime's query-plan reader and cell helpers become an automatic
+    // extension of every database opened after this call. A build without
+    // them still works: each database's probe below then fails.
+    const registerRuntime = SQL._sqlite_explorer_register_query_plan;
+    const registration = typeof registerRuntime === 'function' ? registerRuntime() : undefined;
+    if (registration !== 0) {
+      console.warn(
+        '[Worker] The sql.js runtime functions did not register:',
+        registration === undefined ? 'missing from this build' : `SQLite result code ${registration}`
+      );
+    }
   }
 
   // Create the database. A File handle runs the open ladder (WAL sniff,
@@ -2032,12 +2073,15 @@ async function fetchTableData(table, options = {}) {
     valueHeaders.length * 2 + 1 <= SQLITE_MAX_RESULT_COLUMNS
       ? valueHeaders.map((_, index) => index)
       : identityContainmentRawTextColumnIndices;
+  const textEncoding = containmentRawTextColumnIndices.length > 0
+    ? getCellTextEncoding()
+    : undefined;
   const containmentQuery = buildCellContainmentQuery(
     sql,
     valueHeaders.length,
     containmentOptions,
     containmentRawTextColumnIndices,
-    'blob',
+    cellHelpersApply(textEncoding) ? 'checked' : 'blob',
     true
   );
   const transportQuery = containmentQuery.numericTransport;
@@ -2095,13 +2139,15 @@ async function fetchTableData(table, options = {}) {
     transportQuery.valueColumnCount,
     splitSyntheticRowId ? undefined : companionExactTexts,
     !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined,
-    transportQuery.realTextColumnCount
+    transportQuery.realTextColumnCount,
+    transportQuery.packedRealTextColumnCount
   );
   const valueContained = decodeCellContainment(
     normalized.rows,
     valueHeaders.length,
     normalized.exactIntegerTexts,
-    containmentOptions.maxPageResponseBytes
+    containmentOptions.maxPageResponseBytes,
+    containmentQuery.metadataMayBeNull
   );
   const decodedContained = rowIdRows
     ? prependCellContainmentColumn(
@@ -2116,9 +2162,6 @@ async function fetchTableData(table, options = {}) {
       )
     : valueContained;
   const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
-  const textEncoding = containmentRawTextColumnIndices.length > 0
-    ? normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0])
-    : undefined;
   const sourceRawTextColumnIndices = splitSyntheticRowId
     ? containmentQuery.rawTextColumnIndices.map(index => index + 1)
     : containmentQuery.rawTextColumnIndices;
