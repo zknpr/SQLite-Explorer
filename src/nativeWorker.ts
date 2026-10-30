@@ -3089,11 +3089,10 @@ export async function createNativeDatabaseConnection(
       ): Promise<void> => {
         if (snapshots.length === 0) throw new LegacyRowHistoryError();
         const identity = await resolveNativeTableIdentity(table);
-        const prepared = snapshots.map(snapshot => ({
-          snapshot,
-          states: rowHistoryStates(snapshot),
-          writes: buildRowHistoryWrites(snapshot)
-        }));
+        const prepared = snapshots.map(snapshot => {
+          const states = rowHistoryStates(snapshot);
+          return { snapshot, states, writes: buildRowHistoryWrites(snapshot, undefined, states) };
+        });
         const savepointName = createSavepointName('sp_history_restore_rows');
         await beginNativeSavepoint(savepointName);
         try {
@@ -3133,7 +3132,7 @@ export async function createNativeDatabaseConnection(
               params.unshift(entry.snapshot.rowId);
             }
             const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
-            const rowState = buildRowHistoryPredicate(entry.snapshot);
+            const rowState = buildRowHistoryPredicate(entry.snapshot, undefined, entry.states);
             return {
               insert: {
                 sql: `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} ` +

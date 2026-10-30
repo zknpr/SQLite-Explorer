@@ -1735,11 +1735,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   ): Promise<void> {
     if (snapshots.length === 0) throw new LegacyRowHistoryError();
     const identity = await this.resolveTableIdentity(table);
-    const prepared = snapshots.map(snapshot => ({
-      snapshot,
-      states: rowHistoryStates(snapshot),
-      writes: buildRowHistoryWrites(snapshot, wasmBindPlaceholder)
-    }));
+    const prepared = snapshots.map(snapshot => {
+      const states = rowHistoryStates(snapshot);
+      return { snapshot, states, writes: buildRowHistoryWrites(snapshot, wasmBindPlaceholder, states) };
+    });
     const savepointName = this.createSavepointName('sp_history_restore_rows');
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
@@ -1781,7 +1780,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         if (this.readChangesCount() !== 1) throw new RowHistoryConflictError(table);
 
         const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
-        const rowState = buildRowHistoryPredicate(entry.snapshot, wasmBindPlaceholder);
+        const rowState = buildRowHistoryPredicate(entry.snapshot, wasmBindPlaceholder, entry.states);
         const verified = this.queryRaw(
           `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ` +
           `(${rowIdentity.sql}) AND (${rowState.sql}) LIMIT 2`,

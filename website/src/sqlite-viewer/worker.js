@@ -3782,11 +3782,10 @@ async function restoreRowHistorySnapshots(table, snapshots) {
     throw new LegacyRowHistoryError();
   }
   const identity = await resolveTableIdentity(table);
-  const prepared = snapshots.map(snapshot => ({
-    snapshot,
-    states: rowHistoryStates(snapshot),
-    writes: buildRowHistoryWrites(snapshot, bindPlaceholder)
-  }));
+  const prepared = snapshots.map(snapshot => {
+    const states = rowHistoryStates(snapshot);
+    return { snapshot, states, writes: buildRowHistoryWrites(snapshot, bindPlaceholder, states) };
+  });
   const savepointName = createViewSavepointName('sp_history_restore_rows');
   runSingleStatement(`SAVEPOINT ${savepointName}`);
   try {
@@ -3827,7 +3826,7 @@ async function restoreRowHistorySnapshots(table, snapshots) {
       if (readChangesCount() !== 1) throw new RowHistoryConflictError(table);
 
       const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
-      const rowState = buildRowHistoryPredicate(entry.snapshot, bindPlaceholder);
+      const rowState = buildRowHistoryPredicate(entry.snapshot, bindPlaceholder, entry.states);
       const verified = db.exec(
         `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ` +
         `(${rowIdentity.sql}) AND (${rowState.sql}) LIMIT 2`,

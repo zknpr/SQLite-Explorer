@@ -74,11 +74,13 @@ export function rowHistoryStates(snapshot: DeletedRow): RowHistoryState[] {
   });
 }
 
+/** `states` is rowHistoryStates(snapshot), when the caller already has it. */
 export function buildRowHistoryPredicate(
   snapshot: DeletedRow,
-  bindPlaceholder: (value: CellValue) => string = () => '?'
+  bindPlaceholder: (value: CellValue) => string = () => '?',
+  states: readonly RowHistoryState[] = rowHistoryStates(snapshot)
 ): StoredCellSqlFragment {
-  const predicates = rowHistoryStates(snapshot).map(({ column, state }) => (
+  const predicates = states.map(({ column, state }) => (
     buildStoredCellPredicate(column, state, bindPlaceholder)
   ));
   return {
@@ -91,9 +93,10 @@ export function buildRowHistoryPredicate(
 
 export function buildRowHistoryWrites(
   snapshot: DeletedRow,
-  bindPlaceholder: (value: CellValue) => string = () => '?'
+  bindPlaceholder: (value: CellValue) => string = () => '?',
+  states: readonly RowHistoryState[] = rowHistoryStates(snapshot)
 ): Array<{ column: string; write: StoredCellSqlFragment }> {
-  return rowHistoryStates(snapshot).map(({ column, state }) => ({
+  return states.map(({ column, state }) => ({
     column,
     write: buildStoredCellWrite(state, bindPlaceholder)
   }));
