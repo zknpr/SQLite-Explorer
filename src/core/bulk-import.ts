@@ -1,3 +1,4 @@
+import { bindableIntegerValue } from './integer-utils';
 import type { CellValue, DatabaseOperations, LabeledModification } from './types';
 import { runReadSnapshot } from './operation-serializer';
 import { estimateUndoMemoryBytes } from './undo-history';
@@ -166,17 +167,14 @@ export function mapImportRows(data: ImportData, targets: Array<string | undefine
     ))));
 }
 
-/**
- * A JSON integer past int32 reaches SQLite as a double on both engines, which
- * a column without INTEGER affinity keeps as REAL (and TEXT as '….0'). As a
- * BigInt it binds as INTEGER, as SQLite stores the same literal.
- */
+/** A JSON integer past int32 imports as INTEGER (bindableIntegerValue); other rows are not copied. */
 function bindIntegersExactly(row: Record<string, CellValue>): Record<string, CellValue> {
     let copy: Record<string, CellValue> | undefined;
     for (const [column, value] of Object.entries(row)) {
-        if (typeof value === 'number' && Number.isSafeInteger(value) && value !== (value | 0)) {
+        const bindable = bindableIntegerValue(value);
+        if (bindable !== value) {
             copy ??= { ...row };
-            copy[column] = BigInt(value);
+            copy[column] = bindable;
         }
     }
     return copy ?? row;

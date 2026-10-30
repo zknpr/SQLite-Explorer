@@ -49,6 +49,7 @@ import {
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
 import { normalizeTablePageOptions } from './core/table-pagination';
 import { normalizeCellTextEncoding } from './core/cell-read';
+import { bindableIntegerValue } from './core/integer-utils';
 import { estimateUndoMemoryBytes } from './core/undo-history';
 import type { CellMaterializationService } from './cellMaterialization';
 import { openCellContentViewer } from './cellContentViewer';
@@ -539,6 +540,7 @@ export class HostBridge implements ToastService {
    * Update a single cell value.
    */
   async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, _originalValue?: CellValue) {
+    value = bindableIntegerValue(value);
     const dbOps = this.ensureDatabaseInitialized();
     const connectionGeneration = this.captureConnectionGeneration();
 
@@ -755,6 +757,7 @@ export class HostBridge implements ToastService {
    * Insert a new row.
    */
   async insertRow(table: string, data: Record<string, CellValue>) {
+    data = Object.fromEntries(Object.entries(data).map(([column, value]) => [column, bindableIntegerValue(value)]));
     const dbOps = this.ensureDatabaseInitialized();
     const connectionGeneration = this.captureConnectionGeneration();
 
@@ -1308,6 +1311,7 @@ export class HostBridge implements ToastService {
     updates: CellUpdate[],
     label: string
   ): Promise<Pick<CellUpdateResult, 'rowId' | 'newRowId' | 'columnName'>[] | undefined> {
+    updates = updates.map(update => ({ ...update, value: bindableIntegerValue(update.value) }));
     const dbOps = this.ensureDatabaseInitialized();
     const connectionGeneration = this.captureConnectionGeneration();
 

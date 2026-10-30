@@ -104,6 +104,18 @@ export function sqliteIdentifiersEqual(left: string, right: string): boolean {
   return foldSqliteIdentifier(left) === foldSqliteIdentifier(right);
 }
 
+/**
+ * Both engines bind a whole JS number past int32 as a double (sql.js's rule,
+ * and V8's serialization to txiki), so a column without INTEGER affinity keeps
+ * it as REAL and a TEXT column as '….0'. As a BigInt it binds as INTEGER, as
+ * SQLite stores the same literal. Edits and imports pass values through here.
+ */
+export function bindableIntegerValue(value: CellValue): CellValue {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value !== (value | 0)
+    ? BigInt(value)
+    : value;
+}
+
 export interface ExactNumericTextQuery {
   sql: string;
   transportColumns: string[];
