@@ -3,7 +3,9 @@ import assert from 'node:assert';
 import { serializeValue, deserializeValue, deserializeArgs, uint8ArrayToBase64, base64ToUint8Array } from '../../src/core/serialization';
 import {
     WEBVIEW_PAYLOAD_LIMIT_ERROR_CODE,
+    WEBVIEW_TRANSPORT_SURFACES,
     WebviewPayloadLimitError,
+    assertWebviewTransportPayload,
     fromWebviewPayloadLimitErrorData,
     toWebviewPayloadLimitErrorData
 } from '../../src/core/webview-transport';
@@ -396,5 +398,29 @@ describe('RPC Serialization', () => {
             ...data,
             code: 'NOT_THE_TRANSPORT_CODE'
         }), undefined);
+    });
+});
+
+describe('webview payload string measurement', () => {
+    it('counts the UTF-8 bytes JSON.stringify would produce for every kind of string', () => {
+        const units = [0x00, 0x01, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1f, 0x20, 0x22, 0x5c, 0x7e, 0x7f,
+            0x80, 0x7ff, 0x800, 0x2028, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xfffd, 0xffff, 0x41];
+        let seed = 0x1234;
+        const next = (bound: number) => {
+            seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+            return seed % bound;
+        };
+        const distinct = new Set<string>();
+        for (let round = 0; round < 20000; round++) {
+            const value = String.fromCharCode(...Array.from({ length: next(9) }, () => units[next(units.length)]));
+            distinct.add(value);
+            const expected = Buffer.byteLength(JSON.stringify(value), 'utf8') + (value.startsWith('~') ? 1 : 0);
+            assert.strictEqual(
+                assertWebviewTransportPayload(value, { surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse }),
+                expected,
+                JSON.stringify(value)
+            );
+        }
+        assert.ok(distinct.size > 10000, `only ${distinct.size} distinct strings`);
     });
 });

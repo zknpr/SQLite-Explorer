@@ -115,29 +115,33 @@ function resolveLimits(options: WebviewTransportLimits) {
   };
 }
 
-function utf8ByteLength(value: string): number {
-  let bytes = 0;
+/**
+ * UTF-8 bytes of JSON.stringify(value), counted without building that string:
+ * quotes, two-byte escapes for " \\ \b \t \n \f \r, \u00XX for other
+ * control characters and \uXXXX for unpaired surrogates.
+ */
+function escapedJsonStringByteLength(value: string): number {
+  let bytes = 2;
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
-    if (code < 0x80) bytes += 1;
-    else if (code < 0x800) bytes += 2;
-    else if (code >= 0xD800 && code <= 0xDBFF && index + 1 < value.length) {
-      const next = value.charCodeAt(index + 1);
+    if (code < 0x80) {
+      if (code >= 0x20) bytes += code === 0x22 || code === 0x5c ? 2 : 1;
+      else bytes += code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d ? 2 : 6;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = index + 1 < value.length ? value.charCodeAt(index + 1) : 0;
       if (next >= 0xDC00 && next <= 0xDFFF) {
         bytes += 4;
         index++;
       } else {
-        bytes += 3;
+        bytes += 6;
       }
     } else {
-      bytes += 3;
+      bytes += code >= 0xDC00 && code <= 0xDFFF ? 6 : 3;
     }
   }
   return bytes;
-}
-
-function escapedJsonStringByteLength(value: string): number {
-  return utf8ByteLength(JSON.stringify(value));
 }
 
 function decodedBase64Bytes(base64: string): number {

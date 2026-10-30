@@ -1,5 +1,5 @@
 import { MessageCorrelationId, PendingInvocation, processProtocolMessage } from './core/rpc';
-import { deserializeArgs, serializeValue } from './core/serialization';
+import { deserializeArgs, serializeAssertedValue } from './core/serialization';
 import {
   WEBVIEW_TRANSPORT_SURFACES,
   assertWebviewTransportPayload,
@@ -222,9 +222,7 @@ export class WebviewMessageHandler {
           assertWebviewTransportPayload(rawResponse, {
             surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
           });
-          const serializedResult = serializeValue(result, {
-            surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
-          });
+          const serializedResult = serializeAssertedValue(result);
           // postMessage can reject asynchronously (for example during JSON
           // serialization). Keep it in this chain so the caller gets a failure.
           return this.postMessage({
@@ -301,9 +299,7 @@ export class WebviewMessageHandler {
         }, {
           surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
         });
-        const serializedResult = serializeValue(result, {
-          surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
-        });
+        const serializedResult = serializeAssertedValue(result);
         return this.postMessage({
           type: 'rpc-response',
           id: responseId,

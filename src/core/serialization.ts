@@ -67,6 +67,15 @@ export function serializeValue(
   return serializeValueUnchecked(value);
 }
 
+/**
+ * serializeValue without its size check, for a value inside a message the
+ * caller has just passed through assertWebviewTransportPayload. That check
+ * covers the value, so a second one would only walk it again.
+ */
+export function serializeAssertedValue(value: unknown): unknown {
+  return serializeValueUnchecked(value);
+}
+
 function serializeValueUnchecked(value: unknown): unknown {
   // VS Code webview messages must be JSON-serializable. JSON would silently
   // coerce these SQLite REAL values to null. The escaped scalar namespace
