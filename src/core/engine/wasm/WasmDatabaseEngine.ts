@@ -4654,6 +4654,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           queryOptions,
           containmentRawTextColumnIndices,
           checkedTransport ? 'checked' : 'hex',
+          true,
           true
         );
         const transportQuery = containmentQuery.numericTransport;

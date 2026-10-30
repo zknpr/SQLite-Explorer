@@ -218,6 +218,11 @@ function buildHelperMetadataExpression(columns: string[], byteLimit: number): st
 /**
  * Wrap a filtered/ordered/paginated SELECT and project only bounded TEXT/BLOB
  * windows. The inner SELECT continues to own WHERE and ORDER BY semantics.
+ *
+ * sourceEndsWithOffset: the caller built sourceSql and its outermost SELECT
+ * ends with an OFFSET clause. SQLite never flattens such a subquery, so it
+ * needs no wrapper of its own, which would copy every value through a second
+ * co-routine.
  */
 export function buildCellContainmentQuery(
   sourceSql: string,
@@ -225,8 +230,12 @@ export function buildCellContainmentQuery(
   options: Pick<TableQueryOptions, 'limit' | 'maxInlineCellBytes' | 'maxPageResponseBytes'>,
   rawTextColumnIndices: readonly number[] = [],
   rawTextTransport: RawTextTransport = 'blob',
-  includeRealTextSidecar = false
+  includeRealTextSidecar = false,
+  sourceEndsWithOffset = false
 ): CellContainmentQuery {
+  if (sourceEndsWithOffset && !/ OFFSET \d+$/.test(sourceSql)) {
+    throw new Error('Cell containment source does not end with an OFFSET clause');
+  }
   const effectiveInlineCellBytes = deriveEffectiveInlineCellBytes(options, columnCount);
   const textCharacterWindow = Math.floor(
     effectiveInlineCellBytes / MAX_UTF8_BYTES_PER_CODE_POINT
@@ -285,7 +294,9 @@ export function buildCellContainmentQuery(
   const sourceCte =
     `WITH ${quotedSource} (${quotedValues.join(', ')}) AS` +
     `${metadataUsesTrailer ? ' MATERIALIZED' : ''} (\n` +
-    `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n`;
+    (sourceEndsWithOffset
+      ? `${sourceSql}\n)\n`
+      : `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n`);
   const primaryMetadataProjection = metadataUsesTrailer
     ? ''
     : `, ${metadataExpression} AS ${escapeIdentifier(CELL_METADATA_ALIAS)}`;
@@ -343,7 +354,8 @@ export function buildCellContainmentQuery(
   ];
 
   return {
-    // OFFSET prevents query flattening. At the width ceiling, MATERIALIZED
+    // An OFFSET, the source's own or the wrapper's, prevents query
+    // flattening. At the width ceiling, MATERIALIZED
     // lets the value rows and their one-row metadata trailer scan the same
     // ephemeral result instead of evaluating a volatile source twice.
     sql,

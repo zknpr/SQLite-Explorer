@@ -445,7 +445,9 @@ function buildKeysetPredicate(plan: ResolvedKeysetPlan): { sql: string; params: 
  * clauses. The predicate lands inside this WHERE, so the containment and
  * exact-numeric wrappers compose around the result unchanged. 'before' and
  * 'last' run reversed with a bounded (≤ one page) outer re-sort back to
- * display order, keeping every row-indexed sidecar aligned downstream.
+ * display order, keeping every row-indexed sidecar aligned downstream. Every
+ * form ends with an OFFSET clause, so SQLite never flattens it into the query
+ * that wraps it.
  */
 export function assembleKeysetSelect(input: {
   selectListSql: string;
@@ -476,9 +478,9 @@ export function assembleKeysetSelect(input: {
   if (whereClauses.length > 0) {
     sql += ` WHERE ${whereClauses.join(' AND ')}`;
   }
-  sql += ` ORDER BY ${orderBySql(executionDirection)} LIMIT ${plan.limit}`;
+  sql += ` ORDER BY ${orderBySql(executionDirection)} LIMIT ${plan.limit} OFFSET 0`;
   if (reversedExecution) {
-    sql = `SELECT * FROM (${sql}) ORDER BY ${orderBySql(plan.direction)}`;
+    sql = `SELECT * FROM (${sql}) ORDER BY ${orderBySql(plan.direction)} LIMIT -1 OFFSET 0`;
   }
   return { sql, params };
 }

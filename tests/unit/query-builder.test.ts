@@ -93,7 +93,7 @@ describe('Query Builder', () => {
         { limit: 10, offset: 0 },
         { ...plan, limit: MAX_TABLE_PAGE_ROWS + 1 }
       );
-      assert.match(clamped.sql, new RegExp(`LIMIT ${MAX_TABLE_PAGE_ROWS}$`));
+      assert.match(clamped.sql, new RegExp(`LIMIT ${MAX_TABLE_PAGE_ROWS} OFFSET 0$`));
     });
 
     it('orders a synthetic composite identity by every declared key member', () => {

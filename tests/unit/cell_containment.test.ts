@@ -255,6 +255,56 @@ describe('grid cell containment limits', () => {
         }
     });
 
+    it('evaluates a source that ends with OFFSET once per row without its own wrapper', async () => {
+        const { buildCellContainmentQuery, decodeCellContainment } = await loadContainmentModule();
+        const { assembleKeysetSelect } = await import('../../src/core/keyset-pagination');
+        const database = new DatabaseSync(':memory:');
+        try {
+            database.exec("CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB); INSERT INTO t VALUES (1, x'00'), (2, x'00'), (3, x'00')");
+            let evaluations = 0;
+            database.function('volatile_blob', { deterministic: false }, () => {
+                evaluations += 1;
+                return Buffer.alloc(evaluations % 2 ? 900 : 1, 0x41);
+            });
+            const keyset = (mode: 'first' | 'last') => assembleKeysetSelect({
+                selectListSql: '"k", volatile_blob() AS "v"',
+                escapedTable: '"t"',
+                whereClauses: [],
+                filterParams: [],
+                plan: { mode, keyColumns: ['k'], direction: 'ASC', limit: 3 } as any
+            }).sql;
+            const sources = [
+                'SELECT "k", volatile_blob() AS "v" FROM "t" ORDER BY "k" LIMIT 3 OFFSET 0',
+                keyset('first'),
+                keyset('last')
+            ];
+            for (const source of sources) {
+                const query = buildCellContainmentQuery(
+                    source, 2, { limit: 3, maxInlineCellBytes: 64, maxPageResponseBytes: 1024 }, [], 'blob', false, true
+                );
+                assert.ok(query.sql.includes(`AS (\n${source}\n)\n`), 'the source runs without the wrapper');
+                evaluations = 0;
+                const statement = database.prepare(query.sql);
+                statement.setReturnArrays(true);
+                const decoded = decodeCellContainment(statement.all() as unknown as unknown[][], 2, undefined, 1024);
+                // Flattening would evaluate the call once per reference.
+                assert.strictEqual(evaluations, 3, source);
+                for (const [rowIndex, row] of decoded.rows.entries()) {
+                    const byteLength = decoded.oversizedCells?.[rowIndex]?.[1]?.byteLength
+                        ?? (row[1] as Uint8Array).byteLength;
+                    assert.ok(byteLength === 900 || byteLength === 1, `${source}: row ${rowIndex}`);
+                    if (byteLength === 900) assert.strictEqual((row[1] as Uint8Array).byteLength, query.effectiveInlineCellBytes);
+                }
+            }
+            assert.throws(
+                () => buildCellContainmentQuery('SELECT 1 LIMIT 1', 1, { limit: 1 }, [], 'blob', false, true),
+                /does not end with an OFFSET clause/
+            );
+        } finally {
+            database.close();
+        }
+    });
+
     it('downgrades the payload tail after actual UTF-8 bytes exhaust the page budget', async () => {
         const { decodeCellContainment } = await loadContainmentModule();
         const decoded = decodeCellContainment([

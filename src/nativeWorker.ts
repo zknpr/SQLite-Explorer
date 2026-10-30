@@ -4398,6 +4398,7 @@ export async function createNativeDatabaseConnection(
               queryOptions,
               containmentRawTextColumnIndices,
               checkedTransport ? 'checked' : 'blob',
+              true,
               true
             );
             const transportQuery = containmentQuery.numericTransport;

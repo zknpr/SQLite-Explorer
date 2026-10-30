@@ -2082,6 +2082,7 @@ async function fetchTableData(table, options = {}) {
     containmentOptions,
     containmentRawTextColumnIndices,
     cellHelpersApply(textEncoding) ? 'checked' : 'blob',
+    true,
     true
   );
   const transportQuery = containmentQuery.numericTransport;
