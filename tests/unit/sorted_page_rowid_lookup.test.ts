@@ -28,7 +28,10 @@ function fixtureSql(): string {
     }
     // v's NOCASE ties 'v1' with 'V1': the outer sort must keep the column's collation.
     return `CREATE TABLE t (s, v TEXT COLLATE NOCASE, w INTEGER); INSERT INTO t (s, v, w) VALUES ${values.join(', ')}; ` +
-        `CREATE VIRTUAL TABLE ft USING fts5(s, v); INSERT INTO ft (rowid, s, v) SELECT rowid, s, v FROM t;`;
+        `CREATE VIRTUAL TABLE ft USING fts5(s, v); INSERT INTO ft (rowid, s, v) SELECT rowid, s, v FROM t; ` +
+        // Column names the lookup SQL uses as aliases, none in rowid order.
+        `CREATE TABLE odd (k1, k0, page_keys, page_row); ` +
+        `INSERT INTO odd SELECT (rowid * 37) % 101, (rowid * 53) % 89, (rowid * 61) % 97, (rowid * 71) % 83 FROM t;`;
 }
 
 interface Sweep {
@@ -106,6 +109,9 @@ for (const orderBy of ['s', 'v', 'w']) {
     }
 }
 SWEEPS.push({ table: 't', columns: ['rowid', 's', 'v', 'w'], orderBy: 's', orderDir: 'DESC', globalFilter: '1' });
+for (const orderBy of ['k1', 'k0', 'page_keys', 'page_row']) {
+    SWEEPS.push({ table: 'odd', columns: ['rowid', 'k1', 'k0', 'page_keys', 'page_row'], orderBy, orderDir: 'ASC' });
+}
 
 /** Every sweep, then which page SQL took the rowid lookup. */
 async function assertEngine(ops: DatabaseOperations, captured: string[]) {

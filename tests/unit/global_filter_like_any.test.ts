@@ -178,12 +178,48 @@ const PAGE_OPTIONS = {
     filters: []
 } as unknown as TableQueryOptions;
 
+// More columns than one call takes: the condition ORs one COALESCE per chunk
+// of 100, each with its own needle and patterns in parameter order.
+const WIDE_COLUMNS = Array.from({ length: 150 }, (_, index) => `c${index}`);
+function wideFixtureSql(): string {
+    const row = (id: number, cells: Record<number, string>) =>
+        `(${id}, ${WIDE_COLUMNS.map((_, index) => cells[index] ?? 'NULL').join(', ')})`;
+    const rows = [
+        row(1, { 120: "'has needle here'" }),
+        // Not plain UTF-8, so the second chunk's LIKE decides: it matches 'é'.
+        row(2, { 140: "CAST(x'ffc3a9' AS TEXT)", 3: "'x'" }),
+        row(3, { 5: "'é'" }),
+        row(4, { 0: "'nothing'", 149: "'NEEDLE at the end'" }),
+        row(5, { 99: "'needle at 99'", 100: "'e'" }),
+        row(6, {})
+    ];
+    return `CREATE TABLE wide (id INTEGER PRIMARY KEY, ${WIDE_COLUMNS.join(', ')}); INSERT INTO wide VALUES ${rows.join(', ')};`;
+}
+
+async function assertWideChunks(ops: DatabaseOperations) {
+    await ops.executeQuery(wideFixtureSql());
+    for (const needle of ['needle', 'NEEDLE', 'é', 'zzz', 'e']) {
+        const query = (likeAny: boolean) => buildSelectQuery('wide', {
+            columns: ['id'], globalFilter: needle, globalFilterColumns: WIDE_COLUMNS, orderBy: 'id'
+        } as TableQueryOptions, undefined, undefined, { likeAny });
+        const sql = query(true).sql;
+        assert.strictEqual(sql.split('sqlite_explorer_like_any(').length - 1, 2, 'two chunks');
+        assert.deepStrictEqual(await rows(ops, query(true)), await rows(ops, query(false)), `needle ${needle}`);
+    }
+    const ids = async (needle: string) => (await rows(ops, buildSelectQuery('wide', {
+        columns: ['id'], globalFilter: needle, globalFilterColumns: WIDE_COLUMNS, orderBy: 'id'
+    } as TableQueryOptions, undefined, undefined, { likeAny: true }))).map(row => row[0]);
+    assert.deepStrictEqual(await ids('needle'), [1, 4, 5]);
+    assert.deepStrictEqual(await ids('é'), [2, 3]);
+}
+
 describe('sqlite_explorer_like_any', () => {
     it('matches the LIKE chain on WebAssembly', async () => {
         const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
         try {
             await engine.executeQuery(fixtureSql());
             await assertLikeAnyMatchesLike(engine);
+            await assertWideChunks(engine);
         } finally {
             engine.shutdown();
         }
@@ -236,6 +272,7 @@ describe('sqlite_explorer_like_any', () => {
             assert.strictEqual(firstCount.count, (await rows(ops, filteredIds('john', false))).length);
             assert.strictEqual(await ops.prepareCellHelpers!(), true);
             await assertLikeAnyMatchesLike(ops);
+            await assertWideChunks(ops);
             for (const needle of ['john', '9', 'É']) {
                 const expected = await rows(ops, filteredIds(needle, false));
                 nativeQueries.length = 0;

@@ -364,7 +364,7 @@ Sorted pages of authority-confirmed ordinary rowid tables (not virtual tables) t
 - The inner query sorts only the key columns (sort column, then rowid) under the page's WHERE, seek, LIMIT and OFFSET.
 - A `CROSS JOIN` reads each page row by rowid.
 - The outer `ORDER BY` over the inner key columns is the display order. SQLite drops it for forward pages, and a reversed page sorts at most a page.
-- The inner key columns keep the column's collation.
+- The inner key columns keep the column's collation. They are table-qualified, because `ORDER BY` resolves a bare name to a result alias first: a column named `k1` would otherwise sort by the rowid.
 - The query ends in `LIMIT -1 OFFSET 0`. Without it SQLite flattens it into the containment wrapper and the page order is lost, which `sorted_page_rowid_lookup.test.ts` catches.
 
 ### Count Cache

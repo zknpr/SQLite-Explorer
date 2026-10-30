@@ -472,8 +472,11 @@ export function buildRowIdLookupSelect(input: {
   /** The inner query's LIMIT and OFFSET. */
   pageSql: string;
 }): string {
-  const keys = input.keyColumns.map((column, index) => `${escapeIdentifier(column)} AS "k${index}"`).join(', ');
-  const innerOrder = input.keyColumns.map(column => `${escapeIdentifier(column)} ${input.innerDirection}`).join(', ');
+  // Qualified, because ORDER BY resolves a bare name to a result alias first:
+  // a column named "k1" would otherwise sort by the rowid.
+  const key = (column: string) => `${input.escapedTable}.${escapeIdentifier(column)}`;
+  const keys = input.keyColumns.map((column, index) => `${key(column)} AS "k${index}"`).join(', ');
+  const innerOrder = input.keyColumns.map(column => `${key(column)} ${input.innerDirection}`).join(', ');
   const outerOrder = input.keyColumns.map((_, index) => `"page_keys"."k${index}" ${input.outerDirection}`).join(', ');
   return `SELECT ${input.selectListSql} FROM (SELECT ${keys} FROM ${input.escapedTable}${input.whereSql} ` +
     `ORDER BY ${innerOrder}${input.pageSql}) AS "page_keys" CROSS JOIN ${input.escapedTable} AS ${ROW_ID_LOOKUP_ROW} ` +
