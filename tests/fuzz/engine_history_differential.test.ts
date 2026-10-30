@@ -14,7 +14,7 @@ import type { CellValue, DatabaseOperations, ModificationEntry, RecordId } from 
 
 // Differential fuzz of the history-tracked mutation API: the same inserts,
 // batch edits, key edits, JSON patches, deletes, imports, undos and redos run
-// on WebAssembly and on the native engine in lockstep. After every step both
+// on in-memory and paged WebAssembly and on the native engine in lockstep. After every step both
 // must have succeeded or both failed, and every cell must have the same
 // storage class and stored bytes. A successful undo must also restore the
 // exact contents from before its entry, and a redo those after it, which
@@ -82,7 +82,10 @@ type Kind = typeof KINDS[number];
 const TYPES = ['', 'INTEGER', 'REAL', 'TEXT', 'NUMERIC', 'BLOB', 'INT', 'VARCHAR(10)', 'DOUBLE', 'BOOLEAN'];
 const COLUMNS = ['c0', 'c1', 'c2', 'c3'];
 const OPERATIONS = ['insert', 'insert', 'literal', 'batch', 'batch', 'keyEdit', 'patch', 'delete', 'import', 'undo', 'undo', 'redo'] as const;
-type Engine = 'wasm' | 'native';
+// In-memory WebAssembly is the reference; the paged engine reads its file
+// page by page with a writable overlay, as large files open.
+const ENGINES = ['wasm', 'paged', 'native'] as const;
+type Engine = typeof ENGINES[number];
 type Outcome = { ok: true } | { ok: false; error: string };
 
 const orderColumn = (kind: Kind) => (kind === 'textKey' ? 'k' : 'id');
@@ -122,6 +125,23 @@ async function identities(ops: DatabaseOperations, kind: Kind): Promise<RecordId
     return page.rows.map(row => row[0] as RecordId);
 }
 
+/** A WebAssembly engine on a file past the paged threshold, holding the table. */
+async function openPaged(ddl: string, file: string): Promise<WasmDatabaseEngine> {
+    const seedEngine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+    try {
+        await seedEngine.executeQuery(ddl);
+        await seedEngine.executeQuery('CREATE TABLE pad (b BLOB); INSERT INTO pad VALUES (zeroblob(16384))');
+        fs.writeFileSync(file, await seedEngine.serializeDatabase());
+    } finally {
+        seedEngine.shutdown();
+    }
+    const opened = await createDatabaseEngine({
+        content: null, filePath: file, maxSize: 0, pagedOpenThresholdBytes: 4096, allowPagedFallback: true, readOnlyMode: false
+    });
+    assert.equal(opened.storage, 'paged');
+    return opened.operations as WasmDatabaseEngine;
+}
+
 const attempt = async (work: () => Promise<unknown>): Promise<Outcome> => {
     try {
         await work();
@@ -131,7 +151,7 @@ const attempt = async (work: () => Promise<unknown>): Promise<Outcome> => {
     }
 };
 
-it('keeps WebAssembly and native history-tracked mutations identical', async (context) => {
+it('keeps in-memory, paged and native history-tracked mutations identical', async (context) => {
     const expectedTarget = process.env.FUZZ_EXPECT_TARGET;
     if (!await isNativeAvailable(process.cwd())) {
         if (expectedTarget) throw new Error(`Missing native runtime for ${expectedTarget}`);
@@ -150,25 +170,25 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
             const kind = KINDS[seed % KINDS.length];
             const file = path.join(directory, `seed-${seed}.db`);
             fs.closeSync(fs.openSync(file, 'w'));
+            const ddl = tableSql(kind, random);
             const { databaseOps: nativeOps } = await native.establishConnection(vscode.Uri.file(file), `seed-${seed}`, false);
             const wasm = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
-            const engines: Record<Engine, DatabaseOperations> = { wasm, native: nativeOps };
+            const paged = await openPaged(ddl, path.join(directory, `seed-${seed}-paged.db`));
+            const engines: Record<Engine, DatabaseOperations> = { wasm, paged, native: nativeOps };
             try {
-                const ddl = tableSql(kind, random);
-                for (const ops of Object.values(engines)) await ops.executeQuery(ddl);
-                const history: Record<Engine, ModificationEntry[]> = { wasm: [], native: [] };
+                for (const engine of ['wasm', 'native'] as const) await engines[engine].executeQuery(ddl);
+                const history: Record<Engine, ModificationEntry[]> = { wasm: [], paged: [], native: [] };
                 // Contents around each entry, for the undo and redo oracle.
                 const around = new WeakMap<ModificationEntry, { before: string; after?: string }>();
                 let current = await contents(wasm, kind);
                 const pending: ModificationEntry[] = [];
-                const redo: Record<Engine, ModificationEntry[]> = { wasm: [], native: [] };
+                const redo: Record<Engine, ModificationEntry[]> = { wasm: [], paged: [], native: [] };
                 const log = [ddl];
                 let nextId = 1;
                 for (let step = 0; step < STEPS; step++) {
-                    const rows: Record<Engine, RecordId[]> = {
-                        wasm: await identities(wasm, kind), native: await identities(nativeOps, kind)
-                    };
-                    assert.equal(rows.native.length, rows.wasm.length);
+                    const rows = {} as Record<Engine, RecordId[]>;
+                    for (const engine of ENGINES) rows[engine] = await identities(engines[engine], kind);
+                    for (const engine of ENGINES) assert.equal(rows[engine].length, rows.wasm.length);
                     const operation = pick(OPERATIONS);
                     const value = () => {
                         const [name, make] = pick(VALUES);
@@ -211,7 +231,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                         const sql = columns.length > 0
                             ? `INSERT INTO t (${columns.join(', ')}) VALUES (${literals.join(', ')})`
                             : 'INSERT INTO t DEFAULT VALUES';
-                        for (const engine of ['wasm', 'native'] as const) {
+                        for (const engine of ENGINES) {
                             outcomes[engine] = await attempt(async () => {
                                 await engines[engine].executeQuery(sql);
                                 // Outside history: later entries start from here.
@@ -222,7 +242,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                     } else if (operation === 'insert') {
                         const { data, names } = newRow();
                         description += ` ${names.join(' ')}`;
-                        for (const engine of ['wasm', 'native'] as const) {
+                        for (const engine of ENGINES) {
                             outcomes[engine] = await attempt(async () => {
                                 const insertedRow = await engines[engine].insertRowWithHistory!('t', { ...data });
                                 record(engine, {
@@ -255,7 +275,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                                 description += ` ${index}.${column}=${drawn.name}`;
                             }
                         }
-                        for (const engine of ['wasm', 'native'] as const) {
+                        for (const engine of ENGINES) {
                             outcomes[engine] = await attempt(async () => {
                                 const affectedCells = await engines[engine].updateCellBatch('t', edits.map(edit => ({
                                     rowId: rows[engine][edit.index], column: edit.column, value: edit.value,
@@ -268,7 +288,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                         const victims = rows.wasm.map((_, index) => index).filter(() => random() < 0.3);
                         if (victims.length === 0) victims.push(Math.floor(random() * rows.wasm.length));
                         description += ` ${victims.join(',')}`;
-                        for (const engine of ['wasm', 'native'] as const) {
+                        for (const engine of ENGINES) {
                             outcomes[engine] = await attempt(async () => {
                                 const deletedRows = await engines[engine].deleteRows('t', victims.map(index => rows[engine][index]));
                                 record(engine, { modificationType: 'row_delete', targetTable: 't', description: 'Delete', deletedRows });
@@ -277,7 +297,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                     } else if (operation === 'import') {
                         const batch = Array.from({ length: 1 + Math.floor(random() * 3) }, newRow);
                         description += ` ${batch.map(row => row.names.join(' ')).join(' | ')}`;
-                        for (const engine of ['wasm', 'native'] as const) {
+                        for (const engine of ENGINES) {
                             outcomes[engine] = await attempt(async () => {
                                 record(engine, await runReadSnapshot(engines[engine], tx => importRowsAtomically(
                                     tx, 't', batch.map(row => ({ ...row.data })), 64 * 1024 * 1024
@@ -285,7 +305,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                             });
                         }
                     } else if (operation === 'undo' || operation === 'redo') {
-                        for (const engine of ['wasm', 'native'] as const) {
+                        for (const engine of ENGINES) {
                             const from = operation === 'undo' ? history[engine] : redo[engine];
                             const to = operation === 'undo' ? redo[engine] : history[engine];
                             const entry = from[from.length - 1];
@@ -303,12 +323,14 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                     }
                     steps++;
                     const status = (outcome: Outcome) => (outcome.ok ? 'ok' : `failed: ${outcome.error}`);
-                    log.push(`${step}: ${description} -> wasm ${status(outcomes.wasm)}; native ${status(outcomes.native)}`);
+                    log.push(`${step}: ${description} -> ${ENGINES.map(engine => `${engine} ${status(outcomes[engine])}`).join('; ')}`);
                     if (outcomes.wasm.ok) successes.set(`${kind}:${operation}`, (successes.get(`${kind}:${operation}`) ?? 0) + 1);
-                    const [wasmCells, nativeCells] = [await contents(wasm, kind), await contents(nativeOps, kind)];
+                    const wasmCells = await contents(wasm, kind);
                     const trail = () => `seed ${seed} (${kind}) step ${step}\n  ${log.join('\n  ')}\n  contents before the step: ${current}`;
-                    assert.equal(outcomes.native.ok, outcomes.wasm.ok, `outcomes differ\n${trail()}`);
-                    assert.equal(nativeCells, wasmCells, `cells differ\n${trail()}`);
+                    for (const engine of ENGINES) {
+                        assert.equal(outcomes[engine].ok, outcomes.wasm.ok, `${engine} outcome differs\n${trail()}`);
+                        assert.equal(await contents(engines[engine], kind), wasmCells, `${engine} cells differ\n${trail()}`);
+                    }
                     for (const entry of pending.splice(0)) {
                         const snapshot = around.get(entry);
                         if (snapshot && history.wasm.includes(entry)) snapshot.after = wasmCells;
@@ -318,7 +340,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                     if ((operation === 'undo' || operation === 'redo') && !outcomes.wasm.ok) {
                         assert.match(outcomes.wasm.error, /constraint failed/, `${operation} failed\n${trail()}`);
                     }
-                    if (replayed && outcomes.native.ok) {
+                    if (replayed && outcomes.wasm.ok) {
                         const snapshot = around.get(replayed.entry);
                         const expected = replayed.operation === 'undo' ? snapshot?.before : snapshot?.after;
                         assert.ok(expected !== undefined, `no recorded contents for the ${replayed.operation}\n${trail()}`);
@@ -328,6 +350,7 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
                 }
             } finally {
                 wasm.shutdown();
+                paged.shutdown();
             }
         }
     } finally {
@@ -342,5 +365,5 @@ it('keeps WebAssembly and native history-tracked mutations identical', async (co
         const share = values.get(kind)!.size / VALUES.length;
         assert.ok(share >= VALUE_SHARE_FLOOR, `${kind} drew ${(share * 100).toFixed(0)}% of the values`);
     }
-    console.log(`[history fuzz] ${SEEDS} databases, ${steps} steps, both engines identical`);
+    console.log(`[history fuzz] ${SEEDS} databases, ${steps} steps, all ${ENGINES.length} engines identical`);
 });
