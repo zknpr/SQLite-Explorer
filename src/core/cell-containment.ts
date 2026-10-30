@@ -786,7 +786,7 @@ function parseMetadataToken(token: string, rowIndex: number, columnIndex: number
   };
 }
 
-function utf8ByteLength(value: string): number {
+export function utf8ByteLength(value: string): number {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);

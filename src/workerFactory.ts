@@ -242,6 +242,7 @@ interface WorkerMethods {
   ): Promise<ColumnDropTableState>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
   fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult>;
+  prepareCellHelpers(): Promise<boolean>;
   fetchSchema(): Promise<SchemaSnapshot>;
   getTableInfo(table: string): Promise<ColumnMetadata[]>;
   getPragmas(): Promise<Record<string, CellValue>>;
@@ -291,6 +292,7 @@ const WORKER_METHOD_NAMES = [
   'addColumn',
   'fetchTableData',
   'fetchTableCount',
+  'prepareCellHelpers',
   'fetchSchema',
   'getTableInfo',
   'getPragmas',
@@ -803,6 +805,7 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.fetchTableData(table, options),
         fetchTableCount: (table: string, options: TableCountOptions) =>
           endpoint.fetchTableCount(table, options),
+        prepareCellHelpers: () => endpoint.prepareCellHelpers(),
         fetchSchema: () =>
           endpoint.fetchSchema(),
         getTableInfo: (table: string) =>
@@ -1292,6 +1295,7 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.fetchTableData(table, options),
           fetchTableCount: (table: string, options: TableCountOptions) =>
             workerProxy.fetchTableCount(table, options),
+          prepareCellHelpers: () => workerProxy.prepareCellHelpers(),
           fetchSchema: () =>
             workerProxy.fetchSchema(),
           getTableInfo: (table: string) =>

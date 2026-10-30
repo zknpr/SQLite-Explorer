@@ -1062,6 +1062,10 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().fetchTableData(table, options);
     },
 
+    async prepareCellHelpers(): Promise<boolean> {
+      return requireEngine().prepareCellHelpers();
+    },
+
     async fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult> {
       return requireEngine().fetchTableCount(table, options);
     },

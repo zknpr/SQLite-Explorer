@@ -468,6 +468,13 @@ export interface DatabaseOperations {
     operation: (snapshotOperations: DatabaseOperations) => Promise<T>
   ): Promise<T>;
 
+  /**
+   * Whether the runtime's cell helpers can be called on this connection and
+   * read its TEXT as stored, which holds only for a UTF-8 database. The
+   * native engine loads them on first use.
+   */
+  prepareCellHelpers?(): Promise<boolean>;
+
   /** Execute one bounded SELECT or its query plan; never a write/script. */
   executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, signal?: AbortSignal): Promise<QueryResultSet>;
 

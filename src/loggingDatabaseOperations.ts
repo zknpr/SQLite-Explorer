@@ -522,6 +522,10 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         return this.wrapped.fetchTableCount(table, options);
     }
 
+    async prepareCellHelpers(): Promise<boolean> {
+        return await this.wrapped.prepareCellHelpers?.() ?? false;
+    }
+
     async fetchSchema(): Promise<SchemaSnapshot> {
         return this.logAndDelegate(`Fetching schema`, false, 'fetchSchema');
     }

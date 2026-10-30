@@ -30,6 +30,7 @@ import {
   isReadOnlyPrimaryKeyRecordId
 } from './core/row-identity';
 import { runReadSnapshot } from './core/operation-serializer';
+import { utf8ByteLength } from './core/cell-containment';
 import { ROWID_TABLE_AUTHORITY_SQL } from './core/integer-utils';
 
 /**
@@ -186,6 +187,7 @@ function buildCellProjection(
   columns: readonly string[],
   inlineBytes: number,
   includeInlineBlobs: boolean,
+  plainTextCells: boolean,
   sourceAlias?: string
 ): string {
   const qualifier = sourceAlias ? `${escapeIdentifier(sourceAlias)}.` : '';
@@ -196,14 +198,22 @@ function buildCellProjection(
     // One ASCII envelope per source column keeps even SQLite's 2,000-column
     // maximum exportable. Hex protects raw TEXT bytes (including malformed
     // database encodings) without asking the JS transport to decode them.
+    // With the runtime's cell helpers on a UTF-8 database, TEXT the helper
+    // has checked as plain UTF-8 travels as SQLite's own text instead.
+    const hexText =
+      `'t:' || CAST(${byteLength} AS TEXT) || ':' || ` +
+      `CASE WHEN ${byteLength} <= ${inlineBytes} ` +
+      `THEN hex(CAST(${escaped} AS BLOB)) ELSE '' END `;
     return (
       `CASE ${storageClass} ` +
       `WHEN 'null' THEN 'n:0:' ` +
       `WHEN 'integer' THEN 'i:0:' || CAST(${escaped} AS TEXT) ` +
       `WHEN 'real' THEN 'r:0:' || printf('%!.17g', ${escaped}) ` +
-      `WHEN 'text' THEN 't:' || CAST(${byteLength} AS TEXT) || ':' || ` +
-      `CASE WHEN ${byteLength} <= ${inlineBytes} ` +
-      `THEN hex(CAST(${escaped} AS BLOB)) ELSE '' END ` +
+      `WHEN 'text' THEN ` +
+      (plainTextCells
+        ? `CASE WHEN sqlite_explorer_cell_text_check(${escaped}, ${inlineBytes}) IS NULL ` +
+          `THEN 'T:' || CAST(${byteLength} AS TEXT) || ':' || ${escaped} ELSE ${hexText}END `
+        : hexText) +
       `WHEN 'blob' THEN 'b:' || CAST(${byteLength} AS TEXT) || ':' || ` +
       (includeInlineBlobs
         ? `CASE WHEN ${byteLength} <= ${inlineBytes} THEN hex(${escaped}) ELSE '' END `
@@ -283,7 +293,7 @@ function parsePackedCell(
       ? 'integer'
       : storageCode === 'r'
         ? 'real'
-        : storageCode === 't'
+        : storageCode === 't' || storageCode === 'T'
           ? 'text'
           : storageCode === 'b'
             ? 'blob'
@@ -313,7 +323,12 @@ function parsePackedCell(
       throw new Error(`SQLite returned invalid REAL text for ${context}`);
     }
   } else if (storageClass === 'text') {
-    if (sourceBytes <= inlineBytes) {
+    if (storageCode === 'T') {
+      if (sourceBytes > inlineBytes || utf8ByteLength(payload) !== sourceBytes) {
+        throw new Error(`SQLite returned invalid plain TEXT for ${context}`);
+      }
+      value = payload;
+    } else if (sourceBytes <= inlineBytes) {
       const bytes = decodePackedHex(payload, sourceBytes, context);
       try {
         value = strictTextDecoder(textEncoding).decode(bytes);
@@ -443,6 +458,7 @@ async function* readRowIdTableRows(
   columns: readonly string[],
   selectedRowIds: readonly RecordId[],
   textEncoding: CellTextEncoding,
+  plainTextCells: boolean,
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
   if (columns.length > SQLITE_MAX_RESULT_COLUMNS) {
@@ -453,7 +469,7 @@ async function* readRowIdTableRows(
     EXPORT_ROW_BATCH_SIZE
   );
   const inlineBytes = projectionPlan.inlineBytes;
-  const projection = buildCellProjection(columns, inlineBytes, false);
+  const projection = buildCellProjection(columns, inlineBytes, false, plainTextCells);
   const includeRowIdInProjection = columns.length < SQLITE_MAX_RESULT_COLUMNS;
   const selectedPredicates = selectedRowIds.length > 0
     ? buildRecordIdentityPredicateChunks(
@@ -591,6 +607,7 @@ async function* readPrimaryKeyTableRows(
   identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
   selectedRowIds: readonly RecordId[],
   textEncoding: CellTextEncoding,
+  plainTextCells: boolean,
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
   if (columns.length > SQLITE_MAX_RESULT_COLUMNS) {
@@ -601,7 +618,7 @@ async function* readPrimaryKeyTableRows(
     EXPORT_ROW_BATCH_SIZE
   );
   const inlineBytes = projectionPlan.inlineBytes;
-  const projection = buildCellProjection(columns, inlineBytes, false);
+  const projection = buildCellProjection(columns, inlineBytes, false, plainTextCells);
   if (selectedRowIds.length > 0) {
     const seen = new Set<string>();
     const uniqueRowIds: RecordId[] = [];
@@ -646,6 +663,7 @@ async function* readPrimaryKeyTableRows(
             columns,
             selectedInlineBytes,
             false,
+            plainTextCells,
             SELECTED_PK_SOURCE_ALIAS
           );
           const result = await operations.executeQuery(
@@ -695,6 +713,7 @@ async function* readPrimaryKeyTableRows(
             columns,
             selectedInlineBytes,
             false,
+            plainTextCells,
             SELECTED_PK_SOURCE_ALIAS
           );
           const values = await operations.executeQuery(
@@ -1010,14 +1029,10 @@ async function* readUnstableRows(
   table: string,
   columns: readonly string[],
   textEncoding: CellTextEncoding,
+  plainTextCells: boolean,
   includeInlineBlobs: boolean,
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
-  const projection = buildCellProjection(
-    columns,
-    UNSTABLE_CELL_INLINE_BYTES,
-    includeInlineBlobs
-  );
   if (
     operations.openQueryReadSession
     && operations.readQueryRows
@@ -1027,18 +1042,20 @@ async function* readUnstableRows(
       operations,
       table,
       columns,
-      projection,
+      buildCellProjection(columns, UNSTABLE_CELL_INLINE_BYTES, includeInlineBlobs, plainTextCells),
       textEncoding,
       includeInlineBlobs,
       cancellation
     );
     return;
   }
+  // The native engine builds the spool on its second connection, which does
+  // not load the runtime's cell helpers.
   yield* readUnstableSpoolRows(
     operations,
     table,
     columns,
-    projection,
+    buildCellProjection(columns, UNSTABLE_CELL_INLINE_BYTES, includeInlineBlobs, false),
     textEncoding,
     includeInlineBlobs,
     cancellation
@@ -1052,6 +1069,7 @@ function readRows(
   identity: TableIdentity | undefined,
   selectedRowIds: readonly RecordId[],
   textEncoding: CellTextEncoding,
+  plainTextCells: boolean,
   includeUnstableInlineBlobs: boolean,
   cancellation?: ExportCancellation
 ): AsyncGenerator<ExportRow> {
@@ -1062,6 +1080,7 @@ function readRows(
       columns,
       selectedRowIds,
       textEncoding,
+      plainTextCells,
       cancellation
     );
   }
@@ -1073,6 +1092,7 @@ function readRows(
       identity,
       selectedRowIds,
       textEncoding,
+      plainTextCells,
       cancellation
     );
   }
@@ -1081,6 +1101,7 @@ function readRows(
     table,
     columns,
     textEncoding,
+    plainTextCells,
     includeUnstableInlineBlobs,
     cancellation
   );
@@ -1735,6 +1756,8 @@ export async function streamTableExport(
     const columns = await resolveColumns(snapshotOperations, table, requestedColumns);
     const identity = await resolveIdentity(snapshotOperations, table);
     const textEncoding = await resolveTextEncoding(snapshotOperations);
+    const plainTextCells = textEncoding === 'utf-8'
+      && await snapshotOperations.prepareCellHelpers?.() === true;
     const selectedRowIds = options.rowIds ?? [];
     const containsPrimaryKeyIds = selectedRowIds.some(isPrimaryKeyRecordId);
     if (containsPrimaryKeyIds && !selectedRowIds.every(isPrimaryKeyRecordId)) {
@@ -1760,6 +1783,7 @@ export async function streamTableExport(
       identity,
       selectedRowIds,
       textEncoding,
+      plainTextCells,
       format !== 'csv' && format !== 'excel',
       cancellation
     );

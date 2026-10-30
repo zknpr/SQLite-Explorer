@@ -810,6 +810,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     return normalizeCellTextEncoding(encoding);
   }
 
+  async prepareCellHelpers(): Promise<boolean> {
+    return this.cellHelpersApply();
+  }
+
   /**
    * The cell helpers read TEXT as stored, which is UTF-8 only in a UTF-8
    * database. Missing helpers are logged at construction, another encoding

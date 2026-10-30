@@ -13,7 +13,9 @@ import { createNativeDatabaseConnection, NativeWorkerProcess } from '../../src/n
 import { buildCellContainmentQuery } from '../../src/core/cell-containment';
 import { buildExactNumericTextQuery } from '../../src/core/integer-utils';
 import { prepareReadQuery, SQL_RESULT_BYTES, SQL_RESULT_ROWS } from '../../src/core/sql-workspace';
-import type { CellValue, DatabaseOperations, QueryResultSet, TableQueryOptions } from '../../src/core/types';
+import type { CellValue, DatabaseOperations, ExportOptions, QueryResultSet, TableQueryOptions } from '../../src/core/types';
+import { streamTableExport } from '../../src/tableExportStreaming';
+import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
 
 // The runtime's grid cell helpers (src/runtime/query-plan.c) replace per-cell
 // SQL in grid pages and query console results. These tests hold them to the
@@ -530,6 +532,104 @@ for (const backendName of ['wasm', 'native'] as const) {
                 }
                 assert.ok(Object.keys(first.sqlResult.oversizedCells ?? {}).length > 0, 'the query clips cells');
                 assert.equal(backend.logs.filter(line => line.includes('read UTF-8 only')).length, 1, backend.logs.join('\n'));
+            } finally {
+                backend.dispose();
+            }
+        });
+    });
+}
+
+// Exports send TEXT the helper checked as plain UTF-8 as SQLite's own text and
+// keep hex for the rest. Values past the inline window stream through cell
+// read sessions in both arms.
+const EXPORT_FIXTURE_SQL = [
+    FIXTURE_SQL,
+    'CREATE TABLE long_text (id INTEGER PRIMARY KEY, t TEXT)',
+    "INSERT INTO long_text VALUES (1, printf('%.*c', 20000, 'a')), (2, printf('%.*c', 10000, 'é')), " +
+    "(3, CAST(x'80' || printf('%.*c', 20000, 'a') AS TEXT)), (4, printf('%.*c', 15000, 'b') || CAST(x'00' AS TEXT) || 'c'), " +
+    "(5, 'short')"
+].join(';\n');
+
+const EXPORT_PK_COLUMNS = [{ identifier: 'k', declaredType: 'TEXT', position: 1 }];
+const EXPORTS: Array<[string, string, string[], Partial<ExportOptions>]> = [
+    ['a rowid table', 't', ['id', 'label', 't', 'b', 'r', 'i', 'u'], {}],
+    ['selected rowid rows', 't', ['id', 't', 'u'], { rowIds: [3, 1, 20, 400] }],
+    ['a WITHOUT ROWID table', 'p', ['k', 'v'], {}],
+    ['selected WITHOUT ROWID rows', 'p', ['k', 'v'], {
+        rowIds: ['41', 'c3a9', 'f09f9880', '00'].map(hex => encodePrimaryKeyRecordId(EXPORT_PK_COLUMNS, [hex === '00' ? '\0' : Buffer.from(hex, 'hex').toString('utf8')]))
+    }],
+    ['an identityless view', 'vt', ['label', 't', 'b'], {}],
+    ['streamed long TEXT', 'long_text', ['id', 't'], {}]
+];
+
+/** Record the export's statements, including those inside its read snapshot. */
+function recordStatements(operations: DatabaseOperations, statements: string[]): DatabaseOperations {
+    return new Proxy(operations, {
+        get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver);
+            if (typeof value !== 'function') return value;
+            if (property === 'executeQuery' || property === 'openQueryReadSession') {
+                return (sql: string, ...rest: unknown[]) => { statements.push(sql); return value.call(target, sql, ...rest); };
+            }
+            if (property === 'runReadSnapshot') {
+                return (operation: (snapshot: DatabaseOperations) => Promise<unknown>) => value.call(
+                    target, (snapshot: DatabaseOperations) => operation(recordStatements(snapshot, statements)));
+            }
+            return value.bind(target);
+        }
+    });
+}
+
+async function exportOnce(backend: PageBackend, helpers: boolean, table: string, columns: string[], options: Partial<ExportOptions>) {
+    backend.setHelpers(helpers);
+    const statements: string[] = [];
+    const chunks: Buffer[] = [];
+    const sink = {
+        write: async (chunk: string) => { chunks.push(Buffer.from(chunk, 'utf8')); },
+        writeBytes: async (bytes: Uint8Array) => { chunks.push(Buffer.from(bytes)); }
+    };
+    const rows = await streamTableExport(recordStatements(backend.ops, statements), table, columns,
+        { header: true, includeTableName: true, ...options } as ExportOptions, sink);
+    return { rows, output: Buffer.concat(chunks), usedHelpers: statements.some(sql => sql.includes('sqlite_explorer_cell_text_check')) };
+}
+
+for (const backendName of ['wasm', 'native'] as const) {
+    describe(`${backendName} table exports with and without the cell helpers`, () => {
+        for (const [label, table, columns, options] of EXPORTS) {
+            it(`match for ${label}`, async (context) => {
+                if (backendName === 'native' && !bundledNativeBinary()) {
+                    context.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
+                    return;
+                }
+                const backend = await openBackend[backendName](await buildImage(EXPORT_FIXTURE_SQL));
+                try {
+                    for (const format of ['csv', 'excel', 'json', 'sql'] as const) {
+                        const sqlExport = await exportOnce(backend, false, table, columns, { ...options, format });
+                        const helperExport = await exportOnce(backend, true, table, columns, { ...options, format });
+                        assert.equal(sqlExport.usedHelpers, false);
+                        // The native engine spools views on its second connection, which has no helpers.
+                        assert.equal(helperExport.usedHelpers, !(backendName === 'native' && table === 'vt'), format);
+                        assert.ok(sqlExport.rows > 0, format);
+                        assert.equal(helperExport.rows, sqlExport.rows, format);
+                        assert.ok(helperExport.output.equals(sqlExport.output), `${format} output differs`);
+                    }
+                } finally {
+                    backend.dispose();
+                }
+            });
+        }
+
+        it('keep hex TEXT for a UTF-16 database', async (context) => {
+            if (backendName === 'native' && !bundledNativeBinary()) {
+                context.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
+                return;
+            }
+            const backend = await openBackend[backendName](await buildImage(ROWID_FIXTURE_SQL, 'UTF-16le'));
+            try {
+                const sqlExport = await exportOnce(backend, false, 't', ['id', 't'], { format: 'json' });
+                const helperExport = await exportOnce(backend, true, 't', ['id', 't'], { format: 'json' });
+                assert.equal(helperExport.usedHelpers, false);
+                assert.ok(helperExport.output.equals(sqlExport.output));
             } finally {
                 backend.dispose();
             }

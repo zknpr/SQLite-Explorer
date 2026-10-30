@@ -4610,6 +4610,8 @@ export async function createNativeDatabaseConnection(
           }
         },
 
+        prepareCellHelpers: async () => (await prepareNativeCellHelpers()).cellHelpers,
+
         /**
          * Fetch table row count.
          */
