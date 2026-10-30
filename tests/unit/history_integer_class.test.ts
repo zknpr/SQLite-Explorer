@@ -8,6 +8,8 @@ import * as vscode from 'vscode';
 
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { createNativeDatabaseConnection, isNativeAvailable } from '../../src/nativeWorker';
+import { runReadSnapshot } from '../../src/core/operation-serializer';
+import { importRowsAtomically, parseImport } from '../../src/core/bulk-import';
 import type { DatabaseOperations } from '../../src/core/types';
 
 // INTEGER values past int32, as millisecond timestamps are, in columns whose
@@ -93,6 +95,51 @@ describe('INTEGER past int32 and REAL -0.0 history', () => {
         try {
             const { databaseOps } = await native.establishConnection(vscode.Uri.file(file), 'history-integer-class', false);
             await assertIntegerHistory(databaseOps);
+        } finally {
+            native.workerMethods[Symbol.dispose]();
+            fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        }
+    });
+});
+
+/** A JSON integer past int32 imports as INTEGER, as SQLite stores the literal. */
+async function assertImportedIntegers(ops: DatabaseOperations) {
+    await ops.executeQuery('CREATE TABLE imported (id INTEGER PRIMARY KEY, a, b TEXT, c REAL)');
+    const rows = parseImport('[{"a": 1730000000000, "b": 1730000000000, "c": 1730000000000}, {"a": 7, "b": 7, "c": 0.5}]', 'json').rows;
+    const modification = await runReadSnapshot(ops, tx => importRowsAtomically(tx, 'imported', rows, 64 * 1024 * 1024));
+    const read = async () => (await ops.executeQuery(
+        'SELECT typeof(a) AS ta, CAST(a AS TEXT) AS va, typeof(b) AS tb, b AS vb, typeof(c) AS tc FROM imported ORDER BY id'
+    ))[0].rows;
+    const expected = [['integer', '1730000000000', 'text', '1730000000000', 'real'], ['integer', '7', 'text', '7', 'real']];
+    assert.deepEqual(await read(), expected);
+    await ops.undoModification(modification);
+    await ops.redoModification(modification);
+    assert.deepEqual(await read(), expected);
+}
+
+describe('JSON import of integers past int32', () => {
+    it('stores INTEGER on WebAssembly', async () => {
+        const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+        try {
+            await assertImportedIntegers(engine);
+        } finally {
+            engine.shutdown();
+        }
+    });
+
+    it('stores INTEGER on the native engine', async (context) => {
+        if (!await isNativeAvailable(process.cwd())) {
+            if (process.env.FUZZ_EXPECT_TARGET) throw new Error(`Missing native runtime for ${process.env.FUZZ_EXPECT_TARGET}`);
+            return context.skip('Bundled native runtime unavailable');
+        }
+        fs.mkdirSync('.tmp', { recursive: true });
+        const directory = fs.mkdtempSync(path.resolve('.tmp/history-integer-import-'));
+        const file = path.join(directory, 'import.db');
+        fs.closeSync(fs.openSync(file, 'w'));
+        const native = await createNativeDatabaseConnection(vscode.Uri.file(process.cwd()));
+        try {
+            const { databaseOps } = await native.establishConnection(vscode.Uri.file(file), 'history-integer-import', false);
+            await assertImportedIntegers(databaseOps);
         } finally {
             native.workerMethods[Symbol.dispose]();
             fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

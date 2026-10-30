@@ -65,7 +65,8 @@ const EXPECTED = [
     [2, 'real', '3000000000.0', 'real', '1.25', 'text', "'9'"],
     [3, 'integer', '28', 'real', '2.5', 'text', "'7'"],
     [4, 'integer', '28', 'real', '2.5', 'text', "'7'"],
-    [5, 'real', '3000000000.0', 'integer', '1', 'text', "'8'"],
+    // Imports bind whole numbers past int32 as INTEGER (bindIntegersExactly).
+    [5, 'integer', '3000000000', 'integer', '1', 'text', "'8'"],
     [6, 'integer', '29', 'real', '3.5', 'text', "'11'"],
     [7, 'integer', '28', 'real', '2.333333333333333', 'null', 'NULL'],
     [3000000000, 'integer', '29', 'null', 'NULL', 'text', "'11'"],

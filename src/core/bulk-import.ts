@@ -166,6 +166,22 @@ export function mapImportRows(data: ImportData, targets: Array<string | undefine
     ))));
 }
 
+/**
+ * A JSON integer past int32 reaches SQLite as a double on both engines, which
+ * a column without INTEGER affinity keeps as REAL (and TEXT as '….0'). As a
+ * BigInt it binds as INTEGER, as SQLite stores the same literal.
+ */
+function bindIntegersExactly(row: Record<string, CellValue>): Record<string, CellValue> {
+    let copy: Record<string, CellValue> | undefined;
+    for (const [column, value] of Object.entries(row)) {
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value !== (value | 0)) {
+            copy ??= { ...row };
+            copy[column] = BigInt(value);
+        }
+    }
+    return copy ?? row;
+}
+
 /** The snapshot helper owns the connection queue and a rollback-capable SAVEPOINT. */
 export async function importRowsAtomically(
     operations: DatabaseOperations, table: string, rows: Record<string, CellValue>[],
@@ -196,7 +212,7 @@ export async function importRowsAtomically(
                 batchBytes += rowBytes;
                 end++;
             }
-            const batch = rows.slice(completed, end);
+            const batch = rows.slice(completed, end).map(bindIntegersExactly);
             const snapshots = await transaction.insertRowsWithHistory(table, batch, DEFAULT_MAX_CELL_EDIT_BYTES, maxUndoBytes - historyBytes);
             if (snapshots.length !== batch.length) throw new Error('Backend returned incomplete import history.');
             for (const snapshot of snapshots) {
