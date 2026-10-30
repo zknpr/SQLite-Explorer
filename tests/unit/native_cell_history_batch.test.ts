@@ -4,10 +4,21 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { it, type TestContext } from 'node:test';
+import { after, it, type TestContext } from 'node:test';
 import * as vscode from 'vscode';
 import { createNativeDatabaseConnection, isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import type { ModificationEntry } from '../../src/core/types';
+
+// Windows holds a database file for a moment after its worker is stopped, and
+// a throwing t.after hook skips the hooks behind it. Removing a directory in
+// the same hook as its worker's disposal would leave a test's later workers
+// running and the process would never exit, so directories go last, here.
+const directories: string[] = [];
+after(() => {
+  for (const directory of directories) {
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
 
 async function fixture(t: TestContext, rows = 300) {
   const root = process.cwd();
@@ -17,6 +28,7 @@ async function fixture(t: TestContext, rows = 300) {
   }
   fs.mkdirSync(path.join(root, '.tmp'), { recursive: true });
   const directory = fs.mkdtempSync(path.join(root, '.tmp', 'native-history-batch-'));
+  directories.push(directory);
   const file = path.join(directory, 'history.sqlite');
   const seed = new DatabaseSync(file);
   try {
@@ -25,10 +37,7 @@ async function fixture(t: TestContext, rows = 300) {
       INSERT INTO items SELECT id, 'before-' || id, x'00FF' FROM rows`);
   } finally { seed.close(); }
   const bundle = await createNativeDatabaseConnection(vscode.Uri.file(root));
-  t.after(() => {
-    bundle.workerMethods[Symbol.dispose]();
-    fs.rmSync(directory, { recursive: true, force: true });
-  });
+  t.after(() => bundle.workerMethods[Symbol.dispose]());
   const { databaseOps: db } = await bundle.establishConnection(vscode.Uri.file(file), 'history.sqlite');
   const cells = await db.updateCellBatch('items', Array.from({ length: rows }, (_, index) => [
     { rowId: index + 1, column: 'value', value: index % 2 ? 9007199254740993n : null },
