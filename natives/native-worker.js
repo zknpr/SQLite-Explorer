@@ -2644,6 +2644,25 @@ async function handleRequest(request) {
         }
         const savepointName = ownsSavepoint
           ? `"sqlite_explorer_exec_batch_${++savepointCounter}"` : historySavepoint;
+        // A guarded replay reads changes() after every row. One prepared
+        // reader serves the batch; preparing one per row was most of its cost.
+        let changesReader;
+        const readBatchChanges = () => {
+          if (db.changes !== undefined) return readRunFallbackResult(db).changes;
+          changesReader ??= db.prepare('SELECT changes() AS c');
+          const row = changesReader.all()[0];
+          if (!row) throw new Error('Native SQLite did not return mutation metadata');
+          const changes = typeof row.c === 'bigint' ? Number(row.c) : row.c;
+          if (!Number.isSafeInteger(changes) || changes < 0) {
+            throw new Error('Native SQLite returned an invalid changes() count');
+          }
+          return changes;
+        };
+        const finalizeChangesReader = () => {
+          const reader = changesReader;
+          changesReader = undefined;
+          if (typeof reader?.finalize === 'function') reader.finalize();
+        };
         if (ownsSavepoint) db.exec(`SAVEPOINT ${savepointName}`);
         try {
           for (const item of items) {
@@ -2653,7 +2672,7 @@ async function handleRequest(request) {
              }
              const assertChanges = () => {
                  if (item.expectedChanges !== undefined
-                   && readRunFallbackResult(db).changes !== item.expectedChanges) {
+                   && readBatchChanges() !== item.expectedChanges) {
                      throw new Error(`Guarded batch expected ${item.expectedChanges} changed row(s); cell history was not applied`);
                  }
              };
@@ -2673,10 +2692,12 @@ async function handleRequest(request) {
                  assertChanges();
              }
           }
+          finalizeChangesReader();
           if (ownsSavepoint) db.exec(`RELEASE SAVEPOINT ${savepointName}`);
           result = { success: true };
         } catch (err) {
           try {
+            finalizeChangesReader();
             db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
             if (ownsSavepoint) db.exec(`RELEASE SAVEPOINT ${savepointName}`);
           } catch (rollbackErr) {

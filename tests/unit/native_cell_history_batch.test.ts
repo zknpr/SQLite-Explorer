@@ -68,7 +68,8 @@ it('replays exact native cell batches without per-row IPC and respects an outer 
 it('rolls earlier history chunks back when a late cell was changed or deleted', async t => {
   for (const direction of ['undo', 'redo'] as const) {
     for (const conflict of ['changed', 'deleted'] as const) {
-      const f = await fixture(t); if (!f) return;
+      // Past 1,024 rows, so the conflict lands in a later chunk.
+      const f = await fixture(t, 2100); if (!f) return;
       if (direction === 'redo') await f.db.undoModification(f.modification);
       await f.db.executeQuery(conflict === 'changed'
         ? `UPDATE items SET value = 'external' WHERE id = ${f.rows}`
@@ -80,6 +81,34 @@ it('rolls earlier history chunks back when a late cell was changed or deleted', 
       assert.deepEqual(await f.read(), beforeAttempt, `${direction}/${conflict} must be atomic`);
     }
   }
+});
+
+it('splits a rowid replay by its values\' bytes as well as its rows', async t => {
+  const f = await fixture(t, 1); if (!f) return;
+  const mib = (fill: number) => new Uint8Array(1024 * 1024).fill(fill);
+  await f.db.executeQuery('CREATE TABLE big(id INTEGER PRIMARY KEY, v BLOB)');
+  for (let id = 1; id <= 24; id++) await f.db.executeQuery('INSERT INTO big VALUES (?, ?)', [id, mib(id)]);
+  const read = async () => (await f.db.executeQuery('SELECT id, length(v), hex(substr(v, 1, 1)) FROM big ORDER BY id'))[0].rows;
+  const before = await read();
+  const cells = await f.db.updateCellBatch('big', Array.from({ length: 24 }, (_, index) => (
+    { rowId: index + 1, column: 'v', value: mib(200 + index) }
+  )));
+  const after = await read();
+  const originalCall = NativeWorkerProcess.prototype.call;
+  let execBatches = 0;
+  t.mock.method(NativeWorkerProcess.prototype, 'call', function(this: NativeWorkerProcess, ...args: Parameters<typeof originalCall>) {
+    if (args[0] === 'execBatch') execBatches++;
+    return originalCall.apply(this, args);
+  });
+  const modification: ModificationEntry = {
+    modificationType: 'cell_update', targetTable: 'big', description: 'Large batch', affectedCells: cells
+  };
+  await f.db.undoModification(modification);
+  assert.deepEqual(await read(), before);
+  // 1 MiB per row against the 8 MiB response budget: three chunks of eight.
+  assert.equal(execBatches, 3);
+  await f.db.redoModification(modification);
+  assert.deepEqual(await read(), after);
 });
 
 it('validates post-write storage before committing a batched native replay', async t => {

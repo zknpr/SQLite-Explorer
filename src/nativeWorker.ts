@@ -2570,14 +2570,27 @@ export async function createNativeDatabaseConnection(
           // chunks. Identity moves and JSON merges still need ordered replay.
           if (groups.length > 1 && cells.every(cell => cell.operation !== 'json_patch'
             && (cell.newRowId === undefined || cell.newRowId === cell.rowId))) {
-            const chunkRows = 128;
-            for (let offset = 0; offset < groups.length; offset += chunkRows) {
-              const plans = groups.slice(offset, offset + chunkRows).map(([rowId, rowCells]) => {
+            // A rowid table's chunk is read in one statement each way, as
+            // updateCellBatch reads; a primary-key row is read by its own
+            // query. The history entry's own values keep each chunk's reads
+            // within the response budget.
+            const rowIdReads = identity.kind === 'rowid';
+            const maxChunkRows = rowIdReads ? 1024 : 128;
+            const stateBytes = (state: StoredCellState) => approximateParamBytes([state.rawTextBytes ?? state.value]);
+            for (let offset = 0; offset < groups.length;) {
+              let end = offset;
+              for (let bytes = 0; end < groups.length && end - offset < maxChunkRows; end++) {
+                bytes += groups[end][1].reduce((sum, cell) => (
+                  sum + Math.max(stateBytes(cell.priorState), stateBytes(cell.postState))
+                ), 0);
+                if (bytes > NATIVE_HISTORY_RESPONSE_BUDGET_BYTES && end > offset) break;
+              }
+              const plans = groups.slice(offset, end).map(([rowId, rowCells]) => {
                 const predicate = buildRecordIdentityPredicate(rowId, identity);
                 const expected = rowCells.map(cell => direction === 'undo' ? cell.postState : cell.priorState);
                 const target = rowCells.map(cell => direction === 'undo' ? cell.priorState : cell.postState);
                 return {
-                  rowCells, predicate, expected, target,
+                  rowId, rowCells, predicate, expected, target,
                   query: {
                     sql: `SELECT ${rowCells.map(cell => buildStoredCellStateProjection(cell.columnName)).join(', ')} `
                       + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
@@ -2585,24 +2598,49 @@ export async function createNativeDatabaseConnection(
                   }
                 };
               });
-              const assertStates = (result: NativeQueryBatchResult, target: boolean): void => {
-                if (result.results?.length !== plans.length) {
-                  throw new Error('Cell history batch returned incomplete results');
+              offset = end;
+              // Each plan's cells as [typeof, value] pairs, or undefined when
+              // its row is missing or not unique.
+              const readRows = async (): Promise<Array<CellValue[] | undefined>> => {
+                if (!rowIdReads) {
+                  const result = await worker.call<NativeQueryBatchResult>('queryBatch', [plans.map(plan => plan.query)]);
+                  if (result.results?.length !== plans.length) {
+                    throw new Error('Cell history batch returned incomplete results');
+                  }
+                  return result.results.map(item => (item.values?.length === 1 ? item.values[0] : undefined));
                 }
+                const columns = [...new Set(plans.flatMap(plan => plan.rowCells.map(cell => cell.columnName)))];
+                const rows = new Map<string, CellValue[]>();
+                for (const predicate of buildRecordIdentityPredicateChunks(plans.map(plan => plan.rowId), identity)) {
+                  const result = await worker.call<NativeQueryResult>('query', [
+                    `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} `
+                      + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+                    predicate.params
+                  ]);
+                  for (const row of result.values ?? []) rows.set(String(validateRowId(row[0] as RecordId)), row);
+                }
+                return plans.map(plan => {
+                  const row = rows.get(String(validateRowId(plan.rowId)));
+                  return row && plan.rowCells.flatMap(cell => {
+                    const index = columns.indexOf(cell.columnName);
+                    return [row[index * 2 + 1], row[index * 2 + 2]];
+                  });
+                });
+              };
+              const assertStates = (rows: Array<CellValue[] | undefined>, target: boolean): void => {
                 plans.forEach((plan, index) => {
-                  const rows = result.results[index].values;
+                  const row = rows[index];
                   const states = target ? plan.target : plan.expected;
-                  if (rows?.length !== 1 || !states.every((state, column) => storedCellStatesEqual(
+                  if (!row || !states.every((state, column) => storedCellStatesEqual(
                     state,
-                    parseStoredCellState(rows[0][column * 2], rows[0][column * 2 + 1],
+                    parseStoredCellState(row[column * 2], row[column * 2 + 1],
                       `${table}.${plan.rowCells[column].columnName}`, { textEncoding })
                   ))) {
                     throw new CellHistoryConflictError(table, plan.rowCells.map(cell => cell.columnName));
                   }
                 });
               };
-              const queries = plans.map(plan => plan.query);
-              assertStates(await worker.call<NativeQueryBatchResult>('queryBatch', [queries]), false);
+              assertStates(await readRows(), false);
               const batch: { sql: string; paramsList: CellValue[][]; expectedChanges: number }[] = [];
               for (const plan of plans) {
                 const writes = plan.target.map(state => buildStoredCellWrite(state));
@@ -2622,7 +2660,7 @@ export async function createNativeDatabaseConnection(
                 else batch.push({ sql, paramsList: [params], expectedChanges: 1 });
               }
               await worker.call('execBatch', [batch, savepointName]);
-              assertStates(await worker.call<NativeQueryBatchResult>('queryBatch', [queries]), true);
+              assertStates(await readRows(), true);
             }
             await releaseNativeSavepoint(savepointName);
             return;
