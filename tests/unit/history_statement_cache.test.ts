@@ -55,6 +55,13 @@ async function assertHistoryRoundTrip(ops: DatabaseOperations) {
     assert.deepStrictEqual(await contents(ops), empty);
     await ops.redoModification(modification);
     assert.deepStrictEqual(await contents(ops), imported);
+    // A late row changed outside history stops the whole undo, as itself.
+    await ops.executeQuery("UPDATE items SET note = 'external' WHERE id = 150");
+    await assert.rejects(ops.undoModification(modification), (error: Error & { code?: string }) => (
+        error.code === 'SQLITE_EXPLORER_ROW_HISTORY_CONFLICT'
+    ));
+    await ops.executeQuery("UPDATE items SET note = 'n/a' WHERE id = 150");
+    assert.deepStrictEqual(await contents(ops), imported);
     await ops.undoModification(modification);
     assert.deepStrictEqual(await contents(ops), empty);
 
@@ -68,6 +75,46 @@ async function assertHistoryRoundTrip(ops: DatabaseOperations) {
     assert.strictEqual((await contents(ops)).length, 40);
 }
 
+// New values rotate through every storage class, against priors that rotate
+// too, so replay generates more distinct UPDATE texts than a call keeps prepared.
+function newCellValue(index: number, columnIndex: number): CellValue {
+    const kinds: CellValue[] = [`n${index}_${columnIndex}`, index * 11 + columnIndex, index / 7 + columnIndex,
+        new Uint8Array([columnIndex, index & 0xff]), null];
+    return kinds[(index + 2 * columnIndex) % kinds.length];
+}
+
+async function assertCellHistoryRoundTrip(ops: DatabaseOperations, rowCount = 160) {
+    await ops.executeQuery(TABLE_SQL);
+    await runReadSnapshot(ops, tx => importRowsAtomically(tx, 'items', patternRows(rowCount), 64 * 1024 * 1024));
+    const before = await contents(ops);
+    const updates = Array.from({ length: rowCount }, (_, index) => COLUMNS.slice(0, 3).map((column, columnIndex) => (
+        { rowId: index + 1, column, value: newCellValue(index, columnIndex) }
+    ))).flat();
+    const affectedCells = await ops.updateCellBatch('items', updates);
+    const after = await contents(ops);
+    assert.notDeepStrictEqual(after, before);
+    const modification = { modificationType: 'cell_update' as const, targetTable: 'items', description: 'Batch edit', affectedCells };
+    await ops.undoModification(modification);
+    assert.deepStrictEqual(await contents(ops), before);
+    await ops.redoModification(modification);
+    assert.deepStrictEqual(await contents(ops), after);
+
+    // A conflict on a late row rolls the whole replay back, and the next
+    // replay, after the cell is restored, still runs.
+    const conflictIndex = [...Array(rowCount).keys()].reverse().find(index => typeof newCellValue(index, 0) === 'string')!;
+    await ops.executeQuery('UPDATE items SET c0 = ? WHERE id = ?', ['external', conflictIndex + 1]);
+    const external = await contents(ops);
+    // The conflict leaves the synchronous replay as itself, not as a query failure.
+    await assert.rejects(ops.undoModification(modification), (error: Error & { code?: string }) => (
+        error.code === 'SQLITE_EXPLORER_CELL_HISTORY_CONFLICT' && /changed outside SQLite Explorer history/i.test(error.message)
+    ));
+    assert.deepStrictEqual(await contents(ops), external);
+    await ops.executeQuery('UPDATE items SET c0 = ? WHERE id = ?', [newCellValue(conflictIndex, 0), conflictIndex + 1]);
+    assert.deepStrictEqual(await contents(ops), after);
+    await ops.undoModification(modification);
+    assert.deepStrictEqual(await contents(ops), before);
+}
+
 describe('batched row-history statements', () => {
     it('round-trip import, undo and redo past the statement cache on WebAssembly', async () => {
         const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
@@ -76,6 +123,43 @@ describe('batched row-history statements', () => {
         } finally {
             engine.shutdown();
         }
+    });
+
+    it('round-trip a cell batch\'s undo and redo past the statement cache on WebAssembly', async () => {
+        const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+        try {
+            await assertCellHistoryRoundTrip(engine);
+        } finally {
+            engine.shutdown();
+        }
+    });
+
+    it('prepare a WebAssembly cell batch\'s undo statements once per call, not once per row', async () => {
+        const counts: number[] = [];
+        for (const count of [50, 400]) {
+            const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+            const instance = (engine as unknown as { instance: { prepare(sql: string, ...rest: unknown[]): unknown } }).instance;
+            const prepare = instance.prepare.bind(instance);
+            let prepares = 0;
+            instance.prepare = (sql: string, ...rest: unknown[]) => { prepares++; return prepare(sql, ...rest); };
+            try {
+                await engine.executeQuery(TABLE_SQL);
+                await engine.executeQuery(
+                    `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${count}) ` +
+                    'INSERT INTO items (id, c0, c1) SELECT i, i, \'v\' || i FROM n'
+                );
+                const affectedCells = await engine.updateCellBatch('items', Array.from({ length: count }, (_, index) => (
+                    { rowId: index + 1, column: 'c1', value: `w${index}` }
+                )));
+                prepares = 0;
+                await engine.undoModification({ modificationType: 'cell_update', targetTable: 'items', description: 'Batch edit', affectedCells });
+                counts.push(prepares);
+            } finally {
+                engine.shutdown();
+            }
+        }
+        assert.strictEqual(counts[1], counts[0], `prepares grew with rows: ${counts}`);
+        assert.ok(counts[0] < 30, `prepares per call: ${counts[0]}`);
     });
 
     it('prepare a WebAssembly import\'s statements once per call, not once per row', async () => {
@@ -100,7 +184,7 @@ describe('batched row-history statements', () => {
         }
     });
 
-    it('round-trip import, undo and redo past the statement cache on the native engine', async (context) => {
+    it('round-trip an import and a cell batch past the statement cache on the native engine', async (context) => {
         const platformDir = process.platform === 'darwin'
             ? (process.arch === 'arm64' ? 'aarch64-macos' : 'x86_64-macos')
             : process.platform === 'linux'
@@ -117,6 +201,8 @@ describe('batched row-history statements', () => {
         try {
             const { databaseOps } = await native.establishConnection(vscode.Uri.file(file), 'history-statement-cache', false);
             await assertHistoryRoundTrip(databaseOps);
+            await databaseOps.executeQuery('DROP TABLE items');
+            await assertCellHistoryRoundTrip(databaseOps);
         } finally {
             native.workerMethods[Symbol.dispose]();
             fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

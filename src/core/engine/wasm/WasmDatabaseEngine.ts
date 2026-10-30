@@ -1566,7 +1566,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         cells.map(cell => cell.columnName),
         identity.kind === 'rowid'
       );
-      for (const [originalRowId, rowCells] of groups) {
+      const textEncoding = this.getCellTextEncoding();
+      // Each row restarts the deadline, as when its UPDATE was its own call.
+      this.withHistoryStatements(() => this.mapInDeadlineChunks(groups, ([originalRowId, rowCells]) => {
         const recordedNewRowIds = new Set(
           rowCells.map(cell => cell.newRowId ?? cell.rowId)
         );
@@ -1591,7 +1593,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           currentResult.rows[0][index * 2],
           currentResult.rows[0][index * 2 + 1],
           `${table}.${cell.columnName}`,
-          { textEncoding: this.getCellTextEncoding() }
+          { textEncoding }
         ));
         const targetStates = rowCells.map((cell, index) => {
           const expected = direction === 'undo' ? cell.postState : cell.priorState;
@@ -1627,7 +1629,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           state,
           wasmBindPlaceholder
         ));
-        await this.executeQuery(
+        this.runHistoryStatement(
           `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ` +
           `${rowCells.map((cell, index) => (
             `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`
@@ -1658,13 +1660,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             actualResult.rows[0][index * 2],
             actualResult.rows[0][index * 2 + 1],
             `${table}.${rowCells[index].columnName}`,
-            { textEncoding: this.getCellTextEncoding() }
+            { textEncoding }
           )
         ));
         if (!exactTarget) {
           throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
         }
-      }
+      }));
       await this.executeQuery(`RELEASE ${savepointName}`);
     } catch (error) {
       await this.safeRollbackSavepoint(savepointName, 'replayCellHistory');
@@ -3009,6 +3011,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           );
         }
         const deletedRows: DeletedRow[] = [];
+        const textEncoding = this.getCellTextEncoding();
         for (const predicate of predicates) {
           const current = this.queryRaw(
             `SELECT ${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
@@ -3025,7 +3028,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               row[index * 2],
               row[index * 2 + 1],
               `${table}.${column}`,
-              { textEncoding: this.getCellTextEncoding() }
+              { textEncoding }
             ));
             const deletedRowId = encodePrimaryKeyRecordId(
               identity.columns,
@@ -3086,6 +3089,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         );
       }
       const deletedRows: DeletedRow[] = [];
+      const textEncoding = this.getCellTextEncoding();
       for (const predicate of predicates) {
         const current = this.queryRaw(
           `SELECT CAST(rowid AS TEXT), ` +
@@ -3099,7 +3103,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             row[index * 2 + 1],
             row[index * 2 + 2],
             `${table}.${column}`,
-            { textEncoding: this.getCellTextEncoding() }
+            { textEncoding }
           ));
           const rowData: Record<string, CellValue> = Object.fromEntries(insertableColumns.map(
             (column, index) => [
@@ -3648,6 +3652,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
 
     const results: CellUpdateResult[] = [];
+    const textEncoding = this.getCellTextEncoding();
     for (const [rowId, rowUpdates] of updatesByRow) {
       const columns = [...new Set(rowUpdates.map(update => update.column))];
       if (columns.length !== rowUpdates.length) {
@@ -3667,7 +3672,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           current.rows[0][index * 2],
           current.rows[0][index * 2 + 1],
           `${table}.${update.column}`,
-          { textEncoding: this.getCellTextEncoding() }
+          { textEncoding }
         );
         const priorValue = priorState.value;
         const prepared = prepareCellUpdateForStorage(
@@ -3732,7 +3737,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             post.rows[0][index * 2],
             post.rows[0][index * 2 + 1],
             `${table}.${preparedUpdate.update.column}`,
-            { textEncoding: this.getCellTextEncoding() }
+            { textEncoding }
           ),
           operation: preparedUpdate.prepared.operation
         });
@@ -3794,6 +3799,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
 
       const results: CellUpdateResult[] = [];
+      const textEncoding = this.getCellTextEncoding();
       for (const [rowId, rowUpdates] of updatesByRow) {
         const oldPredicate = buildRecordIdentityPredicate(rowId, identity);
         const columns = [...new Set(rowUpdates.map(update => update.column))];
@@ -3814,7 +3820,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             current.rows[0][index * 2],
             current.rows[0][index * 2 + 1],
             `${table}.${update.column}`,
-            { textEncoding: this.getCellTextEncoding() }
+            { textEncoding }
           );
           const priorValue = priorState.value;
           const prepared = prepareCellUpdateForStorage(
@@ -3891,7 +3897,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               post.rows[0][index * 2],
               post.rows[0][index * 2 + 1],
               `${table}.${preparedUpdate.update.column}`,
-              { textEncoding: this.getCellTextEncoding() }
+              { textEncoding }
             ),
             operation: preparedUpdate.prepared.operation
           });
@@ -4429,6 +4435,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const columns = [...new Set(updates.map(update => update.column))];
       const rowIdPredicates = buildRecordIdentityPredicateChunks(rowIds, rowIdIdentity);
       const currentValues = new Map<string, Map<string, StoredCellState>>();
+      const textEncoding = this.getCellTextEncoding();
       for (const predicate of rowIdPredicates) {
         // History needs exact int64 values, not the display query conversion.
         const current = this.queryRaw(
@@ -4442,7 +4449,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             row[index * 2 + 1],
             row[index * 2 + 2],
             `${table}.${column}`,
-            { textEncoding: this.getCellTextEncoding() }
+            { textEncoding }
           )));
           currentValues.set(String(validateRowId(row[0] as RecordId)), values);
         }
@@ -4610,7 +4617,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             row[index * 2 + 1],
             row[index * 2 + 2],
             `${table}.${column}`,
-            { textEncoding: this.getCellTextEncoding() }
+            { textEncoding }
           )));
           postValues.set(String(validateRowId(row[0] as RecordId)), values);
         }
