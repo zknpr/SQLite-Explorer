@@ -501,7 +501,7 @@ describe('streamTableExport golden parity', () => {
                 sql.content,
                 'INSERT INTO "stage_e_golden" ("id", "name", "note", "payload", "nul", "nullable") ' +
                 'VALUES (1, \'Alice\', \'comma, "quote"\nline\', X\'000102fdfeff\', ' +
-                'CAST(X\'6265666f7265006166746572\' AS TEXT), NULL);\n' +
+                '(\'before\' || char(0) || \'after\'), NULL);\n' +
                 'INSERT INTO "stage_e_golden" ("id", "name", "note", "payload", "nul", "nullable") ' +
                 'VALUES (2, \'O\'\'Reilly 😀\', \'plain\', X\'\', \'ok\', 3.5);'
             );

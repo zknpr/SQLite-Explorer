@@ -130,8 +130,8 @@ describe('SQL Utils', () => {
     it('should securely handle NUL characters in strings', () => {
       const input = 'foo\0bar';
       const output = cellValueToSql(input);
-      // 'foo\0bar' -> 66 6f 6f 00 62 61 72
-      assert.strictEqual(output, "CAST(X'666f6f00626172' AS TEXT)");
+      // No raw NUL in the script; char(0) is TEXT in any database encoding.
+      assert.strictEqual(output, "('foo' || char(0) || 'bar')");
     });
   });
 

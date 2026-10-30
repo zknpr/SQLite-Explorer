@@ -1448,18 +1448,7 @@ async function inspectSqlText(
   return { representable, containsNul };
 }
 
-async function writeUtf8TextHex(
-  operations: DatabaseOperations,
-  input: ExportCellSession,
-  sink: AsyncExportSink,
-  cancellation?: ExportCancellation
-): Promise<void> {
-  const encoder = new TextEncoder();
-  await forEachDecodedText(operations, input, cancellation, async text => {
-    await emit(sink, Buffer.from(encoder.encode(text)).toString('hex'), cancellation);
-  });
-}
-
+/** Quoted SQL text, with each NUL closed out to char(0) as cellValueToSql writes it. */
 async function writeSqlQuotedText(
   operations: DatabaseOperations,
   input: ExportCellSession,
@@ -1467,7 +1456,7 @@ async function writeSqlQuotedText(
   cancellation?: ExportCancellation
 ): Promise<void> {
   await forEachDecodedText(operations, input, cancellation, async text => {
-    await emit(sink, text.replace(/'/g, "''"), cancellation);
+    await emit(sink, text.replace(/'/g, "''").replace(/\0/g, "' || char(0) || '"), cancellation);
   });
 }
 
@@ -1587,9 +1576,9 @@ async function writeSqlCell(
     if (!inspection.representable) {
       await writeUnrepresentableText(operations, input, sink, 'sql', cancellation);
     } else if (inspection.containsNul) {
-      await emit(sink, "CAST(X'", cancellation);
-      await writeUtf8TextHex(operations, input, sink, cancellation);
-      await emit(sink, "' AS TEXT)", cancellation);
+      await emit(sink, "('", cancellation);
+      await writeSqlQuotedText(operations, input, sink, cancellation);
+      await emit(sink, "')", cancellation);
     } else {
       await emit(sink, "'", cancellation);
       await writeSqlQuotedText(operations, input, sink, cancellation);

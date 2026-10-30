@@ -87,13 +87,12 @@ export function cellValueToSql(value: CellValue | undefined): string {
     return value.toString();
   }
   if (typeof value === 'string') {
-    // Check for NUL characters which are unsafe in SQL scripts
-    // If found, encode as hex blob and cast to TEXT
+    // A NUL is unsafe inside a SQL script. char(0) between quoted segments
+    // gives it back as TEXT in whatever encoding the target database uses;
+    // a CAST of hex bytes would be read as that encoding, so UTF-8 bytes
+    // replayed into a UTF-16 database would come back cut at the NUL.
     if (value.includes('\0')) {
-      const encoder = new TextEncoder();
-      const bytes = encoder.encode(value);
-      const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-      return `CAST(X'${hex}' AS TEXT)`;
+      return `(${value.split('\0').map(segment => `'${segment.replace(/'/g, "''")}'`).join(' || char(0) || ')})`;
     }
     // Escape single quotes by doubling them (SQL standard)
     return `'${value.replace(/'/g, "''")}'`;

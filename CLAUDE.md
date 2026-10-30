@@ -406,7 +406,7 @@ Settings in `package.json` → `contributes.configuration`:
 ### SQL Security
 - **LIKE wildcards**: User input in LIKE queries must use `escapeLikePattern()` with `ESCAPE '\\'` clause
 - **SQL types in DDL**: Always validate with `validateSqlType()` to prevent injection via malicious type strings
-- **NUL bytes**: Strings containing `\0` must be encoded as hex blobs in exported SQL
+- **NUL bytes**: Strings containing `\0` are written in exported SQL as quoted segments joined by `char(0)`, never as a raw NUL; a `CAST(X'..' AS TEXT)` would be read in the target database's encoding
 
 ### RPC Serialization
 - **Uint8Array becomes `{}`**: Never send raw Uint8Array via postMessage - use the marker format
