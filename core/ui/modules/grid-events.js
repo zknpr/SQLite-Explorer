@@ -140,11 +140,12 @@ function handleKeydown(event) {
     );
     if (interactiveControl) return;
 
-    // A key the cell branch handles, pressed while a window move parked focus
-    // on the container, acts on the parked cell.
+    // A key the cell branch handles, pressed while focus is on the container,
+    // acts on the cell a window move parked focus from, else on the tab stop.
     const cell = event.target?.closest?.('.data-cell')
         ?? (event.key.startsWith('Arrow') || event.key === ' ' || event.key === 'Enter'
             ? takeParkedGridFocus(event.target)
+                ?? (event.target === event.currentTarget ? focusGridTabStop() : null)
             : null);
     if (cell && !cell.classList.contains('row-number')) {
         if (state.isGridReloading && (event.key === ' ' || event.key === 'Enter')) {

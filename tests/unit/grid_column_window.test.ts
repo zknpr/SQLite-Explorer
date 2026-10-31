@@ -572,6 +572,10 @@ describe('grid column window', {
                 await page.evaluate(() => document.getElementById('gridContainer')!.scrollLeft),
                 8000
             );
+            // Focus is on the grid, so an arrow key moves from the tab stop.
+            assert.equal(await page.evaluate(() => document.activeElement?.id), 'gridContainer');
+            await page.keyboard.press('ArrowDown');
+            assert.deepEqual(await readFocus(page), { active: 'cell-1-3', tabstops: ['cell-1-3'] });
         } finally { await page.close(); }
     });
 
