@@ -393,6 +393,80 @@ describe('grid column window', {
         } finally { await page.close(); }
     });
 
+    async function scrollRowsTo(page: Page, top: number) {
+        await page.evaluate(async scrollTop => {
+            const container = document.getElementById('gridContainer')!;
+            container.scrollTop = scrollTop;
+            container.dispatchEvent(new Event('scroll'));
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        }, top);
+    }
+
+    function readFocus(page: Page) {
+        return page.evaluate(() => ({
+            active: document.activeElement?.id,
+            tabstops: [...document.querySelectorAll('#gridContainer [data-grid-tabstop="true"]')].map(td => td.id)
+        }));
+    }
+
+    it('keeps keyboard focus in the grid when scrolling takes the focused cell out of the window', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.locator('#cell-0-3').click();
+            await page.keyboard.press('ArrowRight');
+            await scrollTo(page, 8000);
+            assert.equal(await page.locator('#cell-0-4').count(), 0, 'the focused cell left the window');
+            assert.equal((await readFocus(page)).active, 'gridContainer');
+            await page.keyboard.press('ArrowDown');
+            assert.deepEqual(await readFocus(page), { active: 'cell-1-4', tabstops: ['cell-1-4'] });
+            assert.deepEqual(await uncoveredColumns(page), []);
+            const visible = await page.evaluate(() => {
+                const box = document.getElementById('gridContainer')!.getBoundingClientRect();
+                const cell = document.getElementById('cell-1-4')!.getBoundingClientRect();
+                return cell.left >= box.left && cell.right <= box.right;
+            });
+            assert.ok(visible, 'the arrow key brings the new cell into view');
+        } finally { await page.close(); }
+    });
+
+    it('gives focus back to the cell when scrolling builds it again', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.locator('#cell-0-3').click();
+            await page.keyboard.press('ArrowRight');
+            await scrollTo(page, 8000);
+            await scrollTo(page, 0);
+            assert.deepEqual(await readFocus(page), { active: 'cell-0-4', tabstops: ['cell-0-4'] });
+        } finally { await page.close(); }
+    });
+
+    it('keeps the tab stop on the last focused cell after focus left the grid', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.locator('#cell-0-3').click();
+            await page.keyboard.press('ArrowRight');
+            await scrollTo(page, 8000);
+            await page.locator('#filterInput').focus();
+            await scrollTo(page, 0);
+            assert.deepEqual(await readFocus(page), { active: 'filterInput', tabstops: ['cell-0-4'] });
+        } finally { await page.close(); }
+    });
+
+    it('keeps keyboard focus in the grid when the row window drops the focused row', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.locator('#cell-2-1').click();
+            await scrollRowsTo(page, 3000);
+            assert.equal(await page.locator('#row-2').count(), 0, 'the focused row left the window');
+            assert.equal((await readFocus(page)).active, 'gridContainer');
+            await page.keyboard.press('ArrowDown');
+            assert.deepEqual(await readFocus(page), { active: 'cell-3-1', tabstops: ['cell-3-1'] });
+            await scrollRowsTo(page, 3000);
+            await scrollRowsTo(page, 0);
+            assert.deepEqual(await readFocus(page), { active: 'cell-3-1', tabstops: ['cell-3-1'] });
+        } finally { await page.close(); }
+    });
+
     /** ARIA positions of the grid; cells keyed by header aria-colindex. */
     function readAriaPositions(page: Page) {
         return page.evaluate(() => {

@@ -186,6 +186,64 @@ let columnWindow = null;
 // window they cover.
 const windowedRowCells = new WeakMap();
 
+// The data cell whose keyboard focus a window move parked on the grid
+// container ({ rowIdx, colIdx }), or null.
+let parkedFocus = null;
+
+/**
+ * Focus inside an element a window move removes would fall to <body>, where
+ * grid keys no longer reach the grid. Park it on the grid container and
+ * remember the data cell: it gets focus back when a window builds it again
+ * or when a key needs it (takeParkedGridFocus).
+ */
+function parkFocusLeaving(element) {
+    const active = document.activeElement;
+    if (!active || active === document.body || !element.contains?.(active)) return;
+    const cell = active.closest?.('.data-cell');
+    parkedFocus = cell && !cell.classList.contains('row-number')
+        ? { rowIdx: Number(cell.dataset.rowidx), colIdx: Number(cell.dataset.colidx) }
+        : null;
+    const container = document.getElementById('gridContainer');
+    if (!container) return;
+    // A div takes script focus only with a tabindex; -1 keeps it out of Tab order.
+    if (!container.hasAttribute('tabindex')) container.tabIndex = -1;
+    container.focus?.({ preventScroll: true });
+}
+
+function restoreParkedFocus() {
+    if (!parkedFocus) return;
+    if (document.activeElement !== document.getElementById('gridContainer')) {
+        // Focus moved on since it was parked; there is nothing to give back.
+        parkedFocus = null;
+        return;
+    }
+    const cell = document.getElementById(`cell-${parkedFocus.rowIdx}-${parkedFocus.colIdx}`);
+    if (!cell) return;
+    parkedFocus = null;
+    cell.focus?.({ preventScroll: true });
+}
+
+/**
+ * When `target` is the grid container holding parked focus, build the parked
+ * cell (scrolling it into view), focus it and return it, so a key pressed
+ * while it was out of the window acts on it. Otherwise null.
+ */
+export function takeParkedGridFocus(target) {
+    if (!parkedFocus || target !== document.getElementById('gridContainer')) return null;
+    const { rowIdx, colIdx } = parkedFocus;
+    parkedFocus = null;
+    ensureGridCellMaterialized(rowIdx, colIdx);
+    const cell = document.getElementById(`cell-${rowIdx}-${colIdx}`);
+    cell?.focus?.({ preventScroll: true });
+    return cell;
+}
+
+/** The roving tab stop moved: cells the windows build later must carry it. */
+export function noteGridKeyboardTarget(rowIdx, colIdx) {
+    const ctx = (virtualWindow ?? columnWindow)?.ctx;
+    if (ctx) ctx.keyboardTarget = { rowIdx, colIdx };
+}
+
 function readViewportWidth(container) {
     const width = container ? container.clientWidth : undefined;
     return typeof width === 'number' && Number.isFinite(width) && width > 0
@@ -784,7 +842,9 @@ function renderWindowRows(vw, newStart, newEnd) {
         );
     }
     for (const [j, tr] of vw.windowRows) {
-        if (!newRows.has(j)) vw.tbody.removeChild(tr);
+        if (newRows.has(j)) continue;
+        parkFocusLeaving(tr);
+        vw.tbody.removeChild(tr);
     }
     // Overlapping rows already have the right order. Moving one with
     // insertBefore detaches its focused cell and sends keyboard events to
@@ -852,7 +912,9 @@ export function updateVirtualGridWindow() {
     // Columns first: rows the row window builds next take the new bounds.
     const columnsChanged = cw ? updateColumnWindow(cw, container) : false;
     const rowsChanged = vw ? updateRowWindow(vw, container) : false;
-    return columnsChanged || rowsChanged;
+    if (!columnsChanged && !rowsChanged) return false;
+    restoreParkedFocus();
+    return true;
 }
 
 function updateRowWindow(vw, container) {
@@ -912,7 +974,9 @@ function patchRowColumns(ctx, dyn, tr, entry, start, end) {
         : [];
     for (let position = entry.start; position < entry.end; position++) {
         if (position < keepStart || position >= keepEnd) {
-            tr.removeChild(entry.cells[position - entry.start]);
+            const td = entry.cells[position - entry.start];
+            parkFocusLeaving(td);
+            tr.removeChild(td);
         }
     }
     const before = [];
@@ -1054,6 +1118,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     // rebuild (or bail before rebuilding).
     virtualWindow = null;
     columnWindow = null;
+    parkedFocus = null;
 
     const headerHeight = GRID_HEADER_HEIGHT;
     const rowHeight = GRID_ROW_HEIGHT;

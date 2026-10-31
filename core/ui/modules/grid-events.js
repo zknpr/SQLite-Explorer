@@ -24,7 +24,12 @@ import {
 } from './grid-actions.js';
 import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
-import { ensureGridCellMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
+import {
+    ensureGridCellMaterialized,
+    noteGridKeyboardTarget,
+    scheduleVirtualGridUpdate,
+    takeParkedGridFocus
+} from './grid-render.js';
 import { revealGridCell } from './grid-reveal.js';
 import { validateRowId } from './utils.js';
 import { getOrderedColumnIndices, getOrderedRowIndices } from './data-utils.js';
@@ -134,7 +139,12 @@ function handleKeydown(event) {
     );
     if (interactiveControl) return;
 
-    const cell = event.target?.closest?.('.data-cell');
+    // A key the cell branch handles, pressed while a window move parked focus
+    // on the container, acts on the parked cell.
+    const cell = event.target?.closest?.('.data-cell')
+        ?? (event.key.startsWith('Arrow') || event.key === ' ' || event.key === 'Enter'
+            ? takeParkedGridFocus(event.target)
+            : null);
     if (cell && !cell.classList.contains('row-number')) {
         if (state.isGridReloading && (event.key === ' ' || event.key === 'Enter')) {
             event.preventDefault();
@@ -184,6 +194,7 @@ function setGridTabstop(cell, focus = true) {
     }
     cell.tabIndex = 0;
     cell.dataset.gridTabstop = 'true';
+    noteGridKeyboardTarget(Number(cell.dataset.rowidx), Number(cell.dataset.colidx));
     if (focus) cell.focus?.({ preventScroll: true });
 }
 

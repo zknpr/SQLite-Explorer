@@ -494,6 +494,12 @@ button.section-title:focus-visible,
     position: relative;
 }
 
+/* Focus parked here stands for a cell scrolled out of the rendered window,
+   which a full render would show no ring for either. */
+.grid-container:focus {
+    outline: none;
+}
+
 .data-grid {
     border-collapse: separate;
     border-spacing: 0;
