@@ -1408,9 +1408,11 @@ function replaceOversizedCellValue(
   const escapedTable = `main.${escapeCellIdentifier(table, 'table')}`;
   const escapedColumn = escapeCellIdentifier(column, 'column');
   const predicate = buildCellLocator(locator);
+  // OR ABORT overrides a schema ON CONFLICT clause, as every other write
+  // history records does: REPLACE would delete a row history never saw.
   executeStatement(
     connection,
-    `UPDATE ${escapedTable} SET ${escapedColumn} = ? ` +
+    `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = ? ` +
       `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
       `AND length(CAST(${escapedColumn} AS BLOB)) = ?`,
     [value, ...predicate.params, expected.storageClass, expected.byteLength]

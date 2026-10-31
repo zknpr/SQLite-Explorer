@@ -85,6 +85,20 @@ for (const backend of ['wasm', 'native'] as const) {
         });
     });
 
+    it(`${backend} replacing an oversized cell with a UNIQUE ON CONFLICT REPLACE duplicate fails and keeps the other row`, async () => {
+        const setup = "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT REPLACE, v TEXT); " +
+            "INSERT INTO t VALUES (1, 'x', 'keep'), (2, 'yyyyyyyyyyyy', 'other');";
+        await withBackend(backend, setup, async ops => {
+            const before = await rows(ops);
+            // An 8-byte edit limit makes the 12-byte value oversized.
+            await assert.rejects(
+                ops.replaceOversizedCell('t', 2, 'k', 'x', { storageClass: 'text', byteLength: 12 }, 8),
+                CONFLICT
+            );
+            assert.deepEqual(await rows(ops), before);
+        });
+    });
+
     it(`${backend} undoing a cell edit whose old value now collides fails and keeps the colliding row`, async () => {
         await withBackend(backend, UNIQUE_REPLACE, async ops => {
             const [cell] = await ops.updateCellBatch('t', [{ rowId: 2, column: 'k', value: 'w' }]);
