@@ -3,8 +3,8 @@ name: Native fuzz
 # Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/), the grid page
 # differential and the memory-map choice against the bundled native worker on
 # all five shipped txiki.js targets (CI's native lanes run on Linux x64 only). Opt-in: manual, or on dev pushes and pull requests to
-# dev that change the harness, the runtimes, the worker client it drives, the
-# toolchain or this workflow.
+# dev that change the harness, the runtimes, any source under src/ (the lanes
+# import most of it), the toolchain or this workflow.
 on:
   workflow_dispatch:
   push:
@@ -22,19 +22,10 @@ on:
       - 'tests/unit/native_cell_history_batch.test.ts'
       - 'tests/unit/native_history_shared_texts.test.ts'
       - 'tests/unit/fts_row_history.test.ts'
-      - 'src/core/cell-pack.ts'
-      - 'src/core/query-builder.ts'
-      - 'src/core/keyset-pagination.ts'
-      - 'src/core/engine/wasm/**'
-      - 'src/core/cell-history.ts'
-      - 'src/core/row-history.ts'
-      - 'src/core/bulk-import.ts'
-      - 'src/core/column-drop.ts'
-      - 'src/hostBridge.ts'
+      - 'src/**'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
-      - 'src/nativeWorker.ts'
       - 'package.json'
       - 'package-lock.json'
       - '.nvmrc'
@@ -54,19 +45,10 @@ on:
       - 'tests/unit/native_cell_history_batch.test.ts'
       - 'tests/unit/native_history_shared_texts.test.ts'
       - 'tests/unit/fts_row_history.test.ts'
-      - 'src/core/cell-pack.ts'
-      - 'src/core/query-builder.ts'
-      - 'src/core/keyset-pagination.ts'
-      - 'src/core/engine/wasm/**'
-      - 'src/core/cell-history.ts'
-      - 'src/core/row-history.ts'
-      - 'src/core/bulk-import.ts'
-      - 'src/core/column-drop.ts'
-      - 'src/hostBridge.ts'
+      - 'src/**'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
-      - 'src/nativeWorker.ts'
       - 'package.json'
       - 'package-lock.json'
       - '.nvmrc'
