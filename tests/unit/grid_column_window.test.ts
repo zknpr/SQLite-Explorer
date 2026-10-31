@@ -472,6 +472,109 @@ describe('grid column window', {
         } finally { await page.close(); }
     });
 
+    /** Tab from the filter box until focus enters the grid; the id or tag it lands on. */
+    async function tabIntoGrid(page: Page) {
+        await page.locator('#filterInput').focus();
+        for (let presses = 0; presses < 20; presses++) {
+            await page.keyboard.press('Tab');
+            const landed = await page.evaluate(() => {
+                const active = document.activeElement;
+                return document.getElementById('gridContainer')!.contains(active)
+                    ? (active!.id || active!.tagName)
+                    : null;
+            });
+            if (landed) return landed;
+        }
+        return null;
+    }
+
+    function cellInView(page: Page, id: string) {
+        return page.evaluate(cellId => {
+            const box = document.getElementById('gridContainer')!.getBoundingClientRect();
+            const cell = document.getElementById(cellId)?.getBoundingClientRect();
+            return !!cell && cell.left >= box.left && cell.right <= box.right
+                && cell.top >= box.top && cell.bottom <= box.bottom;
+        }, id);
+    }
+
+    it('tabs back to the last focused cell after scrolling took it out of the column window', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.locator('#cell-0-3').click();
+            await page.locator('#filterInput').focus();
+            await scrollTo(page, 8000);
+            assert.equal(await page.locator('#cell-0-3').count(), 0, 'the tab stop left the window');
+            assert.equal(await tabIntoGrid(page), 'cell-0-3');
+            assert.ok(await cellInView(page, 'cell-0-3'), 'Tab brings the cell into view');
+            assert.equal(
+                await page.evaluate(() => document.getElementById('gridContainer')!.tabIndex),
+                -1,
+                'the container gives up the tab stop once the cell is built'
+            );
+        } finally { await page.close(); }
+    });
+
+    it('tabs back to the last focused cell after scrolling took its row out of the window', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.locator('#cell-2-1').click();
+            await page.locator('#filterInput').focus();
+            await scrollRowsTo(page, 3000);
+            assert.equal(await page.locator('#row-2').count(), 0, 'the tab stop row left the window');
+            assert.equal(await tabIntoGrid(page), 'cell-2-1');
+            assert.ok(await cellInView(page, 'cell-2-1'), 'Tab brings the cell into view');
+        } finally { await page.close(); }
+    });
+
+    function containerTabIndex(page: Page) {
+        return page.evaluate(() => document.getElementById('gridContainer')!.tabIndex);
+    }
+
+    it('takes the tab stop off the container when another cell or a new render takes it', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.locator('#cell-0-3').click();
+            await page.locator('#filterInput').focus();
+            await scrollTo(page, 8000);
+            assert.equal(await containerTabIndex(page), 0, 'the container holds the tab stop');
+            const visibleCell = await page.evaluate(() => {
+                const container = document.getElementById('gridContainer')!.getBoundingClientRect();
+                return [...document.querySelectorAll<HTMLElement>('#row-1 td.data-cell:not(.row-number)')]
+                    .find(td => td.getBoundingClientRect().left > container.left + 100)!.id;
+            });
+            await page.locator(`#${visibleCell}`).click();
+            assert.equal(await containerTabIndex(page), -1, 'a clicked cell takes the tab stop back');
+
+            await page.locator('#filterInput').focus();
+            await scrollTo(page, 0);
+            assert.equal(await containerTabIndex(page), 0);
+            await page.evaluate(() => (window as any).__columnHarness.renderDataGrid());
+            assert.equal(await containerTabIndex(page), -1, 'a new render puts the tab stop on a built cell');
+        } finally { await page.close(); }
+    });
+
+    it('does not scroll to the tab stop when a click focuses empty grid area', async () => {
+        const page = await openGrid(300, 5);
+        try {
+            await page.locator('#cell-0-3').click();
+            await page.locator('#filterInput').focus();
+            await scrollTo(page, 8000);
+            assert.equal(await page.locator('#cell-0-3').count(), 0, 'the tab stop left the window');
+            const box = (await page.locator('#gridContainer').boundingBox())!;
+            const point = { x: box.x + box.width / 2, y: box.y + box.height - 30 };
+            assert.equal(
+                await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.id, point),
+                'gridContainer',
+                'the click lands on empty grid area'
+            );
+            await page.mouse.click(point.x, point.y);
+            assert.equal(
+                await page.evaluate(() => document.getElementById('gridContainer')!.scrollLeft),
+                8000
+            );
+        } finally { await page.close(); }
+    });
+
     it('keeps keyboard focus in the grid when the row window drops the focused row', async () => {
         const page = await openGrid(300);
         try {

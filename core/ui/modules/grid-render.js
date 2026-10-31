@@ -33,8 +33,8 @@ export const MAX_COLUMN_WIDTH = 10000;
 // markers) derives from `state`, so materializing a row late produces exactly
 // the DOM a full render would have produced. Code that addresses a row's DOM
 // directly must either tolerate absence (updateCellDom, selection diffing —
-// they already do) or call ensureGridRowMaterialized() first (match nav,
-// startCellEdit).
+// they already do) or call ensureGridCellMaterialized() first (match nav,
+// keyboard navigation, startCellEdit).
 // ================================================================
 
 export const GRID_ROW_HEIGHT = 26;
@@ -242,6 +242,35 @@ export function takeParkedGridFocus(target) {
 export function noteGridKeyboardTarget(rowIdx, colIdx) {
     const ctx = (virtualWindow ?? columnWindow)?.ctx;
     if (ctx) ctx.keyboardTarget = { rowIdx, colIdx };
+    syncContainerTabStop();
+}
+
+/**
+ * While the tab stop's cell is out of the windows no data cell is tabbable,
+ * so the grid container holds the tab stop until a window builds the cell.
+ */
+function syncContainerTabStop() {
+    const container = document.getElementById('gridContainer');
+    if (!container) return;
+    const target = (virtualWindow ?? columnWindow)?.ctx.keyboardTarget;
+    if (target && !document.getElementById(`cell-${target.rowIdx}-${target.colIdx}`)) {
+        container.tabIndex = 0;
+    } else if (container.hasAttribute?.('tabindex')) {
+        container.tabIndex = -1;
+    }
+}
+
+/**
+ * Build the tab stop's cell (scrolling it into view) and focus it, as Tab
+ * does in a full render. Returns the cell, or null when there is none.
+ */
+export function focusGridTabStop() {
+    const target = (virtualWindow ?? columnWindow)?.ctx.keyboardTarget;
+    if (!target) return null;
+    ensureGridCellMaterialized(target.rowIdx, target.colIdx);
+    const cell = document.getElementById(`cell-${target.rowIdx}-${target.colIdx}`);
+    cell?.focus?.({ preventScroll: true });
+    return cell;
 }
 
 function readViewportWidth(container) {
@@ -914,6 +943,7 @@ export function updateVirtualGridWindow() {
     const rowsChanged = vw ? updateRowWindow(vw, container) : false;
     if (!columnsChanged && !rowsChanged) return false;
     restoreParkedFocus();
+    syncContainerTabStop();
     return true;
 }
 
@@ -1119,6 +1149,8 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     virtualWindow = null;
     columnWindow = null;
     parkedFocus = null;
+    // The new grid's tab stop is always a built cell.
+    syncContainerTabStop();
 
     const headerHeight = GRID_HEADER_HEIGHT;
     const rowHeight = GRID_ROW_HEIGHT;

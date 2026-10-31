@@ -200,12 +200,12 @@ export function pageSizeForColumns(rowsPerPage, columnCount) {
 /**
  * Show a lowered page size beside the Rows selector, which keeps the chosen
  * size. Status messages replace the record-count note, so it cannot carry
- * this alone.
+ * this alone. pageShown is false once an error replaced the page.
  */
-function syncPageSizeNote() {
+function syncPageSizeNote(pageShown = true) {
     const note = document.getElementById('pageSizeNote');
     if (!note) return;
-    const lowered = state.pageSize < state.rowsPerPage;
+    const lowered = pageShown && state.pageSize < state.rowsPerPage;
     note.hidden = !lowered;
     note.textContent = lowered ? `(${state.pageSize} for ${state.tableColumns.length} columns)` : '';
     note.title = lowered
@@ -519,7 +519,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         let totalPageCount;
         let totalRecordCount;
         let totalRecordCountIsExact;
-        let currentPageIndex = state.currentPageIndex;
+        // A column change can change the page size under a kept page index;
+        // stay on the page that holds the first row the index pointed at.
+        let currentPageIndex = state.pageSize > 0 && state.pageSize !== requestedPageSize
+            ? Math.floor(state.currentPageIndex * state.pageSize / requestedPageSize)
+            : state.currentPageIndex;
         let dataResult;
         let queryOptions;
         let exactBoundStore;
@@ -824,7 +828,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             updateStatus(`Error: ${message}`);
             // Background filters retain the last successful grid so the UI can
             // roll back atomically instead of replacing it with an error panel.
-            if (!keepExistingGridOnError) showErrorState(message);
+            if (!keepExistingGridOnError) {
+                showErrorState(message);
+                syncPageSizeNote(false);
+            }
             return false; // the current load genuinely failed (lets callers retry)
         }
         // Superseded failure: a newer load owns the outcome — return undefined.

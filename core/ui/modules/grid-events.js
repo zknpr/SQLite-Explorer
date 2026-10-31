@@ -26,6 +26,7 @@ import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
 import {
     ensureGridCellMaterialized,
+    focusGridTabStop,
     noteGridKeyboardTarget,
     scheduleVirtualGridUpdate,
     takeParkedGridFocus
@@ -179,6 +180,17 @@ function handleKeydown(event) {
 }
 
 function handleFocusin(event) {
+    const container = event.currentTarget;
+    if (event.target === container) {
+        // The container holds the tab stop only while its cell is out of the
+        // windows. Keyboard focus from outside the grid goes on to that cell;
+        // parking (focus from inside) and a click on empty grid area stay put.
+        if (!container.contains(event.relatedTarget) && container.matches?.(':focus-visible')) {
+            const cell = focusGridTabStop();
+            if (cell) revealGridCell(cell);
+        }
+        return;
+    }
     if (event.target?.classList?.contains('data-cell')
         && !event.target.classList.contains('row-number')) {
         setGridTabstop(event.target, false);

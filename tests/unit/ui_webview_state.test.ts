@@ -39,6 +39,8 @@ declare global {
             persistState(): void;
             updateVirtualGridWindow(): boolean;
             applyBatchUpdate(): Promise<void>;
+            loadTableData(showSpinner?: boolean): Promise<boolean | undefined>;
+            loadTableColumns(): Promise<boolean>;
         };
         __vsCodeState: SavedState | undefined;
         __sidebarWrites: number[];
@@ -47,6 +49,8 @@ declare global {
         __schemaRequests: number;
         __textReadSizes: number[];
         __inspectorTextFixture: string | undefined;
+        __failTableData: boolean;
+        __columnCount: number | undefined;
     }
 }
 
@@ -67,7 +71,8 @@ describe('webview focus and reconstructed view state', {
                     import { state, persistState } from './core/ui/modules/state.js';
                     import { updateVirtualGridWindow } from './core/ui/modules/grid-render.js';
                     import { applyBatchUpdate } from './core/ui/modules/sidebar.js';
-                    window.__uiStateHarness = { state, persistState, updateVirtualGridWindow, applyBatchUpdate };
+                    import { loadTableColumns, loadTableData } from './core/ui/modules/grid-data.js';
+                    window.__uiStateHarness = { state, persistState, updateVirtualGridWindow, applyBatchUpdate, loadTableData, loadTableColumns };
                 `,
                 resolveDir: root
             },
@@ -109,7 +114,7 @@ describe('webview focus and reconstructed view state', {
             window.__schemaRequests = 0;
             window.__textReadSizes = [];
             const refusal = "File size (1.15 MB) exceeds the maximum allowed size (1.00 MB). Configure 'sqliteExplorer.maxFileSize' to increase the limit.";
-            const columns = Array.from({ length: 51 }, (_, index) => ({
+            const makeColumns = (count: number) => Array.from({ length: count }, (_, index) => ({
                 ordinal: index,
                 identifier: index === 0 ? 'id' : `c${index}`,
                 declaredType: index === 0 ? 'INTEGER' : 'TEXT',
@@ -118,6 +123,7 @@ describe('webview focus and reconstructed view state', {
                 isRequired: false,
                 defaultExpression: null
             }));
+            let columns = makeColumns(51);
             Object.assign(window, {
                 acquireVsCodeApi: () => ({
                     getState: () => window.__vsCodeState,
@@ -144,8 +150,9 @@ describe('webview focus and reconstructed view state', {
                         else if (targetMethod === 'fetchSchema') {
                             window.__schemaRequests++;
                             data = { tables: [{ identifier: 'wide' }], views: [], indexes: [] };
-                        } else if (targetMethod === 'getTableInfo') data = columns;
+                        } else if (targetMethod === 'getTableInfo') data = columns = makeColumns(window.__columnCount ?? 51);
                         else if (targetMethod === 'fetchTableCount') data = { count: 10000, isExact: true };
+                        else if (targetMethod === 'fetchTableData' && window.__failTableData) errorMessage = 'disk I/O error';
                         else if (targetMethod === 'fetchTableData') {
                             data = {
                                 rows: Array.from({ length: Math.min(options.limit, 10000 - options.offset) }, (_, index) => {
@@ -208,6 +215,39 @@ describe('webview focus and reconstructed view state', {
             assert.equal(await page.locator('#pageSizeNote').innerText(), '(9800 for 51 columns)');
             assert.ok(await page.locator('#pageSizeNote').isVisible(), 'the note is shown, not just filled');
             assert.equal(await page.locator('#pageSizeSelect').getAttribute('aria-describedby'), 'pageSizeNote');
+        } finally { await page.close(); }
+    });
+
+    it('hides the page-size note when a failed load replaces the grid', async () => {
+        const page = await openViewer({ selectedTable: 'wide', selectedTableType: 'table', rowsPerPage: 10000 });
+        try {
+            assert.ok(await page.locator('#pageSizeNote').isVisible());
+            await page.evaluate(async () => {
+                window.__failTableData = true;
+                await window.__uiStateHarness.loadTableData(true);
+            });
+            assert.equal(await page.locator('#gridContainer .empty-desc').innerText(), 'disk I/O error');
+            assert.equal(await page.locator('#pageSizeNote').isVisible(), false, 'no page is shown, so no page size is named');
+        } finally { await page.close(); }
+    });
+
+    it('stays on the rows shown when a column change lowers the page size', async () => {
+        const page = await openViewer({ selectedTable: 'wide', selectedTableType: 'table', rowsPerPage: 10000 });
+        try {
+            await page.locator('#btnNext').click();
+            await page.waitForFunction(() => window.__uiStateHarness.state.currentPageIndex === 1
+                && !window.__uiStateHarness.state.isGridReloading);
+            const shown = () => page.evaluate(() => ({
+                pageIndex: window.__uiStateHarness.state.currentPageIndex,
+                firstRow: window.__uiStateHarness.state.gridData[0][0]
+            }));
+            assert.deepEqual(await shown(), { pageIndex: 1, firstRow: 9801 });
+            // 200 columns hold 2,500 rows per page; row 9,801 is on the fourth.
+            await page.evaluate(async () => {
+                window.__columnCount = 200;
+                if (await window.__uiStateHarness.loadTableColumns()) await window.__uiStateHarness.loadTableData(false);
+            });
+            assert.deepEqual(await shown(), { pageIndex: 3, firstRow: 7501 });
         } finally { await page.close(); }
     });
 
