@@ -440,6 +440,26 @@ describe('grid column window', {
         } finally { await page.close(); }
     });
 
+    it('copies the selection while focus is parked on the grid', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.evaluate(() => {
+                (window as any).__copied = [];
+                Object.defineProperty(navigator, 'clipboard', {
+                    configurable: true,
+                    value: { writeText: async (text: string) => { (window as any).__copied.push(text); } }
+                });
+            });
+            await page.locator('#cell-0-3').click();
+            const text = await page.locator('#cell-0-3 .cell-text').textContent();
+            await scrollTo(page, 8000);
+            assert.equal((await readFocus(page)).active, 'gridContainer');
+            await page.keyboard.press('Control+c');
+            await page.waitForFunction(() => (window as any).__copied.length > 0, undefined, { timeout: 2000 });
+            assert.deepEqual(await page.evaluate(() => (window as any).__copied), [text]);
+        } finally { await page.close(); }
+    });
+
     it('keeps the tab stop on the last focused cell after focus left the grid', async () => {
         const page = await openGrid(300);
         try {
