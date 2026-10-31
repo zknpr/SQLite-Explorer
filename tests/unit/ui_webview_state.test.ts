@@ -201,6 +201,21 @@ describe('webview focus and reconstructed view state', {
             assert.equal(await page.locator('#statusText').innerText(), '10000 records; 9800 rows per page for 51 columns');
             assert.equal(await page.locator('#pageIndicator').innerText(), '1 / 2');
             assert.equal(await page.evaluate(() => window.__uiStateHarness.state.gridData.length), 9800);
+            // The selector keeps the chosen size; the size in use stays beside
+            // it after a later status message replaces the one above.
+            await page.evaluate(() => { document.getElementById('statusText')!.textContent = 'Saved'; });
+            assert.equal(await page.locator('#pageSizeSelect').inputValue(), '10000');
+            assert.equal(await page.locator('#pageSizeNote').innerText(), '(9800 for 51 columns)');
+            assert.ok(await page.locator('#pageSizeNote').isVisible(), 'the note is shown, not just filled');
+            assert.equal(await page.locator('#pageSizeSelect').getAttribute('aria-describedby'), 'pageSizeNote');
+        } finally { await page.close(); }
+    });
+
+    it('shows no page-size note when the chosen size fits', async () => {
+        const page = await openViewer({ selectedTable: 'wide', selectedTableType: 'table', rowsPerPage: 100 });
+        try {
+            assert.equal(await page.locator('#pageSizeNote').isVisible(), false);
+            assert.equal(await page.locator('#pageSizeNote').textContent(), '');
         } finally { await page.close(); }
     });
 

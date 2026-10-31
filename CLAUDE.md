@@ -373,7 +373,7 @@ Sorted pages of authority-confirmed ordinary rowid tables (not virtual tables) t
 
 ### Wide-Table Page Size
 
-The host fits each page into 16 MiB by giving every cell an equal share, so a page of many cells clips short values or cannot fit at all. `pageSizeForColumns` in `grid-data.js` lowers a load's rows per page so rows × displayed columns stays within 500,000, rounded down to a multiple of 100; the status bar names the lowered size. `state.rowsPerPage` stays the user's persisted choice. `state.pageSize` is the size the displayed page was loaded with, committed with its rows. Code that places a row in the whole result (row numbers, view row identities, clipboard) reads `getPageSize()` from `data-utils.js`, never `state.rowsPerPage`.
+The host fits each page into 16 MiB by giving every cell an equal share, so a page of many cells clips short values or cannot fit at all. `pageSizeForColumns` in `grid-data.js` lowers a load's rows per page so rows × displayed columns stays within 500,000, rounded down to a multiple of 100. The limit counts cells, not columns: a narrow table at a large page size reaches the same per-cell share, so it applies to every width. The Rows selector keeps the chosen size and `#pageSizeNote` beside it shows a lowered one (`syncPageSizeNote`, run with each row commit); the status bar also names it until the next status message. `state.rowsPerPage` stays the user's persisted choice. `state.pageSize` is the size the displayed page was loaded with, committed with its rows. Code that places a row in the whole result (row numbers, view row identities, clipboard) reads `getPageSize()` from `data-utils.js`, never `state.rowsPerPage`.
 
 ### Virtualized Grid
 

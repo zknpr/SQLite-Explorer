@@ -150,7 +150,7 @@
                 <div class="footer-right">
                     <div class="page-selector">
                         <label for="pageSizeSelect">Rows:</label>
-                        <select id="pageSizeSelect">
+                        <select id="pageSizeSelect" aria-describedby="pageSizeNote">
                             <option value="100">100</option>
                             <option value="250">250</option>
                             <option value="500">500</option>
@@ -159,6 +159,7 @@
                             <option value="5000" selected>5000</option>
                             <option value="10000">10000</option>
                         </select>
+                        <span id="pageSizeNote" class="page-size-note" hidden></span>
                     </div>
                     <div class="page-selector">
                         <label for="dateFormatSelect">Date Format:</label>

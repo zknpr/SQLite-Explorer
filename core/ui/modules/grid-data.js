@@ -197,6 +197,23 @@ export function pageSizeForColumns(rowsPerPage, columnCount) {
     return rows >= 100 ? rows - (rows % 100) : rows;
 }
 
+/**
+ * Show a lowered page size beside the Rows selector, which keeps the chosen
+ * size. Status messages replace the record-count note, so it cannot carry
+ * this alone.
+ */
+function syncPageSizeNote() {
+    const note = document.getElementById('pageSizeNote');
+    if (!note) return;
+    const lowered = state.pageSize < state.rowsPerPage;
+    note.hidden = !lowered;
+    note.textContent = lowered ? `(${state.pageSize} for ${state.tableColumns.length} columns)` : '';
+    note.title = lowered
+        ? `Pages hold at most ${MAX_GRID_PAGE_CELLS.toLocaleString('en-US')} cells, so this table shows `
+            + `${state.pageSize} rows per page instead of ${state.rowsPerPage}.`
+        : '';
+}
+
 /** Status bar text for the committed page's count, naming a lowered page size. */
 export function recordCountStatus() {
     const count = `${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`;
@@ -276,6 +293,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     const commitRows = (dataResult, currentPageIndex, container, pageSize) => {
         state.gridData = dataResult.rows || [];
         state.pageSize = pageSize;
+        syncPageSizeNote();
         state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
         state.gridOversizedCells = dataResult.oversizedCells || {};
         state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};

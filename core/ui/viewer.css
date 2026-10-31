@@ -1061,6 +1061,11 @@ button.section-title:focus-visible,
     white-space: nowrap;
 }
 
+.page-size-note {
+    color: var(--text-secondary);
+    font-size: 11px;
+}
+
 .page-selector select {
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);

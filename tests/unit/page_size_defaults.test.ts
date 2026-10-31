@@ -28,7 +28,7 @@ describe('default page size', () => {
             'utf8'
         );
         const selectBody = html.match(
-            /<select id="pageSizeSelect">([\s\S]*?)<\/select>/
+            /<select id="pageSizeSelect"[^>]*>([\s\S]*?)<\/select>/
         )?.[1];
         assert.ok(selectBody, 'pageSizeSelect must exist in viewer.template.html');
 
