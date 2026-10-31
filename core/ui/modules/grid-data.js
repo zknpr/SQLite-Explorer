@@ -180,16 +180,17 @@ function keysetModeCanProveInexactCount(keyset) {
     );
 }
 
-// The host fits a page into 16 MiB by clipping each cell to an equal share of
-// it, so a page of many cells clips short values: at 5,000 rows, values over
+// The host fits a page into 16 MiB by clipping each value to an equal share of
+// it, so a page of many values clips short ones: at 5,000 rows, values over
 // 16 bytes became previews at 200 columns, and 400 columns did not fit at all.
-// 500,000 cells leaves about 33 bytes per cell and keeps the chosen size up to
-// 100 columns at the default 5,000 rows.
-const MAX_GRID_PAGE_CELLS = 500_000;
+// 250,000 values leaves about 67 bytes each, enough for a UUID or most email
+// addresses, and keeps the chosen size up to 49 columns and the rowid at the
+// default 5,000 rows.
+const MAX_GRID_PAGE_CELLS = 250_000;
 
 /**
- * Rows per page for a table of columnCount columns: the chosen size, or fewer
- * for a wide table, rounded down to a multiple of 100 from 100 rows up.
+ * Rows per page for a query of columnCount values a row: the chosen size, or
+ * fewer for a wide one, rounded down to a multiple of 100 from 100 rows up.
  */
 export function pageSizeForColumns(rowsPerPage, columnCount) {
     if (!(columnCount > 0) || rowsPerPage * columnCount <= MAX_GRID_PAGE_CELLS) return rowsPerPage;
@@ -209,7 +210,7 @@ function syncPageSizeNote(pageShown = true) {
     note.hidden = !lowered;
     note.textContent = lowered ? `(${state.pageSize} for ${state.tableColumns.length} columns)` : '';
     note.title = lowered
-        ? `Pages hold at most ${MAX_GRID_PAGE_CELLS.toLocaleString('en-US')} cells, so this table shows `
+        ? `Pages hold at most ${MAX_GRID_PAGE_CELLS.toLocaleString('en-US')} values, so this table shows `
             + `${state.pageSize} rows per page instead of ${state.rowsPerPage}.`
         : '';
 }
@@ -437,18 +438,20 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             requestedTable, filters, globalFilter, columnNames
         );
 
-        // Snapshot the page size once so the clamp, OFFSET, keyset remainder,
-        // and committed page math all derive from the same value across the
-        // awaits below. (A mid-load page-size change also supersedes this
-        // load; the snapshot makes the consistency structural, not reasoned.)
-        const requestedPageSize = pageSizeForColumns(state.rowsPerPage, columnNames.length);
-
         const isTable = requestedTableType === 'table';
 
         // For tables, we need to explicitly request the 'rowid' column to handle row identification.
         // The frontend expects rowid at index 0 for tables (see `getRowId` and `getRowDataOffset`).
         // Query builder handles the construction: SELECT "rowid", "col1", ...
         const queryColumns = isTable ? ['rowid', ...columnNames] : columnNames;
+
+        // Snapshot the page size once so the clamp, OFFSET, keyset remainder,
+        // and committed page math all derive from the same value across the
+        // awaits below. (A mid-load page-size change also supersedes this
+        // load; the snapshot makes the consistency structural, not reasoned.)
+        // The host shares the page budget among every value it returns,
+        // including the rowid.
+        const requestedPageSize = pageSizeForColumns(state.rowsPerPage, queryColumns.length);
 
         // One builder for every data request this load can issue (speculative,
         // clamped, retry), so they can never disagree on anything but the page

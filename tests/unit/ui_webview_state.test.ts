@@ -202,17 +202,17 @@ describe('webview focus and reconstructed view state', {
     }
 
     it('names a lowered page size in the status after restoring a wide table', async () => {
-        // 10,000 rows of 51 columns is past the 500,000-cell page limit.
+        // 10,000 rows of 51 columns and the rowid are past the 250,000-value page limit.
         const page = await openViewer({ selectedTable: 'wide', selectedTableType: 'table', rowsPerPage: 10000 });
         try {
-            assert.equal(await page.locator('#statusText').innerText(), '10000 records; 9800 rows per page for 51 columns');
-            assert.equal(await page.locator('#pageIndicator').innerText(), '1 / 2');
-            assert.equal(await page.evaluate(() => window.__uiStateHarness.state.gridData.length), 9800);
+            assert.equal(await page.locator('#statusText').innerText(), '10000 records; 4800 rows per page for 51 columns');
+            assert.equal(await page.locator('#pageIndicator').innerText(), '1 / 3');
+            assert.equal(await page.evaluate(() => window.__uiStateHarness.state.gridData.length), 4800);
             // The selector keeps the chosen size; the size in use stays beside
             // it after a later status message replaces the one above.
             await page.evaluate(() => { document.getElementById('statusText')!.textContent = 'Saved'; });
             assert.equal(await page.locator('#pageSizeSelect').inputValue(), '10000');
-            assert.equal(await page.locator('#pageSizeNote').innerText(), '(9800 for 51 columns)');
+            assert.equal(await page.locator('#pageSizeNote').innerText(), '(4800 for 51 columns)');
             assert.ok(await page.locator('#pageSizeNote').isVisible(), 'the note is shown, not just filled');
             assert.equal(await page.locator('#pageSizeSelect').getAttribute('aria-describedby'), 'pageSizeNote');
         } finally { await page.close(); }
@@ -241,13 +241,13 @@ describe('webview focus and reconstructed view state', {
                 pageIndex: window.__uiStateHarness.state.currentPageIndex,
                 firstRow: window.__uiStateHarness.state.gridData[0][0]
             }));
-            assert.deepEqual(await shown(), { pageIndex: 1, firstRow: 9801 });
-            // 200 columns hold 2,500 rows per page; row 9,801 is on the fourth.
+            assert.deepEqual(await shown(), { pageIndex: 1, firstRow: 4801 });
+            // 200 columns hold 1,200 rows per page; row 4,801 is on the fifth.
             await page.evaluate(async () => {
                 window.__columnCount = 200;
                 if (await window.__uiStateHarness.loadTableColumns()) await window.__uiStateHarness.loadTableData(false);
             });
-            assert.deepEqual(await shown(), { pageIndex: 3, firstRow: 7501 });
+            assert.deepEqual(await shown(), { pageIndex: 4, firstRow: 4801 });
         } finally { await page.close(); }
     });
 
