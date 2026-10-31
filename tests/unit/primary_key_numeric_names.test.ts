@@ -8,7 +8,9 @@ import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-
 import { createNativeDatabaseConnection } from '../../src/nativeWorker';
 import { serializeOperations } from '../../src/core/operation-serializer';
 import { importRowsAtomically } from '../../src/core/bulk-import';
-import type { DatabaseOperations } from '../../src/core/types';
+import { streamTableExport } from '../../src/tableExportStreaming';
+import { HostBridge } from '../../src/hostBridge';
+import type { DatabaseOperations, ExportOptions, ModificationEntry } from '../../src/core/types';
 
 // The native worker builds result rows from objects keyed by column name, and
 // JavaScript lists integer-like keys first. A WITHOUT ROWID key read back by
@@ -94,3 +96,57 @@ for (const backend of ['wasm', 'native'] as const) {
         });
     });
 }
+
+async function exportText(ops: DatabaseOperations, format: string) {
+    const chunks: Buffer[] = [];
+    const sink = {
+        write: async (chunk: string) => { chunks.push(Buffer.from(chunk, 'utf8')); },
+        writeBytes: async (bytes: Uint8Array) => { chunks.push(Buffer.from(bytes)); }
+    };
+    await streamTableExport(ops, 'r', ['z', '2', '1'], { format, header: true, includeTableName: true } as ExportOptions, sink);
+    return Buffer.concat(chunks).toString('utf8');
+}
+
+for (const backend of ['wasm', 'native'] as const) {
+    it(`${backend} exports, drops and restores columns named like numbers in their places`, async () => {
+        await withBackend(backend, async ops => {
+            const csv = (await exportText(ops, 'csv')).trim().split(/\r?\n/);
+            assert.deepEqual(csv, ['z,2,1', 'z1,two1,one1', 'z2,two2,one2']);
+            const json = JSON.parse(await exportText(ops, 'json')) as Array<Record<string, unknown>>;
+            assert.deepEqual(json.map(row => [row.z, row['2'], row['1']]), [['z1', 'two1', 'one1'], ['z2', 'two2', 'one2']]);
+            const fresh = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+            try {
+                await fresh.executeQuery('CREATE TABLE r ("z" TEXT, "2" TEXT, "1" TEXT)');
+                await fresh.executeQuery(await exportText(ops, 'sql'));
+                assert.deepEqual(await rowidRows(fresh), await rowidRows(ops), 'SQL export');
+            } finally {
+                fresh.shutdown();
+            }
+
+            const stored = await rowidRows(ops);
+            const recorded: ModificationEntry[] = [];
+            const document = {
+                uri: vscode.Uri.file('/fixture/fixture.db'), isConnected: true, fileParts: { filename: 'fixture.db' },
+                isReadOnlyMode: false, connectionGeneration: 1, databaseOperations: ops, undoMemoryLimitBytes: 64 * 1024 * 1024,
+                recordExternalModification: (modification: ModificationEntry) => { recorded.push(modification); }
+            };
+            const bridge = new HostBridge({ webviews: new Map(), context: {}, isReadOnly: false } as never, document as never);
+            await bridge.deleteColumns('r', ['2']);
+            assert.equal(recorded.length, 1);
+            await ops.undoModification(recorded[0]);
+            assert.deepEqual(await rowidRows(ops), stored, 'undo of the column drop');
+
+            const insertedRow = await ops.insertRowWithHistory!('r', { z: 'z3', 2: 'two3', 1: 'one3' });
+            assert.deepEqual((await rowidRows(ops)).at(-1), [3, 'z3', 'two3', 'one3']);
+            const insertion = {
+                modificationType: 'row_insert' as const, targetTable: 'r', targetRowId: insertedRow.rowId,
+                description: 'Insert', rowData: insertedRow.row, insertedRow
+            };
+            await ops.undoModification(insertion);
+            assert.deepEqual(await rowidRows(ops), stored, 'undo of the insert');
+            await ops.redoModification(insertion);
+            assert.deepEqual((await rowidRows(ops)).at(-1), [3, 'z3', 'two3', 'one3'], 'redo of the insert');
+        });
+    });
+}
+
