@@ -77,6 +77,24 @@ export function validateSqlType(type: string): void {
 }
 
 /**
+ * A || chain holds two operators per NUL, and SQLite refuses an expression
+ * deeper than 1000 (SQLITE_MAX_EXPR_DEPTH). Text with more NULs than this is
+ * written as one quoted literal with each NUL escaped, which two nested
+ * replace() calls undo: U+E000 stands for itself followed by 'a' and for a
+ * NUL followed by 'b'. Every U+E000 in the escaped text is followed by its
+ * letter, so the 'b' pairs are exactly the NULs, and once they are gone the
+ * 'a' pairs are exactly the original U+E000s.
+ */
+export const SQL_NUL_CHAIN_MAX_NULS = 100;
+export const SQL_NUL_TEXT_PREFIX = "replace(replace('";
+export const SQL_NUL_TEXT_SUFFIX = "', char(57344, 98), char(0)), char(57344, 97), char(57344))";
+
+/** The quoted body between SQL_NUL_TEXT_PREFIX and SQL_NUL_TEXT_SUFFIX. */
+export function escapeSqlNulText(text: string): string {
+  return text.replace(/'/g, "''").replace(/\uE000/g, '\uE000a').replace(/\0/g, '\uE000b');
+}
+
+/**
  * Convert a CellValue to SQL literal representation.
  * Handles NULL, numbers, strings, and binary data.
  */
@@ -96,7 +114,11 @@ export function cellValueToSql(value: CellValue | undefined): string {
     // a CAST of hex bytes would be read as that encoding, so UTF-8 bytes
     // replayed into a UTF-16 database would come back cut at the NUL.
     if (value.includes('\0')) {
-      return `(${value.split('\0').map(segment => `'${segment.replace(/'/g, "''")}'`).join(' || char(0) || ')})`;
+      const segments = value.split('\0');
+      if (segments.length - 1 > SQL_NUL_CHAIN_MAX_NULS) {
+        return `${SQL_NUL_TEXT_PREFIX}${escapeSqlNulText(value)}${SQL_NUL_TEXT_SUFFIX}`;
+      }
+      return `(${segments.map(segment => `'${segment.replace(/'/g, "''")}'`).join(' || char(0) || ')})`;
     }
     // Escape single quotes by doubling them (SQL standard)
     return `'${value.replace(/'/g, "''")}'`;

@@ -412,7 +412,7 @@ Settings in `package.json` → `contributes.configuration`:
 ### SQL Security
 - **LIKE wildcards**: User input in LIKE queries must use `escapeLikePattern()` with `ESCAPE '\\'` clause
 - **SQL types in DDL**: Always validate with `validateSqlType()` to prevent injection via malicious type strings
-- **NUL bytes**: Strings containing `\0` are written in exported SQL as quoted segments joined by `char(0)`, never as a raw NUL; a `CAST(X'..' AS TEXT)` would be read in the target database's encoding
+- **NUL bytes**: Strings containing `\0` are written in exported SQL as quoted segments joined by `char(0)`, never as a raw NUL; past 100 NULs such a chain would pass SQLite's expression depth limit of 1000, so the text is one literal escaped for two `replace()` calls (`escapeSqlNulText` in `sql-utils.ts`); a `CAST(X'..' AS TEXT)` would be read in the target database's encoding
 
 ### RPC Serialization
 - **Uint8Array becomes `{}`**: Never send raw Uint8Array via postMessage - use the marker format

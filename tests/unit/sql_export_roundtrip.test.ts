@@ -19,7 +19,11 @@ const LITERALS = [
     '0.5', '1.0/3', '1e300', '-1e-300', '0.1+0.2', '5.0', '100.0', '1e16', '-0.0', '1e308*10', '-1e308*10',
     "''", "'a'", "'ünï'", "'😀'", "'it''s'", "'a' || char(0) || 'b'", "char(55296) || 'x'",
     "CAST(X'FF61' AS TEXT)", "CAST(X'EFBBBF61' AS TEXT)", "'a' || char(13) || char(10) || 'b'",
-    "X''", "X'00FF'", 'zeroblob(3)', 'NULL'
+    "X''", "X'00FF'", 'zeroblob(3)', 'NULL',
+    // Past SQLite's expression depth limit of 1000 as one || chain: 600 NULs
+    // alone, 600 between letters, and NULs beside U+E000 and the letters a, b.
+    "replace(hex(zeroblob(600)), '00', char(0))", "replace(hex(zeroblob(600)), '00', 'a' || char(0))",
+    "replace(hex(zeroblob(300)), '00', char(57344) || char(0) || char(57344) || 'b' || char(57344) || 'a' || char(57344))"
 ];
 const COLUMNS = ['n', 'i', 'r', 's', 'b'];
 const TABLE_SQL = 'CREATE TABLE t (id INTEGER PRIMARY KEY, n, i INTEGER, r REAL, s TEXT, b BLOB)';

@@ -10,7 +10,15 @@ import type {
   TableIdentity
 } from './core/types';
 import { crypto as webCrypto } from './platform/cryptoShim';
-import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './core/sql-utils';
+import {
+  escapeIdentifier,
+  escapeMainIdentifier,
+  escapeSqlNulText,
+  SQL_NUL_CHAIN_MAX_NULS,
+  SQL_NUL_TEXT_PREFIX,
+  SQL_NUL_TEXT_SUFFIX,
+  validateRowId
+} from './core/sql-utils';
 import { normalizeCellTextEncoding } from './core/cell-read';
 import {
   createCsvTextInspection,
@@ -1440,23 +1448,31 @@ async function inspectSqlText(
   operations: DatabaseOperations,
   input: ExportCellSession,
   cancellation?: ExportCancellation
-): Promise<{ representable: boolean; containsNul: boolean }> {
-  let containsNul = false;
+): Promise<{ representable: boolean; nulCount: number }> {
+  let nulCount = 0;
   const representable = await inspectDecodedText(operations, input, cancellation, async text => {
-    if (text.includes('\0')) containsNul = true;
+    for (let index = text.indexOf('\0'); index !== -1; index = text.indexOf('\0', index + 1)) nulCount++;
   });
-  return { representable, containsNul };
+  return { representable, nulCount };
 }
 
-/** Quoted SQL text, with each NUL closed out to char(0) as cellValueToSql writes it. */
+/**
+ * Quoted SQL text, with each NUL closed out to char(0), or escaped for
+ * SQL_NUL_TEXT_PREFIX's replace() calls, as cellValueToSql writes it.
+ */
 async function writeSqlQuotedText(
   operations: DatabaseOperations,
   input: ExportCellSession,
   sink: AsyncExportSink,
+  nulEscaped: boolean,
   cancellation?: ExportCancellation
 ): Promise<void> {
   await forEachDecodedText(operations, input, cancellation, async text => {
-    await emit(sink, text.replace(/'/g, "''").replace(/\0/g, "' || char(0) || '"), cancellation);
+    await emit(
+      sink,
+      nulEscaped ? escapeSqlNulText(text) : text.replace(/'/g, "''").replace(/\0/g, "' || char(0) || '"),
+      cancellation
+    );
   });
 }
 
@@ -1575,13 +1591,17 @@ async function writeSqlCell(
     const inspection = await inspectSqlText(operations, input, cancellation);
     if (!inspection.representable) {
       await writeUnrepresentableText(operations, input, sink, 'sql', cancellation);
-    } else if (inspection.containsNul) {
+    } else if (inspection.nulCount > SQL_NUL_CHAIN_MAX_NULS) {
+      await emit(sink, SQL_NUL_TEXT_PREFIX, cancellation);
+      await writeSqlQuotedText(operations, input, sink, true, cancellation);
+      await emit(sink, SQL_NUL_TEXT_SUFFIX, cancellation);
+    } else if (inspection.nulCount > 0) {
       await emit(sink, "('", cancellation);
-      await writeSqlQuotedText(operations, input, sink, cancellation);
+      await writeSqlQuotedText(operations, input, sink, false, cancellation);
       await emit(sink, "')", cancellation);
     } else {
       await emit(sink, "'", cancellation);
-      await writeSqlQuotedText(operations, input, sink, cancellation);
+      await writeSqlQuotedText(operations, input, sink, false, cancellation);
       await emit(sink, "'", cancellation);
     }
   });

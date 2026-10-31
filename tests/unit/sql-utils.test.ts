@@ -9,6 +9,7 @@ import {
   validateRowId,
   validateRowIds
 } from '../../src/core/sql-utils';
+import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 
 describe('SQL Utils', () => {
   describe('validateSqlType', () => {
@@ -132,6 +133,30 @@ describe('SQL Utils', () => {
       const output = cellValueToSql(input);
       // No raw NUL in the script; char(0) is TEXT in any database encoding.
       assert.strictEqual(output, "('foo' || char(0) || 'bar')");
+    });
+
+    it('writes TEXT with many NULs as a literal SQLite can parse in either encoding', async () => {
+      // One || chain per NUL passes SQLite's expression depth limit of 1000.
+      const values = [
+        'a\0'.repeat(600),
+        '\0'.repeat(600),
+        '\uE000\0\uE000b\uE000a\uE000'.repeat(300),
+        "it's\0".repeat(150)
+      ];
+      for (const encoding of ['UTF-8', 'UTF-16le']) {
+        const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+        try {
+          await engine.executeQuery(`PRAGMA encoding = '${encoding}'`);
+          await engine.executeQuery('CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)');
+          for (const [index, value] of values.entries()) {
+            await engine.executeQuery(`INSERT INTO t VALUES (${index + 1}, ${cellValueToSql(value)})`);
+          }
+          const stored = (await engine.executeQuery('SELECT s FROM t ORDER BY id'))[0].rows.map(row => row[0]);
+          assert.deepStrictEqual(stored, values, encoding);
+        } finally {
+          engine.shutdown();
+        }
+      }
     });
   });
 
