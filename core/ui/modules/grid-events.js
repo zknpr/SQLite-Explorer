@@ -24,7 +24,7 @@ import {
 } from './grid-actions.js';
 import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
-import { ensureGridRowMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
+import { ensureGridCellMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
 import { revealGridCell } from './grid-reveal.js';
 import { validateRowId } from './utils.js';
 import { getOrderedColumnIndices, getOrderedRowIndices } from './data-utils.js';
@@ -207,7 +207,7 @@ function moveGridCellFocus(event, rowIdx, colIdx) {
     event.stopPropagation();
     const targetRowIdx = rows[rowPosition];
     const targetColIdx = columns[columnPosition];
-    ensureGridRowMaterialized(targetRowIdx);
+    ensureGridCellMaterialized(targetRowIdx, targetColIdx);
     const target = document.getElementById(`cell-${targetRowIdx}-${targetColIdx}`);
     if (!target) return false;
     setGridTabstop(target);

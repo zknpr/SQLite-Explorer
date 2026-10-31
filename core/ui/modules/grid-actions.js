@@ -5,6 +5,7 @@ import { getGridReloadOwner, loadTableData } from './grid-data.js';
 import {
     MAX_COLUMN_WIDTH,
     MIN_COLUMN_WIDTH,
+    noteColumnWidthsChanged,
     renderDataGrid
 } from './grid-render.js';
 import { updateSelectionStates } from './grid-selection.js';
@@ -831,7 +832,7 @@ function applyColumnWidth(columnName, newWidth) {
         // marker and its derived UI state so the next hover measures again.
         cell.classList?.remove?.('checked-overflow', 'has-overflow');
     }
-
+    noteColumnWidthsChanged();
 }
 
 export function onColumnResizeKeydown(event, columnName) {

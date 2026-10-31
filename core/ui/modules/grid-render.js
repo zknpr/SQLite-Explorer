@@ -152,6 +152,116 @@ function setSpacerHeight(spacer, rowCount) {
 }
 
 // ================================================================
+// VIRTUALIZED COLUMN WINDOW
+//
+// A wide table's cost is per cell, so the row window alone still builds every
+// column of each materialized row: 500 columns cost about 60 ms per window
+// shift. From VIRTUAL_COLUMN_MIN_COUNT unpinned columns, each data row holds
+// its row number and pinned cells, then a left spacer <td>, the unpinned
+// columns around the viewport, and a right spacer <td>. The header keeps every
+// column, and under `table-layout: fixed` its widths set the columns, so a
+// spacer's colSpan covers exactly the columns it stands in for and scrollWidth
+// matches a full render. A spacer standing in for no column is display:none,
+// which takes it out of the table's columns.
+//
+// Moving the window patches each row in place: cells inside both windows are
+// kept, so a focused cell keeps focus. Rows built later (the row window,
+// ensureGridRowMaterialized) read the current bounds from ctx.columnWindow.
+// Code that addresses a cell by id calls ensureGridCellMaterialized() first.
+// ================================================================
+
+// Narrower tables, and containers without a measured width, render every
+// column: the DOM is then exactly what it was before column windowing.
+export const VIRTUAL_COLUMN_MIN_COUNT = 100;
+// Columns materialized beyond each edge of the visible range.
+export const VIRTUAL_COLUMN_OVERSCAN = 10;
+// Re-center when the visible range comes this close to a materialized edge.
+export const VIRTUAL_COLUMN_EDGE_TRIGGER = 5;
+
+// The mounted column window, or null when every column is rendered. Reset at
+// the top of every renderDataGrid call, like virtualWindow.
+let columnWindow = null;
+
+// Per windowed row: its spacers, its window cells in display order, and the
+// window they cover.
+const windowedRowCells = new WeakMap();
+
+function readViewportWidth(container) {
+    const width = container ? container.clientWidth : undefined;
+    return typeof width === 'number' && Number.isFinite(width) && width > 0
+        ? width
+        : null;
+}
+
+/** prefix[k] is the width of the first k columns; prefix.length is count + 1. */
+function columnWidthPrefix(columns) {
+    const prefix = [0];
+    for (const col of columns) {
+        prefix.push(prefix[prefix.length - 1] + (state.columnWidths[col.name] || 120));
+    }
+    return prefix;
+}
+
+/** The column k with prefix[k] <= x < prefix[k + 1], clamped to the columns. */
+function columnAtOffset(prefix, x) {
+    let low = 0;
+    let high = prefix.length - 2;
+    while (low < high) {
+        const middle = (low + high + 1) >> 1;
+        if (prefix[middle] <= x) low = middle;
+        else high = middle - 1;
+    }
+    return Math.max(0, low);
+}
+
+/**
+ * Unpinned column positions [first, last] intersecting the part of the
+ * viewport the sticky row-number and pinned columns do not cover. Unpinned
+ * column k starts stickyWidth + prefix[k] into the table, and the covered
+ * strip is stickyWidth wide, so the offsets cancel for `first`.
+ */
+export function computeVisibleColumnRange(scrollLeft, viewportWidth, stickyWidth, prefix) {
+    const maxIndex = Math.max(0, prefix.length - 2);
+    const band = Math.max(viewportWidth - stickyWidth, 1);
+    const first = Math.min(columnAtOffset(prefix, scrollLeft), maxIndex);
+    const last = Math.min(Math.max(columnAtOffset(prefix, scrollLeft + band - 1), first), maxIndex);
+    return { first, last };
+}
+
+/**
+ * The initial column window for a render, or null to render every column:
+ * fewer than VIRTUAL_COLUMN_MIN_COUNT unpinned columns, or no measured width.
+ */
+export function planVirtualColumnWindow(scrollLeft, viewportWidth, stickyWidth, prefix) {
+    const total = prefix.length - 1;
+    if (total < VIRTUAL_COLUMN_MIN_COUNT) return null;
+    if (viewportWidth === null || !Number.isFinite(viewportWidth) || viewportWidth <= 0) return null;
+    const visible = computeVisibleColumnRange(
+        toFiniteScrollTop(scrollLeft), viewportWidth, stickyWidth, prefix
+    );
+    return { ...windowFromVisible(visible, total, VIRTUAL_COLUMN_OVERSCAN), total };
+}
+
+/** Rendered unpinned column bounds, or null when every column is rendered. */
+export function getVirtualColumnBounds() {
+    return columnWindow ? { start: columnWindow.bounds.start, end: columnWindow.bounds.end } : null;
+}
+
+function createColumnSpacer() {
+    const td = document.createElement('td');
+    td.className = 'virtual-column-spacer';
+    td.setAttribute?.('aria-hidden', 'true');
+    Object.assign(td.style, { padding: '0', border: '0' });
+    return td;
+}
+
+function setColumnSpacerSpan(td, columnCount) {
+    // colSpan cannot be 0; a spacer for no column must leave the table instead.
+    td.colSpan = Math.max(1, columnCount);
+    td.style.display = columnCount > 0 ? '' : 'none';
+}
+
+// ================================================================
 // ROW / CELL CONSTRUCTION
 // ================================================================
 
@@ -426,7 +536,7 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
 
     // A bounded count cannot locate a last-keyset page in the global row order.
     // Use explicit page-local ordinals instead of inventing an OFFSET from it.
-    const rowNumVal = (state.totalRecordCountIsExact ? state.currentPageIndex * getPageSize() : 0) + rowIdx + 1;
+    const rowNumVal = rowNumberValue(rowIdx);
     const rowLabel = `row ${rowNumVal}${state.totalRecordCountIsExact ? '' : ' on this page'}`;
     // Use DOM methods instead of innerHTML for consistency with XSS prevention patterns
     const rowSelectButton = document.createElement('button');
@@ -445,91 +555,121 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
     rowNumTd.appendChild(pinButton);
     tr.appendChild(rowNumTd);
 
-    for (let displayColIdx = 0; displayColIdx < ctx.orderedColumns.length; displayColIdx++) {
-        const col = ctx.orderedColumns[displayColIdx];
-        const originalColIdx = ctx.columnIndexMap.get(col.name);
-        const value = getCellValue(row, originalColIdx);
-        const isNull = value === null || value === undefined;
-        const isCellSelected = dyn.selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
-        const isColPinned = state.pinnedColumns.has(col.name);
-        const oversizedMetadata = getOversizedCellMetadata(rowIdx, originalColIdx);
-        // A bounded grid value is still viewable through the snapshot-backed
-        // inspector. Hiding the affordance made containment look like data loss.
-        const hasContent = !!oversizedMetadata || (!isNull && !(value instanceof Uint8Array));
-        const colWidth = state.columnWidths[col.name] || 120;
-        const isActiveMatch = !!dyn.activeMatch && dyn.activeMatch.rowIdx === rowIdx
-            && dyn.activeMatch.colIdx === originalColIdx;
-        const visibleValue = getCellValueForDisplay(row, rowIdx, originalColIdx);
-        const exactIntegerText = getExactIntegerText(rowIdx, originalColIdx);
-        const displayValue = isActiveMatch
-            ? formatCellValueForActiveMatch(
-                value,
-                col,
-                state.matchNav.term,
-                exactIntegerText
-            )
-            : formatCellValueAsText(visibleValue, col.type, state.dateFormat, col.name);
-
-        const td = document.createElement('td');
-        td.id = `cell-${rowIdx}-${originalColIdx}`;
-        td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''} ${isActiveMatch ? 'active-match-cell' : ''} ${oversizedMetadata ? 'oversized-cell' : ''}`;
-        td.dataset.rowidx = rowIdx;
-        td.dataset.colidx = originalColIdx;
-        const isKeyboardTarget = ctx.keyboardTarget?.rowIdx === rowIdx
-            && ctx.keyboardTarget?.colIdx === originalColIdx;
-        td.tabIndex = isKeyboardTarget ? 0 : -1;
-        td.dataset.gridTabstop = String(isKeyboardTarget);
-        const mutationBlockReason = getCellMutationBlockReason(rowIdx, originalColIdx);
-        if (mutationBlockReason) {
-            td.title = mutationBlockReason;
+    const columnWindow = ctx.columnWindow;
+    if (!columnWindow) {
+        for (let displayColIdx = 0; displayColIdx < ctx.orderedColumns.length; displayColIdx++) {
+            tr.appendChild(buildDataCell(ctx, dyn, row, rowIdx, rowNumVal, displayColIdx));
         }
-
-        Object.assign(td.style, {
-            width: `${colWidth}px`,
-            minWidth: `${colWidth}px`,
-            maxWidth: `${colWidth}px`
-        });
-
-        if (hasContent) td.style.position = 'relative';
-
-        if (isColPinned) {
-            td.style.position = 'sticky';
-            td.style.left = `${ctx.pinnedColumnOffsets.get(col.name)}px`;
-        }
-
-        const textSpan = document.createElement('span');
-        textSpan.className = 'cell-text';
-        // Use DOM text nodes (never innerHTML) for security (prevents XSS).
-        // formatCellValueAsText returns unescaped text suitable for textContent/text nodes.
-        const oversizedDisplay = oversizedMetadata
-            ? formatOversizedPreview(value, oversizedMetadata, displayValue)
-            : undefined;
-        appendHighlightedText(
-            textSpan,
-            oversizedDisplay?.preview ?? displayValue,
-            buildCellHighlightMatcher(value, ctx.columnFilterValues[displayColIdx], exactIntegerText)
-        );
-        if (oversizedDisplay) {
-            textSpan.appendChild(document.createTextNode(oversizedDisplay.details));
-        }
-        td.appendChild(textSpan);
-
-        if (hasContent) {
-            const expandButton = document.createElement('button');
-            expandButton.type = 'button';
-            expandButton.className = 'expand-icon codicon codicon-link-external';
-            const rawTextBytes = oversizedMetadata?.storageClass === 'text'
-                && value instanceof Uint8Array;
-            expandButton.title = rawTextBytes ? 'Inspect raw TEXT bytes' : 'View full content';
-            expandButton.ariaLabel = rawTextBytes
-                ? `Inspect raw TEXT bytes for ${col.name}, row ${rowNumVal}`
-                : `View full content for ${col.name}, row ${rowNumVal}`;
-            td.appendChild(expandButton);
-        }
-
+        return tr;
+    }
+    for (let displayColIdx = 0; displayColIdx < ctx.pinnedColumnCount; displayColIdx++) {
+        tr.appendChild(buildDataCell(ctx, dyn, row, rowIdx, rowNumVal, displayColIdx));
+    }
+    const left = createColumnSpacer();
+    tr.appendChild(left);
+    const cells = [];
+    for (let position = columnWindow.start; position < columnWindow.end; position++) {
+        const td = buildDataCell(ctx, dyn, row, rowIdx, rowNumVal, ctx.pinnedColumnCount + position);
+        cells.push(td);
         tr.appendChild(td);
     }
+    const right = createColumnSpacer();
+    tr.appendChild(right);
+    setColumnSpacerSpan(left, columnWindow.start);
+    setColumnSpacerSpan(right, columnWindow.total - columnWindow.end);
+    windowedRowCells.set(tr, { rowIdx, left, right, cells, start: columnWindow.start, end: columnWindow.end });
     return tr;
+}
+
+/** The row number shown for rowIdx, which places it in the whole result. */
+function rowNumberValue(rowIdx) {
+    return (state.totalRecordCountIsExact ? state.currentPageIndex * getPageSize() : 0) + rowIdx + 1;
+}
+
+/** One data <td> for the column at displayColIdx in ctx.orderedColumns. */
+function buildDataCell(ctx, dyn, row, rowIdx, rowNumVal, displayColIdx) {
+    const col = ctx.orderedColumns[displayColIdx];
+    const originalColIdx = ctx.columnIndexMap.get(col.name);
+    const value = getCellValue(row, originalColIdx);
+    const isNull = value === null || value === undefined;
+    const isCellSelected = dyn.selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
+    const isColPinned = state.pinnedColumns.has(col.name);
+    const oversizedMetadata = getOversizedCellMetadata(rowIdx, originalColIdx);
+    // A bounded grid value is still viewable through the snapshot-backed
+    // inspector. Hiding the affordance made containment look like data loss.
+    const hasContent = !!oversizedMetadata || (!isNull && !(value instanceof Uint8Array));
+    const colWidth = state.columnWidths[col.name] || 120;
+    const isActiveMatch = !!dyn.activeMatch && dyn.activeMatch.rowIdx === rowIdx
+        && dyn.activeMatch.colIdx === originalColIdx;
+    const visibleValue = getCellValueForDisplay(row, rowIdx, originalColIdx);
+    const exactIntegerText = getExactIntegerText(rowIdx, originalColIdx);
+    const displayValue = isActiveMatch
+        ? formatCellValueForActiveMatch(
+            value,
+            col,
+            state.matchNav.term,
+            exactIntegerText
+        )
+        : formatCellValueAsText(visibleValue, col.type, state.dateFormat, col.name);
+
+    const td = document.createElement('td');
+    td.id = `cell-${rowIdx}-${originalColIdx}`;
+    td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''} ${isActiveMatch ? 'active-match-cell' : ''} ${oversizedMetadata ? 'oversized-cell' : ''}`;
+    td.dataset.rowidx = rowIdx;
+    td.dataset.colidx = originalColIdx;
+    const isKeyboardTarget = ctx.keyboardTarget?.rowIdx === rowIdx
+        && ctx.keyboardTarget?.colIdx === originalColIdx;
+    td.tabIndex = isKeyboardTarget ? 0 : -1;
+    td.dataset.gridTabstop = String(isKeyboardTarget);
+    const mutationBlockReason = getCellMutationBlockReason(rowIdx, originalColIdx);
+    if (mutationBlockReason) {
+        td.title = mutationBlockReason;
+    }
+
+    Object.assign(td.style, {
+        width: `${colWidth}px`,
+        minWidth: `${colWidth}px`,
+        maxWidth: `${colWidth}px`
+    });
+
+    if (hasContent) td.style.position = 'relative';
+
+    if (isColPinned) {
+        td.style.position = 'sticky';
+        td.style.left = `${ctx.pinnedColumnOffsets.get(col.name)}px`;
+    }
+
+    const textSpan = document.createElement('span');
+    textSpan.className = 'cell-text';
+    // Use DOM text nodes (never innerHTML) for security (prevents XSS).
+    // formatCellValueAsText returns unescaped text suitable for textContent/text nodes.
+    const oversizedDisplay = oversizedMetadata
+        ? formatOversizedPreview(value, oversizedMetadata, displayValue)
+        : undefined;
+    appendHighlightedText(
+        textSpan,
+        oversizedDisplay?.preview ?? displayValue,
+        buildCellHighlightMatcher(value, ctx.columnFilterValues[displayColIdx], exactIntegerText)
+    );
+    if (oversizedDisplay) {
+        textSpan.appendChild(document.createTextNode(oversizedDisplay.details));
+    }
+    td.appendChild(textSpan);
+
+    if (hasContent) {
+        const expandButton = document.createElement('button');
+        expandButton.type = 'button';
+        expandButton.className = 'expand-icon codicon codicon-link-external';
+        const rawTextBytes = oversizedMetadata?.storageClass === 'text'
+            && value instanceof Uint8Array;
+        expandButton.title = rawTextBytes ? 'Inspect raw TEXT bytes' : 'View full content';
+        expandButton.ariaLabel = rawTextBytes
+            ? `Inspect raw TEXT bytes for ${col.name}, row ${rowNumVal}`
+            : `View full content for ${col.name}, row ${rowNumVal}`;
+        td.appendChild(expandButton);
+    }
+
+    return td;
 }
 
 function createTableBody(ctx, hasActiveFilters) {
@@ -675,32 +815,42 @@ function editorHoldsWindow() {
 }
 
 /**
- * Revalidate the window against the live scroll position, rebuilding the
- * materialized slice when the visible range drifted near/past its edges.
- * No-ops while an inline cell edit is live — the DOM must stay frozen so
- * the editor's <textarea> survives (mirrors the render-skip in loadTableData);
- * cleanupCellEdit schedules a revalidation when the edit ends.
+ * Revalidate the row and column windows against the live scroll position,
+ * rebuilding the materialized slice when the visible range drifted near/past
+ * its edges. No-ops while an inline cell edit is live — the DOM must stay
+ * frozen so the editor's <textarea> survives (mirrors the render-skip in
+ * loadTableData); cleanupCellEdit schedules a revalidation when the edit ends.
  * Returns true when it changed the DOM.
  */
 export function updateVirtualGridWindow() {
     const vw = virtualWindow;
-    if (!vw) return false;
+    const cw = columnWindow;
+    const mounted = vw ?? cw;
+    if (!mounted) return false;
     // The container was wiped (spinner, error view, table switch) since this
     // window was built: the metadata is dead, and rendering from it would
     // paint stale rows over the new content.
-    if (vw.tbody.isConnected === false) {
+    if (mounted.tbody.isConnected === false) {
         virtualWindow = null;
+        columnWindow = null;
         return false;
     }
     if (editorHoldsWindow()) return false;
     // A background commit replaced the page under a skipped render. Re-render
     // from current state (captures the live scroll position, so the viewport
     // does not move).
-    if (vw.gridDataRef !== state.gridData) {
+    if (mounted.gridDataRef !== state.gridData) {
         renderDataGrid();
         return true;
     }
     const container = document.getElementById('gridContainer');
+    // Columns first: rows the row window builds next take the new bounds.
+    const columnsChanged = cw ? updateColumnWindow(cw, container) : false;
+    const rowsChanged = vw ? updateRowWindow(vw, container) : false;
+    return columnsChanged || rowsChanged;
+}
+
+function updateRowWindow(vw, container) {
     const viewportHeight = readViewportHeight(container);
     if (viewportHeight === null) return false;
     const scrollTop = toFiniteScrollTop(container.scrollTop);
@@ -715,6 +865,69 @@ export function updateVirtualGridWindow() {
     return true;
 }
 
+function updateColumnWindow(cw, container) {
+    const viewportWidth = readViewportWidth(container);
+    if (viewportWidth === null) return false;
+    const { bounds } = cw;
+    const visible = computeVisibleColumnRange(
+        toFiniteScrollTop(container.scrollLeft), viewportWidth, cw.stickyWidth, cw.prefix
+    );
+    if (!virtualWindowNeedsUpdate(
+        bounds.start, bounds.end, visible.first, visible.last, bounds.total, VIRTUAL_COLUMN_EDGE_TRIGGER
+    )) {
+        return false;
+    }
+    const next = windowFromVisible(visible, bounds.total, VIRTUAL_COLUMN_OVERSCAN);
+    const dyn = computeDynamicRowState();
+    for (const tr of Array.from(cw.tbody.children)) {
+        const cells = windowedRowCells.get(tr);
+        if (cells) patchRowColumns(cw.ctx, dyn, tr, cells, next.start, next.end);
+    }
+    bounds.start = next.start;
+    bounds.end = next.end;
+    syncSelectionDOM();
+    return true;
+}
+
+/**
+ * Move one row's cells to the window [start, end). Cells in both windows stay
+ * where they are, so a focused cell is never detached; new cells are inserted
+ * on either side of them.
+ */
+function patchRowColumns(ctx, dyn, tr, entry, start, end) {
+    const row = state.gridData[entry.rowIdx];
+    const rowNumVal = rowNumberValue(entry.rowIdx);
+    const build = position => buildDataCell(
+        ctx, dyn, row, entry.rowIdx, rowNumVal, ctx.pinnedColumnCount + position
+    );
+    const keepStart = Math.max(start, entry.start);
+    const keepEnd = Math.min(end, entry.end);
+    const kept = keepStart < keepEnd
+        ? entry.cells.slice(keepStart - entry.start, keepEnd - entry.start)
+        : [];
+    for (let position = entry.start; position < entry.end; position++) {
+        if (position < keepStart || position >= keepEnd) {
+            tr.removeChild(entry.cells[position - entry.start]);
+        }
+    }
+    const before = [];
+    const after = [];
+    if (kept.length === 0) {
+        for (let position = start; position < end; position++) after.push(build(position));
+    } else {
+        for (let position = start; position < keepStart; position++) before.push(build(position));
+        for (let position = keepEnd; position < end; position++) after.push(build(position));
+    }
+    const firstKept = kept[0] ?? entry.right;
+    for (const td of before) tr.insertBefore(td, firstKept);
+    for (const td of after) tr.insertBefore(td, entry.right);
+    setColumnSpacerSpan(entry.left, start);
+    setColumnSpacerSpan(entry.right, ctx.columnWindow.total - end);
+    entry.cells = [...before, ...kept, ...after];
+    entry.start = start;
+    entry.end = end;
+}
+
 let windowUpdateScheduled = false;
 
 /**
@@ -724,7 +937,7 @@ let windowUpdateScheduled = false;
  * assertions deterministic.
  */
 export function scheduleVirtualGridUpdate() {
-    if (!virtualWindow) return;
+    if (!virtualWindow && !columnWindow) return;
     if (typeof requestAnimationFrame !== 'function') {
         updateVirtualGridWindow();
         return;
@@ -781,6 +994,52 @@ export function ensureGridRowMaterialized(rowIdx) {
     updateVirtualGridWindow();
 }
 
+/**
+ * ensureGridRowMaterialized, then the same for the column: when the cell's
+ * unpinned column is outside the column window, scroll it to the middle of
+ * the unpinned band and rebuild the window synchronously. Pinned columns are
+ * always materialized.
+ */
+export function ensureGridCellMaterialized(rowIdx, colIdx) {
+    ensureGridRowMaterialized(rowIdx);
+    let cw = columnWindow;
+    if (!cw) return;
+    if (editorHoldsWindow()) return;
+    if (cw.tbody.isConnected === false) {
+        virtualWindow = null;
+        columnWindow = null;
+        return;
+    }
+    if (cw.gridDataRef !== state.gridData) {
+        renderDataGrid();
+        cw = columnWindow;
+        if (!cw) return;
+    }
+    const position = cw.positionByColIdx.get(colIdx);
+    if (position === undefined) return;
+    if (position >= cw.bounds.start && position < cw.bounds.end) return;
+
+    const container = document.getElementById('gridContainer');
+    if (!container) return;
+    const band = Math.max((readViewportWidth(container) ?? 0) - cw.stickyWidth, 0);
+    const width = cw.prefix[position + 1] - cw.prefix[position];
+    container.scrollLeft = Math.max(0, Math.round(cw.prefix[position] - Math.max(band - width, 0) / 2));
+    updateVirtualGridWindow();
+}
+
+/**
+ * A column width changed without a re-render (column resize): recompute the
+ * column offsets the window is planned from, then revalidate it.
+ */
+export function noteColumnWidthsChanged() {
+    const cw = columnWindow;
+    if (!cw) return;
+    const { ctx } = cw;
+    cw.prefix = columnWidthPrefix(ctx.orderedColumns.slice(ctx.pinnedColumnCount));
+    cw.stickyWidth = ctx.rowNumWidth + columnWidthPrefix(ctx.orderedColumns.slice(0, ctx.pinnedColumnCount))[ctx.pinnedColumnCount];
+    scheduleVirtualGridUpdate();
+}
+
 // ================================================================
 // FULL GRID RENDER
 // ================================================================
@@ -789,6 +1048,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     // Whatever window described the previous DOM is invalid the moment we
     // rebuild (or bail before rebuilding).
     virtualWindow = null;
+    columnWindow = null;
 
     const headerHeight = GRID_HEADER_HEIGHT;
     const rowHeight = GRID_ROW_HEIGHT;
@@ -813,6 +1073,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     // replacing) its content. null in environments without layout, which
     // falls back to rendering every row.
     const viewportHeight = readViewportHeight(container);
+    const viewportWidth = readViewportWidth(container);
 
     const hasActiveFilters = state.filterQuery.trim() !== ''
         || Object.values(state.columnFilters).some(v => v && v.trim() !== '');
@@ -879,11 +1140,19 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
         [state.filterQuery, state.columnFilters[col.name]]
     );
 
+    // Pinned columns come first in orderedColumns; the column window covers
+    // the unpinned ones after them.
+    const pinnedColumnCount = pinnedColumnOffsets.size;
+    const unpinnedColumnPrefix = columnWidthPrefix(orderedColumns.slice(pinnedColumnCount));
+    const stickyWidth = rowNumWidth
+        + columnWidthPrefix(orderedColumns.slice(0, pinnedColumnCount))[pinnedColumnCount];
+
     const ctx = {
         rowNumWidth,
         orderedColumns,
         columnIndexMap,
         pinnedColumnOffsets,
+        pinnedColumnCount,
         pinnedRowOffsets,
         pinnedRowIndices,
         unpinnedRowIndices,
@@ -893,10 +1162,27 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
             viewportHeight,
             pinnedRowIndices.length,
             unpinnedRowIndices.length
+        ),
+        // Mutable {start, end, total}: updateColumnWindow moves it, and rows
+        // built later read it. null renders every column.
+        columnWindow: planVirtualColumnWindow(
+            finalScrollLeft,
+            viewportWidth,
+            stickyWidth,
+            unpinnedColumnPrefix
         )
     };
 
     const orderedColumnIndices = orderedColumns.map(column => columnIndexMap.get(column.name));
+    // The roving tab stop must be a rendered cell.
+    const columnIsRendered = colIdx => {
+        const position = orderedColumnIndices.indexOf(colIdx) - pinnedColumnCount;
+        return !ctx.columnWindow || position < 0
+            || (position >= ctx.columnWindow.start && position < ctx.columnWindow.end);
+    };
+    const fallbackColIdx = ctx.columnWindow && pinnedColumnCount === 0
+        ? orderedColumnIndices[ctx.columnWindow.start]
+        : orderedColumnIndices[0];
     const preferred = state.lastSelectedCell;
     const preferredRowPosition = preferred
         ? unpinnedRowIndices.indexOf(preferred.rowIdx)
@@ -912,12 +1198,29 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     ctx.keyboardTarget = {
         rowIdx: preferredRowIsRendered ? preferred.rowIdx : fallbackRowIdx,
         colIdx: preferred && orderedColumnIndices.includes(preferred.colIdx)
+            && columnIsRendered(preferred.colIdx)
             ? preferred.colIdx
-            : orderedColumnIndices[0]
+            : fallbackColIdx
     };
 
     const tbody = createTableBody(ctx, hasActiveFilters);
     table.appendChild(tbody);
+
+    if (ctx.columnWindow) {
+        const positionByColIdx = new Map();
+        orderedColumnIndices.slice(pinnedColumnCount).forEach((colIdx, position) => {
+            positionByColIdx.set(colIdx, position);
+        });
+        columnWindow = {
+            tbody,
+            ctx,
+            bounds: ctx.columnWindow,
+            prefix: unpinnedColumnPrefix,
+            stickyWidth,
+            positionByColIdx,
+            gridDataRef: state.gridData
+        };
+    }
 
     container.appendChild(table);
 
