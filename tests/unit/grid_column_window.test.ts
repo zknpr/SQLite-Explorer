@@ -392,4 +392,85 @@ describe('grid column window', {
             assert.equal(layout.spacerSpans[0] + layout.columnCells - 1 + layout.spacerSpans[1], 299);
         } finally { await page.close(); }
     });
+
+    /** ARIA positions of the grid; cells keyed by header aria-colindex. */
+    function readAriaPositions(page: Page) {
+        return page.evaluate(() => {
+            const table = document.querySelector('#gridContainer table')!;
+            const headerCells = [...document.querySelectorAll<HTMLElement>('#gridContainer thead tr > th')];
+            const headerIndexByName = new Map(headerCells.map(th => [th.dataset.column, th.getAttribute('aria-colindex')]));
+            const columnNames = (window as any).__columnHarness.state.tableColumns.map((c: { name: string }) => c.name);
+            const wrongCells: string[] = [];
+            const rows: { id: string; rowIndex: string | null }[] = [];
+            let colIndexedCells = 0;
+            for (const tr of document.querySelectorAll<HTMLElement>('#gridContainer tbody tr.data-row')) {
+                rows.push({ id: tr.id, rowIndex: tr.getAttribute('aria-rowindex') });
+                for (const td of tr.querySelectorAll<HTMLElement>('td.data-cell')) {
+                    const actual = td.getAttribute('aria-colindex');
+                    if (actual !== null) colIndexedCells++;
+                    const expected = td.classList.contains('row-number')
+                        ? '1'
+                        : headerIndexByName.get(columnNames[Number(td.dataset.colidx)]);
+                    if (actual !== expected) wrongCells.push(`${td.id}: ${actual} != ${expected}`);
+                }
+            }
+            return {
+                colCount: table.getAttribute('aria-colcount'),
+                rowCount: table.getAttribute('aria-rowcount'),
+                headerRowIndex: document.querySelector('#gridContainer thead tr')!.getAttribute('aria-rowindex'),
+                headerIndices: headerCells.map(th => th.getAttribute('aria-colindex')),
+                rows,
+                colIndexedCells,
+                wrongCells: wrongCells.slice(0, 5)
+            };
+        });
+    }
+
+    it('gives assistive technology the position of every cell in a windowed grid', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.evaluate(() => {
+                const harness = window.__columnHarness;
+                harness.state.pinnedColumns.add('c250');
+                harness.state.pinnedRowIds.add(5);
+                harness.renderDataGrid();
+            });
+            // Both windows move: cells built by the patch path and rows built
+            // by the row window must carry positions too.
+            await scrollTo(page, 9000);
+            await page.evaluate(async () => {
+                const container = document.getElementById('gridContainer')!;
+                container.scrollTop = 2600;
+                container.dispatchEvent(new Event('scroll'));
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            });
+            assert.ok(await page.evaluate(() => window.__columnHarness.getVirtualWindowBounds()!.start > 0));
+            const aria = await readAriaPositions(page);
+            assert.equal(aria.colCount, '301');
+            assert.equal(aria.rowCount, '201');
+            assert.equal(aria.headerRowIndex, '1');
+            assert.deepEqual(aria.headerIndices, Array.from({ length: 301 }, (_, index) => String(index + 1)));
+            assert.ok(aria.colIndexedCells > 100, `${aria.colIndexedCells} cells`);
+            assert.deepEqual(aria.wrongCells, []);
+            // Row 5 (row-4) is pinned, so it is displayed first; every other
+            // row follows in page order after it.
+            assert.deepEqual(aria.rows[0], { id: 'row-4', rowIndex: '2' });
+            for (const { id, rowIndex } of aria.rows.slice(1)) {
+                const rowIdx = Number(id.slice('row-'.length));
+                assert.equal(rowIndex, String((rowIdx < 4 ? rowIdx : rowIdx - 1) + 3), id);
+            }
+        } finally { await page.close(); }
+    });
+
+    it('leaves positions to the DOM on an axis that renders everything', async () => {
+        const page = await openGrid(99, 10);
+        try {
+            const aria = await readAriaPositions(page);
+            assert.deepEqual(
+                [aria.colCount, aria.rowCount, aria.headerRowIndex, aria.colIndexedCells],
+                [null, null, null, 0]
+            );
+            assert.ok(aria.rows.every(row => row.rowIndex === null));
+        } finally { await page.close(); }
+    });
 });

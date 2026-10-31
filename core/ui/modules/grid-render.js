@@ -522,6 +522,8 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
     if (isRowPinned) {
         tr.style.top = `${ctx.pinnedRowOffsets.get(rowId)}px`;
     }
+    // A row window leaves rows out of the DOM; the header row is 1.
+    if (ctx.windowBounds) tr.setAttribute?.('aria-rowindex', String(displayOrdinal + 2));
 
     const rowNumTd = document.createElement('td');
     rowNumTd.className = 'data-cell row-number';
@@ -533,6 +535,7 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
         left: '0',
         zIndex: isRowPinned ? '8' : '2'
     });
+    if (ctx.columnWindow) rowNumTd.setAttribute?.('aria-colindex', '1');
 
     // A bounded count cannot locate a last-keyset page in the global row order.
     // Use explicit page-local ordinals instead of inventing an OFFSET from it.
@@ -614,6 +617,8 @@ function buildDataCell(ctx, dyn, row, rowIdx, rowNumVal, displayColIdx) {
 
     const td = document.createElement('td');
     td.id = `cell-${rowIdx}-${originalColIdx}`;
+    // A column window leaves cells out of the DOM; the row number is column 1.
+    if (ctx.columnWindow) td.setAttribute?.('aria-colindex', String(displayColIdx + 2));
     td.className = `data-cell ${isNull ? 'null-value' : ''} ${isCellSelected ? 'cell-selected' : ''} ${isColPinned ? 'pinned' : ''} ${isActiveMatch ? 'active-match-cell' : ''} ${oversizedMetadata ? 'oversized-cell' : ''}`;
     td.dataset.rowidx = rowIdx;
     td.dataset.colidx = originalColIdx;
@@ -1202,6 +1207,20 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
             ? preferred.colIdx
             : fallbackColIdx
     };
+
+    // Windowed axes replace rows and cells with aria-hidden spacers, so the
+    // table states its full size and every rendered row or cell its position;
+    // assistive technology would otherwise count only what is in the DOM.
+    if (ctx.windowBounds) {
+        table.setAttribute?.('aria-rowcount', String(state.gridData.length + 1));
+        thead.firstChild?.setAttribute?.('aria-rowindex', '1');
+    }
+    if (ctx.columnWindow) {
+        table.setAttribute?.('aria-colcount', String(orderedColumns.length + 1));
+        Array.from(thead.firstChild?.children ?? []).forEach((th, index) => {
+            th.setAttribute?.('aria-colindex', String(index + 1));
+        });
+    }
 
     const tbody = createTableBody(ctx, hasActiveFilters);
     table.appendChild(tbody);
