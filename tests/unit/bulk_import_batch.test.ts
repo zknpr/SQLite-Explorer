@@ -18,14 +18,21 @@ async function withBackend(
     queryTimeout?: number
 ) {
     // For native, the WASM engine only builds the fixture file.
-    const opened = await createDatabaseEngine({
-        content: null, maxSize: 0, readOnlyMode: false, queryTimeout: backend === 'wasm' ? queryTimeout : undefined
-    });
-    const wasm = opened.operations as WasmDatabaseEngine;
+    const opened = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+    let wasm = opened.operations as WasmDatabaseEngine;
     let native: Awaited<ReturnType<typeof createNativeDatabaseConnection>> | undefined;
     let directory: string | undefined;
     try {
         await wasm.executeQuery(setup);
+        if (backend === 'wasm' && queryTimeout !== undefined) {
+            // The fixture builds without the deadline under test: on a loaded
+            // machine a 200,000-row setup outlasts 250 ms.
+            const content = await wasm.serializeDatabase();
+            wasm.shutdown();
+            wasm = (await createDatabaseEngine({
+                content, maxSize: 0, readOnlyMode: false, queryTimeout
+            })).operations as WasmDatabaseEngine;
+        }
         let ops: DatabaseOperations = serializeOperations(wasm);
         if (backend === 'native') {
             fs.mkdirSync('.tmp', { recursive: true });
