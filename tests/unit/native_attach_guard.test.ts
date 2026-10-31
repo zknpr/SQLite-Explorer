@@ -459,7 +459,7 @@ it('enforces the ATTACH refusal in the runtime itself, beneath the worker guard'
         copyAttach: unknown;
     };
 
-    assert.deepEqual(outcome.unpermitted, { errno: 23, message: 'authorization denied' },
+    assert.deepEqual(outcome.unpermitted, { errno: 23, message: 'not authorized' },
         'the runtime refuses ATTACH with SQLITE_AUTH even without the worker guard');
     // SQLITE_AUTH comes only from an authorizer, and the control arms rule out
     // the path and the syntax.

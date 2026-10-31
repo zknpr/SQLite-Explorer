@@ -1131,6 +1131,24 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             );
         });
 
+        await testContext.test('reports SQLite\'s message for failed native statements', async () => {
+            // The runtime reported only the generic text of each code, such as
+            // "SQL logic error" and "constraint failed".
+            await assert.rejects(
+                engine.executeQuery('SELECT * FROM native_missing_table'),
+                /no such table: native_missing_table/
+            );
+            await assert.rejects(
+                engine.insertRow('native_text_primary_key', { key: null, value: 'invalid' }),
+                /NOT NULL constraint failed: native_text_primary_key\.key/
+            );
+            // Fails while stepping on the thread-pool connection.
+            await assert.rejects(
+                engine.executeReadQuery('SELECT abs(-9223372036854775807 - 1) AS value'),
+                /integer overflow/
+            );
+        });
+
         await testContext.test('builds selected native primary-key columns as one NOT NULL composite key', async () => {
             await engine.createTable('native_composite_primary_key', [
                 { name: 'tenant', type: 'TEXT', primaryKey: true, notNull: true },
