@@ -2794,7 +2794,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       return this.readPrimaryKeyRecordId(
         table,
         identity,
-        buildRecordIdentityPredicate(candidateId, identity)
+        buildRecordIdentityPredicate(candidateId, identity),
+        undefined,
+        textEncoding
       );
     }
     this.runHistoryStatement(sql, params);
@@ -2841,16 +2843,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         if (result.rows.length !== 1) {
           throw new Error(`Insert into ${table} did not return exactly one primary-key identity`);
         }
+        const textEncoding = this.getCellTextEncoding();
         const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
           identity,
           result.rows[0],
-          this.getCellTextEncoding(),
+          textEncoding,
           `Cannot insert into ${table}`
         );
         const rowId = this.readPrimaryKeyRecordId(
           table,
           identity,
-          buildRecordIdentityPredicate(candidateId, identity)
+          buildRecordIdentityPredicate(candidateId, identity),
+          undefined,
+          textEncoding
         );
         const history = captureHistory
           ? await this.captureInsertedRowHistory(table, identity, rowId, maxUndoSnapshotBytes)
@@ -3581,7 +3586,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     table: string,
     identity: Extract<TableIdentity, { kind: 'primaryKey' }>,
     predicate: { sql: string; params: CellValue[] },
-    missingRowError?: Error
+    missingRowError?: Error,
+    textEncoding: CellTextEncoding = this.getCellTextEncoding()
   ): RecordId {
     const result = this.queryRaw(
       `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
@@ -3597,7 +3603,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     return encodeByteFaithfulPrimaryKeyRecordId(
       identity,
       result.rows[0],
-      this.getCellTextEncoding(),
+      textEncoding,
       `Cannot resolve updated identity in ${table}`
     );
   }
