@@ -82,6 +82,9 @@ export const state = {
     renderedTable: null,
     currentPageIndex: 0,
     rowsPerPage: DEFAULT_ROWS_PER_PAGE,
+    // Rows per page of the committed grid page. rowsPerPage is the chosen
+    // size; a wide table loads fewer (pageSizeForColumns in grid-data.js).
+    pageSize: undefined,
     totalRecordCount: 0,
     totalRecordCountIsExact: true,
     // Unknown totals are distinct from the existing numeric upper-bound mode.

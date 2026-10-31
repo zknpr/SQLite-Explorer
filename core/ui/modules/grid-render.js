@@ -3,6 +3,7 @@ import { formatCellValueAsText, appendHighlightedText } from './utils.js';
 import { buildCellHighlightMatcher, formatCellValueForActiveMatch } from './match-nav.js';
 import {
     getRowId,
+    getPageSize,
     getCellValue,
     getCellValueForDisplay,
     getExactIntegerText,
@@ -425,7 +426,7 @@ function buildDataRow(ctx, dyn, rowIdx, displayOrdinal) {
 
     // A bounded count cannot locate a last-keyset page in the global row order.
     // Use explicit page-local ordinals instead of inventing an OFFSET from it.
-    const rowNumVal = (state.totalRecordCountIsExact ? state.currentPageIndex * state.rowsPerPage : 0) + rowIdx + 1;
+    const rowNumVal = (state.totalRecordCountIsExact ? state.currentPageIndex * getPageSize() : 0) + rowIdx + 1;
     const rowLabel = `row ${rowNumVal}${state.totalRecordCountIsExact ? '' : ' on this page'}`;
     // Use DOM methods instead of innerHTML for consistency with XSS prevention patterns
     const rowSelectButton = document.createElement('button');
@@ -794,7 +795,7 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
 
     // Calculate row number column width based on the largest row number that will be displayed
     // Base width: 50px for up to 2 digits, add ~8px per additional digit
-    const maxRowNum = (state.totalRecordCountIsExact ? state.currentPageIndex * state.rowsPerPage : 0) + state.gridData.length;
+    const maxRowNum = (state.totalRecordCountIsExact ? state.currentPageIndex * getPageSize() : 0) + state.gridData.length;
     const digitCount = Math.max(2, String(maxRowNum).length);
     const rowNumWidth = 36 + (digitCount * 8); // Base 36px + 8px per digit
 

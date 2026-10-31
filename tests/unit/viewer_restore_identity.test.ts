@@ -135,6 +135,7 @@ it('restores a saved table identity before loading its columns or data', async (
                         './modules/grid.js': `
                             export function loadTableColumns() { return ${harness}.loadTableColumns(); }
                             export function loadTableData() { return ${harness}.loadTableData(); }
+                            export function recordCountStatus() { return ''; }
                             export function initGridInteraction() {}
                             export function initGridControls() {}
                         `,

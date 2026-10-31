@@ -12,6 +12,7 @@ import {
     getOrderedColumnIndices,
     getOrderedRowIndices,
     getOversizedCellMetadata,
+    getPageSize,
     getRowDataOffset,
     remapDisplayedRowIdentity,
     resolveDisplayedCell
@@ -42,7 +43,7 @@ function refuseTruncatedRowSelection() {
         const row = state.gridData[rowIdx];
         const rowId = state.selectedTableType === 'table'
             ? row[0]
-            : state.currentPageIndex * state.rowsPerPage + rowIdx;
+            : state.currentPageIndex * getPageSize() + rowIdx;
         if (!state.selectedRowIds.has(rowId)) continue;
         if (state.tableColumns.some((_column, colIdx) => (
             getOversizedCellMetadata(rowIdx, colIdx)
@@ -135,7 +136,7 @@ export async function copySelectedRowsToClipboard() {
             if (state.selectedTableType === 'table') {
                 rowId = row[0];
             } else {
-                rowId = state.currentPageIndex * state.rowsPerPage + i;
+                rowId = state.currentPageIndex * getPageSize() + i;
             }
 
             if (state.selectedRowIds.has(rowId)) {

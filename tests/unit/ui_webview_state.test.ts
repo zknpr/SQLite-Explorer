@@ -194,6 +194,16 @@ describe('webview focus and reconstructed view state', {
         return page;
     }
 
+    it('names a lowered page size in the status after restoring a wide table', async () => {
+        // 10,000 rows of 51 columns is past the 500,000-cell page limit.
+        const page = await openViewer({ selectedTable: 'wide', selectedTableType: 'table', rowsPerPage: 10000 });
+        try {
+            assert.equal(await page.locator('#statusText').innerText(), '10000 records; 9800 rows per page for 51 columns');
+            assert.equal(await page.locator('#pageIndicator').innerText(), '1 / 2');
+            assert.equal(await page.evaluate(() => window.__uiStateHarness.state.gridData.length), 9800);
+        } finally { await page.close(); }
+    });
+
     it('uses the current preference after recreating a view from stale HTML', async () => {
         const page = await openViewer({ selectedTable: 'wide', selectedTableType: 'table', rowsPerPage: 100 });
         try {

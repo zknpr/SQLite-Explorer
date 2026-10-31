@@ -180,6 +180,31 @@ function keysetModeCanProveInexactCount(keyset) {
     );
 }
 
+// The host fits a page into 16 MiB by clipping each cell to an equal share of
+// it, so a page of many cells clips short values: at 5,000 rows, values over
+// 16 bytes became previews at 200 columns, and 400 columns did not fit at all.
+// 500,000 cells leaves about 33 bytes per cell and keeps the chosen size up to
+// 100 columns at the default 5,000 rows.
+const MAX_GRID_PAGE_CELLS = 500_000;
+
+/**
+ * Rows per page for a table of columnCount columns: the chosen size, or fewer
+ * for a wide table, rounded down to a multiple of 100 from 100 rows up.
+ */
+export function pageSizeForColumns(rowsPerPage, columnCount) {
+    if (!(columnCount > 0) || rowsPerPage * columnCount <= MAX_GRID_PAGE_CELLS) return rowsPerPage;
+    const rows = Math.max(1, Math.floor(MAX_GRID_PAGE_CELLS / columnCount));
+    return rows >= 100 ? rows - (rows % 100) : rows;
+}
+
+/** Status bar text for the committed page's count, naming a lowered page size. */
+export function recordCountStatus() {
+    const count = `${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`;
+    return state.pageSize < state.rowsPerPage
+        ? `${count}; ${state.pageSize} rows per page for ${state.tableColumns.length} columns`
+        : count;
+}
+
 /**
  * Bound the engine query to the rows that can actually exist on an exact page.
  * The containment layer divides its fixed transport budget across `limit`
@@ -248,8 +273,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     let earlyDataResult;
 
     // Both the early page and a count-aware retry use the same atomic row commit.
-    const commitRows = (dataResult, currentPageIndex, container) => {
+    const commitRows = (dataResult, currentPageIndex, container, pageSize) => {
         state.gridData = dataResult.rows || [];
+        state.pageSize = pageSize;
         state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
         state.gridOversizedCells = dataResult.oversizedCells || {};
         state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};
@@ -397,7 +423,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         // and committed page math all derive from the same value across the
         // awaits below. (A mid-load page-size change also supersedes this
         // load; the snapshot makes the consistency structural, not reasoned.)
-        const requestedPageSize = state.rowsPerPage;
+        const requestedPageSize = pageSizeForColumns(state.rowsPerPage, columnNames.length);
 
         const isTable = requestedTableType === 'table';
 
@@ -533,7 +559,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                     state.totalPageCount = 1;
                     state.currentPageIndex = 0;
                     state.countStatus = 'pending';
-                    commitRows(firstPage, 0, container);
+                    commitRows(firstPage, 0, container, requestedPageSize);
                     earlyDataResult = firstPage;
                     state.isLoadingData = false;
                     // Keep the existing reload guard until metadata settles so
@@ -757,10 +783,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         state.totalRecordCountIsExact = totalRecordCountIsExact;
         state.totalPageCount = totalPageCount;
         state.currentPageIndex = currentPageIndex;
-        if (dataResult !== earlyDataResult) commitRows(dataResult, currentPageIndex, container);
+        if (dataResult !== earlyDataResult) commitRows(dataResult, currentPageIndex, container, requestedPageSize);
 
         updatePagination();
-        updateStatus(`${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`);
+        updateStatus(recordCountStatus());
         return true; // signals callers (e.g. filter submit) that the load applied
 
     } catch (err) {
