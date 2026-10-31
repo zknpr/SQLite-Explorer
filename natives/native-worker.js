@@ -2555,6 +2555,7 @@ async function handleRequest(request) {
         const results = [];
         let responseBytes = 0;
         const statements = new Map();
+        let completed = false;
         try {
           // One wrapper reports a timeout and clears the deadline; setting it
           // again at each unit replaces the previous one.
@@ -2574,9 +2575,21 @@ async function handleRequest(request) {
               if (Date.now() - startedAt >= budgetMs || responseBytes >= budgetBytes) break;
             }
           });
+          completed = true;
         } finally {
           for (const statement of statements.values()) {
-            try { statement.finalize(); } catch { /* the request's own outcome is already decided */ }
+            try {
+              statement.finalize();
+            } catch (error) {
+              // After a failed request finalize repeats the error the host
+              // already gets; after a completed one nothing else reports it.
+              if (completed) {
+                console.error(
+                  '[native-worker] Failed to finalize a row-history statement:',
+                  describeNativeError(error, 'Unknown finalize error')
+                );
+              }
+            }
           }
         }
         result = { results };
