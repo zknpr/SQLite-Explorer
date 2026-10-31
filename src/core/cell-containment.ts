@@ -1237,6 +1237,9 @@ function textEncodingLabel(encoding: CellTextEncoding): string {
 /**
  * Project decoded PK values beside byte-exact TEXT companions. Mutation paths
  * use this inside their savepoint before minting an editable identity.
+ * Callers read the row by position. Every column gets a non-numeric alias
+ * because the native worker builds rows from objects keyed by column name,
+ * where a key named like an integer, such as "1", is listed first.
  */
 export function buildByteFaithfulPrimaryKeyProjection(
   identity: Extract<TableIdentity, { kind: 'primaryKey' }>
@@ -1248,11 +1251,14 @@ export function buildByteFaithfulPrimaryKeyProjection(
     );
   }
   const columns = identity.columns.map(column => escapeIdentifier(column.identifier));
+  const valueColumns = columns.map((column, index) => (
+    `${column} AS ${escapeIdentifier(`${CELL_VALUE_PREFIX}${index}`)}`
+  ));
   const rawColumns = columns.map((column, index) => (
     `CASE WHEN typeof(${column}) = 'text' THEN CAST(${column} AS BLOB) END AS ` +
     escapeIdentifier(`${CELL_RAW_TEXT_PREFIX}${index}`)
   ));
-  return [...columns, ...rawColumns].join(', ');
+  return [...valueColumns, ...rawColumns].join(', ');
 }
 
 /** Refuse a mutable identity whenever the engine's TEXT value lost bytes. */
