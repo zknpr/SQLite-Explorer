@@ -301,6 +301,32 @@ const runtimeLoadFailures = new WeakSet();
 const cellPackDatabases = new WeakSet();
 // Connections whose runtime has sqlite_explorer_like_any (global filters).
 const likeAnyDatabases = new WeakSet();
+// Probe failures of a loaded runtime that prepareGridPage has not reported.
+const unreportedRuntimeErrors = new WeakMap();
+
+/**
+ * Load the runtime library on a connection, then probe the functions the grid
+ * may lack. Explain loads it too, so whichever runs first probes; the grid
+ * reports the failures on its next page.
+ */
+function loadRuntimeLibrary(db, library) {
+  db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
+  queryPlanDatabases.add(db);
+  const errors = {};
+  try {
+    executeQuery(db, 'SELECT sqlite_explorer_cell_pack(1, 1, 2)', []);
+    cellPackDatabases.add(db);
+  } catch (error) {
+    errors.cellPackError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+    executeQuery(db, "SELECT sqlite_explorer_like_any('a', 'A')", []);
+    likeAnyDatabases.add(db);
+  } catch (error) {
+    errors.likeAnyError = error instanceof Error ? error.message : String(error);
+  }
+  if (errors.cellPackError || errors.likeAnyError) unreportedRuntimeErrors.set(db, errors);
+}
 
 /** TEMP export spools owned by the interruptible secondary connection. */
 const exportSpools = new Set();
@@ -2313,29 +2339,16 @@ async function handleRequest(request) {
         if (!db) throw new Error("Database not open");
         if (typeof library !== 'string') throw new Error('Invalid runtime library path');
         let cellHelperError;
-        let cellPackError;
-        let likeAnyError;
         if (!queryPlanDatabases.has(db) && !runtimeLoadFailures.has(db)) {
           try {
-            db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
-            queryPlanDatabases.add(db);
-            try {
-              executeQuery(db, 'SELECT sqlite_explorer_cell_pack(1, 1, 2)', []);
-              cellPackDatabases.add(db);
-            } catch (error) {
-              cellPackError = error instanceof Error ? error.message : String(error);
-            }
-            try {
-              executeQuery(db, "SELECT sqlite_explorer_like_any('a', 'A')", []);
-              likeAnyDatabases.add(db);
-            } catch (error) {
-              likeAnyError = error instanceof Error ? error.message : String(error);
-            }
+            loadRuntimeLibrary(db, library);
           } catch (error) {
             runtimeLoadFailures.add(db);
             cellHelperError = error instanceof Error ? error.message : String(error);
           }
         }
+        const { cellPackError, likeAnyError } = unreportedRuntimeErrors.get(db) ?? {};
+        unreportedRuntimeErrors.delete(db);
         result = {
           encoding: executeQuery(db, 'PRAGMA encoding', []).values[0]?.[0],
           cellHelpers: queryPlanDatabases.has(db),
@@ -2420,10 +2433,7 @@ async function handleRequest(request) {
         if (typeof db.allAsync !== 'function') {
           throw new Error('Native SQLite requires primary-connection allAsync support');
         }
-        if (!queryPlanDatabases.has(db)) {
-          db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
-          queryPlanDatabases.add(db);
-        }
+        if (!queryPlanDatabases.has(db)) loadRuntimeLibrary(db, library);
         // Use the primary connection so TEMP objects and pending DDL are
         // included. Threaded execution keeps cancel RPCs deliverable while the
         // bundled C reader bounds compilation and extraction on that handle.

@@ -678,6 +678,21 @@ describe('row-packed grid pages on the native engine', () => {
         }
     });
 
+    it('pack pages after Explain loaded the runtime library first', async (context) => {
+        if (!bundledNativeBinary()) return context.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
+        const backend = await openNative(FIXTURE_SQL);
+        try {
+            const [, table, options] = PAGES[0];
+            await backend.ops.executeReadQuery(`SELECT * FROM ${table}`, [], true);
+            nativeCalls.length = 0;
+            const page = await backend.ops.fetchTableData!(table, structuredClone(options));
+            assert.ok(page.rows.length > 0);
+            assert.ok(nativeCalls.includes('queryPacked'), nativeCalls.join(', '));
+        } finally {
+            backend.dispose();
+        }
+    });
+
     it('keep queryNumeric when the runtime library has no pack function', async (context) => {
         if (!bundledNativeBinary()) return context.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
         const backend = await openNative(FIXTURE_SQL);
