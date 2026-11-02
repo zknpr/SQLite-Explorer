@@ -287,10 +287,10 @@
     "test:history-fuzz": "node --import tsx --test tests/fuzz/engine_history_differential.test.ts tests/fuzz/engine_column_history_differential.test.ts"
   },
   "devDependencies": {
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "@types/vscode": "=1.110.0",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/vsce": "^4.0.0",
+    "@vscode/vsce": "^4.1.0",
     "esbuild": "^0.28.2",
     "esbuild-plugin-polyfill-node": "^0.3.0",
     "mocha": "^12.0.3",
@@ -304,7 +304,7 @@
     "@scure/base": "^2.4.0",
     "@vscode/codicons": "^0.0.45",
     "@vscode/extension-telemetry": "^1.5.2",
-    "sql.js": "^1.15.1"
+    "sql.js": "^1.15.2"
   },
   "overrides": {
     "qs": "^6.16.0",
