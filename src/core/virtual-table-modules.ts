@@ -50,8 +50,9 @@ function foldAscii(text: string): string {
  * modules has the module's name, in some ASCII case, inside its stored SQL,
  * which LIKE matches without case. SQLite stores every virtual table's SQL
  * starting with this prefix. An ordinary database matches no row, so this
- * costs it one query; tables whose module is present are never prepared here,
- * and so never connected.
+ * costs it one query. A table that only mentions one of these names, in its
+ * own name or in its arguments, matches too and is prepared with the rest;
+ * its answer is not "no such module", so it is not counted.
  *
  * Bounded: past MAX_MODULE_CHECK_TABLES matching tables, or with a matching
  * table named longer than MAX_MODULE_CHECK_NAME_BYTES, nothing is prepared
