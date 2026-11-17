@@ -30,9 +30,12 @@ async function fixture(t: TestContext) {
         seed.close();
     }
     const bundles: Awaited<ReturnType<typeof createNativeDatabaseConnection>>[] = [];
-    t.after(() => {
+    // A worker that left an empty -wal is asked to close its database, which
+    // it does once this process returns to its event loop. Windows keeps the
+    // folder undeletable until then, so the removal must not block the loop.
+    t.after(async () => {
         for (const bundle of bundles) bundle.workerMethods[Symbol.dispose]();
-        fs.rmSync(directory, { recursive: true, force: true });
+        await fs.promises.rm(directory, { recursive: true, force: true });
     });
     const open = async () => {
         const bundle = await createNativeDatabaseConnection(vscode.Uri.file(root));

@@ -60,24 +60,65 @@ export function registerSqlWorkspace(_context: vscode.ExtensionContext): vscode.
         if (database && !document.isClosed) bindings.set(document, { database });
         return database;
     };
+    // Completions list every table and view of main with its columns, 500
+    // rows at most. The PRAGMA tables are read through the `pragma` schema: a
+    // user table in main may have their names.
+    const completionRows = async (database: DatabaseDocument): Promise<Array<[string, string | null]>> => {
+        const operations = database.databaseOperations;
+        try {
+            const joined = await operations.executeReadQuery(
+                "SELECT s.name AS table_name, p.name AS column_name FROM main.sqlite_schema AS s JOIN pragma.pragma_table_info(s.name, 'main') AS p WHERE s.type IN ('table', 'view') ORDER BY s.name, p.cid LIMIT 500"
+            );
+            return joined.rows.map(row => [String(row[0]), String(row[1])]);
+        } catch {
+            // One object whose columns cannot be listed fails that query for
+            // the whole database: a view over a dropped table or over a
+            // function only its application registers, a virtual table whose
+            // module is missing. Each object is then asked on its own, and one
+            // that cannot answer is still offered by name. An error that is
+            // not about one object fails the first query below as well.
+            assertAlive(database);
+            const objects = await operations.executeReadQuery(
+                "SELECT name FROM main.sqlite_schema WHERE type IN ('table', 'view') ORDER BY name LIMIT 500"
+            );
+            const rows: Array<[string, string | null]> = [];
+            for (const object of objects.rows) {
+                if (rows.length >= 500) break;
+                assertAlive(database);
+                const table = String(object[0]);
+                let columns: unknown[][] = [];
+                try {
+                    columns = (await operations.executeReadQuery(
+                        "SELECT name FROM pragma.pragma_table_info(?, 'main') ORDER BY cid LIMIT 500", [table]
+                    )).rows;
+                } catch (error) {
+                    // Not about this object: each one after it would wait for the same lock.
+                    // SQLite's whole message, not text a name in the schema can put into another one.
+                    if (/^(Error: )?(\[\w+\] )?database is locked$/.test(String(error))) throw error;
+                    // Any other object is offered by name.
+                }
+                if (columns.length === 0) rows.push([table, null]);
+                for (const column of columns) rows.push([table, String(column[0])]);
+            }
+            return rows;
+        }
+    };
     const refreshCompletions = async (database: DatabaseDocument) => {
         assertAlive(database);
-        const metadata = await database.databaseOperations.executeReadQuery(
-            "SELECT s.name AS table_name, p.name AS column_name FROM main.sqlite_schema AS s JOIN pragma_table_info(s.name, 'main') AS p WHERE s.type IN ('table', 'view') ORDER BY s.name, p.cid LIMIT 500"
-        );
+        const metadata = await completionRows(database);
         assertAlive(database);
         const items: vscode.CompletionItem[] = ['main', 'temp'].map(name => {
             const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Module);
             item.insertText = escapeIdentifier(name); return item;
         });
         const tables = new Set<string>();
-        for (const row of metadata.rows.slice(0, 500)) {
-            const table = String(row[0]), column = String(row[1]);
+        for (const [table, column] of metadata.slice(0, 500)) {
             if (!tables.has(table)) {
                 tables.add(table);
                 const item = new vscode.CompletionItem(table, vscode.CompletionItemKind.Class);
                 item.insertText = escapeIdentifier(table); item.detail = 'main'; items.push(item);
             }
+            if (column === null) continue;
             const item = new vscode.CompletionItem(column, vscode.CompletionItemKind.Field);
             item.insertText = escapeIdentifier(column); item.detail = table; items.push(item);
         }
@@ -128,7 +169,7 @@ export function registerSqlWorkspace(_context: vscode.ExtensionContext): vscode.
         if (prepared.parameterCount) {
             const answer = await vscode.window.showInputBox({
                 title: `${prepared.parameterCount} positional SQL parameters`,
-                prompt: 'JSON array: null, strings, numbers. Exact integers: quoted string with CAST(? AS INTEGER). Bindings are never kept in history.',
+                prompt: 'JSON array: null, strings, numbers. An integer binds as INTEGER; a number with a decimal point or exponent binds as REAL. Bindings are never kept in history.',
                 password: true, ignoreFocusOut: true,
                 validateInput: value => {
                     try {

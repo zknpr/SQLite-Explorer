@@ -5,9 +5,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { it } from 'node:test';
+import { after, it } from 'node:test';
 
-import { getNativeBinaryPath, NativeWorkerProcess } from '../../src/nativeWorker';
+import { getNativeBinaryPath, NativeWorkerProcess, nativeRequestsWrittenByV8 } from '../../src/nativeWorker';
+
+// Every request to the native engine is written by the extension itself (`nativeRequestFormat.ts`).
+after(() => { assert.strictEqual(nativeRequestsWrittenByV8.count, 0, 'no request was left to the editor\'s V8 to write'); });
 
 // Differential fuzz of the native ATTACH/DETACH/VACUUM INTO refusal (the
 // worker's tokenizer guard and the runtime's authorizer): node:sqlite decides

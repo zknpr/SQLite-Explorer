@@ -1,4 +1,5 @@
 import { prepareReadQuery, buildReadTransport, decodeReadTransport, queryPlanRequest, decodeQueryPlan, SQL_RESULT_ROWS, SQL_MAX_COLUMNS } from '../../sql-workspace';
+import { isReadStatement } from '../../read-statement';
 /**
  * WebAssembly-based SQLite database engine (sql.js).
  *
@@ -67,6 +68,7 @@ import {
   keysetFallbackOrder,
   mintKeysetAnchors,
   ordersBySyntheticRowId,
+  primaryKeyCollations,
   resolveKeysetPlan,
   type ResolvedKeysetPlan
 } from '../../keyset-pagination';
@@ -90,6 +92,7 @@ import {
 import {
   buildRowHistoryPredicate,
   buildRowHistoryWrites,
+  chunkRowHistoryColumns,
   LegacyRowHistoryError,
   RowHistoryConflictError,
   rowHistoryStates
@@ -144,6 +147,7 @@ import {
   assertMutableRecordId,
   assertNoApplicableUpdateTriggerTargetWrites,
   assertNoUntrackedMutationPrograms,
+  assertOneRowPerIdentity,
   assertUniqueCellUpdateTargets,
   buildDeleteTriggerProbeSql,
   buildInsertTriggerProbeSql,
@@ -161,7 +165,8 @@ import {
   replacePrimaryKeyRecordIdValues,
   TABLE_IDENTITY_METADATA_SQL,
   unresolvableTriggeredPrimaryKeyUpdateError,
-  unresolvableTriggeredRowIdUpdateError
+  unresolvableTriggeredRowIdUpdateError,
+  type RecordIdentityPredicate
 } from '../../row-identity';
 import {
   assertDeleteSnapshotFitsUndoBudget,
@@ -750,12 +755,31 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     }
   }
 
+  /**
+   * Run a strictly synchronous read while SQLite refuses every write on this
+   * connection. Callers put the deadline handler inside `read`, so the flag
+   * is restored after a timeout
+   * or cancellation has been handled. Holds nest: only the outermost one
+   * changes the flag.
+   */
+  private withWritesRefused<T>(read: () => T, apply = true): T {
+    if (!apply) return read();
+    this.restorePendingExportPragmas();
+    const queryOnly = Number(this.instance.exec('PRAGMA query_only')[0]?.values[0]?.[0]) === 1;
+    if (!queryOnly) this.instance.exec('PRAGMA query_only = ON');
+    try {
+      return read();
+    } finally {
+      if (!queryOnly) this.instance.exec('PRAGMA query_only = OFF');
+    }
+  }
+
   /** Read a generated preview SELECT under the configured VM deadline. */
   private executeSingleQuery(
     sql: string,
     cancellation?: WasmQueryCancellation
   ): QueryResultSet {
-    return this.executeWithProgressHandler(() => {
+    return this.withWritesRefused(() => this.executeWithProgressHandler(() => {
       const sourceStatement = this.prepareSingleStatement(sql);
       const headers = sourceStatement.getColumnNames();
       sourceStatement.free();
@@ -778,7 +802,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       } finally {
         statement.free();
       }
-    }, cancellation);
+    }, cancellation));
   }
 
   /**
@@ -794,11 +818,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
    */
   async executeReadQuery(sql: string, params: CellValue[] = [], explain = false, cancellation?: WasmQueryCancellation): Promise<QueryResultSet> {
     this.assertNoActiveReadSession();
-    const prepared = prepareReadQuery(sql);
+    const prepared = prepareReadQuery(sql, params);
     if (params.length !== prepared.parameterCount) throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
     if (explain) {
       return this.executeWithProgressHandler(() => {
-        const request = queryPlanRequest(prepared.sourceSql, params);
+        const request = queryPlanRequest(prepared.sourceSql, prepared.params);
         return decodeQueryPlan(this.queryRaw(request.sql, request.params).rows[0]?.[0]);
       }, cancellation);
     }
@@ -834,16 +858,24 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
       }
     }
-    return this.executeWithProgressHandler(() => {
-      const transport = buildReadTransport(prepared.sql, headers.length, this.cellHelpersApply());
-      const statement = this.prepareSingleStatement(transport.sql);
-      try {
-        statement.bind(normalizeWasmBindParams(params));
-        const rows: Array<Array<CellValue | bigint>> = [];
-        while (rows.length <= SQL_RESULT_ROWS && statement.step()) rows.push(statement.get(null, { useBigInt: true })!);
-        return decodeReadTransport(headers, rows, transport);
-      } finally { statement.free(); }
-    }, cancellation);
+    // query_only makes SQLite refuse every write, including nested
+    // statements. Hold it only while the user's statement steps, and restore
+    // it outside the deadline so a timeout or cancellation cannot skip it.
+    if (!queryOnly) this.runSingleStatement('PRAGMA query_only = ON');
+    try {
+      return this.executeWithProgressHandler(() => {
+        const transport = buildReadTransport(prepared.sql, headers.length, this.cellHelpersApply());
+        const statement = this.prepareSingleStatement(transport.sql);
+        try {
+          statement.bind(normalizeWasmBindParams(prepared.params));
+          const rows: Array<Array<CellValue | bigint>> = [];
+          while (rows.length <= SQL_RESULT_ROWS && statement.step()) rows.push(statement.get(null, { useBigInt: true })!);
+          return decodeReadTransport(headers, rows, transport);
+        } finally { statement.free(); }
+      }, cancellation);
+    } finally {
+      if (!queryOnly) this.runSingleStatement('PRAGMA query_only = OFF');
+    }
   }
 
   async executeQuery(
@@ -856,7 +888,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const executionState: { currentStmt?: WasmPreparedStatement } = {};
 
     try {
-      return this.executeWithProgressHandler(() => {
+      return this.withWritesRefused(() => this.executeWithProgressHandler(() => {
         const iterator = this.instance.iterateStatements(sql);
         let isFirstStatement = true;
 
@@ -893,7 +925,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           executionState.currentStmt = undefined;
         }
         return results;
-      }, cancellation);
+      }, cancellation), isReadStatement(sql));
     } catch (err) {
       // Ensure current statement is freed if iteration was interrupted
       const interruptedStmt = executionState.currentStmt;
@@ -1093,30 +1125,46 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     return { sessionId };
   }
 
-  async readQueryRows(sessionId: string, maxRows: number): Promise<QueryReadChunk> {
+  async readQueryRows(sessionId: string, maxRows: number, maxBytes?: number): Promise<QueryReadChunk> {
     if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > MAX_QUERY_READ_ROWS) {
       throw new Error(
         `Query read row limit must be an integer between 1 and ${MAX_QUERY_READ_ROWS}`
       );
+    }
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 1)) {
+      throw new Error('Query read byte limit must be a positive integer');
     }
     const session = this.queryReadSession;
     if (!session || session.sessionId !== sessionId) {
       throw new Error(`Query read session not found: ${sessionId}`);
     }
 
-    return this.executeWithProgressHandler(() => {
+    // Each call is one synchronous span, and a nested statement checks the
+    // flag when it starts, so holding it per call covers the whole session.
+    return this.withWritesRefused(() => this.executeWithProgressHandler(() => {
       const rows: CellValue[][] = [];
+      let bytes = 0;
+      let filled = false;
       while (rows.length < maxRows && session.statement.step()) {
         const row = session.statement.get();
         if (!row) {
           throw new Error('SQLite returned no row after a successful statement step');
         }
         rows.push(row);
+        if (maxBytes !== undefined) {
+          // UTF-16 units for text: the caller bounds what crosses to the
+          // host, and that is how a string is held and sent.
+          for (const value of row) {
+            bytes += typeof value === 'string' ? value.length * 2
+              : value instanceof Uint8Array ? value.byteLength : 8;
+          }
+          if (bytes >= maxBytes) { filled = true; break; }
+        }
       }
       // When a batch fills exactly, EOF is learned by the next bounded read;
       // stepping ahead here would consume a row we cannot safely buffer.
-      return { rows, done: rows.length < maxRows };
-    });
+      return { rows, done: !filled && rows.length < maxRows };
+    }));
   }
 
   async closeQueryReadSession(sessionId: string): Promise<void> {
@@ -1219,9 +1267,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     this.restorePendingExportPragmas();
     this.assertSerializable();
     this.pagedState?.assertBaseUnchanged?.();
-    // Buffer-mode sql.js export closes and reopens its connection. Preserve
-    // connection policy, especially foreign-key enforcement, even on a failed
-    // save. Paged export does not reopen SQLite and must not alter its snapshot.
+    // sql.js before 1.16 closed and reopened the connection to export, which
+    // reset connection policy such as foreign-key enforcement. Its backup-based
+    // export keeps the connection; the check and restore stay so a save can
+    // never continue with reset policy. Paged export does not reopen SQLite and
+    // must not alter its snapshot.
     const connectionPragmas = this.pagedState ? [] : [
       'foreign_keys', 'journal_mode', 'synchronous', 'cache_size',
       'locking_mode', 'temp_store', 'query_only'
@@ -1237,6 +1287,13 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     let exportError: unknown;
     try {
       const data = this.instance.export();
+      // sql.js exports through the backup API and marks the copy as a
+      // rollback-journal file. Write a WAL database back in WAL mode, as the
+      // close-and-reopen export did, so a save keeps the file's journal mode.
+      if (data.length >= 20 && connectionPragmas.some(({ pragma, value }) => pragma === 'journal_mode' && value === 'wal')) {
+        data[18] = 2;
+        data[19] = 2;
+      }
       // A cached base page does not invoke hostIo.read(), so revalidate after
       // export as well before any caller is allowed to persist the image.
       this.pagedState?.assertBaseUnchanged?.();
@@ -2576,7 +2633,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       return this.readPrimaryKeyRecordId(
         table,
         identity,
-        buildRecordIdentityPredicate(candidateId, identity),
+        buildRecordIdentityPredicate(candidateId, identity, keyIndex >= 0 ? [column] : []),
         unresolvableTriggeredPrimaryKeyUpdateError(table)
       );
     };
@@ -3039,18 +3096,23 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         }
         const deletedRows: DeletedRow[] = [];
         const textEncoding = this.getCellTextEncoding();
-        for (const predicate of predicates) {
-          const current = this.queryRaw(
+        const columnChunks = chunkRowHistoryColumns(insertableColumns);
+        const currentRows = columnChunks.length === 1
+          ? predicates.map(predicate => this.queryRaw(
             `SELECT ${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
             `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
             predicate.params
-          );
+          ).rows)
+          : [this.readWideRowHistoryRows(table, '', columnChunks, rowIds.map(
+            rowId => buildRecordIdentityPredicate(rowId, identity)
+          ))];
+        for (const rows of currentRows) {
           const primaryKeyIndices = identity.columns.map(column => {
             const index = insertableColumns.indexOf(column.identifier);
             if (index < 0) throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
             return index;
           });
-          deletedRows.push(...current.rows.map(row => {
+          deletedRows.push(...rows.map(row => {
             const states = insertableColumns.map((column, index) => parseStoredCellState(
               row[index * 2],
               row[index * 2 + 1],
@@ -3077,9 +3139,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             };
           }));
         }
-        if (deletedRows.length !== rowIds.length) {
-          throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
-        }
+        assertOneRowPerIdentity(table, rowIds, deletedRows.map(row => row.rowId));
         for (const predicate of predicates) {
           await this.executeQuery(
             `DELETE FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
@@ -3117,14 +3177,19 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       const deletedRows: DeletedRow[] = [];
       const textEncoding = this.getCellTextEncoding();
-      for (const predicate of predicates) {
-        const current = this.queryRaw(
+      const columnChunks = chunkRowHistoryColumns(insertableColumns);
+      const currentRows = columnChunks.length === 1
+        ? predicates.map(predicate => this.queryRaw(
           `SELECT CAST(rowid AS TEXT), ` +
           `${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
           `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
           predicate.params
-        );
-        deletedRows.push(...current.rows.map(row => {
+        ).rows)
+        : [this.readWideRowHistoryRows(table, 'CAST(rowid AS TEXT), ', columnChunks, rowIds.map(
+          rowId => buildRecordIdentityPredicate(rowId, identity)
+        ))];
+      for (const rows of currentRows) {
+        deletedRows.push(...rows.map(row => {
           const rowId = validateRowId(row[0] as RecordId | bigint);
           const states = insertableColumns.map((column, index) => parseStoredCellState(
             row[index * 2 + 1],
@@ -3524,6 +3589,29 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     });
   }
 
+  /**
+   * The rows `SELECT ${prefix}<stored-cell projections>` returns for these
+   * identities, on a table too wide for one SELECT: each identity is read
+   * alone, in column chunks that join by position because an identity names
+   * at most one row. A missing or ambiguous identity yields no row, which the
+   * caller's row count refuses as it would the one-SELECT read.
+   */
+  private readWideRowHistoryRows(
+    table: string,
+    prefix: string,
+    columnChunks: readonly string[][],
+    identities: readonly RecordIdentityPredicate[]
+  ): Array<Array<CellValue | bigint>> {
+    return this.withHistoryStatements(() => identities.flatMap(identity => {
+      const chunks = columnChunks.map((columns, index) => this.queryRaw(
+        `SELECT ${index === 0 ? prefix : ''}${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+        `FROM ${escapeMainIdentifier(table)} WHERE ${identity.sql} LIMIT 2`,
+        identity.params
+      ).rows);
+      return chunks.every(rows => rows.length === 1) ? [chunks.flatMap(rows => rows[0])] : [];
+    }));
+  }
+
   private readRowHistorySnapshot(
     table: string,
     identity: TableIdentity,
@@ -3532,16 +3620,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     textEncoding: CellTextEncoding = this.getCellTextEncoding()
   ): DeletedRow {
     const predicate = buildRecordIdentityPredicate(rowId, identity);
-    const projections = insertableColumns.map(buildStoredCellStateProjection);
-    const result = this.queryRaw(
-      `SELECT ${projections.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
+    // Each chunk reads the one row the identity names, so the chunks join by position.
+    const chunks = chunkRowHistoryColumns(insertableColumns).map(columns => this.queryRaw(
+      `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} FROM ${escapeMainIdentifier(table)} ` +
       `WHERE ${predicate.sql} LIMIT 2`,
       predicate.params
-    );
-    if (result.rows.length !== 1) throw new RowHistoryConflictError(table);
+    ).rows);
+    if (chunks.some(rows => rows.length !== 1)) throw new RowHistoryConflictError(table);
+    const values = chunks.flatMap(rows => rows[0]);
     const states = insertableColumns.map((column, index) => parseStoredCellState(
-      result.rows[0][index * 2],
-      result.rows[0][index * 2 + 1],
+      values[index * 2],
+      values[index * 2 + 1],
       `${table}.${column}`,
       { textEncoding }
     ));
@@ -3910,7 +3999,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const newRowId = this.readPrimaryKeyRecordId(
           table,
           identity,
-          buildRecordIdentityPredicate(candidateId, identity),
+          buildRecordIdentityPredicate(
+            candidateId,
+            identity,
+            primaryKeyReplacements.map(replacement => replacement.column)
+          ),
           unresolvableTriggeredPrimaryKeyUpdateError(table)
         );
         const newPredicate = buildRecordIdentityPredicate(newRowId, identity);
@@ -4806,7 +4899,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const functions: EngineQueryOptions = {
         ...this.queryRuntimeFunctions(queryOptions.globalFilter),
         // A virtual table need not serve rowid IN (...) without a scan.
-        rowIdLookup: isRowIdTable && rowIdTableType !== 'virtual'
+        rowIdLookup: isRowIdTable && rowIdTableType !== 'virtual',
+        keyCollations: primaryKeyCollations(identity)
       };
       const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan, undefined, functions);
       const rowIdQuery = splitSyntheticRowId
@@ -4819,7 +4913,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           )
         : undefined;
 
-      return this.executeWithProgressHandler(() => {
+      return this.withWritesRefused(() => this.executeWithProgressHandler(() => {
         const bindParams = normalizeWasmBindParams(params);
         const headerStmt = this.instance.prepare(sql, bindParams);
         executionState.headerStmt = headerStmt;
@@ -4882,8 +4976,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const stmt = this.instance.prepare(packSql ?? transportQuery.sql, bindParams);
         executionState.stmt = stmt;
         let valueSourceRows: Array<Array<CellValue | bigint>>;
-        if (packAccess) {
-          valueSourceRows = this.readPackedRows(stmt, packSql!, packAccess, containmentQuery);
+        const packDecoder = packAccess ? new CellPackDecoder(containmentQuery) : undefined;
+        if (packDecoder) {
+          valueSourceRows = this.readPackedRows(stmt, packSql!, packAccess!, packDecoder);
         } else {
           const primaryRows: Array<Array<CellValue | bigint>> = [];
           while (stmt.step()) {
@@ -4960,14 +5055,26 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           companionResults
         );
 
-        const normalized = normalizeIntegerRowsForTransport(
-          valueSourceRows,
-          transportQuery.valueColumnCount,
-          splitSyntheticRowId ? undefined : companionExactTexts,
-          !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined,
-          transportQuery.realTextColumnCount,
-          transportQuery.packedRealTextColumnCount
-        );
+        // Packed rows end before any REAL text: the decoder kept the texts
+        // that differ from their values.
+        const normalized = packDecoder
+          ? normalizeIntegerRowsForTransport(
+              valueSourceRows,
+              undefined,
+              companionExactTexts,
+              isRowIdTable && needsExactRowIdIdentity ? 0 : undefined,
+              undefined,
+              undefined,
+              packDecoder.exactTexts
+            )
+          : normalizeIntegerRowsForTransport(
+              valueSourceRows,
+              transportQuery.valueColumnCount,
+              splitSyntheticRowId ? undefined : companionExactTexts,
+              !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined,
+              transportQuery.realTextColumnCount,
+              transportQuery.packedRealTextColumnCount
+            );
         const valueContained = decodeCellContainment(
           normalized.rows,
           valueHeaders.length,
@@ -5082,7 +5189,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               : {}),
             ...(keysetAnchors ? { keysetAnchors } : {})
         };
-      });
+      }));
     } catch (err) {
         const errorDetail = err instanceof Error ? err.message : String(err);
         throw new Error(`Fetch failed: ${errorDetail}`);
@@ -5101,11 +5208,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     stmt: WasmPreparedStatement,
     sql: string,
     heap: WasmPackHeap,
-    containmentQuery: CellContainmentQuery
+    decoder: CellPackDecoder
   ): Array<Array<CellValue | bigint>> {
     const { module } = heap;
     const pointer = stmt.sqliteExplorerPointer?.();
-    const decoder = new CellPackDecoder(containmentQuery);
     if (typeof pointer !== 'number' || module.UTF8ToString(module._sqlite3_sql(pointer)) !== sql) {
       throw new Error('Packed page statement pointer does not name the prepared page statement');
     }
@@ -5307,7 +5413,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         defaultExpression: row[4],
         primaryKeyPosition: row[5] as number,
         isGenerated: Number(row[6] ?? 0) === 2 || Number(row[6] ?? 0) === 3,
-        isRowidAlias: Number(row[7] ?? 0) === 1
+        isRowidAlias: Number(row[7] ?? 0) === 1,
+        ...(typeof row[8] === 'string' ? { primaryKeyCollation: row[8] } : {})
       }));
   }
 
@@ -5464,10 +5571,11 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       fs,
       this.memorySource?.sourcePath,
       path,
-      async temporaryPath => {
-        // The helper supplies a collision-resistant sibling path. `wx` keeps
-        // an unexpected local race from converting it into an overwrite.
-        await fs.promises.writeFile(temporaryPath, data, { flag: 'wx' });
+      async (temporaryPath, mode) => {
+        // The helper supplies a new path in its private directory. `wx` keeps
+        // an unexpected local race from converting it into an overwrite, and
+        // `mode` applies from creation, before the first byte is written.
+        await fs.promises.writeFile(temporaryPath, data, { flag: 'wx', mode });
       },
       signal,
       (level, message, error) => this.logger(level, message, error),

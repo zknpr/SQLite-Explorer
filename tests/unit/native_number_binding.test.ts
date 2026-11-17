@@ -56,7 +56,9 @@ async function storedValues(ops: DatabaseOperations): Promise<unknown[][]> {
         'SELECT typeof(?) AS p1, typeof(?) AS p2, typeof(?) AS p3, typeof(?) AS p4',
         [28, 2.5, 7, 3000000000]
     ))[0].rows;
-    const consoleTypes = (await ops.executeReadQuery('SELECT typeof(?), typeof(?), typeof(?)', [28, 2.5, 7])).rows;
+    // The console binds an int32 bigint as a number, so [28, 2.5, 7] still
+    // crosses to txiki as an array of doubles.
+    const consoleTypes = (await ops.executeReadQuery('SELECT typeof(?), typeof(?), typeof(?)', [28n, 2.5, 7n])).rows;
     return [...rows, ...bound, ...consoleTypes, [undo]];
 }
 

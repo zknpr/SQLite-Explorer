@@ -7,10 +7,17 @@ import {
 
 export const MAX_SCHEMA_DEPENDENCY_SCHEMAS = 32;
 
-/** One row, 1 or 0: whether main or TEMP holds a trigger. Edits only touch main, so no other schema's trigger can fire. */
+/**
+ * One row, 1 or 0: whether main or TEMP holds anything that lets a cell edit
+ * change a table's row count. That is a trigger, or a virtual table: an
+ * UPDATE of an FTS5 table adds rows to its shadow tables with no trigger
+ * involved. SQLite stores every virtual table's SQL with this exact prefix.
+ * Edits only touch main, so no other schema's trigger can fire.
+ */
+const SCHEMA_ROW_COUNT_CHANGER = "type = 'trigger' OR (type = 'table' AND sql LIKE 'CREATE VIRTUAL TABLE%')";
 export const SCHEMA_HAS_TRIGGERS_SQL =
-  "SELECT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger') " +
-  "OR EXISTS (SELECT 1 FROM temp.sqlite_schema WHERE type = 'trigger')";
+  `SELECT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE ${SCHEMA_ROW_COUNT_CHANGER}) ` +
+  `OR EXISTS (SELECT 1 FROM temp.sqlite_schema WHERE ${SCHEMA_ROW_COUNT_CHANGER})`;
 
 /** SCHEMA_HAS_TRIGGERS_SQL's answer; anything but one 0 or 1 is an error. */
 export function readHasTriggers(rows: readonly (readonly unknown[])[] | undefined): boolean {

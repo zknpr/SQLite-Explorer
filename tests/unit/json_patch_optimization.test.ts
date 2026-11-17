@@ -57,6 +57,17 @@ describe('JSON Patch Optimization', () => {
         assert.deepStrictEqual(content, { a: 10, b: 25, d: 5 });
     });
 
+    it('keeps integers past 2^53 exact when a JSON object cell is edited', async () => {
+        const prior = '{"ids":[9007199254740993,1152921504606846977],"name":"a"}';
+        const next = '{"ids":[9007199254740993,1152921504606846977],"name":"b"}';
+        await engine.executeQuery("INSERT INTO data (id, content) VALUES (40, ?)", [prior]);
+
+        await engine.updateCellBatch('data', [{ rowId: 40, column: 'content', value: next, operation: 'set' as const }]);
+
+        const result = await engine.executeQuery("SELECT content FROM data WHERE id = 40");
+        assert.strictEqual(result[0].rows[0][0], next);
+    });
+
     it('should handle json patch on null/empty cell', async () => {
         await engine.insertRow('data', { id: 4, content: null });
 

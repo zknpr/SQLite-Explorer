@@ -29,6 +29,18 @@ const CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS = 5 * 60_000;
 const MAX_SCHEMA_DEPENDENCY_PROBES = 1024;
 const MAX_QUERY_STATEMENTS = 1024;
 const MAX_NATIVE_ERROR_MESSAGE_LENGTH = 8192;
+/**
+ * How long a statement waits for a lock another program holds on the file
+ * before SQLite refuses it with "database is locked": an edit beside a
+ * reader, a read beside a writer that is committing. SQLite's own value is
+ * 0, which failed an edit whenever the database's application touched the
+ * file at that instant. Its busy handler sleeps in steps of 1 to 100 ms and
+ * the statement deadline cannot interrupt it, so this stays well under the
+ * two seconds the host allows a bounded request beyond its deadline. A
+ * request sent without that margin can answer this much late, after the host
+ * has given up on it, when it meets a lock in its deadline's last moments.
+ */
+const LOCK_WAIT_MS = 600;
 
 /** Bound untrusted SQLite/library failures before IPC and stderr forwarding. */
 function describeNativeError(error, fallback) {
@@ -339,6 +351,25 @@ let savepointCounter = 0;
 /** Dedicated, bracketed read connections keyed by opaque session id. */
 const cellReadSessions = new Map();
 const closedCellReadSessionIds = new Set();
+
+/** The wait set on the main connection; SQLite gives a new connection 0. */
+let mainLockWaitMs = 0;
+
+/**
+ * Give the main connection `LOCK_WAIT_MS`, except while a cell read session
+ * holds a snapshot on a handle of its own: only this thread can end that
+ * session, so a statement waiting for its lock would hold up the one thread
+ * that could and then fail as it does at once.
+ */
+function syncMainLockWait(database) {
+  let wanted = LOCK_WAIT_MS;
+  for (const session of cellReadSessions.values()) {
+    if (!session.usesMainConnection) { wanted = 0; break; }
+  }
+  if (wanted === mainLockWaitMs) return;
+  database.exec(`PRAGMA busy_timeout = ${wanted}`);
+  mainLockWaitMs = wanted;
+}
 
 // ============================================================================
 // Message Protocol
@@ -750,8 +781,15 @@ function closeAsyncDatabase() {
   })();
 }
 
-/** Open and probe the optional second connection without breaking sync use. */
-function openAsyncDatabase(path, readOnly) {
+/**
+ * Open and probe the optional second connection without breaking sync use.
+ * It reads the file and writes only its own TEMP spool, so it is opened
+ * read-only whatever the document is: a statement it steps cannot change the
+ * file, which `PRAGMA query_only` could not guarantee here because that also
+ * refuses the TEMP writes. VACUUM INTO writes its own output file and works
+ * on a read-only handle.
+ */
+function openAsyncDatabase(path) {
   return (async () => {
     await closeAsyncDatabase();
     if (asyncCapabilityProbed && !asyncCapabilitySupported) return;
@@ -763,7 +801,10 @@ function openAsyncDatabase(path, readOnly) {
 
     let candidate;
     try {
-      candidate = new AsyncDatabase(path, { readOnly });
+      candidate = new AsyncDatabase(path, { readOnly: true });
+      // Before the probe: its first statement reads the schema, and a
+      // refusal there turns this connection off until the worker restarts.
+      await candidate.all(`PRAGMA busy_timeout = ${LOCK_WAIT_MS}`, []);
       if (!asyncCapabilityProbed) {
         asyncCapabilitySupported = await probeAsyncDatabase(candidate);
         asyncCapabilityProbed = true;
@@ -1298,10 +1339,41 @@ function buildCellLocator(locator) {
   if (locator.integerCasts.some(value => typeof value !== 'boolean')) {
     throw new Error('Cell read primary-key locator contains an invalid INTEGER cast flag');
   }
+  if (
+    locator.collations !== undefined &&
+    (
+      !Array.isArray(locator.collations) ||
+      locator.collations.length !== locator.columns.length ||
+      locator.collations.some(value => value !== null && typeof value !== 'string')
+    )
+  ) {
+    throw new Error('Cell read primary-key locator contains an invalid collation');
+  }
+  // As in primaryKeyColumnSql, each member compares under its key's collation.
+  const operands = columns.map((column, index) => {
+    const collation = locator.collations?.[index];
+    return typeof collation === 'string'
+      ? `${column} COLLATE ${escapeCellIdentifier(collation, 'primary-key collation')}`
+      : column;
+  });
+  // The unary plus drops the CAST's INTEGER affinity, so a typeless key's
+  // INTEGER never also matches its numeric-looking TEXT twin.
   return {
-    sql: columns.map((column, index) => (
-      `${column} = ${locator.integerCasts[index] ? 'CAST(? AS INTEGER)' : '?'}`
-    )).join(' AND '),
+    sql: columns.map((column, index) => {
+      // As in buildRecordIdentityPredicate, an INTEGER identity names INTEGER
+      // storage only, a REAL one, which arrives as a number, numeric storage
+      // only, and a TEXT one TEXT storage only, whatever affinity the column
+      // declares.
+      if (locator.integerCasts[index]) {
+        return `${operands[index]} = +CAST(? AS INTEGER) AND typeof(${column}) = 'integer'`;
+      }
+      if (typeof locator.values[index] === 'number') {
+        return `${operands[index]} = ? AND typeof(${column}) IN ('integer', 'real')`;
+      }
+      return typeof locator.values[index] === 'string'
+        ? `${operands[index]} = ? AND typeof(${column}) = 'text'`
+        : `${operands[index]} = ?`;
+    }).join(' AND '),
     params: locator.values
   };
 }
@@ -1946,6 +2018,21 @@ function parseExportSpoolStatement(sql) {
   ));
   if (match) return { kind: 'read', name: match[1] };
 
+  // A batch of rows: the next rows' sizes, then the rows up to a chosen rowid.
+  match = sql.match(new RegExp(
+    `^SELECT CAST\\(rowid AS TEXT\\), "__export_row_bytes" FROM "${namePattern}" ` +
+    'WHERE rowid > \\? ORDER BY rowid LIMIT 128$',
+    'i'
+  ));
+  if (match) return { kind: 'read', name: match[1] };
+
+  match = sql.match(new RegExp(
+    `^SELECT CAST\\(rowid AS TEXT\\), \\* FROM "${namePattern}" ` +
+    'WHERE rowid > \\? AND rowid <= \\? ORDER BY rowid$',
+    'i'
+  ));
+  if (match) return { kind: 'read', name: match[1] };
+
   match = sql.match(new RegExp(
     `^DROP TABLE IF EXISTS temp\\."${namePattern}"$`,
     'i'
@@ -2055,6 +2142,39 @@ function executeExportSpoolQuery(asyncDatabase, validationDb, requestId, markedS
 }
 
 /**
+ * Whether a request only reads through the primary handle. Grid pages and
+ * bounded reads always do; the host marks a generic or single checked
+ * statement, or a batch made only of them, when it is one SELECT
+ * (isReadStatement in src/core/read-statement.ts).
+ */
+function requestOnlyReads(method, args) {
+  switch (method) {
+    case 'queryNumeric':
+    case 'queryPacked':
+    case 'queryBounded':
+      return true;
+    case 'query':
+      return args[2] === true;
+    case 'querySingle':
+      return args[3] === true;
+    case 'queryBatch':
+      return args[1] === true;
+    default:
+      return false;
+  }
+}
+
+/** Whether SQLite already refuses every write on this handle. */
+function isQueryOnly(connection) {
+  const statement = connection.prepare('PRAGMA query_only');
+  try {
+    return Number(Object.values(statement.all()[0] ?? {})[0]) === 1;
+  } finally {
+    if (typeof statement.finalize === 'function') statement.finalize();
+  }
+}
+
+/**
  * Handle incoming RPC request.
  *
  * @param {object} request - RPC request { id, method, args }
@@ -2066,6 +2186,7 @@ async function handleRequest(request) {
   try {
     assertMainConnectionCellReadSessionAllows(method);
     const deadlineDatabase = db;
+    if (deadlineDatabase && databasePath !== null) syncMainLockWait(deadlineDatabase);
     const executeRequest = async () => {
     let result;
 
@@ -2085,11 +2206,12 @@ async function handleRequest(request) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
         db = new Database(path, { readOnly });
+        mainLockWaitMs = 0;
         // The host maps only files on local disks (nativeMemoryMapBytes).
         if (mmapBytes > 0) db.exec(`PRAGMA main.mmap_size = ${mmapBytes}`);
         databasePath = path;
         databaseReadOnly = readOnly;
-        await openAsyncDatabase(path, readOnly);
+        await openAsyncDatabase(path);
         result = { success: true };
         break;
       }
@@ -2103,6 +2225,7 @@ async function handleRequest(request) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
         db = new Database(":memory:");
+        mainLockWaitMs = 0;
         databasePath = null;
         databaseReadOnly = false;
         result = { success: true };
@@ -2151,7 +2274,7 @@ async function handleRequest(request) {
           db.exec(`PRAGMA journal_mode = '${mode}'`);
           result = { success: true };
         } finally {
-          if (reopenAsync) await openAsyncDatabase(databasePath, databaseReadOnly);
+          if (reopenAsync) await openAsyncDatabase(databasePath);
         }
         break;
       }
@@ -2171,7 +2294,7 @@ async function handleRequest(request) {
 
       case "query": {
         // Execute SQL and return all results
-        // args: [sql: string, params?: any[]]
+        // args: [sql: string, params?: any[], onlyReads?: boolean]
         const [sql, params] = args;
         if (!db) throw new Error("Database not open");
 
@@ -2235,6 +2358,7 @@ async function handleRequest(request) {
         const savepointName = `sqlite_explorer_cell_read_${++savepointCounter}`;
         let bracketOpened = false;
         try {
+          if (!usesMainConnection) connection.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS}`);
           const snapshot = runWithQueryDeadline(connection, operationTimeoutMs, () => {
             connection.exec(`SAVEPOINT "${savepointName}"`);
             bracketOpened = true;
@@ -2338,6 +2462,10 @@ async function handleRequest(request) {
         const [library] = args;
         if (!db) throw new Error("Database not open");
         if (typeof library !== 'string') throw new Error('Invalid runtime library path');
+        // Read first: on a connection without its schema yet, the library's
+        // probes below read the file too, and one refused by another
+        // program's lock would leave its helper off for good.
+        const encoding = executeQuery(db, 'PRAGMA encoding', []).values[0]?.[0];
         let cellHelperError;
         if (!queryPlanDatabases.has(db) && !runtimeLoadFailures.has(db)) {
           try {
@@ -2350,7 +2478,7 @@ async function handleRequest(request) {
         const { cellPackError, likeAnyError } = unreportedRuntimeErrors.get(db) ?? {};
         unreportedRuntimeErrors.delete(db);
         result = {
-          encoding: executeQuery(db, 'PRAGMA encoding', []).values[0]?.[0],
+          encoding,
           cellHelpers: queryPlanDatabases.has(db),
           cellPack: cellPackDatabases.has(db),
           likeAny: likeAnyDatabases.has(db),
@@ -2415,7 +2543,7 @@ async function handleRequest(request) {
           assertSingleStatementPayload(db, `${create}\n${boundary}`, create, boundary);
           db.exec(create);
           try {
-            const statement = db.prepare(`SELECT substr(name, 1, 4097) AS name FROM pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?`);
+            const statement = db.prepare(`SELECT substr(name, 1, 4097) AS name FROM pragma.pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?`);
             try {
               const rows = statement.all([name, maxColumns + 1]);
               if (!rows.length || rows.length > maxColumns) throw new Error('Queries support 1 to 128 result columns.');
@@ -2453,13 +2581,24 @@ async function handleRequest(request) {
         if (typeof db.allAsync !== 'function') {
           throw new Error('Native SQLite requires primary-connection allAsync support');
         }
-        // Keep TEMP objects, pending changes and the host's metadata snapshot
-        // on this handle without blocking delivery of the cancellation RPC.
-        const rows = await runWithQueryDeadline(db, timeoutMs, () => (
-          executeInterruptibleAsyncOperation(id, timeoutMs, signal => (
-            db.allAsync(sql, bindableParams(params ?? []), { signal })
-          ))
-        ));
+        // query_only makes SQLite refuse every write on this handle, nested
+        // statements included. Requests run one at a time and allAsync
+        // settles only after its job ends, so the flag covers exactly this
+        // statement; the restore runs after the deadline is cleared.
+        const queryOnly = Number(executeQuery(db, 'PRAGMA query_only', []).values[0]?.[0]) === 1;
+        if (!queryOnly) db.exec('PRAGMA query_only = ON');
+        let rows;
+        try {
+          // Keep TEMP objects, pending changes and the host's metadata snapshot
+          // on this handle without blocking delivery of the cancellation RPC.
+          rows = await runWithQueryDeadline(db, timeoutMs, () => (
+            executeInterruptibleAsyncOperation(id, timeoutMs, signal => (
+              db.allAsync(sql, bindableParams(params ?? []), { signal })
+            ))
+          ));
+        } finally {
+          if (!queryOnly) db.exec('PRAGMA query_only = OFF');
+        }
         const names = columns;
         result = { columns: names, values: rows.map(row => names.map(name => row[name])) };
         break;
@@ -2521,7 +2660,7 @@ async function handleRequest(request) {
 
       case "queryBatch": {
         // Execute a batch of queries and return results for each
-        // args: [queries: { sql: string, params?: any[] }[]]
+        // args: [queries: { sql: string, params?: any[] }[], onlyReads?: boolean]
         const [queries] = args;
         if (!db) throw new Error("Database not open");
 
@@ -2607,6 +2746,7 @@ async function handleRequest(request) {
           );
         }
         const errors = [];
+        let locked = false;
         for (const sql of queries) {
           if (typeof sql !== 'string' || !/^\s*EXPLAIN\s/i.test(sql)) {
             throw new Error('Schema dependency probes must be EXPLAIN statements');
@@ -2617,10 +2757,17 @@ async function handleRequest(request) {
             errors.push(null);
           } catch (error) {
             errors.push(describeNativeError(error, 'Unknown compile error'));
+            // A locked file refuses every statement that reads the schema,
+            // each after its own wait: the rest get this answer unasked.
+            locked = (Number(error?.errno) & 0xff) === 5;
           } finally {
             if (statement && typeof statement.finalize === 'function') {
               try { statement.finalize(); } catch { /* preparation result is already known */ }
             }
+          }
+          if (locked) {
+            while (errors.length < queries.length) errors.push(errors[errors.length - 1]);
+            break;
           }
         }
         result = { errors };
@@ -2872,22 +3019,34 @@ async function handleRequest(request) {
     return result;
     };
 
-    const result = deadlineDatabase && ![
-      'open',
-      'openMemory',
-      'close',
-      'cancel',
-      'ping',
-      // Arms one deadline per unit of generated statements.
-      'queryHistoryBatch',
-      // These methods can execute on a dedicated snapshot connection. Each
-      // case arms that actual handle rather than the unrelated main database.
-      'openCellReadSession',
-      'readCellChunk',
-      'closeCellReadSession'
-    ].includes(method)
-      ? await runWithQueryDeadline(deadlineDatabase, timeoutMs, executeRequest)
-      : await executeRequest();
+    // A read runs with SQLite refusing every write on this handle. The flag
+    // brackets the deadline: its restore never runs under an expired one.
+    // Requests run one at a time and a cancel request runs no SQL, so no
+    // other statement sees the flag.
+    const refuseWrites = Boolean(deadlineDatabase) && requestOnlyReads(method, args)
+      && !isQueryOnly(deadlineDatabase);
+    if (refuseWrites) deadlineDatabase.exec('PRAGMA query_only = ON');
+    let result;
+    try {
+      result = deadlineDatabase && ![
+        'open',
+        'openMemory',
+        'close',
+        'cancel',
+        'ping',
+        // Arms one deadline per unit of generated statements.
+        'queryHistoryBatch',
+        // These methods can execute on a dedicated snapshot connection. Each
+        // case arms that actual handle rather than the unrelated main database.
+        'openCellReadSession',
+        'readCellChunk',
+        'closeCellReadSession'
+      ].includes(method)
+        ? await runWithQueryDeadline(deadlineDatabase, timeoutMs, executeRequest)
+        : await executeRequest();
+    } finally {
+      if (refuseWrites) deadlineDatabase.exec('PRAGMA query_only = OFF');
+    }
 
     return { id, result };
 

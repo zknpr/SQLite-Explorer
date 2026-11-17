@@ -98,8 +98,8 @@ const CONSOLE_QUERIES: Array<[string, string, CellValue[]]> = [
 ];
 
 /** The console's transport SQL before the helpers, which the fallback keeps. */
-function legacyReadTransportSql(sql: string, columnCount: number): string {
-    const containment = buildCellContainmentQuery(prepareReadQuery(sql).sql, columnCount, {
+function legacyReadTransportSql(sql: string, params: CellValue[], columnCount: number): string {
+    const containment = buildCellContainmentQuery(prepareReadQuery(sql, params).sql, columnCount, {
         limit: SQL_RESULT_ROWS + 1, maxInlineCellBytes: 64 * 1024, maxPageResponseBytes: SQL_RESULT_BYTES
     });
     return buildExactNumericTextQuery(containment.sql, containment.primaryTransportColumnCount).sql;
@@ -485,7 +485,7 @@ async function readBoth(backend: PageBackend, sql: string, params: CellValue[]) 
     const helperResult = await backend.ops.executeReadQuery!(sql, params);
     const helperRun = [...backend.pageSql];
     // WASM appends a boundary comment to the statement it prepares.
-    const legacy = legacyReadTransportSql(sql, sqlResult.headers.length);
+    const legacy = legacyReadTransportSql(sql, params, sqlResult.headers.length);
     const ranLegacy = (run: string[]) => run.some(text => text === legacy || text.startsWith(`${legacy}\n/*sqlite_explorer_boundary_`));
     return {
         sqlResult,

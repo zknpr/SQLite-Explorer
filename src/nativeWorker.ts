@@ -15,6 +15,7 @@ import * as fs from 'fs';
 import * as os from 'node:os';
 import { spawn, ChildProcess } from 'child_process';
 import * as v8 from 'node:v8';
+import { encodeNativeRequest } from './nativeRequestFormat';
 import { canPersistLocalDatabase } from './fileWritability';
 
 import { uiKindToString } from './helpers';
@@ -61,6 +62,7 @@ import {
   assertUsableSqlIdentifier,
   escapeIdentifier,
   escapeMainIdentifier,
+  joinExpressionTerms,
   validateSqlType,
   validateRowId
 } from './core/sql-utils';
@@ -81,6 +83,7 @@ import {
   keysetFallbackOrder,
   mintKeysetAnchors,
   ordersBySyntheticRowId,
+  primaryKeyCollations,
   resolveKeysetPlan
 } from './core/keyset-pagination';
 import {
@@ -102,6 +105,7 @@ import {
 import {
   buildRowHistoryPredicate,
   buildRowHistoryWrites,
+  chunkRowHistoryColumns,
   LegacyRowHistoryError,
   RowHistoryConflictError,
   rowHistoryStates
@@ -110,6 +114,7 @@ import {
   assertMutableRecordId,
   assertNoApplicableUpdateTriggerTargetWrites,
   assertNoUntrackedMutationPrograms,
+  assertOneRowPerIdentity,
   assertUniqueCellUpdateTargets,
   buildDeleteTriggerProbeSql,
   buildInsertTriggerProbeSql,
@@ -171,11 +176,11 @@ import {
   CellPackDecoder,
   decodeCellPackRows
 } from './core/cell-pack';
-import { parsePackedRealTexts } from './core/integer-utils';
 import { serializeOperations } from './core/operation-serializer';
 import { DatabaseFileChangedError } from './core/database-file-changed';
 import { type DatabaseConnectionInvalidatedError, DatabaseTransactionRecoveryError } from './core/database-connection-invalidated';
 import { InvocationTimeoutError } from './core/rpc';
+import { isReadStatement } from './core/read-statement';
 import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
@@ -202,6 +207,7 @@ import {
   SCHEMA_HAS_TRIGGERS_SQL,
   type SchemaDependencySnapshot
 } from './core/schema-dependency';
+import { findTablesWithMissingModules } from './core/virtual-table-modules';
 import { crypto } from './platform/cryptoShim';
 import { DEFAULT_QUERY_TIMEOUT_MS } from './config';
 import {
@@ -321,6 +327,34 @@ const MAX_NATIVE_WORKER_RESPONSE_BYTES = 64 * 1024 * 1024;
 
 /** Timeout for native worker initialization (ms) */
 const INIT_TIMEOUT = 10000;
+/**
+ * How long a worker whose input was ended may take to close its databases
+ * and exit before it is killed. An idle worker needs a few milliseconds; one
+ * still inside a statement cannot see the end of its input.
+ */
+const WORKER_EXIT_GRACE_MS = 2000;
+
+/** Characters of a worker's stderr that a failed start quotes. */
+const STARTUP_STDERR_CHARS = 2000;
+/**
+ * Bytes kept to decode them, once: even at four bytes a character this is
+ * more than STARTUP_STDERR_CHARS, so the byte cut never splits a quoted one.
+ */
+const STARTUP_STDERR_BYTES = 8 * 1024;
+
+/**
+ * What a worker wrote to stderr before ready, for the message of a failed
+ * start. Control characters other than newline and tab are replaced: the
+ * text reaches the output channel and notifications.
+ */
+function startupStderrExcerpt(stderr: Buffer): string {
+  const text = stderr.toString('utf8');
+  const excerpt = text.slice(0, STARTUP_STDERR_CHARS)
+    .replace(/\r\n/g, '\n')
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, '\uFFFD')
+    .trim();
+  return excerpt && text.length > STARTUP_STDERR_CHARS ? `${excerpt}…` : excerpt;
+}
 
 /** Timeout for individual queries (ms) */
 const QUERY_TIMEOUT = DEFAULT_QUERY_TIMEOUT_MS;
@@ -333,6 +367,17 @@ function isGeneratedExportSpoolStatement(sql: string): boolean {
     || new RegExp(
       `^SELECT CAST\\(rowid AS TEXT\\), \\* FROM ${quotedName} ` +
       'WHERE rowid > \\? ORDER BY rowid LIMIT 1$',
+      'i'
+    ).test(sql)
+    // A batch of rows: the next rows' sizes, then the rows up to a chosen rowid.
+    || new RegExp(
+      `^SELECT CAST\\(rowid AS TEXT\\), "__export_row_bytes" FROM ${quotedName} ` +
+      'WHERE rowid > \\? ORDER BY rowid LIMIT 128$',
+      'i'
+    ).test(sql)
+    || new RegExp(
+      `^SELECT CAST\\(rowid AS TEXT\\), \\* FROM ${quotedName} ` +
+      'WHERE rowid > \\? AND rowid <= \\? ORDER BY rowid$',
       'i'
     ).test(sql)
     || new RegExp(`^DROP TABLE IF EXISTS temp\\.${quotedName}$`, 'i').test(sql)
@@ -353,6 +398,49 @@ const NATIVE_HISTORY_REQUEST_BUDGET_MS = 1000;
 const NATIVE_HISTORY_RESPONSE_BUDGET_BYTES = 8 * 1024 * 1024;
 /** Distinct texts one queryHistoryBatch call sends once; the worker caches 32 statements. */
 const NATIVE_HISTORY_SHARED_TEXTS = 32;
+/**
+ * The largest value history reads whole. A request returns after the unit
+ * that crosses the response budget, so it holds less than the budget plus
+ * one unit, and that must stay under the frame cap.
+ */
+const NATIVE_HISTORY_CELL_MAX_BYTES = MAX_NATIVE_WORKER_RESPONSE_BYTES - 2 * NATIVE_HISTORY_RESPONSE_BUDGET_BYTES;
+/**
+ * The largest value history reads at all: one that a response carries when
+ * it holds nothing else, with room left under the frame cap for its
+ * encoding. 1.8.3 deleted and restored rows with such values, and failed
+ * past the frame cap by losing the worker.
+ */
+const NATIVE_HISTORY_LONE_CELL_MAX_BYTES = MAX_NATIVE_WORKER_RESPONSE_BYTES - 1024 * 1024;
+/**
+ * A history read that one response carries is kept to the bound of the
+ * per-cell path's largest response, leaving the rest of the frame cap for
+ * the encoding. Beside its value bytes each row and each cell is counted at
+ * NATIVE_HISTORY_ITEM_BYTES; the encoding of a row with its rowid, one
+ * cell's storage class and its value measured 36 bytes.
+ */
+const NATIVE_HISTORY_RESPONSE_MAX_BYTES = NATIVE_HISTORY_CELL_MAX_BYTES;
+const NATIVE_HISTORY_ITEM_BYTES = 64;
+
+/**
+ * The most stored bytes, summed over `columnCount` columns, each of
+ * `rowCount` rows may hold for one response to carry them all. Negative when
+ * not even empty rows would fit.
+ */
+export function nativeHistoryRowByteLimit(rowCount: number, columnCount: number): number {
+  return Math.floor(NATIVE_HISTORY_RESPONSE_MAX_BYTES / rowCount) - NATIVE_HISTORY_ITEM_BYTES * (columnCount + 1);
+}
+
+/**
+ * A row's stored bytes in these columns. octet_length reads a TEXT or BLOB
+ * size from the record header without loading the value, and a TEXT value's
+ * size is that of the bytes buildStoredCellStateProjection returns.
+ */
+function storedRowBytesSql(columns: readonly string[]): string {
+  return joinExpressionTerms(
+    columns.map(column => `coalesce(octet_length(${escapeIdentifier(column)}), 0)`),
+    '+'
+  ) || '0';
+}
 
 function approximateParamBytes(params: readonly CellValue[]): number {
   let bytes = 0;
@@ -523,6 +611,41 @@ export async function nativeMemoryMapBytes(
 // Native Worker Communication
 // ============================================================================
 
+// A serialized value starts with this tag and the version of its format.
+const WIRE_FORMAT_TAG = 0xff;
+const WIRE_FORMAT_VERSION_THE_RUNTIME_READS = 15;
+const WIRE_FORMAT_VERSION_OF_V8_15 = 16;
+// The id the worker answers with when it could not read what it was sent.
+const UNREAD_REQUEST_ID = -1;
+
+/** How many requests held a value `encodeNativeRequest` does not write, and went out as V8 writes them. */
+export const nativeRequestsWrittenByV8 = { count: 0 };
+
+/**
+ * V8's own bytes, for a request with a value the extension's writer leaves
+ * to it. No request the extension makes holds one, so the first is logged.
+ *
+ * The bundled runtime reads this format up to version 15 and refuses a newer
+ * one ("Data clone error"). V8 15.0, which VS Code runs from 1.139 on, writes
+ * version 16. It only writes the lengths and offsets of ArrayBuffers and
+ * their views as 64-bit numbers (V8 commit 3f4cb1dd), which below 4 GB are
+ * the same bytes as before, and the bytes after the version were compared
+ * for 65 values between Node 24 and VS Code 1.145's runtime as well. So such
+ * a message is labelled with the version the runtime reads. A version this
+ * has not been compared for is left as it is: the engine then answers that
+ * it could not read the request (`handleMessage`).
+ */
+function serializedByV8(msg: unknown): Buffer {
+  if (nativeRequestsWrittenByV8.count++ === 0) {
+    console.warn('[NativeWorker] A request held a value the extension does not write itself; it was sent as the editor writes it.');
+  }
+  const serialized = v8.serialize(msg);
+  if (serialized[0] === WIRE_FORMAT_TAG && serialized[1] === WIRE_FORMAT_VERSION_OF_V8_15) {
+    serialized[1] = WIRE_FORMAT_VERSION_THE_RUNTIME_READS;
+  }
+  return serialized;
+}
+
 /**
  * Write a length-prefixed V8-serialized message.
  *
@@ -530,7 +653,9 @@ export async function nativeMemoryMapBytes(
  * @param msg - Message to send
  */
 function writeMessage(stream: NodeJS.WritableStream, msg: unknown): void {
-  const serialized = v8.serialize(msg);
+  // Written here, as version 15 of the format, whatever version the
+  // editor's V8 writes (`nativeRequestFormat.ts`).
+  const serialized = encodeNativeRequest(msg) ?? serializedByV8(msg);
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32BE(serialized.byteLength, 0);
 
@@ -557,6 +682,8 @@ export class NativeWorkerProcess {
   private chunks: Buffer[] = [];
   private chunksTotalLength = 0;
   private expectedLength = -1;
+  /** Fails a start() still waiting for ready; retire() calls it with its reason. */
+  private rejectStart: ((reason: Error) => void) | null = null;
 
   constructor(
     private readonly binaryPath: string,
@@ -578,9 +705,25 @@ export class NativeWorkerProcess {
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        // An exit whose stderr never closed is still the cause.
+        failStart(exitError ?? new Error('Native worker initialization timed out'));
         this.stop();
-        reject(new Error('Native worker initialization timed out'));
       }, INIT_TIMEOUT);
+
+      // Until ready, keep the start of stderr: a dynamic loader names the
+      // GLIBC version it lacks there and exits 127.
+      let startupStderr: Buffer[] | null = [];
+      let startupStderrBytes = 0;
+      let exitError: Error | undefined;
+      const failStart = (error: Error) => {
+        if (!startupStderr) return;
+        const excerpt = startupStderrExcerpt(Buffer.concat(startupStderr));
+        startupStderr = null;
+        this.rejectStart = null;
+        clearTimeout(timeout);
+        reject(excerpt ? new Error(`${error.message}; stderr: ${excerpt}`, { cause: error }) : error);
+      };
+      this.rejectStart = failStart;
 
       // Spawn txiki-js with the worker script
       const child = spawn(this.binaryPath, ['run', this.workerScript], {
@@ -592,11 +735,9 @@ export class NativeWorkerProcess {
 
       const handleIpcError = (streamName: string, err: Error) => {
         if (this.process !== child) return;
-        clearTimeout(timeout);
         const error = new Error(`Native worker ${streamName} failed: ${err.message}`, { cause: err });
         console.error(`[NativeWorker] ${error.message}`);
         this.retire(error);
-        reject(error);
       };
 
       // Handle stdout (message responses). A retired child can still deliver
@@ -616,12 +757,16 @@ export class NativeWorkerProcess {
       // Handle stderr (debug output)
       child.stderr?.on('data', (chunk: Buffer) => {
         console.warn('[NativeWorker]', chunk.toString());
+        if (startupStderr && startupStderrBytes < STARTUP_STDERR_BYTES) {
+          const kept = chunk.subarray(0, STARTUP_STDERR_BYTES - startupStderrBytes);
+          startupStderr.push(kept);
+          startupStderrBytes += kept.length;
+        }
       });
       child.stderr?.on('error', (err: Error) => handleIpcError('diagnostic stream', err));
 
       // Handle process exit
       child.on('exit', (code) => {
-        clearTimeout(timeout);
         if (this.process !== child) return;
         const error = new Error(
           code === 0 || code === null
@@ -631,22 +776,30 @@ export class NativeWorkerProcess {
         if (code !== 0 && code !== null) {
           console.error(`[NativeWorker] Process exited with code ${code}`);
         }
+        if (startupStderr) {
+          // Node can report the exit before it has read all of stderr; 'close'
+          // follows once it has. The initialization timeout bounds the wait.
+          exitError = error;
+          this.rejectStart = null;
+        }
         this.retire(error, false);
-        reject(error);
+      });
+      child.on('close', () => {
+        if (exitError) failStart(exitError);
       });
 
       // Handle process errors
       child.on('error', (err) => {
-        clearTimeout(timeout);
         if (this.process !== child) return;
         this.retire(err, false);
-        reject(err);
       });
 
       // Wait for ready signal
       const onReady = (msg: { ready?: boolean }) => {
         if (msg.ready) {
           clearTimeout(timeout);
+          startupStderr = null;
+          this.rejectStart = null;
           resolve();
         }
       };
@@ -666,10 +819,58 @@ export class NativeWorkerProcess {
   }
 
   /**
-   * Stop the native worker process.
+   * Stop the native worker process at once, by killing it.
    */
   stop(): void {
     this.retire(new Error('Native worker stopped'));
+  }
+
+  /**
+   * Stop the worker by ending its input. The worker then closes its
+   * databases and exits: that releases their file locks and removes a -wal
+   * and -shm that hold nothing. A killed worker keeps them until its process
+   * is gone, and leaves the two files beside a WAL database it only read; on
+   * Windows the database cannot be deleted or renamed meanwhile. Requests
+   * fail from this call on, as after stop(). A worker that has not exited
+   * after WORKER_EXIT_GRACE_MS is killed.
+   *
+   * Closing the last connection to a WAL database also checkpoints it, which
+   * rewrites the main file from its -wal: the caller must know that the -wal
+   * holds nothing (see createNativeDatabaseConnection).
+   */
+  end(): void {
+    const child = this.process;
+    this.retire(new Error('Native worker stopped'), false);
+    if (!child) return;
+    const kill = (): void => { child.kill(); };
+    const timer = setTimeout(kill, WORKER_EXIT_GRACE_MS);
+    timer.unref();
+    child.once('exit', () => clearTimeout(timer));
+    try {
+      if (child.stdin && !child.stdin.destroyed) child.stdin.end();
+      else kill();
+    } catch {
+      kill();
+    }
+  }
+
+  /**
+   * Kill the worker and resolve when its process is gone, which is when the
+   * operating system has released its file locks, or after
+   * WORKER_EXIT_GRACE_MS at the latest.
+   */
+  stopAndWait(): Promise<void> {
+    const child = this.process;
+    this.stop();
+    if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    return new Promise(resolve => {
+      const timer = setTimeout(resolve, WORKER_EXIT_GRACE_MS);
+      timer.unref();
+      child.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   /**
@@ -679,19 +880,34 @@ export class NativeWorkerProcess {
    * @param args - Arguments to pass
    * @param timeoutMs - Host-side transport deadline
    * @param signal - Optional cancellation for preemptible worker calls
+   * @param workerTimeoutMs - Statement deadline the worker arms when it starts
+   *   the request; a read sets it below timeoutMs so its own error arrives first
    * @returns Promise resolving to the result
    */
   async call<T>(
     method: string,
     args: unknown[] = [],
     timeoutMs: number = QUERY_TIMEOUT,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    workerTimeoutMs: number = timeoutMs
   ): Promise<T> {
     if (!this.process || !this.process.stdin) {
       throw new Error('Native worker not running');
     }
     if (signal?.aborted) {
       throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
+    }
+    // The worker steps a read with writes refused (requestOnlyReads in
+    // native-worker.js). Every generic query passes through here, so the
+    // statement is classified in one place for all callers.
+    if (method === 'query') {
+      args = [args[0], args[1], typeof args[0] === 'string' && isReadStatement(args[0])];
+    } else if (method === 'querySingle') {
+      args = [args[0], args[1], args[2], typeof args[0] === 'string' && isReadStatement(args[0])];
+    } else if (method === 'queryBatch' && Array.isArray(args[0])) {
+      args = [args[0], (args[0] as Array<{ sql?: unknown }>).every(
+        query => typeof query?.sql === 'string' && isReadStatement(query.sql)
+      )];
     }
 
     const id = ++this.messageId;
@@ -749,7 +965,7 @@ export class NativeWorkerProcess {
       if (abortListener) signal!.addEventListener('abort', abortListener, { once: true });
 
       try {
-        writeMessage(this.process!.stdin!, { id, method, args, timeoutMs });
+        writeMessage(this.process!.stdin!, { id, method, args, timeoutMs: workerTimeoutMs });
       } catch (cause) {
         const error = cause instanceof Error ? cause : new Error(String(cause));
         this.retire(error);
@@ -845,6 +1061,14 @@ export class NativeWorkerProcess {
       return;
     }
 
+    if (typedMsg.id === UNREAD_REQUEST_ID && typedMsg.error) {
+      // The worker could not read a request, so it cannot say which one, and
+      // that request would wait out its whole time limit. Every request in
+      // flight fails now, with the worker's reason, and the worker is stopped.
+      this.retire(new Error(`The native engine could not read a request: ${typedMsg.error}`));
+      return;
+    }
+
     const pending = this.pendingRequests.get(typedMsg.id);
     if (!pending) {
       return;
@@ -882,6 +1106,7 @@ export class NativeWorkerProcess {
     this.chunksTotalLength = 0;
     this.expectedLength = -1;
     this.cleanup(reason);
+    this.rejectStart?.(reason);
   }
 
   /**
@@ -985,12 +1210,12 @@ export const nativeGridRowPack = { enabled: true, maxBytes: 32 * 1024 * 1024 };
  * read through queryNumeric instead, when it must.
  */
 async function fetchNativePackedPage(
-  worker: NativeWorkerProcess,
+  callRead: <T>(method: string, args: unknown[]) => Promise<T>,
   sourceSql: string,
   params: CellValue[],
   containmentQuery: CellContainmentQuery
 ): Promise<{ result: NativeQueryResult } | { fallback: string }> {
-  const packed = await worker.call<{ values?: unknown[][]; tooLarge?: true }>('queryPacked', [
+  const packed = await callRead<{ values?: unknown[][]; tooLarge?: true }>('queryPacked', [
     buildCellPackWrappedQuery(sourceSql, containmentQuery, true),
     params,
     nativeGridRowPack.maxBytes
@@ -1003,25 +1228,15 @@ async function fetchNativePackedPage(
   // so such a page is read again; only that read's rows are returned.
   if (decoder.nonPlainTextValues > 0) return { fallback: 'holds TEXT that is not plain UTF-8' };
   const logicalColumnCount = containmentQuery.primaryTransportColumnCount;
-  const realColumns = containmentQuery.numericTransport.packedRealTextColumnCount ?? 0;
-  let exactIntegerTexts: Record<number, Record<number, string>> | undefined;
-  const values = decoded.map((row, rowIndex) => {
-    const out = row.slice(0, logicalColumnCount);
+  // Decoded rows end before any REAL text; the decoder kept the texts that differ.
+  const values = decoded.map(out => {
     for (let column = 0; column < out.length; column++) {
       const value = out[column];
       if (typeof value === 'bigint' && Number.isSafeInteger(Number(value))) out[column] = Number(value);
     }
-    if (realColumns > 0) {
-      const texts = parsePackedRealTexts(row.slice(logicalColumnCount), logicalColumnCount, rowIndex);
-      if (texts) {
-        for (const [column, text] of texts) {
-          if (text === String(out[column])) continue;
-          ((exactIntegerTexts ??= {})[rowIndex] ??= {})[column] = text;
-        }
-      }
-    }
     return out as CellValue[];
   });
+  const exactIntegerTexts = decoder.exactTexts;
   return {
     result: {
       columns: containmentQuery.numericTransport.transportColumns.slice(0, logicalColumnCount),
@@ -1066,6 +1281,14 @@ export async function createNativeDatabaseConnection(
   // Create and start worker
   const worker = new NativeWorkerProcess(binaryPath, workerScript);
   await worker.start();
+  // Reads get queryTimeout as the worker's statement deadline, so a slow one
+  // fails with the worker's own error and the worker stays usable; the host
+  // deadline adds the margin and stops only a worker that no longer answers.
+  // Writes keep call()'s fixed QUERY_TIMEOUT, as do the reads inside them: an
+  // interrupted write rolls back the whole transaction (see queryNativeBatch).
+  const callRead = <T>(method: string, args: unknown[]): Promise<T> => worker.call<T>(
+    method, args, queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, undefined, queryTimeout
+  );
   let currentOperations: DatabaseOperations | undefined;
   let invalidationEmitter: vsc.EventEmitter<DatabaseConnectionInvalidatedError> | undefined;
 
@@ -1093,10 +1316,48 @@ export async function createNativeDatabaseConnection(
     }
   };
 
-  // Termination handler
+  // The database this bundle has open, and whether its -wal was there before.
+  let openedPath: string | undefined;
+  let walExistedBeforeOpen = false;
+
+  /**
+   * Whether closing the open database leaves every file as it was found.
+   * The last connection to close a WAL database checkpoints it: the changes
+   * waiting in its -wal are written into the main file and the -wal is
+   * deleted. That must not happen to a database someone only looked at, nor
+   * silently merge the edits made here, so the database is closed only when
+   * its -wal was created by this open and still holds nothing; closing then
+   * removes it and the -shm again.
+   */
+  const closingChangesNothing = (): boolean => {
+    if (!openedPath) return true;
+    if (walExistedBeforeOpen) return false;
+    try {
+      return fs.statSync(`${openedPath}-wal`).size === 0;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+  };
+
+  /** Whether this open left an empty -wal (and its -shm) beside the database. */
+  const leftEmptyWal = (): boolean => {
+    if (!openedPath || walExistedBeforeOpen) return false;
+    try {
+      return fs.statSync(`${openedPath}-wal`).size === 0;
+    } catch {
+      return false;
+    }
+  };
+
+  // Termination handler. Closing the database is worth its few milliseconds
+  // only when it removes files this open created: for any other database the
+  // kill releases the file sooner (on Windows 1 ms against about 25 before
+  // it can be deleted or renamed), and for one whose -wal holds changes a
+  // close would rewrite the main file.
   const terminateWorker = () => {
     invalidationEmitter?.dispose();
-    worker.stop();
+    if (leftEmptyWal()) worker.end();
+    else worker.stop();
   };
 
   return {
@@ -1187,6 +1448,8 @@ export async function createNativeDatabaseConnection(
             `[NativeWorker] Reading ${displayName} without a memory map: its filesystem could not be identified (${error instanceof Error ? error.message : String(error)}).`
           );
         }
+        walExistedBeforeOpen = fs.existsSync(`${openPath}-wal`);
+        openedPath = openPath;
         await worker.call('open', [openPath, readOnly, mmapBytes]);
         const after = await readNativeFileIdentity(filePath);
         if (before && !sameNativeFileIdentity(before, after)) return invalidateConnection();
@@ -1456,7 +1719,8 @@ export async function createNativeDatabaseConnection(
           dfltValue: result.columns.indexOf('dflt_value'),
           pk: result.columns.indexOf('pk'),
           hidden: result.columns.indexOf('hidden'),
-          rowidAlias: result.columns.indexOf('is_rowid_alias')
+          rowidAlias: result.columns.indexOf('is_rowid_alias'),
+          primaryKeyCollation: result.columns.indexOf('primary_key_collation')
         };
         const hiddenCode = (row: readonly CellValue[]) => Number(
           index.hidden >= 0 ? row[index.hidden] : row[6] ?? 0
@@ -1471,7 +1735,10 @@ export async function createNativeDatabaseConnection(
             defaultExpression: index.dfltValue >= 0 ? row[index.dfltValue] : row[4],
             primaryKeyPosition: (index.pk >= 0 ? row[index.pk] : row[5]) as number,
             isGenerated: hiddenCode(row) === 2 || hiddenCode(row) === 3,
-            isRowidAlias: Number(index.rowidAlias >= 0 ? row[index.rowidAlias] : row[7] ?? 0) === 1
+            isRowidAlias: Number(index.rowidAlias >= 0 ? row[index.rowidAlias] : row[7] ?? 0) === 1,
+            ...(index.primaryKeyCollation >= 0 && typeof row[index.primaryKeyCollation] === 'string'
+              ? { primaryKeyCollation: row[index.primaryKeyCollation] as string }
+              : {})
           }));
       };
 
@@ -1568,6 +1835,26 @@ export async function createNativeDatabaseConnection(
         });
       };
 
+      /** Each identity chunk's row count and value bytes, from metadata alone. */
+      const readNativeDeleteSnapshotSizes = async (
+        table: string,
+        insertableColumns: readonly string[],
+        predicates: ReturnType<typeof buildRecordIdentityPredicateChunks>,
+        includeSyntheticRowId: boolean
+      ): Promise<Array<{ rowCount: number; valueBytes: number }>> => {
+        const valueColumns = deleteSnapshotValueColumns(
+          insertableColumns,
+          includeSyntheticRowId
+        );
+        const sizes: Array<{ rowCount: number; valueBytes: number }> = [];
+        for (const predicate of predicates) {
+          const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
+          const result = await worker.call<NativeQueryResult>('query', [query.sql, query.params]);
+          sizes.push(parseDeleteSnapshotSizeRow(result.values?.[0]));
+        }
+        return sizes;
+      };
+
       const assertNativeDeleteSnapshotWithinBudget = async (
         table: string,
         insertableColumns: readonly string[],
@@ -1576,30 +1863,68 @@ export async function createNativeDatabaseConnection(
         includeSyntheticRowId: boolean,
         maxSnapshotBytes: number,
         operation: 'Delete' | 'Insert' = 'Delete'
-      ): Promise<void> => {
-        const valueColumns = deleteSnapshotValueColumns(
+      ): Promise<Array<{ rowCount: number; valueBytes: number }>> => {
+        const sizes = await readNativeDeleteSnapshotSizes(
+          table,
           insertableColumns,
+          predicates,
           includeSyntheticRowId
         );
-        let rowCount = 0;
-        let valueBytes = 0;
-        for (const predicate of predicates) {
-          const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
-          const result = await worker.call<NativeQueryResult>('query', [query.sql, query.params]);
-          const chunk = parseDeleteSnapshotSizeRow(result.values?.[0]);
-          rowCount += chunk.rowCount;
-          valueBytes += chunk.valueBytes;
-        }
         assertDeleteSnapshotFitsUndoBudget({
           table,
           insertableColumns,
           includeSyntheticRowId,
           rowIds,
-          rowCount,
-          valueBytes,
+          rowCount: sizes.reduce((total, size) => total + size.rowCount, 0),
+          valueBytes: sizes.reduce((total, size) => total + size.valueBytes, 0),
           maxSnapshotBytes,
           operation
         });
+        return sizes;
+      };
+
+      /**
+       * The rows a delete snapshots, one array per identity chunk, laid out as
+       * one SELECT of the rowid when `withRowId` and every column's stored
+       * state returns them. A chunk is read in that one statement when its
+       * measured size fits one response; otherwise each of its rows is read
+       * cell by cell. `sizes` come from the same savepoint, and count TEXT
+       * twice, so the estimate errs large.
+       */
+      const readNativeDeleteSnapshotRows = async (
+        table: string,
+        identity: TableIdentity,
+        insertableColumns: readonly string[],
+        predicates: ReturnType<typeof buildRecordIdentityPredicateChunks>,
+        sizes: ReadonlyArray<{ rowCount: number; valueBytes: number }>,
+        rowIds: readonly RecordId[],
+        withRowId: boolean
+      ): Promise<CellValue[][][]> => {
+        const chunks: CellValue[][][] = [];
+        const bindsPerIdentity = identity.kind === 'rowid' ? 1 : identity.columns.length;
+        let start = 0;
+        for (const [index, predicate] of predicates.entries()) {
+          const chunkRowIds = rowIds.slice(start, start += predicate.params.length / bindsPerIdentity);
+          const responseBytes = sizes[index].valueBytes
+            + sizes[index].rowCount * NATIVE_HISTORY_ITEM_BYTES * (insertableColumns.length + 1);
+          if (responseBytes <= NATIVE_HISTORY_RESPONSE_MAX_BYTES) {
+            chunks.push((await worker.call<NativeQueryResult>('query', [
+              `SELECT ${withRowId ? 'CAST(rowid AS TEXT), ' : ''}` +
+              `${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
+              `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+              predicate.params
+            ])).values);
+            continue;
+          }
+          const byCell = await readNativeRowsByCell(table, chunkRowIds.map(rowId => ({
+            predicate: buildRecordIdentityPredicate(rowId, identity),
+            columns: insertableColumns
+          })));
+          chunks.push(byCell.flatMap((cells, position) => cells
+            ? [[...(withRowId ? [String(validateRowId(chunkRowIds[position]))] : []), ...cells.flat()]]
+            : []));
+        }
+        return chunks;
       };
 
       const findNativeTableIdentity = async (table: string): Promise<TableIdentity | undefined> => {
@@ -1649,6 +1974,17 @@ export async function createNativeDatabaseConnection(
       ): Promise<DeletedRow> => {
         const predicate = buildRecordIdentityPredicate(rowId, identity);
         const textEncoding = await readNativeCellTextEncoding();
+        const columnChunks = chunkRowHistoryColumns(insertableColumns);
+        if (columnChunks.length > 1) {
+          const [row] = await readNativeWideRowHistoryRows(table, '', columnChunks, [predicate]);
+          return parseNativeRowHistorySnapshot(
+            table,
+            rowId,
+            insertableColumns,
+            { columns: [], values: row ? [row] : [] },
+            textEncoding
+          );
+        }
         const result = await worker.call<NativeQueryResult>('query', [
           `SELECT ${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
           `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
@@ -1768,6 +2104,7 @@ export async function createNativeDatabaseConnection(
         kind: 'rowid'; value: CellValue;
       } | {
         kind: 'primaryKey'; columns: string[]; values: CellValue[]; integerCasts: boolean[];
+        collations?: (string | null)[];
       } => {
         const predicate = buildRecordIdentityPredicate(rowId, identity);
         return identity.kind === 'rowid'
@@ -1776,7 +2113,10 @@ export async function createNativeDatabaseConnection(
               kind: 'primaryKey',
               columns: identity.columns.map(column => column.identifier),
               values: predicate.params,
-              integerCasts: predicate.primaryKeyIntegerCasts!
+              integerCasts: predicate.primaryKeyIntegerCasts!,
+              ...(identity.columns.some(column => column.collation !== undefined)
+                ? { collations: identity.columns.map(column => column.collation ?? null) }
+                : {})
             };
       };
 
@@ -2012,19 +2352,15 @@ export async function createNativeDatabaseConnection(
           if (columns.length !== rowUpdates.length) {
             throw new Error(`Batch update for ${table} contains the same column more than once`);
           }
-          const current = await worker.call<NativeQueryResult>('query', [
-            `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
-            `FROM ${escapeMainIdentifier(table)} WHERE rowid = ? LIMIT 2`,
-            [rowId]
-          ]);
-          if (current.values.length !== 1) {
+          const current = await readNativeRowCellStates(table, { sql: 'rowid = ?', params: [rowId] }, columns);
+          if (!current) {
             throw new Error(`Cannot update ${table}: row identity no longer exists`);
           }
 
           const preparedUpdates = await Promise.all(rowUpdates.map(async (update, index) => {
             const priorState = parseStoredCellState(
-              current.values[0][index * 2],
-              current.values[0][index * 2 + 1],
+              current[index][0],
+              current[index][1],
               `${table}.${update.column}`,
               { textEncoding }
             );
@@ -2070,12 +2406,8 @@ export async function createNativeDatabaseConnection(
               preparedUpdate.storedValue
             );
           }
-          const post = await worker.call<NativeQueryResult>('query', [
-            `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
-            `FROM ${escapeMainIdentifier(table)} WHERE rowid = ? LIMIT 2`,
-            [newRowId]
-          ]);
-          if (post.values.length !== 1) {
+          const post = await readNativeRowCellStates(table, { sql: 'rowid = ?', params: [newRowId] }, columns);
+          if (!post) {
             throw unresolvableTriggeredRowIdUpdateError(table);
           }
           for (const [index, preparedUpdate] of preparedUpdates.entries()) {
@@ -2087,8 +2419,8 @@ export async function createNativeDatabaseConnection(
               newValue: preparedUpdate.prepared.value,
               priorState: preparedUpdate.priorState,
               postState: parseStoredCellState(
-                post.values[0][index * 2],
-                post.values[0][index * 2 + 1],
+                post[index][0],
+                post[index][1],
                 `${table}.${preparedUpdate.update.column}`,
                 { textEncoding }
               ),
@@ -2157,19 +2489,15 @@ export async function createNativeDatabaseConnection(
             if (columns.length !== rowUpdates.length) {
               throw new Error(`Batch update for ${table} contains the same column more than once`);
             }
-            const current = await worker.call<NativeQueryResult>('query', [
-              `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
-              `FROM ${escapeMainIdentifier(table)} WHERE ${oldPredicate.sql} LIMIT 2`,
-              oldPredicate.params
-            ]);
-            if (current.values.length !== 1) {
+            const current = await readNativeRowCellStates(table, oldPredicate, columns);
+            if (!current) {
               throw new Error(`Cannot update ${table}: row identity no longer exists`);
             }
 
             const preparedUpdates = await Promise.all(rowUpdates.map(async (update, index) => {
               const priorState = parseStoredCellState(
-                current.values[0][index * 2],
-                current.values[0][index * 2 + 1],
+                current[index][0],
+                current[index][1],
                 `${table}.${update.column}`,
                 { textEncoding }
               );
@@ -2221,16 +2549,16 @@ export async function createNativeDatabaseConnection(
             const newRowId = await readNativePrimaryKeyRecordId(
               table,
               identity,
-              buildRecordIdentityPredicate(candidateId, identity),
+              buildRecordIdentityPredicate(
+                candidateId,
+                identity,
+                primaryKeyReplacements.map(replacement => replacement.column)
+              ),
               unresolvableTriggeredPrimaryKeyUpdateError(table)
             );
             const newPredicate = buildRecordIdentityPredicate(newRowId, identity);
-            const post = await worker.call<NativeQueryResult>('query', [
-              `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
-              `FROM ${escapeMainIdentifier(table)} WHERE ${newPredicate.sql} LIMIT 2`,
-              newPredicate.params
-            ]);
-            if (post.values.length !== 1) {
+            const post = await readNativeRowCellStates(table, newPredicate, columns);
+            if (!post) {
               throw unresolvableTriggeredPrimaryKeyUpdateError(table);
             }
             for (const [index, preparedUpdate] of preparedUpdates.entries()) {
@@ -2242,8 +2570,8 @@ export async function createNativeDatabaseConnection(
                 newValue: preparedUpdate.prepared.value,
                 priorState: preparedUpdate.priorState,
                 postState: parseStoredCellState(
-                  post.values[0][index * 2],
-                  post.values[0][index * 2 + 1],
+                  post[index][0],
+                  post[index][1],
                   `${table}.${preparedUpdate.update.column}`,
                   { textEncoding }
                 ),
@@ -2584,8 +2912,9 @@ export async function createNativeDatabaseConnection(
             && (cell.newRowId === undefined || cell.newRowId === cell.rowId))) {
             // A rowid table's chunk is read in one statement each way, as
             // updateCellBatch reads; a primary-key row is read by its own
-            // query. The history entry's own values keep each chunk's reads
-            // within the response budget.
+            // query. The history entry's own values keep each chunk's writes
+            // within the request budget. A row whose current cells would take
+            // a read past one response is read cell by cell instead.
             const rowIdReads = identity.kind === 'rowid';
             const maxChunkRows = rowIdReads ? 1024 : 128;
             const stateBytes = (state: StoredCellState) => approximateParamBytes([state.rawTextBytes ?? state.value]);
@@ -2601,43 +2930,55 @@ export async function createNativeDatabaseConnection(
                 const predicate = buildRecordIdentityPredicate(rowId, identity);
                 const expected = rowCells.map(cell => direction === 'undo' ? cell.postState : cell.priorState);
                 const target = rowCells.map(cell => direction === 'undo' ? cell.priorState : cell.postState);
-                return {
-                  rowId, rowCells, predicate, expected, target,
-                  query: {
-                    sql: `SELECT ${rowCells.map(cell => buildStoredCellStateProjection(cell.columnName)).join(', ')} `
-                      + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
-                    params: predicate.params
-                  }
-                };
+                return { rowId, rowCells, predicate, expected, target };
               });
               offset = end;
               // Each plan's cells as [typeof, value] pairs, or undefined when
               // its row is missing or not unique.
               const readRows = async (): Promise<Array<CellValue[] | undefined>> => {
+                let rows: Array<CellValue[] | undefined>;
                 if (!rowIdReads) {
-                  const result = await worker.call<NativeQueryBatchResult>('queryBatch', [plans.map(plan => plan.query)]);
+                  const result = await worker.call<NativeQueryBatchResult>('queryBatch', [plans.map(plan => {
+                    const columns = plan.rowCells.map(cell => cell.columnName);
+                    return {
+                      sql: `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} `
+                        + `FROM ${escapeMainIdentifier(table)} WHERE ${plan.predicate.sql} AND `
+                        + `${storedRowBytesSql(columns)} <= ${nativeHistoryRowByteLimit(plans.length, columns.length)} LIMIT 2`,
+                      params: plan.predicate.params
+                    };
+                  })]);
                   if (result.results?.length !== plans.length) {
                     throw new Error('Cell history batch returned incomplete results');
                   }
-                  return result.results.map(item => (item.values?.length === 1 ? item.values[0] : undefined));
-                }
-                const columns = [...new Set(plans.flatMap(plan => plan.rowCells.map(cell => cell.columnName)))];
-                const rows = new Map<string, CellValue[]>();
-                for (const predicate of buildRecordIdentityPredicateChunks(plans.map(plan => plan.rowId), identity)) {
-                  const result = await worker.call<NativeQueryResult>('query', [
-                    `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} `
-                      + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
-                    predicate.params
-                  ]);
-                  for (const row of result.values ?? []) rows.set(String(validateRowId(row[0] as RecordId)), row);
-                }
-                return plans.map(plan => {
-                  const row = rows.get(String(validateRowId(plan.rowId)));
-                  return row && plan.rowCells.flatMap(cell => {
-                    const index = columns.indexOf(cell.columnName);
-                    return [row[index * 2 + 1], row[index * 2 + 2]];
+                  rows = result.results.map(item => (item.values?.length === 1 ? item.values[0] : undefined));
+                } else {
+                  const columns = [...new Set(plans.flatMap(plan => plan.rowCells.map(cell => cell.columnName)))];
+                  const found = new Map<string, CellValue[]>();
+                  for (const predicate of buildRecordIdentityPredicateChunks(plans.map(plan => plan.rowId), identity)) {
+                    const result = await worker.call<NativeQueryResult>('query', [
+                      `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} `
+                        + `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} AND `
+                        + `${storedRowBytesSql(columns)} <= ${nativeHistoryRowByteLimit(predicate.params.length, columns.length)}`,
+                      predicate.params
+                    ]);
+                    for (const row of result.values ?? []) found.set(String(validateRowId(row[0] as RecordId)), row);
+                  }
+                  rows = plans.map(plan => {
+                    const row = found.get(String(validateRowId(plan.rowId)));
+                    return row && plan.rowCells.flatMap(cell => {
+                      const index = columns.indexOf(cell.columnName);
+                      return [row[index * 2 + 1], row[index * 2 + 2]];
+                    });
                   });
-                });
+                }
+                const unread = plans.filter((_, index) => !rows[index]);
+                if (unread.length === 0) return rows;
+                const byCell = await readNativeRowsByCell(table, unread.map(plan => ({
+                  predicate: plan.predicate,
+                  columns: plan.rowCells.map(cell => cell.columnName)
+                })));
+                let next = 0;
+                return rows.map(row => row ?? byCell[next++]?.flat());
               };
               const assertStates = (rows: Array<CellValue[] | undefined>, target: boolean): void => {
                 plans.forEach((plan, index) => {
@@ -2688,19 +3029,18 @@ export async function createNativeDatabaseConnection(
             const currentRowId = direction === 'undo' ? recordedNewRowId : originalRowId;
             const targetRowId = direction === 'undo' ? originalRowId : recordedNewRowId;
             const currentPredicate = buildRecordIdentityPredicate(currentRowId, identity);
-            const projections = rowCells.map(cell => buildStoredCellStateProjection(cell.columnName));
-            const currentResult = await worker.call<NativeQueryResult>('query', [
-              `SELECT ${projections.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
-              `WHERE ${currentPredicate.sql} LIMIT 2`,
-              currentPredicate.params
-            ]);
-            if (currentResult.values.length !== 1) {
+            const currentResult = await readNativeRowCellStates(
+              table,
+              currentPredicate,
+              rowCells.map(cell => cell.columnName)
+            );
+            if (!currentResult) {
               throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
             }
 
             const currentStates = rowCells.map((cell, index) => parseStoredCellState(
-              currentResult.values[0][index * 2],
-              currentResult.values[0][index * 2 + 1],
+              currentResult[index][0],
+              currentResult[index][1],
               `${table}.${cell.columnName}`,
               { textEncoding }
             ));
@@ -2754,19 +3094,19 @@ export async function createNativeDatabaseConnection(
             }
 
             const targetPredicate = buildRecordIdentityPredicate(targetRowId, identity);
-            const actualResult = await worker.call<NativeQueryResult>('query', [
-              `SELECT ${projections.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
-              `WHERE ${targetPredicate.sql} LIMIT 2`,
-              targetPredicate.params
-            ]);
-            if (actualResult.values.length !== 1) {
+            const actualResult = await readNativeRowCellStates(
+              table,
+              targetPredicate,
+              rowCells.map(cell => cell.columnName)
+            );
+            if (!actualResult) {
               throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
             }
             const exactTarget = targetStates.every((state, index) => storedCellStatesEqual(
               state,
               parseStoredCellState(
-                actualResult.values[0][index * 2],
-                actualResult.values[0][index * 2 + 1],
+                actualResult[index][0],
+                actualResult[index][1],
                 `${table}.${rowCells[index].columnName}`,
                 { textEncoding }
               )
@@ -2899,6 +3239,143 @@ export async function createNativeDatabaseConnection(
       };
 
       /**
+       * Each cell's [typeof, value] pair, or undefined when its row is missing
+       * or not unique. Every cell is its own history unit, so a response holds
+       * the response budget plus one cell, and no other cell is read. History
+       * reads rows here that one response cannot carry. A value too large to
+       * share a response is read again in a request of its own, and one too
+       * large for any response is refused instead of read.
+       */
+      const readNativeCellStates = async (
+        table: string,
+        cells: ReadonlyArray<{ predicate: { sql: string; params: CellValue[] }; column: string }>
+      ): Promise<Array<[CellValue, CellValue] | undefined>> => {
+        // Read column by column: the worker keeps 32 statements a request, and
+        // row by row over more columns than that would prepare most reads anew.
+        const columnOrder = new Map<string, number>();
+        for (const { column } of cells) if (!columnOrder.has(column)) columnOrder.set(column, columnOrder.size);
+        const order = cells.map((_, index) => index)
+          .sort((left, right) => columnOrder.get(cells[left].column)! - columnOrder.get(cells[right].column)!);
+        const read = (index: number, maxBytes: number) => {
+          const { predicate, column } = cells[index];
+          const escaped = escapeIdentifier(column);
+          return {
+            // TEXT crosses as its bytes, as buildStoredCellStateProjection says.
+            sql: `SELECT typeof(${escaped}), CASE WHEN octet_length(${escaped}) > ${maxBytes} THEN NULL ` +
+              `WHEN typeof(${escaped}) = 'text' THEN CAST(${escaped} AS BLOB) ELSE ${escaped} END, ` +
+              `octet_length(${escaped}) FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+            params: predicate.params
+          };
+        };
+        const reads = order.map(index => read(index, NATIVE_HISTORY_CELL_MAX_BYTES));
+        const results: NativeQueryResult[] = [];
+        for (const group of groupConsecutive(reads, approximateQueryBytes)) {
+          results.push(...await queryNativeBatch(group));
+        }
+        const states: Array<[CellValue, CellValue] | undefined> = cells.map(() => undefined);
+        const refuse = (index: number, storageClass: CellValue, bytes: CellValue): never => {
+          throw new Error(
+            `Cannot read ${table}.${cells[index].column} for undo history: its ${String(bytes)}-byte ` +
+            `${String(storageClass)} value is larger than the native engine returns at once`
+          );
+        };
+        const alone: number[] = [];
+        results.forEach((result, position) => {
+          const index = order[position];
+          if (result.values?.length !== 1) return;
+          const [storageClass, value, bytes] = result.values[0];
+          if (Number(bytes) > NATIVE_HISTORY_LONE_CELL_MAX_BYTES) refuse(index, storageClass, bytes);
+          if (Number(bytes) > NATIVE_HISTORY_CELL_MAX_BYTES) alone.push(index);
+          else states[index] = [storageClass, value];
+        });
+        // Each in a request of its own, so the response holds this value only.
+        for (const index of alone) {
+          const [result] = await queryNativeBatch([read(index, NATIVE_HISTORY_LONE_CELL_MAX_BYTES)]);
+          if (result?.values?.length !== 1) continue;
+          const [storageClass, value, bytes] = result.values[0];
+          // The row may have changed between the two reads.
+          if (Number(bytes) > NATIVE_HISTORY_LONE_CELL_MAX_BYTES) refuse(index, storageClass, bytes);
+          states[index] = [storageClass, value];
+        }
+        return states;
+      };
+
+      /** Each row's pairs from readNativeCellStates, or undefined when any is missing. */
+      const readNativeRowsByCell = async (
+        table: string,
+        rows: ReadonlyArray<{ predicate: { sql: string; params: CellValue[] }; columns: readonly string[] }>
+      ): Promise<Array<Array<[CellValue, CellValue]> | undefined>> => {
+        const pairs = await readNativeCellStates(table, rows.flatMap(row => row.columns.map(column => ({
+          predicate: row.predicate,
+          column
+        }))));
+        let next = 0;
+        return rows.map(row => {
+          const cells = pairs.slice(next, next += row.columns.length);
+          return cells.every(cell => cell !== undefined) ? cells : undefined;
+        });
+      };
+
+      /**
+       * One row's [typeof, value] pairs for columns, or undefined when the row
+       * is missing or not unique. One statement reads the row if its cells fit
+       * one response, which the statement checks from their stored sizes in
+       * the same evaluation; otherwise each cell is read on its own.
+       */
+      const readNativeRowCellStates = async (
+        table: string,
+        predicate: { sql: string; params: CellValue[] },
+        columns: readonly string[]
+      ): Promise<Array<[CellValue, CellValue]> | undefined> => {
+        const result = await worker.call<NativeQueryResult>('query', [
+          `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} FROM ${escapeMainIdentifier(table)} ` +
+          `WHERE ${predicate.sql} AND ${storedRowBytesSql(columns)} <= ${nativeHistoryRowByteLimit(1, columns.length)} LIMIT 2`,
+          predicate.params
+        ]);
+        if (result.values.length === 1) {
+          const row = result.values[0];
+          return columns.map((_, index) => [row[index * 2], row[index * 2 + 1]]);
+        }
+        return (await readNativeRowsByCell(table, [{ predicate, columns }]))[0];
+      };
+
+      /**
+       * The rows `SELECT ${prefix}<stored-cell projections>` returns for these
+       * identities, on a table too wide for one SELECT: each identity is read
+       * alone, one history unit of column chunks that join by position because
+       * an identity names at most one row. A missing or ambiguous identity
+       * yields undefined.
+       */
+      const readNativeWideRowHistoryRows = async (
+        table: string,
+        prefix: string,
+        columnChunks: readonly string[][],
+        identities: ReadonlyArray<{ sql: string; params: CellValue[] }>
+      ): Promise<Array<CellValue[] | undefined>> => {
+        const reads = identities.map(identity => columnChunks.map((columns, index) => ({
+          sql: `SELECT ${index === 0 ? prefix : ''}${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+            `FROM ${escapeMainIdentifier(table)} WHERE ${identity.sql} LIMIT 2`,
+          params: identity.params
+        })));
+        const rows: Array<CellValue[] | undefined> = [];
+        for (const group of groupConsecutive(
+          reads,
+          unit => unit.reduce((bytes, read) => bytes + approximateQueryBytes(read), 0),
+          NATIVE_HISTORY_BATCH_BYTES,
+          Math.max(1, Math.floor(NATIVE_HISTORY_BATCH_ITEMS / columnChunks.length))
+        )) {
+          const results = await queryNativeBatch(group.flat(), columnChunks.length);
+          for (let start = 0; start < results.length; start += columnChunks.length) {
+            const chunks = results.slice(start, start + columnChunks.length);
+            rows.push(chunks.every(chunk => chunk.values?.length === 1)
+              ? chunks.flatMap(chunk => chunk.values[0])
+              : undefined);
+          }
+        }
+        return rows;
+      };
+
+      /**
        * insertNativeRowInternal's guards for many rows at a time. Each phase
        * sends its per-row statements in queryBatch round trips; per-row IPC
        * made a 100,000-row import take minutes.
@@ -3013,6 +3490,7 @@ export async function createNativeDatabaseConnection(
           // whose projection exceeds the group bound is read alone, so no read
           // materializes more than one bound beyond what the budget admitted.
           const projections = insertableColumns.map(buildStoredCellStateProjection).join(', ');
+          const columnChunks = chunkRowHistoryColumns(insertableColumns);
           let remainingSnapshotBytes = maxUndoSnapshotBytes;
           const checkBudget = (index: number): void => {
             if (remainingSnapshotBytes === undefined) return;
@@ -3042,7 +3520,10 @@ export async function createNativeDatabaseConnection(
           }) + approximateQueryBytes(reads[index]));
           for (const group of readGroups) {
             checkBudget(group[0]);
-            const results = await queryNativeBatch(group.map(index => reads[index]));
+            const results: NativeQueryResult[] = columnChunks.length === 1
+              ? await queryNativeBatch(group.map(index => reads[index]))
+              : (await readNativeWideRowHistoryRows(table, '', columnChunks, group.map(index => predicates[index])))
+                .map(row => ({ columns: [], values: row ? [row] : [] }));
             group.forEach((index, position) => {
               if (position > 0) checkBudget(index);
               const snapshot = parseNativeRowHistorySnapshot(
@@ -3192,10 +3673,10 @@ export async function createNativeDatabaseConnection(
 
         executeReadQuery: async (sql, params = [], explain = false, signal) => {
           signal?.throwIfAborted();
-          const prepared = prepareReadQuery(sql);
+          const prepared = prepareReadQuery(sql, params);
           if (params.length !== prepared.parameterCount) throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
           if (explain) {
-            const request = queryPlanRequest(prepared.sourceSql, params);
+            const request = queryPlanRequest(prepared.sourceSql, prepared.params);
             const value = await worker.call<CellValue>('workspaceQueryPlan', [request.sql, request.params, queryPlanLibrary, queryTimeout],
               queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
             signal?.throwIfAborted();
@@ -3213,7 +3694,7 @@ export async function createNativeDatabaseConnection(
             const headers = await worker.call<string[]>('describeReadQuery', [prepared.sql, prepared.metadataSql, boundary, SQL_MAX_COLUMNS, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
             signal?.throwIfAborted();
             const transport = buildReadTransport(prepared.sql, headers.length, cellHelpers);
-            const result = await worker.call<NativeQueryResult>('workspaceQuery', [transport.sql, boundary, params, transport.transportColumns, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
+            const result = await worker.call<NativeQueryResult>('workspaceQuery', [transport.sql, boundary, prepared.params, transport.transportColumns, queryTimeout], queryTimeout + BOUNDED_QUERY_TRANSPORT_MARGIN_MS, signal);
             signal?.throwIfAborted();
             const decoded = decodeReadTransport(headers, result.values, transport);
             await releaseNativeSavepoint(savepointName);
@@ -3240,7 +3721,12 @@ export async function createNativeDatabaseConnection(
             );
           } else {
             signal?.throwIfAborted();
-            result = await worker.call<NativeQueryResult>('query', [sql, params]);
+            // Only a SELECT counts as a read. Callers also send savepoint
+            // control, whose RELEASE can commit an import run in a read
+            // snapshot, and the save's WAL checkpoint: those keep the fixed limit.
+            result = isReadStatement(sql)
+              ? await callRead<NativeQueryResult>('query', [sql, params])
+              : await worker.call<NativeQueryResult>('query', [sql, params]);
             signal?.throwIfAborted();
           }
 
@@ -3808,7 +4294,7 @@ export async function createNativeDatabaseConnection(
             return readNativePrimaryKeyRecordId(
               table,
               identity,
-              buildRecordIdentityPredicate(candidateId, identity),
+              buildRecordIdentityPredicate(candidateId, identity, keyIndex >= 0 ? [column] : []),
               unresolvableTriggeredPrimaryKeyUpdateError(table)
             );
           };
@@ -3955,24 +4441,36 @@ export async function createNativeDatabaseConnection(
             try {
               await assertNativeMutationHasNoUntrackedPrograms('DELETE', table);
               const insertableColumns = await getNativeInsertableColumnNames(table);
-              if (maxUndoSnapshotBytes !== undefined) {
-                await assertNativeDeleteSnapshotWithinBudget(
+              const sizes = maxUndoSnapshotBytes !== undefined
+                ? await assertNativeDeleteSnapshotWithinBudget(
                   table,
                   insertableColumns,
                   predicates,
                   rowIds,
                   false,
                   maxUndoSnapshotBytes
-                );
-              }
+                )
+                : await readNativeDeleteSnapshotSizes(table, insertableColumns, predicates, false);
               const textEncoding = await readNativeCellTextEncoding();
               const deletedRows: DeletedRow[] = [];
-              for (const predicate of predicates) {
-                const current = await worker.call<NativeQueryResult>('query', [
-                  `SELECT ${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
-                  `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
-                  predicate.params
-                ]);
+              const columnChunks = chunkRowHistoryColumns(insertableColumns);
+              const currentRows: CellValue[][][] = [];
+              if (columnChunks.length === 1) {
+                currentRows.push(...await readNativeDeleteSnapshotRows(
+                  table,
+                  identity,
+                  insertableColumns,
+                  predicates,
+                  sizes,
+                  rowIds,
+                  false
+                ));
+              } else {
+                currentRows.push((await readNativeWideRowHistoryRows(table, '', columnChunks, rowIds.map(
+                  rowId => buildRecordIdentityPredicate(rowId, identity)
+                ))).filter(row => row !== undefined));
+              }
+              for (const rows of currentRows) {
                 const primaryKeyIndices = identity.columns.map(column => {
                   const index = insertableColumns.indexOf(column.identifier);
                   if (index < 0) {
@@ -3980,7 +4478,7 @@ export async function createNativeDatabaseConnection(
                   }
                   return index;
                 });
-                deletedRows.push(...current.values.map(row => {
+                deletedRows.push(...rows.map(row => {
                   const states = insertableColumns.map((column, index) => parseStoredCellState(
                     row[index * 2],
                     row[index * 2 + 1],
@@ -4007,9 +4505,7 @@ export async function createNativeDatabaseConnection(
                   };
                 }));
               }
-              if (deletedRows.length !== rowIds.length) {
-                throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
-              }
+              assertOneRowPerIdentity(table, rowIds, deletedRows.map(row => row.rowId));
               for (const predicate of predicates) {
                 await worker.call('run', [
                   `DELETE FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
@@ -4036,26 +4532,37 @@ export async function createNativeDatabaseConnection(
           try {
             await assertNativeMutationHasNoUntrackedPrograms('DELETE', table);
             const insertableColumns = await getNativeInsertableColumnNames(table);
-            if (maxUndoSnapshotBytes !== undefined) {
-              await assertNativeDeleteSnapshotWithinBudget(
+            const sizes = maxUndoSnapshotBytes !== undefined
+              ? await assertNativeDeleteSnapshotWithinBudget(
                 table,
                 insertableColumns,
                 predicates,
                 rowIds,
                 true,
                 maxUndoSnapshotBytes
-              );
-            }
+              )
+              : await readNativeDeleteSnapshotSizes(table, insertableColumns, predicates, true);
             const textEncoding = await readNativeCellTextEncoding();
             const deletedRows: DeletedRow[] = [];
-            for (const predicate of predicates) {
-              const current = await worker.call<NativeQueryResult>('query', [
-                `SELECT CAST(rowid AS TEXT), ` +
-                `${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
-                `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
-                predicate.params
-              ]);
-              deletedRows.push(...current.values.map(row => {
+            const columnChunks = chunkRowHistoryColumns(insertableColumns);
+            const currentRows: CellValue[][][] = [];
+            if (columnChunks.length === 1) {
+              currentRows.push(...await readNativeDeleteSnapshotRows(
+                table,
+                identity,
+                insertableColumns,
+                predicates,
+                sizes,
+                rowIds,
+                true
+              ));
+            } else {
+              currentRows.push((await readNativeWideRowHistoryRows(table, 'CAST(rowid AS TEXT), ', columnChunks, rowIds.map(
+                rowId => buildRecordIdentityPredicate(rowId, identity)
+              ))).filter(row => row !== undefined));
+            }
+            for (const rows of currentRows) {
+              deletedRows.push(...rows.map(row => {
                 const deletedRowId = validateRowId(row[0] as RecordId | bigint);
                 const states = insertableColumns.map((column, index) => parseStoredCellState(
                   row[index * 2 + 1],
@@ -4530,7 +5037,7 @@ export async function createNativeDatabaseConnection(
               // ORDER BY), the page execution, and the anchor minting below all
               // derive from this one in-savepoint answer, so an external WAL
               // commit between reads can never desynchronize them.
-              const authority = await worker.call<NativeQueryResult>('query', [
+              const authority = await callRead<NativeQueryResult>('query', [
                 ROWID_TABLE_AUTHORITY_SQL,
                 [table, table]
               ]);
@@ -4581,7 +5088,11 @@ export async function createNativeDatabaseConnection(
               likeAny
             } = await prepareNativeCellHelpers();
             // A virtual table need not serve rowid IN (...) without a scan.
-            const engineOptions = { likeAny, rowIdLookup: isRowIdTable && rowIdTableType !== 'virtual' };
+            const engineOptions = {
+              likeAny,
+              rowIdLookup: isRowIdTable && rowIdTableType !== 'virtual',
+              keyCollations: primaryKeyCollations(identity)
+            };
             const { sql, params } = buildSelectQuery(table, valueQueryOptions, keysetPlan, undefined, engineOptions);
             const rowIdQuery = splitSyntheticRowId
               ? buildSelectQuery(
@@ -4632,7 +5143,7 @@ export async function createNativeDatabaseConnection(
               && hasRowIdShape;
             let packedResult: NativeQueryResult | undefined;
             if (nativeGridRowPack.enabled && cellPack && !splitSyntheticRowId && cellPackApplies(containmentQuery)) {
-              const packed = await fetchNativePackedPage(worker, sql, params, containmentQuery);
+              const packed = await fetchNativePackedPage(callRead, sql, params, containmentQuery);
               if ('result' in packed) packedResult = packed.result;
               else if (!nativePackFallbacksLogged.has(packed.fallback)) {
                 nativePackFallbacksLogged.add(packed.fallback);
@@ -4642,7 +5153,7 @@ export async function createNativeDatabaseConnection(
                 );
               }
             }
-            const primaryResult = packedResult ?? await worker.call<NativeQueryResult>('queryNumeric', [
+            const primaryResult = packedResult ?? await callRead<NativeQueryResult>('queryNumeric', [
                   transportQuery.sql,
                   params,
                   transportQuery.transportColumns,
@@ -4656,7 +5167,7 @@ export async function createNativeDatabaseConnection(
               containmentQuery
             ) as CellValue[][];
             const rowIdResult = rowIdQuery
-              ? await worker.call<NativeQueryResult>('query', [
+              ? await callRead<NativeQueryResult>('query', [
                   rowIdQuery.sql,
                   rowIdQuery.params
                 ])
@@ -4681,7 +5192,7 @@ export async function createNativeDatabaseConnection(
                 sourceRows.map(row => row[0] as CellValue)
               );
               if (companionQueries.length > 0) {
-                const companionBatch = await worker.call<NativeQueryBatchResult>('queryBatch', [
+                const companionBatch = await callRead<NativeQueryBatchResult>('queryBatch', [
                   companionQueries.map(query => ({ sql: query.sql, params: query.params }))
                 ]);
                 if (companionBatch.results?.length !== companionQueries.length) {
@@ -4702,17 +5213,22 @@ export async function createNativeDatabaseConnection(
 
             // txiki preserves SQLite int64 values as BigInt. The generated
             // companion columns also retain authoritative REAL text before V8
-            // normalizes the storage class into a JavaScript Number.
+            // normalizes the storage class into a JavaScript Number. A packed
+            // page's texts were compared with its values on the host already.
+            const workerExactTexts = packedResult ? undefined : primaryResult.exactIntegerTexts;
             const normalized = normalizeIntegerRowsForTransport(
               valueSourceRows,
               undefined,
               splitSyntheticRowId
-                ? primaryResult.exactIntegerTexts
+                ? workerExactTexts
                 : mergeExactIntegerTextMaps(
                     companionExactTexts,
-                    primaryResult.exactIntegerTexts
+                    workerExactTexts
                   ),
-              !splitSyntheticRowId && needsExactRowIdIdentity ? 0 : undefined
+              !splitSyntheticRowId && needsExactRowIdIdentity ? 0 : undefined,
+              undefined,
+              undefined,
+              packedResult?.exactIntegerTexts
             );
             const valueContained = decodeCellContainment(
               normalized.rows,
@@ -4859,7 +5375,7 @@ export async function createNativeDatabaseConnection(
           const likeAny = getActiveFilterValue(options.globalFilter) !== undefined
             && (await prepareNativeCellHelpers()).likeAny;
           const { sql, params } = buildCountQuery(table, options, { likeAny });
-          const result = await worker.call<NativeQueryResult>('query', [sql, params]);
+          const result = await callRead<NativeQueryResult>('query', [sql, params]);
           if (result && result.values && result.values.length > 0) {
             const val = result.values[0][0];
             return { count: typeof val === 'number' ? val : 0, isExact: true };
@@ -4880,7 +5396,7 @@ export async function createNativeDatabaseConnection(
             { sql: SCHEMA_HAS_TRIGGERS_SQL }
           ];
 
-          const res = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
+          const res = await callRead<NativeQueryBatchResult>('queryBatch', [queries]);
 
           // Validate the response — throw instead of silently returning empty schema
           if (!res || !res.results || res.results.length < 5) {
@@ -4923,7 +5439,7 @@ export async function createNativeDatabaseConnection(
           ];
 
           const queries = pragmasToFetch.map(pragma => ({ sql: `PRAGMA ${pragma}` }));
-          const res = await worker.call<NativeQueryBatchResult>('queryBatch', [queries]);
+          const res = await callRead<NativeQueryBatchResult>('queryBatch', [queries]);
 
           const result: Record<string, CellValue> = {};
 
@@ -4989,7 +5505,7 @@ export async function createNativeDatabaseConnection(
          */
         ping: async () => {
           try {
-            await worker.call('query', ['SELECT 1']);
+            await callRead('query', ['SELECT 1']);
             return true;
           } catch {
             return false;
@@ -5060,7 +5576,7 @@ export async function createNativeDatabaseConnection(
           let writeCompleted = false;
           let savedIdentity: NativeFileIdentity | undefined;
           try {
-            result = await writeDatabaseSnapshotAtomically(
+            const written = await writeDatabaseSnapshotAtomically(
               fs,
               filePath,
               targetPath,
@@ -5069,9 +5585,9 @@ export async function createNativeDatabaseConnection(
                 // A replacement between admission and that capture must not be
                 // accepted as a new destination for the retired native source.
                 await assertCurrentFile();
-                // VACUUM INTO itself refuses an existing path. The atomic helper
-                // keeps that private snapshot off the destination until fsync and
-                // target-generation validation have both succeeded.
+                // VACUUM INTO creates the snapshot at the path the atomic
+                // helper gives. The helper keeps it off the destination until
+                // fsync and target-generation validation have succeeded.
                 await worker.call(
                   'vacuumInto',
                   [temporaryPath, queryTimeout],
@@ -5080,8 +5596,6 @@ export async function createNativeDatabaseConnection(
                 );
                 await assertCurrentFile();
                 if (replacingActiveSource) {
-                  const snapshotIdentity = await readNativeFileIdentity(temporaryPath);
-                  savedIdentity = { ...snapshotIdentity, canonicalPath: identity.canonicalPath };
                   // A WAL connection keeps a shared main-file lock even with no
                   // frames. Close both native handles before the helper obtains
                   // its exclusive lock; serialized operations prevent this
@@ -5096,8 +5610,16 @@ export async function createNativeDatabaseConnection(
                   ? ''
                   : ` ${error instanceof Error ? error.message : String(error)}`;
                 outputChannel?.appendLine(`[NativeWorker] ${message}${details}`);
-              }
+              },
+              undefined,
+              undefined,
+              // Staged: VACUUM INTO creates its own file.
+              true
             );
+            result = { requiresReopen: written.requiresReopen };
+            // The file now at the path, as the helper verified it: the snapshot
+            // it renamed there, or this same file when it wrote into it.
+            savedIdentity = { canonicalPath: identity.canonicalPath, dev: written.installed.dev, ino: written.installed.ino };
             writeCompleted = true;
           } catch (error) {
             writeError = error;
@@ -5233,24 +5755,48 @@ export async function createNativeDatabaseConnection(
           const columns = [...new Set(updates.map(update => update.column))];
           const textEncoding = await readNativeCellTextEncoding();
           const rowIdPredicates = buildRecordIdentityPredicateChunks(rowIds, rowIdIdentity);
-          const currentValues = new Map<string, Map<string, StoredCellState>>();
-          for (const predicate of rowIdPredicates) {
-            const current = await worker.call<NativeQueryResult>('query', [
-              `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
-              `FROM ${escapedTable} WHERE ${predicate.sql}`,
-              predicate.params
-            ]);
-            for (const row of current.values ?? []) {
-              const values = new Map<string, StoredCellState>();
-              columns.forEach((column, index) => values.set(column, parseStoredCellState(
-                row[index * 2 + 1],
-                row[index * 2 + 2],
-                `${table}.${column}`,
-                { textEncoding }
-              )));
-              currentValues.set(String(validateRowId(row[0] as RecordId)), values);
+          // Each identity chunk is read in one statement, which also reads the
+          // batch's other columns of each row. A row whose cells there would
+          // take the response past its bound is left out by the same
+          // statement, from the cells' stored sizes, and only its edited cells
+          // are then read, each on its own.
+          const readEditedCells = async (): Promise<Map<string, Map<string, StoredCellState>>> => {
+            const states = new Map<string, Map<string, StoredCellState>>();
+            for (const predicate of rowIdPredicates) {
+              const current = await worker.call<NativeQueryResult>('query', [
+                `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+                `FROM ${escapedTable} WHERE ${predicate.sql} AND ` +
+                `${storedRowBytesSql(columns)} <= ${nativeHistoryRowByteLimit(predicate.params.length, columns.length)}`,
+                predicate.params
+              ]);
+              for (const row of current.values ?? []) {
+                const values = new Map<string, StoredCellState>();
+                columns.forEach((column, index) => values.set(column, parseStoredCellState(
+                  row[index * 2 + 1],
+                  row[index * 2 + 2],
+                  `${table}.${column}`,
+                  { textEncoding }
+                )));
+                states.set(String(validateRowId(row[0] as RecordId)), values);
+              }
             }
-          }
+            const unread = updates.filter(update => !states.has(String(validateRowId(update.rowId))));
+            if (unread.length === 0) return states;
+            const pairs = await readNativeCellStates(table, unread.map(update => ({
+              predicate: buildRecordIdentityPredicate(update.rowId, rowIdIdentity),
+              column: update.column
+            })));
+            pairs.forEach((pair, index) => {
+              if (!pair) return;
+              const { rowId, column } = unread[index];
+              const key = String(validateRowId(rowId));
+              const row = states.get(key) ?? new Map<string, StoredCellState>();
+              row.set(column, parseStoredCellState(pair[0], pair[1], `${table}.${column}`, { textEncoding }));
+              states.set(key, row);
+            });
+            return states;
+          };
+          const currentValues = await readEditedCells();
           const results: Array<Omit<CellUpdateResult, 'postState'>> = [];
           const processedUpdates = await Promise.all(updates.map(async update => {
             const rowId = validateRowId(update.rowId);
@@ -5333,24 +5879,7 @@ export async function createNativeDatabaseConnection(
             throw unresolvableTriggeredRowIdUpdateError(table);
           }
 
-          const postValues = new Map<string, Map<string, StoredCellState>>();
-          for (const predicate of rowIdPredicates) {
-            const post = await worker.call<NativeQueryResult>('query', [
-              `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
-              `FROM ${escapedTable} WHERE ${predicate.sql}`,
-              predicate.params
-            ]);
-            for (const row of post.values ?? []) {
-              const values = new Map<string, StoredCellState>();
-              columns.forEach((column, index) => values.set(column, parseStoredCellState(
-                row[index * 2 + 1],
-                row[index * 2 + 2],
-                `${table}.${column}`,
-                { textEncoding }
-              )));
-              postValues.set(String(validateRowId(row[0] as RecordId)), values);
-            }
-          }
+          const postValues = await readEditedCells();
           const completedResults: CellUpdateResult[] = results.map(result => {
             const postState = postValues.get(String(result.rowId))?.get(result.columnName);
             if (!postState) {
@@ -5448,7 +5977,23 @@ export async function createNativeDatabaseConnection(
       return {
         databaseOps: operationsFacade,
         isReadOnly: readOnly,
-        onDidInvalidate: connectionInvalidationEmitter.event
+        onDidInvalidate: connectionInvalidationEmitter.event,
+        closeDatabase: async () => {
+          if (closingChangesNothing()) await worker.call('close');
+          else await worker.stopAndWait();
+        },
+        // compileBatch reports each prepare error as data; the query path
+        // would also log every expected "no such module" as a worker error.
+        findTablesWithMissingModules: modules => findTablesWithMissingModules({
+          queryRows: async sql => (await callRead<NativeQueryResult>('query', [sql])).values ?? [],
+          compileStatements: async statements => {
+            const result = await worker.call<NativeCompileBatchResult>('compileBatch', [statements]);
+            if (!Array.isArray(result.errors)) {
+              throw new Error('Native virtual-table module check returned invalid results');
+            }
+            return result.errors.map(error => error ?? undefined);
+          }
+        }, modules)
       };
     }
   };

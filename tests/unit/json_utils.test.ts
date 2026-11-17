@@ -420,6 +420,45 @@ describe('prepareCellUpdateForStorage', () => {
         assert.deepStrictEqual(prepared, { value: '{"a":1}', operation: 'set' });
     });
 
+    it('stores the typed text when an untouched array holds an integer past 2^53', () => {
+        // A patch carries every array whole and is printed from parsed numbers,
+        // so it would write 9007199254740992 over an element nobody edited.
+        const prior = '{"ids":[9007199254740993],"name":"a"}';
+        const next = '{"ids":[9007199254740993],"name":"b"}';
+        assert.deepStrictEqual(prepareCellUpdateForStorage(next, prior), { value: next, operation: 'set' });
+    });
+
+    it('stores the typed text when the new value holds a number JSON cannot round-trip', () => {
+        const next = '{"n":9007199254740995}';
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage(next, '{"n":1}'),
+            { value: next, operation: 'set' }
+        );
+        const decimal = '{"price":0.1000000000000000055511151231257827}';
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage(decimal, '{"price":1}'),
+            { value: decimal, operation: 'set' }
+        );
+    });
+
+    it('stores the typed text when two integers past 2^53 differ only below double precision', () => {
+        // Parsed, both are 9007199254740992: a patch would hold only {"a":2}
+        // and drop the change to n.
+        const next = '{"a":2,"n":9007199254740992}';
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage(next, '{"a":1,"n":9007199254740993}'),
+            { value: next, operation: 'set' }
+        );
+    });
+
+    it('still patches when digits past 2^53 appear only inside a string', () => {
+        const prepared = prepareCellUpdateForStorage(
+            '{"id":"9007199254740993","name":"b"}',
+            '{"id":"9007199254740993","name":"a"}'
+        );
+        assert.deepStrictEqual(prepared, { value: '{"name":"b"}', operation: 'json_patch' });
+    });
+
     it('still patches when null appears only inside an array', () => {
         // Merge patch copies arrays verbatim, so nulls inside them are data,
         // not delete markers — the optimization stays safe here.

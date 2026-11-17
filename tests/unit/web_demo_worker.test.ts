@@ -16,6 +16,8 @@ import {
 } from '../../src/core/cell-edit-policy';
 import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
 import { MAX_TABLE_PAGE_ROWS } from '../../src/core/query-builder';
+import { parseImport } from '../../src/core/bulk-import';
+import { createDatabaseEngine } from '../../src/core/sqlite-db';
 import {
     encodePrimaryKeyRecordId,
     isReadOnlyPrimaryKeyRecordId
@@ -246,9 +248,39 @@ describe('web demo SQL editor queries', () => {
         }
         await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[]'), /Expected 1/);
         await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[true]'), /null, string/);
-        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[9007199254740993]'), /safe integer/);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[9223372036854775808]'), /64-bit/);
         await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '{'), /JSON/);
         assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT label FROM items')).rows[0][0], 'original');
+    });
+
+    it('binds integer parameters exactly and keeps reals and text, as the extension console does', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)');
+        await worker.invoke('runQuery', "INSERT INTO t VALUES (3000000000, 'big'), (9007199254740993, 'past53')");
+        await worker.invoke('runQuery', "CREATE TABLE s (code TEXT); INSERT INTO s VALUES ('3000000000')");
+        const typed: Array<[string, string, string]> = [
+            ['3000000000', 'integer', '3000000000'],
+            ['9007199254740993', 'integer', '9007199254740993'],
+            ['-9223372036854775808', 'integer', '-9223372036854775808'],
+            ['9223372036854775807', 'integer', '9223372036854775807'],
+            ['7', 'integer', '7'],
+            ['1.0', 'real', '1.0'],
+            ['1e3', 'real', '1000.0'],
+            ['2.5', 'real', '2.5'],
+            ['"7"', 'text', "'7'"],
+            ['null', 'null', 'NULL']
+        ];
+        const result = await worker.invoke('executeReadQuery',
+            'SELECT ' + typed.map((_, index) => `typeof(?${index + 1}) AS t${index}, quote(?${index + 1}) AS q${index}`).join(', '),
+            `[${typed.map(([text]) => text).join(', ')}]`);
+        assert.deepStrictEqual(Array.from(result.rows[0]), typed.flatMap(([, type, quoted]) => [type, quoted]));
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT label FROM t WHERE id=?', '[9007199254740993]')).rows[0][0], 'past53');
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT count(*) FROM s WHERE code = ?', '[3000000000]')).rows[0][0], 1);
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT ? / 2', '[1.0]')).rows[0][0], 0.5);
+        assert.strictEqual((await worker.invoke('executeReadQuery', "SELECT '3000000000' = ?", '[3000000000]')).rows[0][0], 0);
+        assert.deepStrictEqual(Array.from((await worker.invoke('executeReadQuery', 'SELECT typeof(?)', '[3000000000]')).headers),
+            Array.from((await worker.invoke('executeReadQuery', 'SELECT typeof(?)', '[7]')).headers));
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[9223372036854775808]'), /64-bit/);
     });
 
     it('bounds rows, columns and bytes before transporting results', async () => {
@@ -275,6 +307,97 @@ describe('web demo SQL editor queries', () => {
             'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n'), /timed out/);
         expired = false;
         assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT 1')).rows[0][0], 1);
+    });
+
+    it('steps reads under query_only and restores the connection', async () => {
+        // SELECTs that write when stepped.
+        const spellings = [
+            'SELECT * FROM pragma_optimize(0x10002)',
+            'SELECT * FROM "pragma_optimize"(0x10002)',
+            'SELECT * FROM [pragma_optimize](0x10002)',
+            'SELECT * FROM `pragma_optimize`(0x10002)',
+            'SELECT * FROM main.pragma_optimize(0x10002)',
+            'SELECT * FROM "MAIN"."Pragma_Optimize"(0x10002)',
+            'SELECT * FROM PrAgMa_OpTiMiZe',
+            'WITH t AS MATERIALIZED (SELECT * FROM pragma_optimize(0x10002)) SELECT count(*) AS n FROM t',
+            'SELECT (SELECT count(*) FROM pragma_optimize(0x10002)) AS n',
+            'SELECT optimize(docs) AS merged FROM docs LIMIT 1'
+        ];
+        const longRead = 'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n';
+        const cancellationFlag = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+        const worker = await createWorkerHarness({
+            // Cancel once the console's own statement is prepared for stepping.
+            onSql: (kind, sql) => {
+                if (kind === 'prepare' && sql.includes('x<100000000') && !sql.startsWith('CREATE')) {
+                    Atomics.store(cancellationFlag, 0, 1);
+                }
+            }
+        });
+        await worker.invoke('runQuery',
+            'CREATE TABLE analyzed (id INTEGER PRIMARY KEY, label TEXT); ' +
+            'CREATE INDEX analyzed_label ON analyzed(label); ' +
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 200) INSERT INTO analyzed(label) SELECT 'label' || (x % 7) FROM n; " +
+            'CREATE VIRTUAL TABLE docs USING fts4(body)');
+        // One segment per statement, so optimize() has segments to merge.
+        for (const body of ['one', 'two', 'three']) await worker.invoke('runQuery', 'INSERT INTO docs VALUES (?)', [body]);
+        const image = async () => Buffer.from(await worker.invoke('exportDatabase', 'test.db'));
+        const outcomes = [];
+        for (const sql of spellings) {
+            const before = await image();
+            const error = await worker.invoke('executeReadQuery', sql).then(
+                () => '',
+                (e: unknown) => e instanceof Error ? e.message : String(e)
+            );
+            const changed = !before.equals(await image());
+            const stat1 = await workerScalar(worker, "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'");
+            // Judge every spelling against an unanalyzed database.
+            if (stat1) await worker.invoke('runQuery', 'DROP TABLE sqlite_stat1');
+            outcomes.push({ sql, refused: /readonly database/.test(error), stat1, changed });
+        }
+        assert.deepStrictEqual(outcomes, spellings.map(sql => ({ sql, refused: true, stat1: 0, changed: false })));
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+
+        // TEMP objects, CTEs and reading table-valued pragmas still work; the
+        // statement itself steps under query_only.
+        await worker.invoke('runQuery', "CREATE TEMP TABLE session_note (note TEXT); INSERT INTO session_note VALUES ('temporary')");
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT note FROM temp.session_note')).rows[0][0], 'temporary');
+        assert.deepStrictEqual(Array.from((await worker.invoke('executeReadQuery',
+            "SELECT name FROM pragma_table_info('analyzed') ORDER BY cid")).rows, (row: unknown[]) => row[0]), ['id', 'label']);
+        assert.strictEqual((await worker.invoke('executeReadQuery',
+            "WITH c AS (SELECT id FROM analyzed WHERE label = 'label3') SELECT count(*) AS n FROM c")).rows[0][0], 29);
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT query_only FROM pragma_query_only')).rows[0][0], 1);
+
+        // The previous state returns after a failing step and a cancellation.
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT abs(-9223372036854775807 - 1) AS value'), /integer overflow/);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        await assert.rejects(worker.invoke('executeReadQuery', longRead, '[]', cancellationFlag), /cancelled/);
+        assert.strictEqual(Atomics.load(cancellationFlag, 0), 1, 'cancellation arrived after the statement was prepared');
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        await worker.invoke('runQuery', "INSERT INTO analyzed(label) VALUES ('written after the console')");
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM analyzed'), 201);
+
+        let expired = false;
+        let clock = 0;
+        const timed = await createWorkerHarness({
+            queryTimeout: 10,
+            now: () => expired ? (clock += 20) : clock,
+            // Expire the deadline once the console's own statement is prepared.
+            onSql: (kind, sql) => {
+                if (kind === 'prepare' && sql.includes('x<100000000') && !sql.startsWith('CREATE')) expired = true;
+            }
+        });
+        await assert.rejects(timed.invoke('executeReadQuery', longRead), /timed out/);
+        assert.strictEqual(expired, true, 'the deadline expired after the statement was prepared');
+        expired = false;
+        assert.strictEqual(await workerScalar(timed, 'PRAGMA query_only'), 0);
+
+        // A read-only connection is already query_only and stays so.
+        const readOnly = await createWorkerHarness({ readOnlyMode: true, content: new Uint8Array(await image()) });
+        await assert.rejects(readOnly.invoke('executeReadQuery', spellings[0]), /readonly database/);
+        assert.strictEqual((await readOnly.invoke('executeReadQuery', 'SELECT count(*) AS n FROM analyzed')).rows[0][0], 201);
+        assert.strictEqual((await readOnly.invoke('executeReadQuery', 'SELECT query_only FROM pragma_query_only')).rows[0][0], 1);
+        assert.strictEqual((await readOnly.invoke('executeReadQuery',
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'")).rows[0][0], 0);
     });
 });
 
@@ -479,6 +602,61 @@ describe('web demo view worker', () => {
                 ['integer', '-9223372036854775808']
             ]
         );
+    });
+
+    it('leaves generated columns out of SQL exports so they load back', async () => {
+        const createSql = 'CREATE TABLE g (a INTEGER, d INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL, ' +
+            "s TEXT GENERATED ALWAYS AS ('s' || a) STORED, b TEXT)";
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', createSql);
+        await worker.invoke('runQuery', "INSERT INTO g (a, b) VALUES (1, 'x'), (2, NULL)");
+        const exportText = async (columns: string[], options: Record<string, unknown>) => Array.from(
+            (await worker.invoke('exportTable', { table: 'g' }, columns, {}, {}, options)).contentChunks
+        ).join('');
+        const contents = async (harness: WorkerHarness) => Array.from(
+            (await harness.invoke('runQuery', 'SELECT a, d, s, b FROM g ORDER BY rowid'))[0].rows,
+            (row: unknown[]) => Array.from(row)
+        );
+
+        for (const columns of [[], ['a', 'd', 's', 'b']]) {
+            const sql = await exportText(columns, { format: 'sql' });
+            const reloaded = await createWorkerHarness();
+            await reloaded.invoke('runQuery', createSql);
+            await reloaded.invoke('runQuery', sql);
+            assert.deepStrictEqual(await contents(reloaded), [[1, 2, 's1', 'x'], [2, 4, 's2', null]]);
+            assert.strictEqual(
+                sql,
+                'INSERT INTO "g" ("a", "b") VALUES (1, \'x\');\n' +
+                'INSERT INTO "g" ("a", "b") VALUES (2, NULL);'
+            );
+        }
+        assert.strictEqual(
+            await exportText(['a', 'D'], { format: 'sql' }),
+            'INSERT INTO "g" ("a") VALUES (1);\nINSERT INTO "g" ("a") VALUES (2);'
+        );
+        assert.strictEqual(await exportText([], { format: 'csv' }), 'a,d,s,b\n1,2,s1,x\n2,4,s2,');
+        assert.deepStrictEqual(JSON.parse(await exportText([], { format: 'json' })), [
+            { a: 1, d: 2, s: 's1', b: 'x' }, { a: 2, d: 4, s: 's2', b: null }
+        ]);
+        await assert.rejects(exportText(['d', 's'], { format: 'sql' }), /generated/);
+    });
+
+    it('writes a CSV record of one empty field as "" so it imports back', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE single (a); INSERT INTO single VALUES (NULL), ('x'), (''), (NULL); " +
+            'CREATE TABLE unnamed (""); INSERT INTO unnamed VALUES (\'x\')'
+        );
+        const exportCsv = async (table: string, columns: string[], format = 'csv') => Array.from(
+            (await worker.invoke('exportTable', { table }, columns, {}, {}, { format })).contentChunks
+        ).join('');
+
+        const csv = await exportCsv('single', ['a']);
+        assert.deepStrictEqual(parseImport(csv, 'csv').rows, [{ a: '' }, { a: 'x' }, { a: '' }, { a: '' }]);
+        assert.strictEqual(csv, 'a\n""\nx\n""\n""');
+        assert.strictEqual(await exportCsv('single', ['a'], 'excel'), csv);
+        assert.strictEqual(await exportCsv('unnamed', ['']), '""\nx');
     });
 
     it('exports prototype-spelled columns as own enumerable JSON properties', async () => {
@@ -881,6 +1059,296 @@ describe('web demo view worker', () => {
         assert.strictEqual(new Set(values).size, 5000);
         assert.ok(values.includes('row-1'));
         assert.ok(values.includes('row-5000'));
+    });
+
+    it('refuses demo multi-row operations whose INTEGER identity names a row in a column later declared TEXT', async () => {
+        // The fixture holds INTEGER 1 beside TEXT '1' in a column declared
+        // TEXT. Each identity must name only its own row.
+        const seed = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations!;
+        await seed.executeQuery(
+            'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted VALUES (1, 'integer'), ('1', 'text'), ('2', 'other'); " +
+            'CREATE TABLE crafted_pair (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_pair VALUES (1, 5, 'integer'), ('1', 5, 'text'), ('2', 5, 'other')"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID' " +
+            "WHERE name = 'crafted'"
+        );
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted_pair (a TEXT, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID' " +
+            "WHERE name = 'crafted_pair'"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const worker = await createWorkerHarness({ content: await seed.serializeDatabase() });
+        const single: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: 'TEXT', position: 1 }];
+        const pair: PrimaryKeyColumn[] = [
+            { identifier: 'a', declaredType: 'TEXT', position: 1 },
+            { identifier: 'b', declaredType: '', position: 2 }
+        ];
+        for (const [table, integerKey, otherKey] of [
+            ['crafted', encodePrimaryKeyRecordId(single, [1n]), encodePrimaryKeyRecordId(single, ['2'])],
+            ['crafted_pair', encodePrimaryKeyRecordId(pair, [1n, 5n]), encodePrimaryKeyRecordId(pair, ['2', 5n])]
+        ] as const) {
+            const stored = async () => (await worker.invoke(
+                'runQuery',
+                `SELECT typeof(${table === 'crafted' ? 'k' : 'a'}), v FROM ${table} ORDER BY v`
+            ))[0].rows;
+            const before = await stored();
+            assert.deepStrictEqual(before, [['integer', 'integer'], ['text', 'other'], ['text', 'text']]);
+            const exported = await worker.invoke(
+                'exportTable',
+                { table },
+                ['v'],
+                {},
+                {},
+                { format: 'csv', rowIds: [integerKey] }
+            );
+            assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v');
+            await assert.rejects(worker.invoke('deleteRows', table, [integerKey]));
+            await assert.rejects(worker.invoke('deleteRows', table, [integerKey, otherKey]));
+            assert.deepStrictEqual(await stored(), before);
+        }
+    });
+
+    it('refuses demo REAL identities that name a row in a column later declared TEXT', async () => {
+        // A REAL identity binds as a number, which a column declared TEXT
+        // compares as text. Each identity must name only its own row.
+        const seed = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations!;
+        await seed.executeQuery(
+            'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted VALUES (1.0, 'real'), ('1', 'text'), ('2', 'other'); " +
+            "CREATE TABLE text_key (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; INSERT INTO text_key VALUES ('x', 'row')"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID' " +
+            "WHERE name = 'crafted'"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const worker = await createWorkerHarness({ content: await seed.serializeDatabase() });
+        const single: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: 'TEXT', position: 1 }];
+        const realKey = encodePrimaryKeyRecordId(single, [1]);
+        const stored = async () => (await worker.invoke(
+            'runQuery',
+            'SELECT typeof(k), v FROM crafted ORDER BY v'
+        ))[0].rows;
+        const before = await stored();
+        assert.deepStrictEqual(before, [['text', 'other'], ['real', 'real'], ['text', 'text']]);
+        await assert.rejects(worker.invoke('getCellMetadata', { table: 'crafted', rowId: realKey, column: 'v' }));
+        await assert.rejects(worker.invoke('updateCell', 'crafted', realKey, 'v', 'edited'));
+        await assert.rejects(worker.invoke('deleteRows', 'crafted', [realKey]));
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'crafted' },
+            ['v'],
+            {},
+            {},
+            { format: 'csv', rowIds: [realKey] }
+        );
+        assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v');
+        assert.deepStrictEqual(await stored(), before);
+
+        // The identity re-read after a key edit carries the class of the
+        // value written, which the column's affinity changed.
+        const edited = await worker.invoke(
+            'updateCell',
+            'text_key',
+            encodePrimaryKeyRecordId(single, ['x']),
+            'k',
+            5
+        );
+        assert.match(decodeURIComponent(edited), /\["text","5"\]/);
+        assert.deepStrictEqual(
+            (await worker.invoke('runQuery', 'SELECT typeof(k), k, v FROM text_key'))[0].rows,
+            [['text', '5', 'row']]
+        );
+    });
+
+    it('keeps demo TEXT identities off a numeric twin and refuses a delete that does not match one row per identity', async () => {
+        // A TEXT identity binds as text, which a column declared INTEGER
+        // compares as a number; and a key declared COLLATE NOCASE over rows
+        // stored under BINARY holds 'A' and 'a'. Each identity must match
+        // exactly one row, its own.
+        const seed = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations!;
+        await seed.executeQuery(
+            'CREATE TABLE crafted_int (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_int VALUES (1, 'number'), ('1', 'text'), (2, 'other'); " +
+            'CREATE TABLE folded (a TEXT, v TEXT, PRIMARY KEY (a)) WITHOUT ROWID; ' +
+            "INSERT INTO folded VALUES ('A', 'upper'), ('a', 'lower'), ('c', 'other')"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted_int (k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID' " +
+            "WHERE name = 'crafted_int'"
+        );
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE folded (a TEXT, v TEXT, PRIMARY KEY (a COLLATE NOCASE)) WITHOUT ROWID' " +
+            "WHERE name = 'folded'"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const worker = await createWorkerHarness({ content: await seed.serializeDatabase() });
+        const single: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: 'INTEGER', position: 1 }];
+        const textKey = encodePrimaryKeyRecordId(single, ['1']);
+        const stored = async () => (await worker.invoke(
+            'runQuery',
+            'SELECT typeof(k), v FROM crafted_int ORDER BY v'
+        ))[0].rows;
+        const before = await stored();
+        assert.deepStrictEqual(before, [['integer', 'number'], ['integer', 'other'], ['text', 'text']]);
+        await assert.rejects(worker.invoke('updateCell', 'crafted_int', textKey, 'v', 'edited'));
+        await assert.rejects(worker.invoke('getCellMetadata', { table: 'crafted_int', rowId: textKey, column: 'v' }));
+        await assert.rejects(worker.invoke('deleteRows', 'crafted_int', [textKey]));
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'crafted_int' },
+            ['v'],
+            {},
+            {},
+            { format: 'csv', rowIds: [textKey] }
+        );
+        assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v');
+        assert.deepStrictEqual(await stored(), before);
+
+        const foldedKey: PrimaryKeyColumn[] = [{ identifier: 'a', declaredType: 'TEXT', position: 1 }];
+        const folded = async () => (await worker.invoke('runQuery', 'SELECT a, v FROM folded ORDER BY v'))[0].rows;
+        const foldedBefore = await folded();
+        const lower = encodePrimaryKeyRecordId(foldedKey, ['a']);
+        await assert.rejects(worker.invoke('deleteRows', 'folded', [lower, encodePrimaryKeyRecordId(foldedKey, [5n])]));
+        assert.deepStrictEqual(await folded(), foldedBefore);
+        await assert.rejects(worker.invoke('deleteRows', 'folded', [lower]));
+        assert.deepStrictEqual(await folded(), foldedBefore);
+    });
+
+    it('edits, exports and deletes demo TEXT keys under the TEXT storage check', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_text_keys (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; " +
+            "INSERT INTO demo_text_keys VALUES ('1', 'text'), ('b', 'other'); " +
+            'CREATE TABLE demo_typeless_text_keys (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO demo_typeless_text_keys VALUES ('1', 'text'), (1, 'integer'), ('b', 'other')"
+        );
+        for (const [table, declaredType] of [['demo_text_keys', 'TEXT'], ['demo_typeless_text_keys', '']] as const) {
+            const rows = async () => (await worker.invoke(
+                'runQuery',
+                `SELECT typeof(k), CAST(k AS TEXT), v FROM ${table} ORDER BY v`
+            ))[0].rows;
+            const before = await rows();
+            const textKey = encodePrimaryKeyRecordId([{ identifier: 'k', declaredType, position: 1 }], ['1']);
+            const exported = await worker.invoke(
+                'exportTable',
+                { table },
+                ['v'],
+                {},
+                {},
+                { format: 'csv', rowIds: [textKey] }
+            );
+            assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v\ntext');
+            await worker.invoke('updateCell', table, textKey, 'v', 'text-edited');
+            assert.ok((await rows()).some((row: unknown[]) => row[2] === 'text-edited'));
+            await worker.invoke('updateCell', table, textKey, 'v', 'text');
+            assert.deepStrictEqual(await rows(), before);
+            assert.strictEqual((await worker.invoke('deleteRows', table, [textKey])).length, 1);
+            assert.deepStrictEqual(await rows(), before.filter((row: unknown[]) => row[2] !== 'text'));
+        }
+    });
+
+    it('addresses and pages a demo key whose collation is stricter than its column', async () => {
+        // 'A' and 'a' are distinct keys under the key's BINARY collation and
+        // equal under the column's NOCASE. Each identity must name one row,
+        // and a page turn must show both.
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_cased (a TEXT COLLATE NOCASE, g INTEGER, v TEXT, PRIMARY KEY (a COLLATE BINARY)) WITHOUT ROWID; ' +
+            "INSERT INTO demo_cased VALUES ('A', 1, 'A'), ('a', 1, 'a'), ('B', 2, 'B'), ('b', 1, 'b'), " +
+            "('c', 2, 'c'), ('C', 2, 'C'), ('d', 1, 'd')"
+        );
+        const stored = async () => (await worker.invoke(
+            'runQuery',
+            'SELECT v FROM demo_cased ORDER BY a COLLATE BINARY'
+        ))[0].rows.map((row: unknown[]) => row[0]);
+        const before = await stored();
+
+        for (const [sort, oracleOrder] of [
+            [{}, 'a COLLATE BINARY ASC'],
+            [{ orderBy: 'a', orderDir: 'DESC' }, 'a COLLATE BINARY DESC'],
+            [{ orderBy: 'g', orderDir: 'ASC' }, 'g ASC, a COLLATE BINARY ASC']
+        ] as const) {
+            const oracle = (await worker.invoke(
+                'runQuery',
+                `SELECT v FROM demo_cased ORDER BY ${oracleOrder}`
+            ))[0].rows.map((row: unknown[]) => row[0]);
+            const options = (page: number, keyset?: unknown) => ({
+                columns: ['rowid', 'a', 'g', 'v'],
+                ...sort,
+                limit: 1,
+                offset: page,
+                ...(keyset ? { keyset } : {})
+            });
+            const forward: unknown[] = [];
+            let anchor: string | undefined;
+            for (let page = 0; page < oracle.length; page++) {
+                const result = await worker.invoke('fetchTableData', 'demo_cased', options(
+                    page,
+                    page === 0 ? { mode: 'first' } : { mode: 'after', anchor }
+                ));
+                forward.push(...result.rows.map((row: unknown[]) => row[3]));
+                anchor = result.keysetAnchors?.last;
+                assert.ok(anchor, `${oracleOrder}: anchor on page ${page}`);
+            }
+            assert.deepStrictEqual(forward, oracle, `${oracleOrder}: Next walk`);
+            const backward: unknown[] = [];
+            for (let page = oracle.length - 1; page >= 0; page--) {
+                const result = await worker.invoke('fetchTableData', 'demo_cased', options(
+                    page,
+                    page === oracle.length - 1
+                        ? { mode: 'last', lastPageRowCount: 1 }
+                        : { mode: 'before', anchor }
+                ));
+                backward.unshift(...result.rows.map((row: unknown[]) => row[3]));
+                anchor = result.keysetAnchors?.first;
+            }
+            assert.deepStrictEqual(backward, oracle, `${oracleOrder}: Prev walk`);
+            const offsetPages: unknown[] = [];
+            for (let page = 0; page < oracle.length; page++) {
+                const result = await worker.invoke('fetchTableData', 'demo_cased', options(page));
+                offsetPages.push(...result.rows.map((row: unknown[]) => row[3]));
+            }
+            assert.deepStrictEqual(offsetPages, oracle, `${oracleOrder}: OFFSET pages`);
+        }
+
+        const keyColumns: PrimaryKeyColumn[] = [{ identifier: 'a', declaredType: 'TEXT', position: 1 }];
+        const lower = encodePrimaryKeyRecordId(keyColumns, ['a']);
+        const missing = encodePrimaryKeyRecordId(keyColumns, ['zz']);
+        await assert.rejects(worker.invoke('deleteRows', 'demo_cased', [lower, missing]));
+        assert.deepStrictEqual(await stored(), before);
+        const metadata = await worker.invoke('getCellMetadata', { table: 'demo_cased', rowId: lower, column: 'v' });
+        assert.deepStrictEqual(
+            [metadata.storageClass, metadata.byteLength],
+            ['text', 1]
+        );
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_cased' },
+            ['v'],
+            {},
+            {},
+            { format: 'csv', rowIds: [lower] }
+        );
+        assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v\na');
+        await worker.invoke('updateCell', 'demo_cased', lower, 'v', 'a-edited');
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                "SELECT a, v FROM demo_cased WHERE a IN ('A', 'a') ORDER BY a COLLATE BINARY"
+            ))[0].rows,
+            [['A', 'A'], ['a', 'a-edited']]
+        );
+        assert.strictEqual((await worker.invoke('deleteRows', 'demo_cased', [lower])).length, 1);
+        assert.deepStrictEqual(await stored(), before.filter((value: unknown) => value !== 'a'));
     });
 
     it('chunks a demo rowid delete above the SQLite bind limit', async () => {
@@ -3495,6 +3963,59 @@ describe('web demo view worker', () => {
         assert.strictEqual(shadow.keysetAnchors, undefined);
     });
 
+    it('seeks from a demo Last page bounded to its remainder, and not under another page size', async () => {
+        const observed: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (_kind, sql) => observed.push(sql)
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_last_page (value TEXT); ' +
+            'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 23) ' +
+            "INSERT INTO demo_last_page(value) SELECT 'row-' || n FROM seq"
+        );
+        // As the grid sends it: pageSize is the rows per page it pages by, and
+        // a final page whose count this load fetched (Last) has a lower limit.
+        const request = (pageIndex: number, pageSize: number, limit: number, keyset: object) => ({
+            columns: ['rowid', 'value'],
+            globalFilterColumns: ['value'],
+            limit,
+            offset: pageIndex * pageSize,
+            pageSize,
+            keyset
+        });
+        const run = async (options: object) => {
+            observed.length = 0;
+            const page = await worker.invoke('fetchTableData', 'demo_last_page', options);
+            return { ids: Array.from(page.rows, (row: any) => Number(row[0])), anchors: page.keysetAnchors, sql: observed.join('\n') };
+        };
+        const scansTo = (sql: string, offset: number) => new RegExp(`\\bOFFSET ${offset}\\b`).test(sql);
+        const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+        // 23 rows at 5 a page: Last is page 4, 3 rows, bounded to them.
+        const last = await run(request(4, 5, 3, { mode: 'last', lastPageRowCount: 3 }));
+        assert.deepStrictEqual(last.ids, range(21, 23));
+        assert.ok(last.anchors?.first);
+        // Prev and a refetch read a cached count and ask for a full page; a
+        // clipped-cell retry asks for the remainder again. All three seek.
+        for (const [label, options, offset, want] of [
+            ['Prev', request(3, 5, 5, { mode: 'before', anchor: last.anchors.first }), 15, range(16, 20)],
+            ['refetch', request(4, 5, 5, { mode: 'atOrAfter', anchor: last.anchors.first }), 20, range(21, 23)],
+            ['clipped retry', request(4, 5, 3, { mode: 'atOrAfter', anchor: last.anchors.first }), 20, range(21, 23)]
+        ] as const) {
+            const step = await run(options);
+            assert.deepStrictEqual(step.ids, want, `${label}: rows`);
+            assert.ok(!scansTo(step.sql, offset), `${label}: scanned to OFFSET ${offset}:\n${step.sql}`);
+            assert.ok(/\bOFFSET 0\b/.test(step.sql), `${label}: no seek:\n${step.sql}`);
+        }
+
+        // A column change lowers the page size to 3, the old remainder: page
+        // 6 of 3 is rows 19-21, and the anchor from row 21 must not seek it.
+        const resized = await run(request(6, 3, 3, { mode: 'atOrAfter', anchor: last.anchors.first }));
+        assert.deepStrictEqual(resized.ids, range(19, 21));
+        assert.ok(scansTo(resized.sql, 18), `old page size: did not fall back:\n${resized.sql}`);
+    });
+
     it('seeks int64 anchors beyond 2^53 exactly on NONE-affinity sort columns', async () => {
         const worker = await createWorkerHarness();
         await worker.invoke(
@@ -5775,5 +6296,242 @@ describe('web demo edits of whole numbers past int32', () => {
             await workerScalar(worker, "SELECT group_concat(kind, ',') FROM (SELECT typeof(a) || '/' || typeof(b) AS kind FROM demo_int ORDER BY id)"),
             'integer/text,integer/integer,integer/integer'
         );
+    });
+});
+
+// sql.js exports through the backup API and marks its copy as a rollback-journal
+// file; the download keeps a WAL database in WAL mode, as the extension's save does.
+describe('web demo download journal mode', () => {
+    it('keeps a WAL database in WAL mode and a rollback-journal one in rollback mode', async () => {
+        const seed = await createWorkerHarness();
+        await seed.invoke('runQuery', "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'a')");
+        const rollback = Uint8Array.from(await seed.invoke('exportDatabase', 'test.db'));
+        const wal = Uint8Array.from(rollback);
+        wal[18] = 2; wal[19] = 2;
+        for (const [content, journalMode, header] of [[wal, 'wal', [2, 2]], [rollback, 'delete', [1, 1]]] as const) {
+            const worker = await createWorkerHarness({ content: Uint8Array.from(content) });
+            await worker.invoke('runQuery', "INSERT INTO t VALUES (2, 'b')");
+            assert.strictEqual(await workerScalar(worker, 'PRAGMA journal_mode'), journalMode);
+            const saved = Uint8Array.from(await worker.invoke('exportDatabase', 'test.db'));
+            assert.deepStrictEqual([saved[18], saved[19]], header);
+            const reopened = await createWorkerHarness({ content: saved });
+            assert.strictEqual(await workerScalar(reopened, "SELECT group_concat(v, ',') FROM t"), 'a,b');
+        }
+    });
+});
+
+// A schema ON CONFLICT clause applies to every INSERT and UPDATE that does not
+// name its own. The demo's edit writes say OR ABORT, as the extension engines'
+// do (conflict_clause_history.test.ts), so a conflicting edit fails instead of
+// deleting a row (REPLACE) or skipping the write (IGNORE).
+describe('web demo edits under schema ON CONFLICT clauses', () => {
+    const uniqueTable = (clause: string) =>
+        `CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT ${clause}, v TEXT); ` +
+        "INSERT INTO t VALUES (1, 'x', 'keep'), (2, 'y', 'other');";
+    const UNIQUE_REPLACE = uniqueTable('REPLACE');
+    const CONFLICT = /UNIQUE constraint failed/;
+    const seeded = async (setup: string) => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', setup);
+        return worker;
+    };
+    const rows = async (worker: WorkerHarness) => Array.from(
+        (await worker.invoke('runQuery', 'SELECT * FROM t ORDER BY 1'))[0]?.rows ?? [],
+        (row: unknown[]) => Array.from(row)
+    );
+
+    it('refuses a cell edit that collides with a UNIQUE ON CONFLICT REPLACE row', async () => {
+        const worker = await seeded(UNIQUE_REPLACE);
+        const before = await rows(worker);
+        await assert.rejects(worker.invoke('updateCell', 't', 2, 'k', 'x'), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses rowid batch edits that collide under ON CONFLICT REPLACE or IGNORE', async () => {
+        for (const clause of ['REPLACE', 'IGNORE']) {
+            const worker = await seeded(uniqueTable(clause));
+            const before = await rows(worker);
+            await assert.rejects(
+                worker.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'x' }]),
+                CONFLICT,
+                clause
+            );
+            assert.deepStrictEqual(await rows(worker), before, clause);
+            await assert.rejects(worker.invoke('updateCellBatch', 't', [
+                { rowId: 2, column: 'v', value: 'changed' },
+                { rowId: 2, column: 'k', value: 'x' }
+            ]), CONFLICT, clause);
+            assert.deepStrictEqual(await rows(worker), before, clause);
+        }
+    });
+
+    it('refuses a rowid batch JSON patch whose result collides with a UNIQUE ON CONFLICT REPLACE row', async () => {
+        const worker = await seeded(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT REPLACE, v TEXT); ' +
+            `INSERT INTO t VALUES (1, '{"a":1}', 'keep'), (2, '{}', 'other');`
+        );
+        const before = await rows(worker);
+        await assert.rejects(worker.invoke('updateCellBatch', 't', [
+            { rowId: 2, column: 'k', value: '{"a":1}', operation: 'json_patch' }
+        ]), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses a rowid-alias batch edit onto an INTEGER PRIMARY KEY ON CONFLICT REPLACE key', async () => {
+        const worker = await seeded(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY ON CONFLICT REPLACE, v TEXT); ' +
+            "INSERT INTO t VALUES (1, 'keep'), (2, 'other');"
+        );
+        const before = await rows(worker);
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'id', value: 1 }]),
+            CONFLICT
+        );
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses a WITHOUT ROWID key edit onto a PRIMARY KEY ON CONFLICT REPLACE key', async () => {
+        const worker = await seeded(
+            'CREATE TABLE t (k TEXT PRIMARY KEY ON CONFLICT REPLACE, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO t VALUES ('a', 'keep'), ('b', 'other');"
+        );
+        const page = await worker.invoke('fetchTableData', 't', {
+            columns: ['rowid', 'k', 'v'],
+            limit: 10,
+            offset: 0
+        });
+        const identity = page.rows.find((row: unknown[]) => row[1] === 'b')[0];
+        assert.match(identity, /^pk:/);
+        const before = await rows(worker);
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', [{ rowId: identity, column: 'k', value: 'a' }]),
+            CONFLICT
+        );
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses inserts onto an existing ON CONFLICT REPLACE key', async () => {
+        for (const withoutRowId of [false, true]) {
+            const worker = await seeded(
+                'CREATE TABLE t (id INTEGER PRIMARY KEY ON CONFLICT REPLACE, v TEXT)' +
+                `${withoutRowId ? ' WITHOUT ROWID' : ''}; INSERT INTO t VALUES (1, 'keep');`
+            );
+            for (const method of ['insertRow', 'insertRowWithHistory']) {
+                await assert.rejects(
+                    worker.invoke(method, 't', { id: 1, v: 'new' }),
+                    CONFLICT,
+                    `${method} withoutRowId=${withoutRowId}`
+                );
+                assert.deepStrictEqual(await rows(worker), [[1, 'keep']]);
+            }
+        }
+        // DEFAULT VALUES: the column default collides with an existing row.
+        const worker = await seeded(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT REPLACE DEFAULT 'x', v TEXT); " +
+            "INSERT INTO t VALUES (1, 'x', 'keep');"
+        );
+        await assert.rejects(worker.invoke('insertRowWithHistory', 't', {}), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), [[1, 'x', 'keep']]);
+    });
+
+    it('refuses an oversized-cell replacement that collides with a UNIQUE ON CONFLICT REPLACE row', async () => {
+        const worker = await seeded(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT REPLACE, v TEXT); ' +
+            "INSERT INTO t VALUES (1, 'x', 'keep'), (2, 'yyyyyyyyyyyy', 'other');"
+        );
+        const before = await rows(worker);
+        // An 8-byte edit limit makes the 12-byte value oversized.
+        await assert.rejects(
+            worker.invoke('replaceOversizedCell', 't', 2, 'k', 'x', { storageClass: 'text', byteLength: 12 }, 8),
+            CONFLICT
+        );
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses undoing a cell edit whose old value now collides', async () => {
+        const worker = await seeded(UNIQUE_REPLACE);
+        const affectedCells = await worker.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'w' }]);
+        await worker.invoke('runQuery', "INSERT INTO t (id, k, v) VALUES (3, 'y', 'external')");
+        const before = await rows(worker);
+        await assert.rejects(worker.invoke('undoModification', {
+            modificationType: 'cell_update',
+            targetTable: 't',
+            affectedCells
+        }), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses redoing an inserted row that now collides', async () => {
+        const worker = await seeded(UNIQUE_REPLACE);
+        const insertedRow = await worker.invoke('insertRowWithHistory', 't', { k: 'z', v: 'inserted' });
+        const modification = {
+            modificationType: 'row_insert',
+            targetTable: 't',
+            targetRowId: insertedRow.rowId,
+            insertedRow
+        };
+        await worker.invoke('undoModification', modification);
+        await worker.invoke('runQuery', "INSERT INTO t (id, k, v) VALUES (9, 'z', 'external')");
+        const before = await rows(worker);
+        await assert.rejects(worker.invoke('redoModification', modification), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses NULL into a NOT NULL ON CONFLICT REPLACE column instead of taking the default', async () => {
+        const worker = await seeded(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'd')"
+        );
+        await assert.rejects(
+            worker.invoke('insertRowWithHistory', 't', { id: 1, v: null }),
+            /NOT NULL constraint failed/
+        );
+        assert.deepStrictEqual(await rows(worker), []);
+        // Leaving the column out still takes its default.
+        await worker.invoke('insertRowWithHistory', 't', { id: 2 });
+        assert.deepStrictEqual(await rows(worker), [[2, 'd']]);
+    });
+
+    it('probes triggers and foreign-key actions with the OR ABORT its writes use', async () => {
+        // A REPLACE resolution deletes the conflicting row, which runs DELETE
+        // triggers (with recursive triggers on) and foreign-key DELETE actions
+        // that an OR ABORT write never runs; a probe without OR ABORT would
+        // refuse a non-conflicting edit the write itself allows.
+        const triggered = await seeded(
+            UNIQUE_REPLACE +
+            ' CREATE TABLE log (id); ' +
+            'CREATE TRIGGER t_deleted AFTER DELETE ON t BEGIN INSERT INTO log VALUES (OLD.id); END; ' +
+            'PRAGMA recursive_triggers = ON;'
+        );
+        await triggered.invoke('insertRowWithHistory', 't', { id: 3, k: 'z', v: 'inserted' });
+        await triggered.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'w' }]);
+        assert.deepStrictEqual(
+            await rows(triggered),
+            [[1, 'x', 'keep'], [2, 'w', 'other'], [3, 'z', 'inserted']]
+        );
+
+        const referenced = await seeded(
+            UNIQUE_REPLACE +
+            ' CREATE TABLE child (parent REFERENCES t(id) ON DELETE CASCADE); INSERT INTO child VALUES (1);'
+        );
+        await referenced.invoke('setPragma', 'foreign_keys', true);
+        await referenced.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'w' }]);
+        assert.deepStrictEqual(await rows(referenced), [[1, 'x', 'keep'], [2, 'w', 'other']]);
+        // A colliding edit fails without deleting row 1 or cascading into child.
+        await assert.rejects(referenced.invoke('updateCell', 't', 2, 'k', 'x'), CONFLICT);
+        assert.deepStrictEqual(await rows(referenced), [[1, 'x', 'keep'], [2, 'w', 'other']]);
+        assert.strictEqual(await workerScalar(referenced, 'SELECT count(*) FROM child'), 1);
+    });
+
+    it('refuses a plain UNIQUE conflict and keeps the row (control)', async () => {
+        const worker = await seeded(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE); INSERT INTO t VALUES (1, 'x'), (2, 'y');"
+        );
+        await assert.rejects(worker.invoke('updateCell', 't', 2, 'k', 'x'), CONFLICT);
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'x' }]),
+            CONFLICT
+        );
+        await assert.rejects(worker.invoke('insertRowWithHistory', 't', { k: 'x' }), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), [[1, 'x'], [2, 'y']]);
     });
 });

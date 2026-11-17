@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
-import { assertRuntimeVersion } from './vscode-runtime.mjs';
+import { assertRuntimeVersion, runtimeVersion } from './vscode-runtime.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const extensionDevelopmentPath = path.resolve(scriptDirectory, '..');
@@ -19,7 +19,17 @@ if (!versionMatch) {
   throw new Error(`Expected engines.vscode to be an exact caret pin, received ${engineRange}`);
 }
 
-const vscodeVersion = versionMatch[1];
+// The lane runs against the oldest VS Code the extension supports, unless
+// another one is named: `--vscode stable` or `--vscode 1.145.0`. The editor's
+// runtime changes with its version, and with it what the extension host sends
+// the native engine. A lane held to the oldest version did not see VS Code
+// 1.145 write a format the engine could not read.
+const named = process.argv.indexOf('--vscode');
+const vscodeVersion = named === -1 ? versionMatch[1] : process.argv[named + 1];
+const exactVersion = typeof vscodeVersion === 'string' && /^\d+\.\d+\.\d+$/.test(vscodeVersion);
+if (!exactVersion && vscodeVersion !== 'stable') {
+  throw new Error(`Expected --vscode to name "stable" or an exact version, received ${vscodeVersion}`);
+}
 const extensionTestsPath = path.join(
   extensionDevelopmentPath,
   '.desktop-test-out',
@@ -37,7 +47,9 @@ if (!fs.existsSync(extensionTestsPath)) {
 // Validate the selected application before launching or allocating test state.
 const vscodeExecutablePath = process.env.VSCODE_TEST_EXECUTABLE_PATH
   ?? await downloadAndUnzipVSCode(vscodeVersion);
-const actualVersion = assertRuntimeVersion(vscodeExecutablePath, vscodeVersion);
+const actualVersion = exactVersion
+  ? assertRuntimeVersion(vscodeExecutablePath, vscodeVersion)
+  : runtimeVersion(vscodeExecutablePath).version;
 console.log(`[Desktop tests] Verified VS Code ${actualVersion} at ${vscodeExecutablePath}`);
 
 const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-explorer-desktop-'));

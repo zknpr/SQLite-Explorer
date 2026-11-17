@@ -2,6 +2,7 @@ import './vscode_mock_setup';
 
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import v8 from 'node:v8';
 import { describe, it } from 'node:test';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import {
@@ -326,6 +327,46 @@ describe('grid cell containment limits', () => {
             ),
             9
         );
+    });
+
+    it('measures exact UTF-8 bytes once three bytes per UTF-16 unit reach a budget', async () => {
+        const { decodeCellContainment } = await loadContainmentModule();
+        // '€' is one UTF-16 unit and three UTF-8 bytes: the bound is exact for it.
+        assert.deepStrictEqual(decodeCellContainment([['€€€', '']], 1, undefined, 9).rows, [['€€€']]);
+        const clipped = decodeCellContainment([['€€€', '']], 1, undefined, 8);
+        assert.deepStrictEqual(clipped.rows, [['']]);
+        assert.deepStrictEqual(clipped.oversizedCells, { 0: { 0: { storageClass: 'text', byteLength: 9 } } });
+        // 12 bytes by the bound, 6 exact: the page fits and keeps every value.
+        const fits = decodeCellContainment([['éé', ''], ['ab', '']], 1, undefined, 6);
+        assert.deepStrictEqual(fits, { rows: [['éé'], ['ab']] });
+    });
+
+    it('drops previews from the tail when only the wire size passes the transport budget', async () => {
+        const { decodeCellContainment } = await loadContainmentModule();
+        // 25.6 MB of BLOB previews fit a 64 MiB page budget, but their
+        // Base64 form passes the aggregate transport budget.
+        const columnCount = 50;
+        const value = new Uint8Array(256);
+        const transportedRow = [...Array(columnCount).fill(value), '|'.repeat(columnCount - 1)];
+        const decoded = decodeCellContainment(Array(2000).fill(transportedRow), columnCount, undefined, 64 * 1024 * 1024);
+        assert.deepStrictEqual(decoded.rows[0][0], value);
+        assert.deepStrictEqual(decoded.rows[1999][columnCount - 1], new Uint8Array(0));
+        assert.deepStrictEqual(decoded.oversizedCells?.[1999]?.[columnCount - 1], { storageClass: 'blob', byteLength: 256 });
+        assert.ok(!decoded.oversizedCells?.[0], 'the earliest previews stay inline');
+    });
+
+    it('normalizes rows into packed arrays and keeps a source row\'s holes', async () => {
+        const { normalizeIntegerRowsForTransport } = await import('../../src/core/integer-utils.ts');
+        const dense = normalizeIntegerRowsForTransport([[4n, 'x', null]]).rows[0];
+        assert.deepStrictEqual(dense, [4, 'x', null]);
+        // Structured clone (worker to host) writes a packed array densely ('A').
+        // Checked before the hole below: V8 then starts later rows of the
+        // same literal holey.
+        assert.equal(v8.serialize(dense)[2], 0x41);
+        const sparse = normalizeIntegerRowsForTransport([[1n, , 3n]]).rows[0];
+        assert.equal(sparse.length, 3);
+        assert.equal(1 in sparse, false);
+        assert.deepStrictEqual(sparse, [1, , 3]);
     });
 
     it('keeps the 32 MiB aggregate transport guard unreachable for contained pages', async () => {

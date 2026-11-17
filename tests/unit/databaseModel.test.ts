@@ -9,6 +9,7 @@ import * as vscode from 'vscode';
 import { mockVscode } from './mocks/vscode';
 import { createDeferred } from './helpers/deferred';
 import { ModificationTracker } from '../../src/core/undo-history';
+import { plainNotificationError } from '../../src/notificationText';
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
 import { NativeWorkerProcess } from '../../src/nativeWorker';
 import type { DatabaseOperations, LabeledModification, ModificationEntry } from '../../src/core/types';
@@ -177,7 +178,7 @@ describe('isAutoCommitEnabled', () => {
         // Clear module cache for databaseModel.ts and any other src modules (excluding mocks)
         // to re-evaluate the IsRemoteWorkspaceMode constant
         Object.keys(require('module')._cache).forEach(key => {
-            if (key.includes('src/') && !key.includes('workerFactory')) {
+            if (key.replace(/\\/g, '/').includes('src/') && !key.includes('workerFactory')) {
                 delete require('module')._cache[key];
             }
         });
@@ -1401,6 +1402,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         let serializeCallCount = 0;
         let serializeArgCount = -1;
         let writeFileCalled = false;
+        const written: string[] = [];
 
         const dbOps = {
             engineKind: Promise.resolve('wasm'),
@@ -1422,7 +1424,7 @@ describe('DatabaseDocument save/saveAs fallback', () => {
                 ...originalFs,
                 writeFile: async (uri: any, content: any) => {
                     writeFileCalled = true;
-                    assert.notStrictEqual(uri.toString(), sourceUri.toString());
+                    written.push(uri.toString());
                     assert.deepStrictEqual(content, new Uint8Array([4, 5, 6]));
                 },
                 readFile: async () => new Uint8Array([])
@@ -1437,6 +1439,10 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.strictEqual(serializeCallCount, 1, 'serializeDatabase should be called exactly once');
             assert.strictEqual(serializeArgCount, 1, 'serializeDatabase should receive the save AbortSignal');
             assert.strictEqual(writeFileCalled, true, 'fs.writeFile should be called');
+            // A complete sibling copy first, then the existing destination in place.
+            assert.strictEqual(written.length, 2);
+            assert.notStrictEqual(written[0], sourceUri.toString());
+            assert.strictEqual(written[1], sourceUri.toString());
         } finally {
             Object.defineProperty(mockVscode.workspace, 'fs', {
                 value: originalFs,
@@ -1493,6 +1499,61 @@ describe('DatabaseDocument save/saveAs fallback', () => {
             assert.deepStrictEqual(resources.get(sourceUri.toString()), originalBytes);
             assert.strictEqual(renameCalled, false);
             assert.strictEqual(deleted.length, 1, 'the partial sibling temporary must be cleaned');
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+        }
+    });
+
+    it('save: names the complete sibling copy when the non-file destination write fails', async () => {
+        const sourceUri = createUri('vscode-vfs', '/github/user/repo/test.db');
+        const image = new Uint8Array([4, 5, 6]);
+        const resources = new Map<string, Uint8Array>([[sourceUri.toString(), new Uint8Array([9, 9, 9])]]);
+        const doc = createDocBypassingFactory({
+            engineKind: Promise.resolve('wasm'),
+            serializeDatabase: async () => image
+        }, sourceUri);
+
+        const originalFs = mockVscode.workspace.fs;
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                stat: async (uri: any) => {
+                    const bytes = resources.get(uri.toString());
+                    if (!bytes) {
+                        const error = new Error('missing');
+                        (error as any).code = 'FileNotFound';
+                        throw error;
+                    }
+                    return { type: 1, ctime: 1, mtime: 1, size: bytes.byteLength };
+                },
+                readFile: async (uri: any) => resources.get(uri.toString())!,
+                writeFile: async (uri: any, content: Uint8Array) => {
+                    if (uri.toString() === sourceUri.toString()) {
+                        resources.set(uri.toString(), new Uint8Array([4]));
+                        throw new Error('provider failed while writing the destination');
+                    }
+                    resources.set(uri.toString(), content);
+                },
+                delete: async (uri: any) => { resources.delete(uri.toString()); }
+            } as any,
+            writable: true,
+            configurable: true
+        });
+
+        try {
+            const error = await doc.save().then(() => undefined, (reason: unknown) => reason);
+            assert.ok(error instanceof Error);
+            // VS Code shows this message after the provider wrapper, which only disarms link syntax.
+            const shown = (plainNotificationError(error) as Error).message;
+            const siblings = [...resources.keys()].filter(key => key !== sourceUri.toString());
+            assert.strictEqual(siblings.length, 1, 'the complete copy must remain');
+            assert.match(shown, /^Failed to save database: /);
+            assert.ok(shown.includes(siblings[0]), shown);
+            assert.deepStrictEqual(resources.get(siblings[0]), image);
         } finally {
             Object.defineProperty(mockVscode.workspace, 'fs', {
                 value: originalFs,
@@ -1764,8 +1825,8 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         Object.defineProperty(mockVscode.workspace, 'fs', {
             value: {
                 ...originalFs,
-                writeFile: async (uri: any, content: any) => {
-                    assert.notStrictEqual(uri.toString(), sourceUri.toString());
+                // The sibling copy and then the destination; both wait here.
+                writeFile: async (_uri: any, content: any) => {
                     assert.deepStrictEqual(content, new Uint8Array([7, 8, 9]));
                     markWriteStarted();
                     await writeMayFinish;
@@ -1855,8 +1916,8 @@ describe('DatabaseDocument save/saveAs fallback', () => {
         Object.defineProperty(mockVscode.workspace, 'fs', {
             value: {
                 ...originalFs,
-                writeFile: async (uri: any, content: any) => {
-                    assert.notStrictEqual(uri.toString(), sourceUri.toString());
+                // The sibling copy and then the destination; both wait here.
+                writeFile: async (_uri: any, content: any) => {
                     assert.deepStrictEqual(content, new Uint8Array([10, 11, 12]));
                     markWriteStarted();
                     await writeMayFinish;
@@ -3585,6 +3646,134 @@ describe('DatabaseDocument hot-exit restore', () => {
             });
             mockVscode.window.showErrorMessage = originalShowErrorMessage;
             mockVscode.window.showWarningMessage = originalShowWarningMessage;
+            if (originalWorkerFactoryCacheEntry) {
+                moduleCache[workerFactoryPath] = originalWorkerFactoryCacheEntry;
+            } else {
+                delete moduleCache[workerFactoryPath];
+            }
+            delete moduleCache[databaseModelModulePath];
+        }
+    });
+
+    it('restores a hot-exit backup on the engine that wrote it', async () => {
+        // Native has written a backup's unsaved edits to the file already and
+        // WebAssembly replays them, so a restore on the other engine would
+        // apply them twice or drop them.
+        const connectionCalls: unknown[][] = [];
+        let openedEngine: 'native' | 'wasm' = 'native';
+        let replayFails = false;
+        let backupBytes: Uint8Array | undefined;
+        const originalFs = mockVscode.workspace.fs;
+        const originalShowErrorMessage = mockVscode.window.showErrorMessage;
+        const moduleCache = require('module')._cache;
+        const workerFactoryPath = require.resolve('../../src/workerFactory');
+        const originalWorkerFactoryCacheEntry = moduleCache[workerFactoryPath];
+        const databaseModelModulePath = require.resolve('../../src/databaseModel');
+
+        Object.defineProperty(mockVscode.workspace, 'fs', {
+            value: {
+                ...originalFs,
+                readFile: async () => backupBytes,
+                writeFile: async (_uri: unknown, bytes: Uint8Array) => { backupBytes = bytes; }
+            },
+            writable: true,
+            configurable: true
+        });
+        mockVscode.window.showErrorMessage = async () => undefined;
+        moduleCache[workerFactoryPath] = {
+            id: workerFactoryPath,
+            filename: workerFactoryPath,
+            loaded: true,
+            exports: {
+                createDatabaseConnection: async () => ({
+                    establishConnection: async (...args: unknown[]) => {
+                        connectionCalls.push(args);
+                        return {
+                            databaseOps: {
+                                engineKind: Promise.resolve(openedEngine),
+                                ping: async () => {},
+                                applyModifications: async () => {
+                                    if (replayFails) throw new Error('replay failed');
+                                }
+                            },
+                            isReadOnly: false
+                        };
+                    },
+                    workerMethods: { [Symbol.dispose]: () => {} }
+                })
+            }
+        };
+        delete moduleCache[databaseModelModulePath];
+
+        try {
+            const { DatabaseDocument } = require('../../src/databaseModel');
+            let documentCount = 0;
+            const create = (backupId?: string) => DatabaseDocument.create(
+                {
+                    reporter: undefined,
+                    isVerified: true,
+                    context: { extensionUri: mockVscode.Uri.file('/ext') },
+                    forceReadOnly: false,
+                    outputChannel: undefined
+                },
+                mockVscode.Uri.file(`/test/engine-backup-${++documentCount}.db`),
+                { backupId }
+            );
+            const cancellation = {
+                isCancellationRequested: false,
+                onCancellationRequested: () => ({ dispose: () => {} })
+            };
+            const draft: LabeledModification = {
+                label: 'Draft',
+                description: 'Draft value',
+                modificationType: 'cell_update',
+                targetTable: 'items',
+                targetRowId: 1,
+                targetColumn: 'value',
+                priorValue: 'saved',
+                newValue: 'draft'
+            };
+
+            for (const engine of ['native', 'wasm'] as const) {
+                openedEngine = engine;
+                const document = await create();
+                assert.strictEqual(connectionCalls.at(-1)![4], undefined, 'a plain open leaves the engine to the factory');
+                await document.backup(mockVscode.Uri.file('/backup/engine'), cancellation);
+                await create('vscode-userdata:///backup/engine');
+                assert.strictEqual(connectionCalls.at(-1)![4], engine);
+            }
+
+            // A failed replay reopens read-only on the backup's engine too.
+            const wasmBackup = new ModificationTracker<LabeledModification>(100);
+            wasmBackup.record(draft);
+            backupBytes = wasmBackup.serialize('wasm');
+            openedEngine = 'wasm';
+            replayFails = true;
+            const callsBefore = connectionCalls.length;
+            await create('vscode-userdata:///backup/failed');
+            assert.deepStrictEqual(
+                connectionCalls.slice(callsBefore).map(args => [args[2], args[4]]),
+                [[false, 'wasm'], [true, 'wasm']]
+            );
+            replayFails = false;
+
+            const legacy = new ModificationTracker<LabeledModification>(100);
+            legacy.record(draft);
+            backupBytes = legacy.serialize();
+            openedEngine = 'native';
+            await create('vscode-userdata:///backup/legacy');
+            assert.strictEqual(
+                connectionCalls.at(-1)![4],
+                'native',
+                'a backup without an engine predates per-file engine choice, when such a file opened natively'
+            );
+        } finally {
+            Object.defineProperty(mockVscode.workspace, 'fs', {
+                value: originalFs,
+                writable: true,
+                configurable: true
+            });
+            mockVscode.window.showErrorMessage = originalShowErrorMessage;
             if (originalWorkerFactoryCacheEntry) {
                 moduleCache[workerFactoryPath] = originalWorkerFactoryCacheEntry;
             } else {

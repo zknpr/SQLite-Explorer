@@ -887,14 +887,17 @@ function oversizedMetadataInsertionWireBytes(
 
 function estimateExactIntegerTextsWireBytes(exactIntegerTexts: ExactIntegerTextMap | undefined): number {
   if (!exactIntegerTexts) return 0;
-  const rows = Object.entries(exactIntegerTexts);
+  // Object.keys, not Object.entries: a REAL page can hold a text per cell,
+  // and entries allocates a pair for each.
+  const rows = Object.keys(exactIntegerTexts);
   let bytes = 2 + Math.max(0, rows.length - 1);
-  for (const [rowIndex, row] of rows) {
+  for (const rowIndex of rows) {
     bytes += objectKeyWireBytes(rowIndex);
-    const cells = Object.entries(row);
+    const row = exactIntegerTexts[rowIndex as unknown as number];
+    const cells = Object.keys(row);
     bytes += 2 + Math.max(0, cells.length - 1);
-    for (const [columnIndex, exactText] of cells) {
-      bytes += objectKeyWireBytes(columnIndex) + utf8ByteLength(exactText) + 2;
+    for (const columnIndex of cells) {
+      bytes += objectKeyWireBytes(columnIndex) + utf8ByteLength(row[columnIndex as unknown as number]) + 2;
     }
   }
   return bytes;
@@ -920,6 +923,23 @@ export function decodeCellContainment(
   maxPageResponseBytes: number = DEFAULT_MAX_PAGE_RESPONSE_BYTES,
   metadataMayBeNull = false
 ): DecodedCellContainment {
+  // A string's UTF-8 length is at most three bytes per UTF-16 unit. A page
+  // that reaches neither budget with every string measured by that bound
+  // reaches neither with its exact lengths, so nothing is clipped and the
+  // result is the same; only a page that reaches one is measured exactly.
+  return containCells(transportedRows, valueColumnCount, exactIntegerTexts, maxPageResponseBytes, metadataMayBeNull, false)
+    ?? containCells(transportedRows, valueColumnCount, exactIntegerTexts, maxPageResponseBytes, metadataMayBeNull, true)!;
+}
+
+/** Undefined when exactLengths is false and a budget was reached. */
+function containCells(
+  transportedRows: readonly (readonly unknown[])[],
+  valueColumnCount: number,
+  exactIntegerTexts: ExactIntegerTextMap | undefined,
+  maxPageResponseBytes: number,
+  metadataMayBeNull: boolean,
+  exactLengths: boolean
+): DecodedCellContainment | undefined {
   const pageByteBudget = positiveIntegerOr(
     maxPageResponseBytes,
     DEFAULT_MAX_PAGE_RESPONSE_BYTES
@@ -944,8 +964,11 @@ export function decodeCellContainment(
   };
 
   let noOversizedTokens: string[] | undefined;
+  let boundReached = false;
 
   const rows = transportedRows.map((row, rowIndex) => {
+    // The exact pass validates and decodes every row again.
+    if (boundReached) return [];
     if (row.length < valueColumnCount + 1) {
       throw new Error(
         `Cell containment row ${rowIndex} has ${row.length} values; ` +
@@ -972,7 +995,9 @@ export function decodeCellContainment(
       if (sqlMetadata) recordOversizedCell(rowIndex, columnIndex, sqlMetadata);
 
       const value = values[columnIndex];
-      const byteLength = inlineCellByteLength(value);
+      const byteLength = exactLengths
+        ? inlineCellByteLength(value)
+        : typeof value === 'string' ? value.length * 3 : inlineCellByteLength(value);
       if (byteLength === undefined || byteLength === 0) {
         rowsWireBytes += transportedCellWireBytes(value);
         continue;
@@ -982,6 +1007,10 @@ export function decodeCellContainment(
         pageBudgetExhausted
         || byteLength > pageByteBudget - inlineBytes
       ) {
+        if (!exactLengths) {
+          boundReached = true;
+          break;
+        }
         pageBudgetExhausted = true;
         const metadata = sqlMetadata ?? {
           storageClass: typeof value === 'string' ? 'text' as const : 'blob' as const,
@@ -995,21 +1024,24 @@ export function decodeCellContainment(
       }
 
       inlineBytes += byteLength;
-      retainedInlineCells.push(rowIndex, columnIndex);
+      // Only the exact pass can drop previews again below.
+      if (exactLengths) retainedInlineCells.push(rowIndex, columnIndex);
       rowsWireBytes += typeof value === 'string' ? byteLength + 2 : transportedCellWireBytes(value);
     }
     return values;
   });
+  if (boundReached) return undefined;
 
   let retainedExactIntegerTexts: ExactIntegerTextMap | undefined;
   if (exactIntegerTexts) {
-    for (const [rowIndexText, exactRow] of Object.entries(exactIntegerTexts)) {
-      for (const [columnIndexText, exactText] of Object.entries(exactRow)) {
+    for (const rowIndexText of Object.keys(exactIntegerTexts)) {
+      const exactRow = exactIntegerTexts[rowIndexText as unknown as number];
+      for (const columnIndexText of Object.keys(exactRow)) {
         const columnIndex = Number(columnIndexText);
         if (columnIndex >= valueColumnCount) continue;
         retainedExactIntegerTexts ??= {};
         retainedExactIntegerTexts[Number(rowIndexText)] ??= {};
-        retainedExactIntegerTexts[Number(rowIndexText)][columnIndex] = exactText;
+        retainedExactIntegerTexts[Number(rowIndexText)][columnIndex] = exactRow[columnIndexText as unknown as number];
       }
     }
   }
@@ -1024,6 +1056,7 @@ export function decodeCellContainment(
   let aggregateBytes = rowsWireBytes
     + estimateOversizedCellsWireBytes(oversizedCells)
     + estimateExactIntegerTextsWireBytes(retainedExactIntegerTexts);
+  if (!exactLengths && aggregateBytes > aggregateBudget) return undefined;
 
   for (
     let index = retainedInlineCells.length - 2;

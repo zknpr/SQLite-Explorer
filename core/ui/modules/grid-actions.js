@@ -339,6 +339,22 @@ function focusFilterInput(scope) {
     input.setSelectionRange?.(input.value.length, input.value.length);
 }
 
+/**
+ * Return focus to a filter input after its queued load, but only when focus
+ * is still on that input or on the body (a header rebuild detaches a focused
+ * column filter). Anything else is where the user went while the load was
+ * pending, e.g. an inline cell editor opened during the debounce: taking focus
+ * from it blurs the editor, whose blur handler saves the half-typed value.
+ */
+function restoreFilterFocus(scope) {
+    const input = scope === GLOBAL_MATCH_SCOPE
+        ? document.getElementById('filterInput')
+        : getColumnFilterInput(scope);
+    const active = document.activeElement;
+    if (active && active !== input && active !== document.body) return;
+    focusFilterInput(scope);
+}
+
 function scheduleFilterApply(
     delay = FILTER_DEBOUNCE_MS,
     table = state.selectedTable,
@@ -380,7 +396,7 @@ async function processFilterQueue(table = state.selectedTable, reloadWait = null
         const action = state.filterPendingAction;
         state.filterPendingAction = null;
         if (action?.focusScope !== null && action?.focusScope !== undefined) {
-            focusFilterInput(action.focusScope);
+            restoreFilterFocus(action.focusScope);
         }
         persistState();
         return false;
@@ -450,7 +466,7 @@ async function processFilterQueue(table = state.selectedTable, reloadWait = null
     if (state.filterApplyPending) {
         const pendingAction = state.filterPendingAction;
         if (pendingAction?.table === table && pendingAction.focusScope !== null) {
-            focusFilterInput(pendingAction.focusScope);
+            restoreFilterFocus(pendingAction.focusScope);
         }
         clearFilterTimer();
         return processFilterQueue(table);
@@ -460,7 +476,7 @@ async function processFilterQueue(table = state.selectedTable, reloadWait = null
     const action = state.filterPendingAction;
     if (!action || action.table !== table) return true;
     state.filterPendingAction = null;
-    if (action.focusScope !== null) focusFilterInput(action.focusScope);
+    if (action.focusScope !== null) restoreFilterFocus(action.focusScope);
     if (action.navigate) navigateMatches(action.scope, action.direction);
     return true;
 }

@@ -134,6 +134,8 @@ export interface PrimaryKeyColumn {
   identifier: string;
   declaredType: string;
   position: number;
+  /** The collation the primary key compares this member with, when read from the schema. */
+  collation?: string;
 }
 
 /** The database identity mechanism for rows in one table. */
@@ -199,6 +201,8 @@ export interface ColumnMetadata {
   isGenerated?: boolean;
   /** True only when this exact INTEGER PRIMARY KEY aliases the table rowid. */
   isRowidAlias?: boolean;
+  /** The collation a WITHOUT ROWID primary key compares this member with. */
+  primaryKeyCollation?: string;
 }
 
 /**
@@ -289,8 +293,9 @@ export interface SchemaSnapshot {
   /** All indexes in database */
   indexes: IndexMetadata[];
   /**
-   * Whether main or TEMP holds a trigger. Without one, a cell edit cannot
-   * change any table's row count, so the webview keeps those counts.
+   * Whether main or TEMP holds a trigger or a virtual table. Without either,
+   * a cell edit cannot change any table's row count, so the webview keeps
+   * those counts.
    */
   hasTriggers?: boolean;
 }
@@ -486,7 +491,12 @@ export interface DatabaseOperations {
    */
   prepareCellHelpers?(): Promise<boolean>;
 
-  /** Execute one bounded SELECT or its query plan; never a write/script. */
+  /**
+   * Execute one bounded SELECT or its query plan; never a write/script.
+   * Unlike the other methods, a bigint parameter binds as INTEGER and every
+   * number as REAL, whole or not, as the console's literals are typed
+   * (parseQueryParameters).
+   */
   executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, signal?: AbortSignal): Promise<QueryResultSet>;
 
   /** Execute SQL query */
@@ -515,8 +525,12 @@ export interface DatabaseOperations {
   /** Open one SELECT for incremental reads when the backend exposes a cursor. */
   openQueryReadSession?(sql: string): Promise<QueryReadSession>;
 
-  /** Step a bounded number of rows from an open query read session. */
-  readQueryRows?(sessionId: string, maxRows: number): Promise<QueryReadChunk>;
+  /**
+   * Step a bounded number of rows from an open query read session. With
+   * maxBytes, the read also stops after the row that brings its values to
+   * that many bytes, so rows of unknown size can be read in batches.
+   */
+  readQueryRows?(sessionId: string, maxRows: number, maxBytes?: number): Promise<QueryReadChunk>;
 
   /** Idempotently finalize an incremental query read session. */
   closeQueryReadSession?(sessionId: string): Promise<void>;
@@ -765,6 +779,13 @@ export interface TableQueryOptions {
   orderDir?: 'ASC' | 'DESC';
   limit?: number;
   offset?: number;
+  /**
+   * Rows per page of the paging this request belongs to, when `limit` can be
+   * lower: the grid bounds a final page's LIMIT to the rows its count leaves.
+   * Keyset anchors are tagged with it, so they stay valid across such a page.
+   * Omitted, the page size is `limit`.
+   */
+  pageSize?: number;
   filters?: {
     column: string;
     value: string;

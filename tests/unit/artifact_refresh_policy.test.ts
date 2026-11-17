@@ -28,8 +28,8 @@ const sourceRepositoryRoot = path.resolve(
 );
 
 const TXIKI_BRANCH = 'master';
-const TXIKI_COMMIT = 'e0211b66af5e35521929a5727065f0235ad3f8ce';
-const TXIKI_RUN = '41183550205';
+const TXIKI_COMMIT = '172b8310c5e7304ca72083f12164c95c44eb171f';
+const TXIKI_RUN = '43520538528';
 
 interface ScriptSpec {
     name: string;
@@ -71,6 +71,12 @@ const scriptSpecs: readonly ScriptSpec[] = [
 ];
 
 const temporaryRoots = new Set<string>();
+
+// The refresh script starts `gh` without a shell. Windows starts only an .exe
+// that way, and the stub here is a Node script behind gh.cmd.
+const NO_GH_STUB = process.platform === 'win32'
+    ? 'the gh stub is a script, which Windows cannot start without a shell'
+    : false;
 
 afterEach(() => {
     for (const root of temporaryRoots) {
@@ -303,6 +309,8 @@ function assertInstalled(harness: Harness, spec: ScriptSpec): void {
             intendedDestinations.add(relativeDestination);
             const installedPath = path.join(harness.repositoryRoot, relativeDestination);
             assert.deepEqual(readFileSync(installedPath), expectedContents);
+            // Windows has no execute bit: Node reports 0o666 for a writable file.
+            if (process.platform === 'win32') continue;
             if (spec.executable) {
                 assert.equal(statSync(installedPath).mode & 0o777, 0o755);
             } else {
@@ -432,7 +440,7 @@ test('runtime refresh and source builds share the rollback-protected artifact in
 
 for (const spec of scriptSpecs) {
     describe(`${spec.name} refresh provenance`, () => {
-        test('default mode validates exact successful metadata before installing', () => {
+        test('default mode validates exact successful metadata before installing', { skip: NO_GH_STUB }, () => {
             const harness = createHarness(spec);
             const result = runScript(harness);
             assert.equal(result.status, 0, combinedOutput(result));
@@ -471,7 +479,7 @@ for (const spec of scriptSpecs) {
                 /expected conclusion success/i
             ]
         ] as const) {
-            test(`default mode rejects ${label} without partial writes`, () => {
+            test(`default mode rejects ${label} without partial writes`, { skip: NO_GH_STUB }, () => {
                 const harness = createHarness(spec);
                 harness.environment.FAKE_GH_METADATA = JSON.stringify(metadata);
                 assertRejected(harness, [], expectedMessage);

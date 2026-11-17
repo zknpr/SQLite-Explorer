@@ -34,7 +34,7 @@ import { LoggingDatabaseOperations } from './loggingDatabaseOperations';
 import { plainErrors, plainNotificationText } from './notificationText';
 import {
   captureWorkspaceFileGeneration,
-  writeWorkspaceFileAtomically
+  replaceWorkspaceFile
 } from './atomicWorkspaceWrite';
 
 // ============================================================================
@@ -125,6 +125,24 @@ function pagedNonFilePersistenceError(): Error {
   ));
 }
 
+/**
+ * Show a warning without waiting for it. A notification without actions
+ * settles only when the user dismisses it, and callers hold a document barrier.
+ */
+function showWarningWithoutWaiting(message: string, logPrefix: string): void {
+  try {
+    void Promise.resolve(vsc.window.showWarningMessage(plainNotificationText(message))).catch(error => {
+      GlobalOutputChannel?.appendLine(`[${logPrefix}] ${error instanceof Error ? error.message : String(error)}`);
+    });
+  } catch (error) {
+    GlobalOutputChannel?.appendLine(`[${logPrefix}] ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function logWorkspaceSaveWarning(message: string, error: unknown): void {
+  GlobalOutputChannel?.appendLine(`[Save] ${message} (${error instanceof Error ? error.message : String(error)})`);
+}
+
 function isSaveCancellation(error: unknown): boolean {
   // VS Code's RPC revives errors without their original class prototype.
   return error instanceof vsc.CancellationError
@@ -150,6 +168,7 @@ interface OpenedDocumentConnection {
   tracker: ModificationTracker<DocumentModification> | null;
   autoCommit: boolean;
   forceReadOnlyOnReconnect: boolean;
+  engineKind: 'native' | 'wasm';
 }
 
 type InitialConnectionFactory = (cancellation?: vsc.CancellationToken) => Promise<OpenedDocumentConnection>;
@@ -221,11 +240,13 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         documentKey, { factory: initialConnectionFactory, error }
       );
     }
-    return new DatabaseDocument(
+    const document = new DatabaseDocument(
       viewerProvider, fileUri, opened.tracker, opened.autoCommit,
       opened.connectionState, opened.workerMethods, connectionFactory, reporter,
       opened.forceReadOnlyOnReconnect, documentKey
     );
+    document.#pinUnsavedHistoryFor(opened.engineKind);
+    return document;
   }
 
   static async #initializeConnection(
@@ -239,12 +260,31 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     let forceReadOnlyOnReconnect = configuredForceReadOnly;
     const { filename } = getUriParts(fileUri);
     const autoCommit = isAutoCommitEnabled();
+    let tracker: ModificationTracker<DocumentModification> | null = null;
+    let backupEngine: 'native' | 'wasm' | undefined;
+    // Instant commit does not make a backup redundant: the setting may have
+    // been switched on since, or the commit failed, and on WebAssembly the
+    // backup is the only copy of the edits.
+    if (typeof openContext.backupId === 'string') {
+      const backupUri = vsc.Uri.parse(openContext.backupId);
+      const backupData = await vsc.workspace.fs.readFile(backupUri);
+      tracker = ModificationTracker.deserialize<DocumentModification>(
+        backupData,
+        MODIFICATION_LIMIT,
+        getMaxUndoMemoryBytes()
+      );
+      // The restore reopens the engine the backup was made on. A backup that
+      // names none predates per-file engine choice, when every file this
+      // could open natively did.
+      backupEngine = tracker.backupEngineKind ?? 'native';
+    }
     let databaseOps: DatabaseOperations;
     let result = await connectionBundle.establishConnection(
       fileUri,
       filename,
       configuredForceReadOnly,
-      autoCommit
+      autoCommit,
+      backupEngine
     );
     databaseOps = result.databaseOps;
     let isReadOnly = result.isReadOnly ?? configuredForceReadOnly;
@@ -260,16 +300,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     databaseOps = withSqlLogging(databaseOps, filename, viewerProvider.outputChannel);
 
     // Restore modification history from backup
-    let tracker: ModificationTracker<DocumentModification> | null = null;
-    if (typeof openContext.backupId === 'string' && !autoCommit) {
-      const backupUri = vsc.Uri.parse(openContext.backupId);
-      const backupData = await vsc.workspace.fs.readFile(backupUri);
-      tracker = ModificationTracker.deserialize<DocumentModification>(
-        backupData,
-        MODIFICATION_LIMIT,
-        getMaxUndoMemoryBytes()
-      );
-
+    if (tracker) {
       try {
         // Reconcile the opened database to the live timeline state. WASM opens
         // checkpoint bytes and may need forward replay or saved-edit reverts;
@@ -294,7 +325,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             fileUri,
             filename,
             true,
-            autoCommit
+            autoCommit,
+            backupEngine
           );
           databaseOps = withSqlLogging(
             result.databaseOps,
@@ -330,8 +362,20 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       autoCommit,
       connectionState: { databaseOps, isReadOnly, storage: result.storage, onDidInvalidate: result.onDidInvalidate },
       workerMethods: connectionBundle.workerMethods,
-      forceReadOnlyOnReconnect
+      forceReadOnlyOnReconnect,
+      engineKind
     };
+  }
+
+  /**
+   * A hot-exit backup holds only the tracker. Restoring it on WebAssembly
+   * replays the unsaved entries onto the saved file, so none of them may be
+   * evicted by the entry or memory limits; the tracker asks for a save
+   * instead once they fill its memory. The native engine has written every
+   * edit to the file already, so its history keeps the plain limits.
+   */
+  #pinUnsavedHistoryFor(engineKind: 'native' | 'wasm'): void {
+    this.#modificationTracker.pinUncommittedEntries(engineKind === 'wasm');
   }
 
   /** Get configured max file size */
@@ -598,6 +642,11 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
   );
   readonly onDidChange = this.#modificationEmitter.event;
 
+  // VS Code moves its undo cursor before it calls an edit's undo, so a refused
+  // undo at the saved position reads as clean. The provider marks it dirty again.
+  readonly #unsavedChangesKeptEmitter = this._register(new vsc.EventEmitter<void>());
+  readonly onDidKeepUnsavedChanges = this.#unsavedChangesKeptEmitter.event;
+
   // ============================================================================
   // Lifecycle
   // ============================================================================
@@ -641,6 +690,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     if (this.#connectionInvalidatedError) throw this.#connectionInvalidatedError;
     const tracker = this.#modificationTracker;
     const historyWasBlocked = tracker.isHistoryRecordingBlockedByBarrierLimit;
+    const unsavedHistoryWasFull = tracker.isHistoryRecordingBlockedByUncommittedLimit;
     if (modification.undoPolicy === 'barrier') {
       tracker.recordBarrier(modification);
     } else {
@@ -649,15 +699,24 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
 
     this.#modificationEmitter.fire(this.#createEditEvent(modification));
 
+    let message: string | undefined;
     if (
       !historyWasBlocked
       && tracker.isHistoryRecordingBlockedByBarrierLimit
     ) {
-      const message = vsc.l10n.t(
+      message = vsc.l10n.t(
         'Undo history reached its configured limit after a forward-only edit. ' +
         'Current changes remain dirty and protected for recovery, but further edits are blocked. ' +
         'Save the database before making more changes.'
       );
+    } else if (!unsavedHistoryWasFull && tracker.isHistoryRecordingBlockedByUncommittedLimit) {
+      message = vsc.l10n.t(
+        'Unsaved changes reached the undo history memory limit (sqliteExplorer.maxUndoMemory). ' +
+        'They remain dirty and protected for recovery, but further edits are blocked. ' +
+        'Save the database before making more changes.'
+      );
+    }
+    if (message !== undefined) {
       try {
         void Promise.resolve(vsc.window.showWarningMessage(plainNotificationText(message))).catch(error => {
           GlobalOutputChannel?.appendLine(
@@ -697,6 +756,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         if (!undoneEntry) {
           editState = 'applied';
           if (tracker.isUndoBlockedByBarrier) {
+            if (tracker.hasUncommittedChanges()) this.#unsavedChangesKeptEmitter.fire();
             const blocked = tracker.undoBlockingEntry;
             await vsc.window.showWarningMessage(vsc.l10n.t(
               blocked?.undoBarrierKind === 'persistent_pragma'
@@ -706,6 +766,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
             return;
           }
           GlobalOutputChannel?.appendLine('[Undo] No entry found in tracker');
+          // VS Code keeps every edit; the tracker evicts its oldest entries
+          // past the history limits, and the native engine keeps them on disk.
+          showWarningWithoutWaiting(
+            vsc.l10n.t('{0} is no longer in the undo history and was not undone.', modification.label),
+            'Undo warning failed'
+          );
           return;
         }
         if (undoneEntry !== modification) {
@@ -1031,11 +1097,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const binaryContent = await this.databaseOperations.serializeDatabase(saveSignal);
     saveSignal?.throwIfAborted();
     try {
-      await writeWorkspaceFileAtomically(
+      await replaceWorkspaceFile(
         this.uri,
         binaryContent,
         destinationGeneration,
-        saveSignal
+        saveSignal,
+        logWorkspaceSaveWarning
       );
     } catch (err) {
       if (saveSignal?.aborted && err === saveSignal.reason) {
@@ -1221,11 +1288,12 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
 
     try {
-      await writeWorkspaceFileAtomically(
+      await replaceWorkspaceFile(
         targetUri,
         binaryContent,
         destinationGeneration,
-        saveSignal
+        saveSignal,
+        logWorkspaceSaveWarning
       );
     } catch (error) {
       if (saveSignal?.aborted && error === saveSignal.reason) {
@@ -1258,6 +1326,16 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       );
       await vsc.window.showWarningMessage(plainNotificationText(message));
       throw new Error('File Revert cannot cross an unsaved oversized-cell history barrier');
+    }
+    if (this.#modificationTracker.hasEvictedUncommittedEntries) {
+      // Reverting the retained entries would stop short of the saved state.
+      // VS Code neither waits for Revert nor shows its error, so warn here.
+      const message = vsc.l10n.t(
+        'Undo history no longer holds every change made since the last save, so File Revert ' +
+        'cannot restore the saved database. Nothing was reverted.'
+      );
+      showWarningWithoutWaiting(message, 'File Revert warning failed');
+      throw new Error(message);
     }
     let invalidatedByRecoveryReload = false;
     try {
@@ -1553,6 +1631,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         }
       }
     }
+    this.#pinUnsavedHistoryFor(opened.engineKind);
     this.#initialConnectionFactory = undefined;
     this.#initialOpenError = undefined;
     this.#observeConnectionInvalidation(opened.connectionState);
@@ -1566,6 +1645,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const replacementBundle = await this.connectionFactory();
     let result: EstablishedDatabaseConnection;
     let databaseOps: DatabaseOperations;
+    let engineKind: 'native' | 'wasm';
     try {
       result = await replacementBundle.establishConnection(
         this.uri,
@@ -1578,6 +1658,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
         filename,
         this.viewerProvider.outputChannel
       );
+      // A reconnect can land on the other engine, when native stops opening the file.
+      engineKind = await databaseOps.engineKind;
     } catch (error) {
       try {
         replacementBundle.workerMethods[Symbol.dispose]();
@@ -1613,6 +1695,7 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     const previousWorkerMethods = this.workerMethods;
     this.workerMethods = replacementBundle.workerMethods;
     this.connectionState = nextConnectionState;
+    this.#pinUnsavedHistoryFor(engineKind);
     this.#observeConnectionInvalidation(nextConnectionState);
     try {
       if (disposePrevious) previousWorkerMethods?.[Symbol.dispose]();
@@ -1644,7 +1727,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
       throw new vsc.CancellationError();
     }
     if (this.#initialOpenError) throw this.#initialOpenError;
-    if (!this.#connectionInvalidatedError && await this.databaseOperations.engineKind === 'native') {
+    const engineKind = await this.databaseOperations.engineKind;
+    if (!this.#connectionInvalidatedError && engineKind === 'native') {
       try {
         // Backup can be the first activity after an external replacement. Let
         // native identity admission retire that file's history before encoding
@@ -1656,7 +1740,8 @@ export class DatabaseDocument extends Disposable implements vsc.CustomDocument {
     }
     // Hot-exit persists only ModificationTracker history. It never copies the
     // database image, so a multi-gigabyte paged base is not materialized here.
-    const serializedState = this.#modificationTracker.serialize();
+    // The engine goes with it: the restore must reopen the same one.
+    const serializedState = this.#modificationTracker.serialize(engineKind);
     if (cancellation?.isCancellationRequested) {
       throw new vsc.CancellationError();
     }

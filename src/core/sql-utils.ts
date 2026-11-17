@@ -30,6 +30,24 @@ export function escapeMainIdentifier(identifier: string): string {
   return `main.${escapeIdentifier(identifier)}`;
 }
 
+const EXPRESSION_TERM_GROUP = 200;
+
+/**
+ * Join expression terms with a binary operator. SQLite refuses an expression
+ * nested more than 1,000 deep, which one flat chain over a wide table's
+ * columns reaches near that many terms, so a longer list is joined in
+ * parenthesized groups. Up to one group the text is the flat chain.
+ */
+export function joinExpressionTerms(terms: readonly string[], operator: 'AND' | '+'): string {
+  const separator = ` ${operator} `;
+  if (terms.length <= EXPRESSION_TERM_GROUP) return terms.join(separator);
+  const groups: string[] = [];
+  for (let start = 0; start < terms.length; start += EXPRESSION_TERM_GROUP) {
+    groups.push(`(${terms.slice(start, start + EXPRESSION_TERM_GROUP).join(separator)})`);
+  }
+  return groups.join(separator);
+}
+
 /**
  * Reject identifiers that cannot be represented safely, without imposing an
  * application-specific naming grammar on SQLite identifiers.

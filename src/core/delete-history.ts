@@ -1,7 +1,7 @@
 import type { CellValue, RecordId } from './types';
 import type { RecordIdentityPredicate } from './row-identity';
 import { estimateUndoMemoryBytes } from './undo-history';
-import { escapeIdentifier, escapeMainIdentifier } from './sql-utils';
+import { escapeIdentifier, escapeMainIdentifier, joinExpressionTerms } from './sql-utils';
 
 const DELETED_ROW_STRUCTURAL_BYTES = 32;
 const STORAGE_CLASS_ENTRY_STRUCTURAL_BYTES = 48;
@@ -28,7 +28,7 @@ export function buildDeleteSnapshotSizeQuery(
   valueColumns: readonly string[],
   predicate: RecordIdentityPredicate
 ): { sql: string; params: CellValue[] } {
-  const valueBytes = valueColumns.map(column => {
+  const valueBytes = joinExpressionTerms(valueColumns.map(column => {
     const escaped = escapeIdentifier(column);
     return (
       `CASE typeof(${escaped}) ` +
@@ -36,7 +36,7 @@ export function buildDeleteSnapshotSizeQuery(
       `WHEN 'blob' THEN octet_length(${escaped}) ` +
       `WHEN 'integer' THEN 8 WHEN 'real' THEN 8 ELSE 0 END`
     );
-  }).join(' + ') || '0';
+  }), '+') || '0';
   return {
     sql:
       `SELECT COUNT(*), COALESCE(SUM(${valueBytes}), 0) ` +

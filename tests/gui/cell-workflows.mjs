@@ -550,7 +550,9 @@ try {
       } else {
         assert.equal(await frame.getByRole('button', { name: 'View bounded Hex preview', exact: true }).isVisible(), true);
         await frame.getByRole('button', { name: 'View bounded Hex preview', exact: true }).click();
-        assert.match(await frame.locator('#tab-hex textarea').inputValue(), /1A 45 DF A3/i);
+        assert.match(await frame.locator('#tab-hex .hex-dump-content').textContent(), /1A 45 DF A3/i);
+        // On the Hex tab the same button opens the full Hex text; Download is on Preview.
+        await frame.locator('.tab-btn[data-tab="preview"]').click();
       }
       await download('video-download.webm', videoBytes);
       await screenshot('17-webm-outcome'); await closeInspector();

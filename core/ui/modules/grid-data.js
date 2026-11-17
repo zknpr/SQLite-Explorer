@@ -112,11 +112,12 @@ export function getGridReloadOwner() {
  * OFFSET query. `nav` is the page's relationship to the committed grid
  * ('first'/'next'/'prev'/'last' from the nav buttons, 'refetch' otherwise).
  * Anchors are only usable when they describe the exact page the intent
- * expects for this table — a clamped index after a shrunken count, a table
- * switch, or a rapid double-click whose first load never committed all fail
- * these checks and fall back to OFFSET. The engine independently re-validates
- * the anchor's embedded query tag, so sort/filter/page-size staleness needs no
- * tracking here.
+ * expects for this table at this page size — a clamped index after a shrunken
+ * count, a table switch, a column change that lowered the page size, or a
+ * rapid double-click whose first load never committed all fail these checks
+ * and fall back to OFFSET. The engine independently re-validates the anchor's
+ * embedded query tag, which also names the page size, so sort/filter
+ * staleness needs no tracking here.
  *
  * `recordCount`/`pageCount` are undefined for the speculative data query a
  * cache miss fires in parallel with its count; anchor-based modes never need
@@ -128,7 +129,8 @@ function buildKeysetRequest(nav, pageIndex, pageCount, recordCount, countIsExact
     // any refetch at 0, and single-page tables.
     if (pageIndex === 0) return { mode: 'first' };
     const anchors = state.keysetAnchors;
-    const usable = anchors && anchors.table === table;
+    // A page index means different rows under another page size.
+    const usable = anchors && anchors.table === table && anchors.pageSize === pageSize;
     if (nav === 'next' && usable && anchors.pageIndex === pageIndex - 1 && anchors.last) {
         return { mode: 'after', anchor: anchors.last };
     }
@@ -314,6 +316,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         state.keysetAnchors = {
             table: requestedTable,
             pageIndex: currentPageIndex,
+            pageSize,
             first: dataResult.keysetAnchors?.first ?? null,
             last: dataResult.keysetAnchors?.last ?? null
         };
@@ -480,6 +483,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                       )
                     : requestedPageSize,
                 offset: pageIndex * requestedPageSize,
+                // The engine tags anchors with the page size, not the limit,
+                // which a final page bounds to its remainder.
+                pageSize: requestedPageSize,
                 filters,
                 globalFilter
             };
@@ -711,6 +717,19 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             }
         }
         if (queryOptions.limit > countAwareOptions.limit && hasClippedCells(dataResult)) {
+            // A seek bounded to the rows the count leaves returns exactly that
+            // many even from an anchor that moved, so the length check below
+            // cannot catch it. Judge the anchor on the full page in hand.
+            if (queryOptions.keyset && keysetResultNeedsOffsetRetry(
+                queryOptions.keyset,
+                dataResult,
+                totalRecordCount,
+                totalRecordCountIsExact,
+                currentPageIndex,
+                requestedPageSize
+            )) {
+                delete countAwareOptions.keyset;
+            }
             queryOptions = countAwareOptions;
             dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
             if (isSuperseded()) return;

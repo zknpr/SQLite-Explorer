@@ -3,12 +3,13 @@ import './vscode_mock_setup'; // Must be first
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { it } from 'node:test';
+import { after, it } from 'node:test';
 import * as vscode from 'vscode';
 
 import {
     createNativeDatabaseConnection,
-    NativeWorkerProcess
+    NativeWorkerProcess,
+    nativeRequestsWrittenByV8
 } from '../../src/nativeWorker';
 import { cancelTokenToAbortSignal } from '../../src/core/cancellation-utils';
 import { InvocationTimeoutError } from '../../src/core/rpc';
@@ -17,6 +18,7 @@ import {
     OversizedCellReplacementRequiredError
 } from '../../src/core/cell-edit-policy';
 import { decodePrimaryKeyRecordId, isReadOnlyPrimaryKeyRecordId } from '../../src/core/row-identity';
+import { createDatabaseEngine } from '../../src/core/sqlite-db';
 import { ROWID_TABLE_AUTHORITY_SQL } from '../../src/core/integer-utils';
 import { WITHOUT_ROWID_TABLE_SQL } from '../../src/core/paged-count';
 import { streamTableExport } from '../../src/tableExporter';
@@ -36,6 +38,9 @@ import type {
     LabeledModification,
     TableQueryOptions
 } from '../../src/core/types';
+
+// Every request to the native engine is written by the extension itself (`nativeRequestFormat.ts`).
+after(() => { assert.strictEqual(nativeRequestsWrittenByV8.count, 0, 'no request was left to the editor\'s V8 to write'); });
 
 const BUNDLED_TXIKI_SQLITE_VERSION = '3.54.1';
 const DIVERGENT_REAL_TEXT_BY_NATIVE_SQLITE_VERSION: Record<string, string> = {
@@ -81,6 +86,25 @@ function getBundledNativeBinary(repoRoot: string): string | undefined {
         process.platform === 'win32' ? 'tjs.exe' : 'tjs'
     );
     return fs.existsSync(binary) ? binary : undefined;
+}
+
+/**
+ * Build a file whose stored values do not follow the declared column types.
+ * The native engine only opens it.
+ */
+async function writeRedeclaredDatabase(
+    filePath: string,
+    setupSql: string,
+    redeclarations: readonly [table: string, createSql: string][]
+): Promise<void> {
+    const seed = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations!;
+    await seed.executeQuery(setupSql);
+    await seed.executeQuery('PRAGMA writable_schema = ON');
+    for (const [table, createSql] of redeclarations) {
+        await seed.executeQuery('UPDATE sqlite_schema SET sql = ? WHERE name = ?', [createSql, table]);
+    }
+    await seed.executeQuery('PRAGMA writable_schema = OFF');
+    fs.writeFileSync(filePath, await seed.serializeDatabase());
 }
 
 async function captureNativeRowidTableState(
@@ -449,6 +473,22 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                     'ROLLBACK TO native_bounded_snapshot_read'
                 ]);
                 await activeRawWorker.call('run', ['RELEASE native_bounded_snapshot_read']);
+            }
+        });
+
+        await testContext.test('leaves an already query_only connection query_only after a console read', async () => {
+            const boundary = '/*sqlite_explorer_boundary_native_query_only*/';
+            await activeRawWorker.call('run', ['PRAGMA query_only = ON']);
+            try {
+                const result = await activeRawWorker.call<{ values: unknown[][] }>(
+                    'workspaceQuery',
+                    ['SELECT 7 AS value', boundary, [], ['value'], 1000]
+                );
+                assert.deepStrictEqual(result.values, [[7]]);
+                const state = await activeRawWorker.call<{ values: unknown[][] }>('query', ['PRAGMA query_only']);
+                assert.deepStrictEqual(state.values, [[1]]);
+            } finally {
+                await activeRawWorker.call('run', ['PRAGMA query_only = OFF']);
             }
         });
         activeRawWorker.stop();
@@ -1433,6 +1473,132 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 );
             } finally {
                 utf16Bundle?.workerMethods[Symbol.dispose]();
+            }
+        });
+
+        await testContext.test('steps native console reads under query_only and restores the connection', async () => {
+            // The console read steps under query_only (read_refuses_writes.test.ts).
+            const consolePath = path.join(testDir, 'native-console-read.sqlite');
+            fs.closeSync(fs.openSync(consolePath, 'w'));
+            const image = () => Buffer.concat([consolePath, `${consolePath}-wal`].map(file => (
+                fs.existsSync(file) ? fs.readFileSync(file) : Buffer.alloc(0)
+            )));
+            let consoleBundle:
+                | Awaited<ReturnType<typeof createNativeDatabaseConnection>>
+                | undefined;
+            try {
+                const activeBundle = await createNativeDatabaseConnection(
+                    vscode.Uri.file(repoRoot), undefined, undefined, 1000
+                );
+                consoleBundle = activeBundle;
+                // A fresh open forgets this connection's analysis state, which
+                // DROP TABLE sqlite_stat1 alone does not.
+                const reopen = async () => (await activeBundle.establishConnection(
+                    vscode.Uri.file(consolePath),
+                    'native-console-read.sqlite'
+                )).databaseOps;
+                let consoleEngine = await reopen();
+                const scalar = async (sql: string) => (await consoleEngine.executeQuery(sql))[0].rows[0][0];
+                const longRead = 'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n';
+                await consoleEngine.executeQuery('CREATE TABLE analyzed (id INTEGER PRIMARY KEY, label TEXT)');
+                await consoleEngine.executeQuery('CREATE INDEX analyzed_label ON analyzed(label)');
+                await consoleEngine.executeQuery(
+                    'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 200) ' +
+                    "INSERT INTO analyzed(label) SELECT 'label' || (x % 7) FROM n"
+                );
+                const spellings = [
+                    'SELECT * FROM pragma_optimize(0x10002)',
+                    'SELECT * FROM "pragma_optimize"(0x10002)',
+                    'SELECT * FROM [pragma_optimize](0x10002)',
+                    'SELECT * FROM `pragma_optimize`(0x10002)',
+                    'SELECT * FROM main.pragma_optimize(0x10002)',
+                    'SELECT * FROM "MAIN"."Pragma_Optimize"(0x10002)',
+                    'SELECT * FROM PrAgMa_OpTiMiZe',
+                    'WITH t AS MATERIALIZED (SELECT * FROM pragma_optimize(0x10002)) SELECT count(*) AS n FROM t',
+                    'SELECT (SELECT count(*) FROM pragma_optimize(0x10002)) AS n'
+                ];
+                if (await scalar("SELECT count(*) FROM pragma_module_list WHERE name = 'fts4'") === 1) {
+                    await consoleEngine.executeQuery('CREATE VIRTUAL TABLE docs USING fts4(body)');
+                    // One segment per statement, so optimize() has segments to merge.
+                    for (const body of ['one', 'two', 'three']) {
+                        await consoleEngine.executeQuery('INSERT INTO docs VALUES (?)', [body]);
+                    }
+                    spellings.push('SELECT optimize(docs) AS merged FROM docs LIMIT 1');
+                }
+                const outcomes = [];
+                for (const sql of spellings) {
+                    consoleEngine = await reopen();
+                    const before = image();
+                    const error = await consoleEngine.executeReadQuery(sql).then(
+                        () => '',
+                        (e: unknown) => e instanceof Error ? e.message : String(e)
+                    );
+                    const changed = !before.equals(image());
+                    const stat1 = await scalar("SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'");
+                    // Judge every spelling against an unanalyzed database.
+                    if (stat1) await consoleEngine.executeQuery('DROP TABLE sqlite_stat1');
+                    outcomes.push({ sql, refused: /readonly database/.test(error), stat1, changed });
+                }
+                assert.deepStrictEqual(
+                    outcomes,
+                    spellings.map(sql => ({ sql, refused: true, stat1: 0, changed: false }))
+                );
+                assert.strictEqual(await scalar('PRAGMA query_only'), 0);
+
+                const beforePlan = image();
+                assert.ok((await consoleEngine.executeReadQuery(spellings[0], [], true)).rows.length);
+                assert.ok(beforePlan.equals(image()), 'Explain compiles the statement without stepping it');
+
+                // The guarded handle is the one stepping the statement, and
+                // TEMP objects, CTEs and reading table-valued pragmas still work.
+                assert.deepStrictEqual((await consoleEngine.executeReadQuery('SELECT query_only FROM pragma_query_only')).rows, [[1]]);
+                await consoleEngine.executeQuery('CREATE TEMP TABLE session_note (note TEXT)');
+                await consoleEngine.executeQuery("INSERT INTO session_note VALUES ('temporary')");
+                assert.deepStrictEqual((await consoleEngine.executeReadQuery('SELECT note FROM temp.session_note')).rows, [['temporary']]);
+                assert.deepStrictEqual(
+                    (await consoleEngine.executeReadQuery("SELECT name FROM pragma_table_info('analyzed') ORDER BY cid")).rows,
+                    [['id'], ['label']]
+                );
+                assert.deepStrictEqual(
+                    (await consoleEngine.executeReadQuery("WITH c AS (SELECT id FROM analyzed WHERE label = 'label3') SELECT count(*) AS n FROM c")).rows,
+                    [[29]]
+                );
+
+                // The previous state returns after a failing step, a host
+                // cancellation and a worker deadline.
+                await assert.rejects(consoleEngine.executeReadQuery('SELECT abs(-9223372036854775807 - 1) AS value'), /integer overflow/);
+                assert.strictEqual(await scalar('PRAGMA query_only'), 0);
+                const controller = new AbortController();
+                const cancel = setTimeout(() => controller.abort(), 100);
+                try {
+                    await assert.rejects(consoleEngine.executeReadQuery(longRead, [], false, controller.signal));
+                    assert.strictEqual(controller.signal.aborted, true);
+                } finally { clearTimeout(cancel); }
+                assert.strictEqual(await scalar('PRAGMA query_only'), 0);
+                await assert.rejects(consoleEngine.executeReadQuery(longRead), /timed out/i);
+                assert.strictEqual(await scalar('PRAGMA query_only'), 0);
+
+                // The savepoint was released: a later write reaches the file.
+                const beforeWrite = image();
+                await consoleEngine.executeQuery("INSERT INTO analyzed(label) VALUES ('written after the console')");
+                assert.ok(!beforeWrite.equals(image()));
+                assert.strictEqual(await scalar("SELECT count(*) FROM analyzed WHERE label = 'written after the console'"), 1);
+
+                // A read-only open keeps working and returns to its previous state.
+                fs.chmodSync(consolePath, 0o444);
+                const readOnlyConnection = await activeBundle.establishConnection(
+                    vscode.Uri.file(consolePath),
+                    'native-console-read.sqlite'
+                );
+                assert.strictEqual(readOnlyConnection.isReadOnly, true);
+                consoleEngine = readOnlyConnection.databaseOps;
+                assert.deepStrictEqual((await consoleEngine.executeReadQuery('SELECT count(*) AS n FROM analyzed')).rows, [[201]]);
+                await assert.rejects(consoleEngine.executeReadQuery(spellings[0]), /readonly database/);
+                assert.strictEqual(await scalar('PRAGMA query_only'), 0);
+                assert.strictEqual(await scalar("SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'"), 0);
+            } finally {
+                consoleBundle?.workerMethods[Symbol.dispose]();
+                fs.chmodSync(consolePath, 0o644);
             }
         });
 
@@ -2591,7 +2757,7 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
 
             // NONE-affinity sort column: int64 anchor values beyond 2^53
             // travel as decimal strings across the native IPC and must seek
-            // exactly through CAST(? AS INTEGER) in both directions.
+            // exactly through +CAST(? AS INTEGER) in both directions.
             await engine.executeQuery(
                 'CREATE TABLE native_keyset_none_affinity (x, v TEXT); ' +
                 'INSERT INTO native_keyset_none_affinity(x, v) VALUES ' +
@@ -2626,6 +2792,450 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 noneOptions(0, { mode: 'before', anchor: nonePage1.keysetAnchors.first })
             );
             assert.deepStrictEqual(nonePrev.rows, nonePage0.rows);
+        });
+
+        await testContext.test('keeps native int64 INTEGER keys apart from numeric-looking TEXT', async () => {
+            // Native rows carry an INTEGER past 2^53 as a BigInt, so its seek
+            // anchor and row identity bind through an INTEGER cast. In a
+            // typeless column TEXT '9007199254740994' is not that number:
+            // ORDER BY puts every TEXT after every INTEGER, and TEXT
+            // '9007199254740993' is a different key from INTEGER 9007199254740993.
+            await engine.executeQuery(
+                'CREATE TABLE native_keyset_mixed (x, v TEXT); ' +
+                'INSERT INTO native_keyset_mixed(x, v) VALUES ' +
+                "(9007199254740993, 'i3'), ('9007199254740994', 't4'), (9007199254740995, 'i5'), " +
+                "('9007199254740996', 't6'), (9007199254740997, 'i7'), ('9007199254740998', 't8'), " +
+                "(9007199254740999, 'i9'), ('1', 't1'); " +
+                'CREATE TABLE native_twin_keys (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+                'INSERT INTO native_twin_keys VALUES ' +
+                "(9007199254740993, 'integer'), ('9007199254740993', 'text')"
+            );
+            for (const orderDir of ['ASC', 'DESC'] as const) {
+                const options = (pageIndex: number, keyset: TableQueryOptions['keyset']) => ({
+                    columns: ['rowid', 'x', 'v'],
+                    orderBy: 'x',
+                    orderDir,
+                    limit: 3,
+                    offset: pageIndex * 3,
+                    keyset
+                });
+                const labels = (pages: Awaited<ReturnType<typeof engine.fetchTableData>>[]) =>
+                    pages.flatMap(page => page.rows.map(row => row[2]));
+                const oracle = (await engine.executeQuery(
+                    `SELECT v FROM native_keyset_mixed ORDER BY x ${orderDir}, rowid ${orderDir}`
+                ))[0].rows.map(row => row[0]);
+
+                const forward = [
+                    await engine.fetchTableData('native_keyset_mixed', options(0, { mode: 'first' }))
+                ];
+                for (let index = 1; index < 3; index++) {
+                    const anchor = forward[index - 1].keysetAnchors?.last;
+                    assert.ok(anchor, `${orderDir}: missing last anchor on page ${index - 1}`);
+                    forward.push(await engine.fetchTableData(
+                        'native_keyset_mixed',
+                        options(index, { mode: 'after', anchor })
+                    ));
+                }
+                assert.deepStrictEqual(labels(forward), oracle, `${orderDir}: Next walk`);
+
+                const backward = [await engine.fetchTableData(
+                    'native_keyset_mixed',
+                    options(2, { mode: 'last', lastPageRowCount: 2 })
+                )];
+                for (let index = 1; index >= 0; index--) {
+                    const anchor = backward[0].keysetAnchors?.first;
+                    assert.ok(anchor, `${orderDir}: missing first anchor on page ${index + 1}`);
+                    backward.unshift(await engine.fetchTableData(
+                        'native_keyset_mixed',
+                        options(index, { mode: 'before', anchor })
+                    ));
+                }
+                assert.deepStrictEqual(labels(backward), oracle, `${orderDir}: Prev walk`);
+            }
+
+            const twinPage = await engine.fetchTableData('native_twin_keys', {
+                columns: ['rowid', 'k', 'v'],
+                limit: 10,
+                offset: 0
+            });
+            const integerTwin = twinPage.rows.find(row => row[2] === 'integer')?.[0] as string;
+            // The identity must carry the INTEGER class, which is what makes
+            // its binds take the cast.
+            assert.match(decodeURIComponent(integerTwin), /\["integer","9007199254740993"\]/);
+            assert.deepStrictEqual(
+                await engine.getCellMetadata({ table: 'native_twin_keys', rowId: integerTwin, column: 'v' }),
+                { storageClass: 'text', byteLength: 7, textEncoding: 'utf-8' }
+            );
+            await engine.updateCell('native_twin_keys', integerTwin, 'v', 'integer-edited');
+            const chunks: string[] = [];
+            await streamTableExport(
+                engine,
+                'native_twin_keys',
+                ['v'],
+                { format: 'csv', rowIds: [integerTwin] },
+                { write: async chunk => { chunks.push(chunk); } }
+            );
+            assert.strictEqual(chunks.join(''), 'v\ninteger-edited');
+            assert.deepStrictEqual(
+                (await engine.executeQuery(
+                    'SELECT typeof(k), CAST(k AS TEXT), v FROM native_twin_keys ORDER BY k'
+                ))[0].rows,
+                [['integer', '9007199254740993', 'integer-edited'], ['text', '9007199254740993', 'text']]
+            );
+        });
+
+        await testContext.test('keeps native multi-row INTEGER identities off a TEXT twin in a column later declared TEXT', async () => {
+            // Native carries an INTEGER past 2^53 as an INTEGER-class identity.
+            // In a column declared TEXT each identity must name only its own row.
+            const craftedPath = path.join(testDir, 'native-redeclared-int64.sqlite');
+            await writeRedeclaredDatabase(
+                craftedPath,
+                'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+                "INSERT INTO crafted VALUES (9007199254740993, 'integer'), ('9007199254740993', 'text'), ('2', 'other'); " +
+                'CREATE TABLE crafted_pair (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+                'INSERT INTO crafted_pair VALUES ' +
+                "(9007199254740993, 'x', 'integer'), ('9007199254740993', 'x', 'text'), ('2', 'x', 'other')",
+                [
+                    ['crafted', 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID'],
+                    ['crafted_pair', 'CREATE TABLE crafted_pair (a TEXT, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID']
+                ]
+            );
+            let craftedBundle:
+                | Awaited<ReturnType<typeof createNativeDatabaseConnection>>
+                | undefined;
+            try {
+                craftedBundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                const crafted = (await craftedBundle.establishConnection(
+                    vscode.Uri.file(craftedPath),
+                    'native-redeclared-int64.sqlite'
+                )).databaseOps;
+                for (const [table, columns] of [['crafted', ['k', 'v']], ['crafted_pair', ['a', 'b', 'v']]] as const) {
+                    const stored = async () => (await crafted.executeQuery(
+                        `SELECT typeof(${columns[0]}), v FROM ${table} ORDER BY v`
+                    ))[0].rows;
+                    const before = await stored();
+                    assert.deepStrictEqual(before, [['integer', 'integer'], ['text', 'other'], ['text', 'text']]);
+                    const page = await crafted.fetchTableData(table, {
+                        columns: ['rowid', ...columns],
+                        limit: 10,
+                        offset: 0
+                    });
+                    const identityOf = (label: string) => page.rows.find(row => row[columns.length] === label)![0] as string;
+                    const integerKey = identityOf('integer');
+                    assert.match(decodeURIComponent(integerKey), /\["integer","9007199254740993"\]/);
+                    const chunks: string[] = [];
+                    await streamTableExport(
+                        crafted,
+                        table,
+                        ['v'],
+                        { format: 'csv', rowIds: [integerKey] },
+                        { write: async chunk => { chunks.push(chunk); } }
+                    );
+                    assert.strictEqual(chunks.join(''), 'v');
+                    await assert.rejects(() => crafted.deleteRows(table, [integerKey]));
+                    await assert.rejects(() => crafted.deleteRows(table, [integerKey, identityOf('other')]));
+                    assert.deepStrictEqual(await stored(), before);
+                }
+            } finally {
+                craftedBundle?.workerMethods[Symbol.dispose]();
+            }
+        });
+
+        await testContext.test('keeps native number identities off a TEXT twin in a column later declared TEXT', async () => {
+            // Native reports an INTEGER up to 2^53 as a number, so its identity
+            // has the REAL class and binds as a number. In a column declared
+            // TEXT each identity must name only its own row.
+            const craftedPath = path.join(testDir, 'native-redeclared-number.sqlite');
+            await writeRedeclaredDatabase(
+                craftedPath,
+                'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+                "INSERT INTO crafted VALUES (1, 'integer'), ('1', 'text'), ('2', 'other'); " +
+                'CREATE TABLE crafted_pair (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+                "INSERT INTO crafted_pair VALUES (1, 5, 'integer'), ('1', 5, 'text'), ('2', 5, 'other'); " +
+                "CREATE TABLE text_key (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; INSERT INTO text_key VALUES ('x', 'row')",
+                [
+                    ['crafted', 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID'],
+                    ['crafted_pair', 'CREATE TABLE crafted_pair (a TEXT, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID']
+                ]
+            );
+            let craftedBundle:
+                | Awaited<ReturnType<typeof createNativeDatabaseConnection>>
+                | undefined;
+            try {
+                craftedBundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                const crafted = (await craftedBundle.establishConnection(
+                    vscode.Uri.file(craftedPath),
+                    'native-redeclared-number.sqlite'
+                )).databaseOps;
+                for (const [table, columns] of [['crafted', ['k', 'v']], ['crafted_pair', ['a', 'b', 'v']]] as const) {
+                    const stored = async () => (await crafted.executeQuery(
+                        `SELECT typeof(${columns[0]}), v FROM ${table} ORDER BY v`
+                    ))[0].rows;
+                    const before = await stored();
+                    assert.deepStrictEqual(before, [['integer', 'integer'], ['text', 'other'], ['text', 'text']]);
+                    const page = await crafted.fetchTableData(table, {
+                        columns: ['rowid', ...columns],
+                        limit: 10,
+                        offset: 0
+                    });
+                    const identityOf = (label: string) => page.rows.find(row => row[columns.length] === label)![0] as string;
+                    const integerKey = identityOf('integer');
+                    assert.match(decodeURIComponent(integerKey), new RegExp(`\\["${columns[0]}",\\["real",1\\]\\]`));
+                    await assert.rejects(() => crafted.getCellMetadata({ table, rowId: integerKey, column: 'v' }));
+                    await assert.rejects(() => crafted.updateCell(table, integerKey, 'v', 'edited'));
+                    await assert.rejects(() => crafted.updateCellBatch(table, [
+                        { rowId: integerKey, column: 'v', value: 'edited' }
+                    ]));
+                    await assert.rejects(() => crafted.deleteRows(table, [integerKey]));
+                    await assert.rejects(() => crafted.deleteRows(table, [integerKey, identityOf('other')]));
+                    const chunks: string[] = [];
+                    await streamTableExport(
+                        crafted,
+                        table,
+                        ['v'],
+                        { format: 'csv', rowIds: [integerKey] },
+                        { write: async chunk => { chunks.push(chunk); } }
+                    );
+                    assert.strictEqual(chunks.join(''), 'v');
+                    assert.deepStrictEqual(await stored(), before);
+                }
+
+                // The identity re-read after a key edit carries the class of
+                // the value written, which the column's affinity changed.
+                const textKeyPage = await crafted.fetchTableData('text_key', {
+                    columns: ['rowid', 'k', 'v'],
+                    limit: 10,
+                    offset: 0
+                });
+                const edited = await crafted.updateCell('text_key', textKeyPage.rows[0][0] as string, 'k', 5);
+                assert.match(decodeURIComponent(String(edited)), /\["text","5"\]/);
+                assert.deepStrictEqual(
+                    (await crafted.executeQuery('SELECT typeof(k), k, v FROM text_key'))[0].rows,
+                    [['text', '5', 'row']]
+                );
+            } finally {
+                craftedBundle?.workerMethods[Symbol.dispose]();
+            }
+        });
+
+        await testContext.test('keeps native TEXT identities off a numeric twin and refuses a delete that does not match one row per identity', async () => {
+            // A TEXT identity binds as text, which a column declared INTEGER
+            // compares as a number; and a key declared COLLATE NOCASE over rows
+            // stored under BINARY holds 'A' and 'a'. Each identity must match
+            // exactly one row, its own.
+            const craftedPath = path.join(testDir, 'native-redeclared-text.sqlite');
+            await writeRedeclaredDatabase(
+                craftedPath,
+                'CREATE TABLE crafted_int (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+                "INSERT INTO crafted_int VALUES (1, 'number'), ('1', 'text'), (2, 'other'); " +
+                'CREATE TABLE crafted_pair (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+                "INSERT INTO crafted_pair VALUES (1, 'x', 'number'), ('1', 'x', 'text'), (2, 'x', 'other'); " +
+                'CREATE TABLE folded (a TEXT, v TEXT, PRIMARY KEY (a)) WITHOUT ROWID; ' +
+                "INSERT INTO folded VALUES ('A', 'upper'), ('a', 'lower'), ('c', 'other')",
+                [
+                    ['crafted_int', 'CREATE TABLE crafted_int (k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID'],
+                    ['crafted_pair', 'CREATE TABLE crafted_pair (a INTEGER, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID'],
+                    ['folded', 'CREATE TABLE folded (a TEXT, v TEXT, PRIMARY KEY (a COLLATE NOCASE)) WITHOUT ROWID']
+                ]
+            );
+            let craftedBundle:
+                | Awaited<ReturnType<typeof createNativeDatabaseConnection>>
+                | undefined;
+            try {
+                craftedBundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+                const crafted = (await craftedBundle.establishConnection(
+                    vscode.Uri.file(craftedPath),
+                    'native-redeclared-text.sqlite'
+                )).databaseOps;
+                for (const [table, columns] of [['crafted_int', ['k', 'v']], ['crafted_pair', ['a', 'b', 'v']]] as const) {
+                    const stored = async () => (await crafted.executeQuery(
+                        `SELECT typeof(${columns[0]}), v FROM ${table} ORDER BY v`
+                    ))[0].rows;
+                    const before = await stored();
+                    assert.deepStrictEqual(before, [['integer', 'number'], ['integer', 'other'], ['text', 'text']]);
+                    const page = await crafted.fetchTableData(table, {
+                        columns: ['rowid', ...columns],
+                        limit: 10,
+                        offset: 0
+                    });
+                    const textKey = page.rows.find(row => row[columns.length] === 'text')![0] as string;
+                    assert.match(decodeURIComponent(textKey), /\["text","1"\]/);
+                    await assert.rejects(() => crafted.updateCell(table, textKey, 'v', 'edited'));
+                    await assert.rejects(() => crafted.updateCellBatch(table, [
+                        { rowId: textKey, column: 'v', value: 'edited' }
+                    ]));
+                    await assert.rejects(() => crafted.getCellMetadata({ table, rowId: textKey, column: 'v' }));
+                    await assert.rejects(() => crafted.deleteRows(table, [textKey]));
+                    const chunks: string[] = [];
+                    await streamTableExport(
+                        crafted,
+                        table,
+                        ['v'],
+                        { format: 'csv', rowIds: [textKey] },
+                        { write: async chunk => { chunks.push(chunk); } }
+                    );
+                    assert.strictEqual(chunks.join(''), 'v');
+                    assert.deepStrictEqual(await stored(), before);
+                }
+
+                const folded = async () => (await crafted.executeQuery('SELECT a, v FROM folded ORDER BY v'))[0].rows;
+                const foldedBefore = await folded();
+                const page = await crafted.fetchTableData('folded', { columns: ['rowid', 'a', 'v'], limit: 10, offset: 0 });
+                const lower = page.rows.find(row => row[2] === 'lower')![0] as string;
+                const missing = lower.replace(encodeURIComponent('["text","a"]'), encodeURIComponent('["integer","5"]'));
+                assert.notStrictEqual(missing, lower);
+                await assert.rejects(() => crafted.deleteRows('folded', [lower, missing]));
+                assert.deepStrictEqual(await folded(), foldedBefore);
+                await assert.rejects(() => crafted.deleteRows('folded', [lower]));
+                assert.deepStrictEqual(await folded(), foldedBefore);
+            } finally {
+                craftedBundle?.workerMethods[Symbol.dispose]();
+            }
+        });
+
+        await testContext.test('edits, exports, deletes and restores native TEXT keys under the TEXT storage check', async () => {
+            await engine.executeQuery(
+                "CREATE TABLE native_text_keys (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; " +
+                "INSERT INTO native_text_keys VALUES ('1', 'text'), ('b', 'other'); " +
+                'CREATE TABLE native_typeless_text_keys (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+                "INSERT INTO native_typeless_text_keys VALUES ('1', 'text'), (1, 'integer'), ('b', 'other')"
+            );
+            for (const table of ['native_text_keys', 'native_typeless_text_keys']) {
+                const rows = async () => (await engine.executeQuery(
+                    `SELECT typeof(k), CAST(k AS TEXT), v FROM ${table} ORDER BY v`
+                ))[0].rows;
+                const before = await rows();
+                const page = await engine.fetchTableData(table, { columns: ['rowid', 'k', 'v'], limit: 10, offset: 0 });
+                const textKey = page.rows.find(row => row[2] === 'text')![0] as string;
+                assert.match(decodeURIComponent(textKey), /\["text","1"\]/);
+                assert.deepStrictEqual(
+                    await engine.getCellMetadata({ table, rowId: textKey, column: 'v' }),
+                    { storageClass: 'text', byteLength: 4, textEncoding: 'utf-8' }
+                );
+                const chunks: string[] = [];
+                await streamTableExport(
+                    engine,
+                    table,
+                    ['v'],
+                    { format: 'csv', rowIds: [textKey] },
+                    { write: async chunk => { chunks.push(chunk); } }
+                );
+                assert.strictEqual(chunks.join(''), 'v\ntext');
+                const affectedCells = await engine.updateCellBatch(table, [
+                    { rowId: textKey, column: 'v', value: 'text-edited' }
+                ]);
+                assert.ok((await rows()).some(row => row[2] === 'text-edited'));
+                await engine.undoModification({
+                    description: 'Undo the native TEXT key edit',
+                    modificationType: 'cell_update',
+                    targetTable: table,
+                    affectedCells
+                });
+                assert.deepStrictEqual(await rows(), before);
+                const deletedRows = await engine.deleteRows(table, [textKey]);
+                assert.strictEqual(deletedRows.length, 1);
+                assert.deepStrictEqual(await rows(), before.filter(row => row[2] !== 'text'));
+                await engine.undoModification({
+                    description: 'Restore the native TEXT key row',
+                    modificationType: 'row_delete',
+                    targetTable: table,
+                    deletedRows
+                });
+                assert.deepStrictEqual(await rows(), before);
+            }
+        });
+
+        await testContext.test('addresses and pages a native key whose collation is stricter than its column', async () => {
+            // 'A' and 'a' are distinct keys under the key's BINARY collation and
+            // equal under the column's NOCASE. Each identity must name one row,
+            // and a page turn must show both.
+            await engine.executeQuery(
+                'CREATE TABLE native_cased (a TEXT COLLATE NOCASE, g INTEGER, v TEXT, PRIMARY KEY (a COLLATE BINARY)) WITHOUT ROWID; ' +
+                "INSERT INTO native_cased VALUES ('A', 1, 'A'), ('a', 1, 'a'), ('B', 2, 'B'), ('b', 1, 'b'), " +
+                "('c', 2, 'c'), ('C', 2, 'C'), ('d', 1, 'd')"
+            );
+            const stored = async () => (await engine.executeQuery(
+                'SELECT v FROM native_cased ORDER BY a COLLATE BINARY'
+            ))[0].rows.map(row => row[0]);
+            const before = await stored();
+
+            for (const [sort, oracleOrder] of [
+                [{}, 'a COLLATE BINARY ASC'],
+                [{ orderBy: 'a', orderDir: 'DESC' as const }, 'a COLLATE BINARY DESC'],
+                [{ orderBy: 'g', orderDir: 'ASC' as const }, 'g ASC, a COLLATE BINARY ASC']
+            ] as const) {
+                const oracle = (await engine.executeQuery(
+                    `SELECT v FROM native_cased ORDER BY ${oracleOrder}`
+                ))[0].rows.map(row => row[0]);
+                const options = (page: number, keyset?: TableQueryOptions['keyset']) => ({
+                    columns: ['rowid', 'a', 'g', 'v'],
+                    ...sort,
+                    limit: 1,
+                    offset: page,
+                    ...(keyset ? { keyset } : {})
+                });
+                const forward: unknown[] = [];
+                let anchor: string | undefined;
+                for (let page = 0; page < oracle.length; page++) {
+                    const result = await engine.fetchTableData('native_cased', options(
+                        page,
+                        page === 0 ? { mode: 'first' } : { mode: 'after', anchor: anchor! }
+                    ));
+                    forward.push(...result.rows.map(row => row[3]));
+                    anchor = result.keysetAnchors?.last;
+                    assert.ok(anchor, `${oracleOrder}: anchor on page ${page}`);
+                }
+                assert.deepStrictEqual(forward, oracle, `${oracleOrder}: Next walk`);
+                const backward: unknown[] = [];
+                for (let page = oracle.length - 1; page >= 0; page--) {
+                    const result = await engine.fetchTableData('native_cased', options(
+                        page,
+                        page === oracle.length - 1
+                            ? { mode: 'last', lastPageRowCount: 1 }
+                            : { mode: 'before', anchor: anchor! }
+                    ));
+                    backward.unshift(...result.rows.map(row => row[3]));
+                    anchor = result.keysetAnchors?.first;
+                }
+                assert.deepStrictEqual(backward, oracle, `${oracleOrder}: Prev walk`);
+                const offsetPages: unknown[] = [];
+                for (let page = 0; page < oracle.length; page++) {
+                    offsetPages.push(...(await engine.fetchTableData('native_cased', options(page))).rows.map(row => row[3]));
+                }
+                assert.deepStrictEqual(offsetPages, oracle, `${oracleOrder}: OFFSET pages`);
+            }
+
+            const page = await engine.fetchTableData('native_cased', {
+                columns: ['rowid', 'a', 'g', 'v'],
+                limit: 10,
+                offset: 0
+            });
+            const lower = page.rows.find(row => row[3] === 'a')![0] as string;
+            const missing = lower.replace(encodeURIComponent('["text","a"]'), encodeURIComponent('["text","zz"]'));
+            assert.notStrictEqual(missing, lower);
+            await assert.rejects(() => engine.deleteRows('native_cased', [lower, missing]));
+            assert.deepStrictEqual(await stored(), before);
+            assert.deepStrictEqual(
+                await engine.getCellMetadata({ table: 'native_cased', rowId: lower, column: 'v' }),
+                { storageClass: 'text', byteLength: 1, textEncoding: 'utf-8' }
+            );
+            const chunks: string[] = [];
+            await streamTableExport(
+                engine,
+                'native_cased',
+                ['v'],
+                { format: 'csv', rowIds: [lower] },
+                { write: async chunk => { chunks.push(chunk); } }
+            );
+            assert.strictEqual(chunks.join(''), 'v\na');
+            await engine.updateCell('native_cased', lower, 'v', 'a-edited');
+            await engine.updateCellBatch('native_cased', [{ rowId: lower, column: 'g', value: 9 }]);
+            assert.deepStrictEqual(
+                (await engine.executeQuery("SELECT a, g, v FROM native_cased WHERE a IN ('A', 'a') ORDER BY a COLLATE BINARY"))[0].rows,
+                [['A', 1, 'A'], ['a', 9, 'a-edited']]
+            );
+            assert.strictEqual((await engine.deleteRows('native_cased', [lower])).length, 1);
+            assert.deepStrictEqual(await stored(), before.filter(value => value !== 'a'));
         });
 
         await testContext.test('edits and replays a WITHOUT ROWID primary-key identity', async () => {
@@ -3588,6 +4198,15 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
                 (await engine.executeQuery(
                     'SELECT id, value FROM native_pragma_shadow_target ORDER BY id'
                 ))[0].rows,
+                [[1, 'before'], [2, 'after']]
+            );
+
+            // The SQL console names a query's columns from table_info of a
+            // TEMP view, which must be SQLite's own table here as well.
+            assert.deepStrictEqual(
+                (await engine.executeReadQuery(
+                    'SELECT id, value FROM native_pragma_shadow_target ORDER BY id'
+                )).rows,
                 [[1, 'before'], [2, 'after']]
             );
         });

@@ -24,6 +24,22 @@ async function assertTriggerPresence(ops: DatabaseOperations) {
     assert.strictEqual(await hasTriggers(), true);
     await ops.executeQuery('DROP TRIGGER temp.temp_trigger');
     assert.strictEqual(await hasTriggers(), false);
+
+    // A virtual table writes its own shadow tables on UPDATE with no trigger:
+    // each FTS5 update adds a row to its _data table, so that count changes.
+    await ops.executeQuery("CREATE VIRTUAL TABLE docs USING fts5(body)");
+    await ops.executeQuery("INSERT INTO docs(rowid, body) VALUES (1, 'first words')");
+    const shadowRows = async () => Number((await ops.executeQuery('SELECT count(*) FROM docs_data'))[0].rows[0][0]);
+    const before = await shadowRows();
+    await ops.executeQuery("UPDATE docs SET body = 'other words' WHERE rowid = 1");
+    assert.notStrictEqual(await shadowRows(), before, 'the FTS5 update changed a shadow table row count');
+    assert.strictEqual(await hasTriggers(), true);
+    await ops.executeQuery('DROP TABLE docs');
+    assert.strictEqual(await hasTriggers(), false);
+    await ops.executeQuery("CREATE VIRTUAL TABLE temp.temp_docs USING fts5(body)");
+    assert.strictEqual(await hasTriggers(), true);
+    await ops.executeQuery('DROP TABLE temp.temp_docs');
+    assert.strictEqual(await hasTriggers(), false);
 }
 
 describe('schema trigger presence', () => {

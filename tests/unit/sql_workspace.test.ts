@@ -4,9 +4,24 @@ import assert from 'node:assert/strict';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { parseQueryParameters, prepareReadQuery, SQL_RESULT_ROWS } from '../../src/core/sql-workspace';
 
+it('reads column labels for a parameter that touches a keyword', async () => {
+  assert.match(prepareReadQuery('SELECT 7 AS n WHERE 1=?AND 1 LIMIT?').metadataSql, /1=NULL AND 1 LIMIT NULL/);
+  // A parameter that stands alone keeps its label text.
+  assert.match(prepareReadQuery('SELECT ?, (?)').metadataSql, /SELECT NULL, \(NULL\)/);
+  const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+  try {
+    const result = await engine.executeReadQuery('SELECT 7 AS n WHERE 1=?AND 1 LIMIT?', [1, 5]);
+    assert.deepEqual(result.headers, ['n']);
+    assert.deepEqual(result.rows, [[7]]);
+  } finally {
+    engine.shutdown();
+  }
+});
+
 it('binds typed parameters without rounding integers', () => {
-    assert.deepEqual(parseQueryParameters('[null,"text",1,1.5]'), [null, 'text', 1, 1.5]);
-    assert.throws(() => parseQueryParameters('[9007199254740993]'), /safe integer/);
+    assert.deepEqual(parseQueryParameters('[null,"text",1,1.5]'), [null, 'text', 1n, 1.5]);
+    assert.deepEqual(parseQueryParameters('[9007199254740993, "9", 1.0, -0, 2E2]'), [9007199254740993n, '9', 1, 0n, 200]);
+    assert.throws(() => parseQueryParameters('[9223372036854775808]'), /64-bit/);
     assert.throws(() => parseQueryParameters('[true]'), /null, string/);
     assert.deepEqual(prepareReadQuery("SELECT '?' AS literal, ?1 AS value; -- end").parameterCount, 1);
     assert.equal(prepareReadQuery('SELECT account$id FROM accounts').parameterCount, 0);
@@ -113,6 +128,102 @@ it('enforces the configured query timeout in WASM', async () => {
         await assert.rejects(operations.executeReadQuery('WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000) SELECT sum(x) FROM n'), /timed out/i);
         assert.deepEqual((await operations.executeReadQuery('SELECT 1 AS value')).rows, [[1]]);
     } finally { (operations as WasmDatabaseEngine).shutdown(); }
+});
+
+// SELECTs that write when stepped. The console steps every read under query_only.
+const WRITING_READS = [
+    'SELECT * FROM pragma_optimize(0x10002)',
+    'SELECT * FROM "pragma_optimize"(0x10002)',
+    'SELECT * FROM [pragma_optimize](0x10002)',
+    'SELECT * FROM `pragma_optimize`(0x10002)',
+    'SELECT * FROM main.pragma_optimize(0x10002)',
+    'SELECT * FROM "MAIN"."Pragma_Optimize"(0x10002)',
+    'SELECT * FROM PrAgMa_OpTiMiZe',
+    'WITH t AS MATERIALIZED (SELECT * FROM pragma_optimize(0x10002)) SELECT count(*) AS n FROM t',
+    'SELECT (SELECT count(*) FROM pragma_optimize(0x10002)) AS n',
+    'SELECT optimize(docs) AS merged FROM docs LIMIT 1'
+];
+
+async function seedWritingReads(db: DatabaseOperations) {
+    await db.executeQuery('CREATE TABLE analyzed (id INTEGER PRIMARY KEY, label TEXT)');
+    await db.executeQuery('CREATE INDEX analyzed_label ON analyzed(label)');
+    await db.executeQuery("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 200) INSERT INTO analyzed(label) SELECT 'label' || (x % 7) FROM n");
+    await db.executeQuery('CREATE VIRTUAL TABLE docs USING fts4(body)');
+    // One segment per statement, so optimize() has segments to merge.
+    for (const body of ['one', 'two', 'three']) await db.executeQuery('INSERT INTO docs VALUES (?)', [body]);
+}
+
+async function writingReadOutcomes(db: DatabaseOperations, image: () => Promise<Uint8Array>) {
+    const outcomes = [];
+    for (const sql of WRITING_READS) {
+        const before = Buffer.from(await image());
+        const error = await db.executeReadQuery(sql).then(() => '', (e: unknown) => e instanceof Error ? e.message : String(e));
+        const changed = !before.equals(Buffer.from(await image()));
+        const stat1 = (await db.executeQuery("SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'"))[0].rows[0][0];
+        // Judge every spelling against an unanalyzed database.
+        if (stat1) await db.executeQuery('DROP TABLE sqlite_stat1');
+        outcomes.push({ sql, refused: /readonly database/.test(error), stat1, changed });
+    }
+    return outcomes;
+}
+
+const refusedWithoutChange = () => WRITING_READS.map(sql => ({ sql, refused: true, stat1: 0, changed: false }));
+
+it('steps console reads under query_only on WASM and restores the connection afterwards', async () => {
+    const { operations } = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+    assert.ok(operations);
+    const queryOnly = async (db: DatabaseOperations) => (await db.executeQuery('PRAGMA query_only'))[0].rows[0][0];
+    try {
+        await seedWritingReads(operations);
+        assert.deepEqual(await writingReadOutcomes(operations, () => operations.serializeDatabase()), refusedWithoutChange());
+        assert.equal(await queryOnly(operations), 0, 'a refused statement must not leave the connection read-only');
+        const plan = await operations.executeReadQuery('SELECT * FROM pragma_optimize(0x10002)', [], true);
+        assert.ok(plan.rows.length, 'Explain compiles the statement without stepping it');
+        assert.equal((await operations.executeQuery("SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'"))[0].rows[0][0], 0);
+
+        // Unsaved edits, TEMP objects, CTEs and reading table-valued pragmas stay readable.
+        await operations.executeQuery("INSERT INTO analyzed(label) VALUES ('unsaved')");
+        await operations.executeQuery('CREATE TEMP TABLE session_note (note TEXT)');
+        await operations.executeQuery("INSERT INTO session_note VALUES ('temporary')");
+        assert.deepEqual((await operations.executeReadQuery("SELECT count(*) AS n FROM analyzed WHERE label = 'unsaved'")).rows, [[1]]);
+        assert.deepEqual((await operations.executeReadQuery('SELECT note FROM temp.session_note')).rows, [['temporary']]);
+        assert.deepEqual((await operations.executeReadQuery("SELECT name FROM pragma_table_info('analyzed') ORDER BY cid")).rows, [['id'], ['label']]);
+        assert.deepEqual((await operations.executeReadQuery("WITH c AS (SELECT label FROM analyzed WHERE label = 'unsaved') SELECT count(*) AS n FROM c")).rows, [[1]]);
+        assert.deepEqual((await operations.executeReadQuery('SELECT query_only FROM pragma_query_only')).rows, [[1]], 'the statement steps under query_only');
+        assert.equal(await queryOnly(operations), 0);
+
+        // The previous state returns after a failing step and a cancellation mid-statement.
+        await assert.rejects(operations.executeReadQuery('SELECT abs(-9223372036854775807 - 1) AS value'), /integer overflow/);
+        assert.equal(await queryOnly(operations), 0);
+        let polls = 0;
+        const lateCancellation = {
+            // The metadata step polls a handful of times; the long CTE polls thousands.
+            get aborted() { return ++polls > 20; },
+            throwIfAborted() { if (polls > 20) { const error = new Error('cancelled'); error.name = 'AbortError'; throw error; } }
+        } as unknown as AbortSignal;
+        await assert.rejects(operations.executeReadQuery('WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n', [], false, lateCancellation), { name: 'AbortError' });
+        assert.ok(polls > 20, 'cancellation arrived while the statement was stepping');
+        assert.equal(await queryOnly(operations), 0);
+        await operations.executeQuery("INSERT INTO analyzed(label) VALUES ('written after the console')");
+        assert.deepEqual((await operations.executeQuery("SELECT count(*) FROM analyzed WHERE label IN ('unsaved', 'written after the console')"))[0].rows, [[2]]);
+
+        // A connection that was already query_only stays so.
+        const readonly = await createDatabaseEngine({ content: await operations.serializeDatabase(), maxSize: 0, readOnlyMode: true });
+        try {
+            await assert.rejects(readonly.operations!.executeReadQuery(WRITING_READS[0]), /readonly database/);
+            assert.deepEqual((await readonly.operations!.executeReadQuery('SELECT count(*) AS n FROM analyzed')).rows, [[202]]);
+            assert.equal(await queryOnly(readonly.operations!), 1);
+            assert.equal((await readonly.operations!.executeQuery("SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'"))[0].rows[0][0], 0);
+        } finally { (readonly.operations as WasmDatabaseEngine).shutdown(); }
+    } finally { (operations as WasmDatabaseEngine).shutdown(); }
+
+    // Long enough for the metadata step, so the deadline expires while the statement steps.
+    const timed = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false, queryTimeout: 50 });
+    assert.ok(timed.operations);
+    try {
+        await assert.rejects(timed.operations.executeReadQuery('WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n'), /timed out/i);
+        assert.equal(await queryOnly(timed.operations), 0, 'a timeout must not leave the connection read-only');
+    } finally { (timed.operations as WasmDatabaseEngine).shutdown(); }
 });
 
 it('keeps native read queries usable on a read-only main database', async () => {

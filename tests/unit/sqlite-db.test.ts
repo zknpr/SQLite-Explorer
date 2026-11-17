@@ -382,6 +382,8 @@ describe('WasmDatabaseEngine', () => {
       // Mock the WASM Database instance
       const mockDb = {
         progress_handler: () => {},
+        // The engine reads and sets PRAGMA query_only around a SELECT.
+        exec: () => [],
         iterateStatements: (sql: string) => {
           return [{
             bind: () => {},

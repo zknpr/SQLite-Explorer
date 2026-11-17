@@ -67,6 +67,10 @@ export const ROWID_ALIAS_COLUMN_SQL =
  * Native files can receive external schema commits between RPCs, so callers
  * must not combine a separate table_xinfo read with ROWID_ALIAS_COLUMN_SQL.
  * Binds the main-schema relation name once.
+ *
+ * A WITHOUT ROWID key column also reports the collation its primary key
+ * compares it with, which can differ from the column's own: rows are distinct
+ * under the key's collation, so identities must compare and order with it.
  */
 export const TABLE_XINFO_WITH_ROWID_ALIAS_SQL =
   `SELECT info."cid", info."name", info."type", info."notnull", ` +
@@ -76,7 +80,12 @@ export const TABLE_XINFO_WITH_ROWID_ALIAS_SQL =
   `AND (SELECT count(*) FROM pragma.pragma_table_info(target."name", 'main') ` +
   `WHERE "pk" > 0) = 1 ` +
   `AND NOT EXISTS (SELECT 1 FROM pragma.pragma_index_list(target."name", 'main') ` +
-  `WHERE "origin" = 'pk') THEN 1 ELSE 0 END AS is_rowid_alias ` +
+  `WHERE "origin" = 'pk') THEN 1 ELSE 0 END AS is_rowid_alias, ` +
+  `CASE WHEN target."wr" = 1 AND info."pk" > 0 THEN (` +
+  `SELECT key."coll" FROM pragma.pragma_index_list(target."name", 'main') AS pk_index ` +
+  `JOIN pragma.pragma_index_xinfo(pk_index."name", 'main') AS key ` +
+  `WHERE pk_index."origin" = 'pk' AND key."cid" = info."cid" AND key."key" = 1 LIMIT 1` +
+  `) END AS primary_key_collation ` +
   `FROM pragma.pragma_table_list AS target ` +
   `JOIN pragma.pragma_table_xinfo(target."name", 'main') AS info ` +
   `WHERE target."schema" = 'main' AND target."name" = ? ORDER BY info."cid"`;
@@ -389,6 +398,10 @@ export function collectRowIdExactRealTexts(
  * BigInts and REALs whose SQLite text differs from JavaScript's String(value).
  * The protocol field retains its legacy exactIntegerTexts name, but the sparse
  * string sidecar now covers both cases and remains JSON/RPC-safe.
+ *
+ * decodedExactTexts is CellPackDecoder.exactTexts for these rows: its texts
+ * were compared with these REAL values while the pack was decoded, so the map
+ * is taken over as the sidecar, without checking each text again.
  */
 export function normalizeIntegerRowsForTransport(
   sourceRows: readonly (readonly unknown[])[],
@@ -396,7 +409,8 @@ export function normalizeIntegerRowsForTransport(
   transportedExactTexts?: ExactIntegerTextMap,
   exactIntegerIdentityColumn?: number,
   realTextColumnCount = valueColumnCount,
-  packedRealTextColumnCount?: number
+  packedRealTextColumnCount?: number,
+  decodedExactTexts?: ExactIntegerTextMap
 ): { rows: CellValue[][]; exactIntegerTexts?: ExactIntegerTextMap } {
   if (packedRealTextColumnCount !== undefined) {
     if (valueColumnCount === undefined || !Number.isInteger(packedRealTextColumnCount) || packedRealTextColumnCount < 1) {
@@ -411,7 +425,7 @@ export function normalizeIntegerRowsForTransport(
     throw new Error(`Invalid exact numeric text column count: ${realTextColumnCount}`);
   }
   const sidecarColumnCount = packedRealTextColumnCount ?? realTextColumnCount ?? 0;
-  let exactIntegerTexts: ExactIntegerTextMap | undefined;
+  let exactIntegerTexts: ExactIntegerTextMap | undefined = decodedExactTexts;
   const setExactText = (rowIndex: number, columnIndex: number, text: string) => {
     exactIntegerTexts ??= {};
     exactIntegerTexts[rowIndex] ??= {};
@@ -434,7 +448,17 @@ export function normalizeIntegerRowsForTransport(
         )
       : undefined;
 
-    return sourceRow.slice(0, logicalColumnCount).map((value, columnIndex) => {
+    // A loop, not slice().map(): this runs for every cell of every page.
+    // Rows are built by push so they stay packed arrays, which structured
+    // clone (worker to host) copies densely; map() also returned packed rows.
+    const normalizedRow: CellValue[] = [];
+    for (let columnIndex = 0; columnIndex < logicalColumnCount; columnIndex++) {
+      // map() left a hole where the source row has one.
+      if (!(columnIndex in sourceRow)) {
+        normalizedRow.length = columnIndex + 1;
+        continue;
+      }
+      const value = sourceRow[columnIndex];
       let normalizedValue = value as CellValue | bigint;
       if (typeof value === 'bigint') {
         const numericValue = Number(value);
@@ -469,8 +493,9 @@ export function normalizeIntegerRowsForTransport(
           }
         }
       }
-      return normalizedValue as CellValue;
-    });
+      normalizedRow.push(normalizedValue as CellValue);
+    }
+    return normalizedRow;
   });
 
   if (transportedExactTexts) {

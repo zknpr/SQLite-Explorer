@@ -1,0 +1,65 @@
+name: Platform unit tests
+
+# The whole unit suite on the four targets where CI otherwise runs a short
+# list of test files (CI runs the whole suite on Linux x64 only). Tests that
+# fail on one platform alone went unseen until the suite was run there by
+# hand: on Windows a save that replaces a file, for one. The Windows run
+# takes about 25 minutes, so this is not on every push: nightly on dev, on
+# pull requests to main (the release merge), and by hand.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: platform-unit-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-windows
+          - runner: macos-15-intel
+            target: x86_64-macos
+          - runner: macos-15
+            target: aarch64-macos
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-gnu
+    steps:
+      # A scheduled run starts from the default branch; the work is on dev.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build extension, worker & WASM
+        run: node scripts/build.mjs
+
+      # FUZZ_EXPECT_TARGET makes a missing native binary a failure instead of
+      # a skip. The removal statistics show, on Windows, how long tests waited
+      # for a stopped worker to let go of its files.
+      - name: Unit tests
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+          SQLITE_EXPLORER_TEST_RM_STATS: '1'
+        run: npm test

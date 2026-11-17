@@ -7,8 +7,8 @@
  * An already-downloaded artifact can be verified without network access only
  * when its complete pinned provenance is supplied explicitly:
  *   node scripts/refresh-natives.mjs --from /path/to/run-artifacts \
- *     --run 41183550205 --branch master \
- *     --commit e0211b66af5e35521929a5727065f0235ad3f8ce
+ *     --run 43520538528 --branch master \
+ *     --commit 172b8310c5e7304ca72083f12164c95c44eb171f
  */
 
 import { execFileSync } from 'node:child_process';
@@ -20,14 +20,14 @@ import { createPinnedArtifactPolicy } from './lib/pinned-artifacts.mjs';
 
 const REPOSITORY = 'zknpr/txiki.js';
 const SOURCE_BRANCH = 'master';
-const SOURCE_COMMIT = 'e0211b66af5e35521929a5727065f0235ad3f8ce';
-const PINNED_RUN_ID = '41183550205';
+const SOURCE_COMMIT = '172b8310c5e7304ca72083f12164c95c44eb171f';
+const PINNED_RUN_ID = '43520538528';
 const PINNED_SHA256 = Object.freeze({
-  'aarch64-linux-gnu/tjs': '61835be731cc3eaf2ed5040d718f6e52e725a9dd402e59e8bc8b963e8e3364c7',
-  'aarch64-macos/tjs': '9865b1caa4b4580e9179086843630d220e3dad1d61e4f425207dc193c35f59e5',
-  'x86_64-linux-gnu/tjs': '204a177e59e88a781fd54c0b443de0a95c688807bc60b8ff39458a5826b908c6',
-  'x86_64-macos/tjs': '13ea631298d7fa039d39a505d9bbfee4800fcb3673690c11604f07e9ad7cf8ba',
-  'x86_64-windows/tjs.exe': '674dfeb63bf6da94d3ec887ee4da389e9451ef681100738ff5e9ace787fc5175'
+  'aarch64-linux-gnu/tjs': '95d13f5471fd03beb8fd47046f0e428658cf653e51d06757a5e2a20bef620b98',
+  'aarch64-macos/tjs': '90c2e074938be5142193d7419791f924a7a63ade5783ad2f63ad43120b8846b5',
+  'x86_64-linux-gnu/tjs': '870810d42f7e7e02343d0ba1e2c0b49114116d44e77be21c4437ad1e40d1ae29',
+  'x86_64-macos/tjs': 'bd012455821e07d82ad402d92a87f47ffad40b6d148b66a3be62c00c19dd6a1a',
+  'x86_64-windows/tjs.exe': '2c49ab220a6d282a85c413ad14ecc68e3eaaab2f0d3ad6d62b521bdb57f9ed08'
 });
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));

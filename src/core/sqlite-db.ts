@@ -822,8 +822,8 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().openQueryReadSession(sql);
     },
 
-    async readQueryRows(sessionId: string, maxRows: number): Promise<QueryReadChunk> {
-      return requireEngine().readQueryRows(sessionId, maxRows);
+    async readQueryRows(sessionId: string, maxRows: number, maxBytes?: number): Promise<QueryReadChunk> {
+      return requireEngine().readQueryRows(sessionId, maxRows, maxBytes);
     },
 
     async closeQueryReadSession(sessionId: string): Promise<void> {

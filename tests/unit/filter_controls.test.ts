@@ -356,6 +356,49 @@ describe('filter controls', () => {
         }
     });
 
+    it('gives focus back after a debounced load only when the filter still has it or the reload dropped it', async () => {
+        const timers = installTimerHarness();
+        const { globalInput } = installFilterDocument();
+        const state = await prepareState([{ name: 'value', type: 'TEXT' }]);
+        const { backendApi } = await import(apiModulePath);
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async () => ({ rows: [['hit']] });
+        const doc = (globalThis as any).document;
+        const body = { tagName: 'BODY' };
+        doc.body = body;
+        // An inline cell editor opened during the debounce.
+        const editor = { tagName: 'TEXTAREA', classList: createClassList(['cell-input']) };
+        const { onFilterInput } = await import(gridActionsModulePath);
+
+        const typeAndLoad = async (value: string, activeElement: any) => {
+            globalInput.value = value;
+            doc.activeElement = globalInput;
+            onFilterInput({ target: globalInput, isComposing: false });
+            doc.activeElement = activeElement;
+            await timers.run(300);
+            assert.strictEqual(state.filterPendingAction, null);
+        };
+
+        try {
+            await typeAndLoad('a', editor);
+            assert.strictEqual(globalInput.focusCount, 0, 'the editor keeps focus');
+            assert.strictEqual(doc.activeElement, editor);
+
+            await typeAndLoad('ab', body);
+            assert.strictEqual(globalInput.focusCount, 1, 'focus the reload dropped returns to the filter');
+            assert.strictEqual(doc.activeElement, globalInput);
+
+            await typeAndLoad('abc', globalInput);
+            assert.strictEqual(globalInput.focusCount, 2, 'a filter that kept focus keeps it');
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            timers.restore();
+        }
+    });
+
     it('keeps a queued filter when a newer grid reload takes ownership after the legacy retry budget', async () => {
         const timers = installTimerHarness();
         const { globalInput, elements } = installFilterDocument({ globalValue: 'needle' });

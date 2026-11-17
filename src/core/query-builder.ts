@@ -8,6 +8,7 @@ import { getActiveFilterValue } from './filter-utils';
 import {
   assembleKeysetSelect,
   buildRowIdLookupSelect,
+  keyColumnOrderSql,
   ROW_ID_LOOKUP_ROW,
   rowIdLookupApplies,
   type ResolvedKeysetPlan
@@ -100,7 +101,9 @@ export function buildSelectQuery(
     : (orderBy ? [orderBy] : []);
   const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
   const orderSql = orderedColumns.length > 0
-    ? ` ORDER BY ${orderedColumns.map(column => `${escapeIdentifier(column)} ${direction}`).join(', ')}`
+    ? ` ORDER BY ${orderedColumns.map(column => (
+        `${keyColumnOrderSql(column, engine.keyCollations?.get(column))} ${direction}`
+      )).join(', ')}`
     : '';
   let pageSql = '';
   if (limit !== undefined) {
@@ -174,6 +177,12 @@ export interface EngineQueryOptions {
    * every row.
    */
   rowIdLookup?: boolean;
+  /**
+   * The table's WITHOUT ROWID key collations (primaryKeyCollations), which
+   * ORDER BY applies to those columns so a page follows the order its keyset
+   * anchors seek.
+   */
+  keyCollations?: ReadonlyMap<string, string>;
 }
 
 /** Values per sqlite_explorer_like_any call, as for the cell pack. */

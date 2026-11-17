@@ -4,13 +4,40 @@ import assert from 'node:assert';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import { createDatabaseEngine } from '../../src/core/sqlite-db';
-import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
+import {
+    buildRecordIdentitiesPredicate,
+    buildRecordIdentityPredicate,
+    encodePrimaryKeyRecordId
+} from '../../src/core/row-identity';
+import { streamTableExport } from '../../src/tableExporter';
 import type {
     DatabaseOperations,
     ModificationEntry,
     PrimaryKeyColumn,
     RecordId
 } from '../../src/core/types';
+
+/**
+ * A database whose stored values do not follow the declared column types
+ * or collations.
+ */
+async function createRedeclaredEngine(
+    setupSql: string,
+    redeclarations: readonly [table: string, createSql: string][]
+): Promise<DatabaseOperations> {
+    const seed = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations!;
+    await seed.executeQuery(setupSql);
+    await seed.executeQuery('PRAGMA writable_schema = ON');
+    for (const [table, createSql] of redeclarations) {
+        await seed.executeQuery('UPDATE sqlite_schema SET sql = ? WHERE name = ?', [createSql, table]);
+    }
+    await seed.executeQuery('PRAGMA writable_schema = OFF');
+    return (await createDatabaseEngine({
+        content: await seed.serializeDatabase(),
+        maxSize: 0,
+        readOnlyMode: false
+    })).operations!;
+}
 
 describe('WITHOUT ROWID primary-key identity', () => {
     let engine: DatabaseOperations;
@@ -354,7 +381,7 @@ describe('WITHOUT ROWID primary-key identity', () => {
         );
         assert.deepStrictEqual(metadata?.identity, {
             kind: 'primaryKey',
-            columns: [{ identifier: 'key', declaredType: 'TEXT', position: 1 }]
+            columns: [{ identifier: 'key', declaredType: 'TEXT', position: 1, collation: 'BINARY' }]
         });
 
         const page = await engine.fetchTableData('text_identity', {
@@ -693,6 +720,580 @@ describe('WITHOUT ROWID primary-key identity', () => {
             byteLength: 6,
             textEncoding: 'utf-8'
         });
+    });
+
+    it('refuses an INTEGER identity whose column was later declared TEXT, beside its TEXT twin', async () => {
+        // The fixture holds INTEGER 1 and TEXT '1' in a column declared TEXT.
+        // Each identity must name only its own row.
+        const seed = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations!;
+        await seed.executeQuery(
+            'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted VALUES (1, 'integer'), ('1', 'text'), (2, 'other')"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID' " +
+            "WHERE name = 'crafted'"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const crafted = (await createDatabaseEngine({
+            content: await seed.serializeDatabase(),
+            maxSize: 0,
+            readOnlyMode: false
+        })).operations!;
+        const rows = async () => (await crafted.executeQuery('SELECT typeof(k), v FROM crafted'))[0].rows;
+        const stored = [['integer', 'integer'], ['integer', 'other'], ['text', 'text']];
+        assert.deepStrictEqual(await rows(), stored);
+        const page = await crafted.fetchTableData('crafted', { columns: ['rowid', 'k', 'v'], limit: 10, offset: 0 });
+        const integerRow = page.rows.find(row => row[2] === 'integer');
+        assert.ok(integerRow, 'the INTEGER row is on the page');
+        const integerKey = integerRow[0] as RecordId;
+
+        await assert.rejects(() => crafted.updateCell('crafted', integerKey, 'v', 'edited'));
+        await assert.rejects(() => crafted.updateCellBatch('crafted', [{ rowId: integerKey, column: 'v', value: 'edited' }]));
+        await assert.rejects(() => crafted.getCellMetadata({ table: 'crafted', rowId: integerKey, column: 'v' }));
+        assert.deepStrictEqual(await rows(), stored);
+    });
+
+    it('refuses multi-row operations whose INTEGER identity names a row in a column later declared TEXT', async () => {
+        // The fixture of the test above, for the forms that address several
+        // rows at once: the IN list, the row-value IN and the selected-row
+        // export join.
+        const seed = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations!;
+        await seed.executeQuery(
+            'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted VALUES (1, 'integer'), ('1', 'text'), ('2', 'other'); " +
+            'CREATE TABLE crafted_pair (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_pair VALUES (1, 5, 'integer'), ('1', 5, 'text'), ('2', 5, 'other'); " +
+            'CREATE TABLE crafted_restore (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_restore VALUES (1, 'integer'), ('1', 'text')"
+        );
+        const restorePage = await seed.fetchTableData('crafted_restore', {
+            columns: ['rowid', 'k', 'v'],
+            limit: 10,
+            offset: 0
+        });
+        const deletedRows = await seed.deleteRows(
+            'crafted_restore',
+            [restorePage.rows.find(row => row[2] === 'integer')![0] as RecordId]
+        );
+        assert.strictEqual(deletedRows.length, 1);
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        for (const [table, sql] of [
+            ['crafted', 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID'],
+            ['crafted_pair', 'CREATE TABLE crafted_pair (a TEXT, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID'],
+            ['crafted_restore', 'CREATE TABLE crafted_restore (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID']
+        ]) {
+            await seed.executeQuery('UPDATE sqlite_schema SET sql = ? WHERE name = ?', [sql, table]);
+        }
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const crafted = (await createDatabaseEngine({
+            content: await seed.serializeDatabase(),
+            maxSize: 0,
+            readOnlyMode: false
+        })).operations!;
+        const stored = async (table: string) => (await crafted.executeQuery(
+            `SELECT typeof(${table === 'crafted_pair' ? 'a' : 'k'}), v FROM ${table} ORDER BY v`
+        ))[0].rows;
+        const identityOf = async (table: string, columns: string[], label: string) => {
+            const page = await crafted.fetchTableData(table, { columns: ['rowid', ...columns], limit: 10, offset: 0 });
+            const row = page.rows.find(candidate => candidate[columns.length] === label);
+            assert.ok(row, `${table}: no row labelled ${label}`);
+            return row[0] as RecordId;
+        };
+        const exportSelected = async (table: string, rowIds: RecordId[]) => {
+            const chunks: string[] = [];
+            await streamTableExport(crafted, table, ['v'], { format: 'csv', rowIds }, {
+                write: async chunk => { chunks.push(chunk); }
+            });
+            return chunks.join('');
+        };
+        const before = {
+            crafted: await stored('crafted'),
+            crafted_pair: await stored('crafted_pair'),
+            crafted_restore: await stored('crafted_restore')
+        };
+        assert.deepStrictEqual(before.crafted, [['integer', 'integer'], ['text', 'other'], ['text', 'text']]);
+
+        for (const [table, columns] of [['crafted', ['k', 'v']], ['crafted_pair', ['a', 'b', 'v']]] as const) {
+            const integerKey = await identityOf(table, [...columns], 'integer');
+            const otherKey = await identityOf(table, [...columns], 'other');
+            assert.strictEqual(await exportSelected(table, [integerKey]), 'v');
+            await assert.rejects(() => crafted.deleteRows(table, [integerKey]));
+            await assert.rejects(() => crafted.deleteRows(table, [integerKey, otherKey]));
+            assert.deepStrictEqual(await stored(table), before[table]);
+        }
+
+        // Restoring the deleted INTEGER row would turn it into TEXT '1'.
+        await assert.rejects(() => crafted.undoModification({
+            description: 'Restore the INTEGER row',
+            modificationType: 'row_delete',
+            targetTable: 'crafted_restore',
+            deletedRows
+        }));
+        assert.deepStrictEqual(await stored('crafted_restore'), before.crafted_restore);
+
+        // A TEXT identity still names its own row.
+        await crafted.deleteRows('crafted', [await identityOf('crafted', ['k', 'v'], 'text')]);
+        assert.deepStrictEqual(await stored('crafted'), [['integer', 'integer'], ['text', 'other']]);
+    });
+
+    it('refuses a REAL identity whose column was later declared TEXT, beside its TEXT twin', async () => {
+        // A REAL identity binds as a number, which a column declared TEXT
+        // compares as text. Each identity must name only its own row.
+        const seed = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations!;
+        await seed.executeQuery(
+            'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted VALUES (1.0, 'real'), ('1', 'text'), (2.5, 'real-fraction'), ('2.5', 'text-fraction'); " +
+            'CREATE TABLE crafted_pair (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_pair VALUES (1.0, 'x', 'real'), ('1', 'x', 'text')"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID' " +
+            "WHERE name = 'crafted'"
+        );
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted_pair (a TEXT, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID' " +
+            "WHERE name = 'crafted_pair'"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const crafted = (await createDatabaseEngine({
+            content: await seed.serializeDatabase(),
+            maxSize: 0,
+            readOnlyMode: false
+        })).operations!;
+        for (const [table, columns, labels] of [
+            ['crafted', ['k', 'v'], ['real', 'real-fraction']],
+            ['crafted_pair', ['a', 'b', 'v'], ['real']]
+        ] as const) {
+            const stored = async () => (await crafted.executeQuery(
+                `SELECT typeof(${columns[0]}), v FROM ${table} ORDER BY v`
+            ))[0].rows;
+            const before = await stored();
+            const page = await crafted.fetchTableData(table, { columns: ['rowid', ...columns], limit: 10, offset: 0 });
+            for (const label of labels) {
+                const realKey = page.rows.find(row => row[columns.length] === label)![0] as RecordId;
+                assert.match(decodeURIComponent(String(realKey)), /\["real",/);
+                await assert.rejects(() => crafted.getCellMetadata({ table, rowId: realKey, column: 'v' }));
+                await assert.rejects(() => crafted.updateCell(table, realKey, 'v', 'edited'));
+                await assert.rejects(() => crafted.updateCellBatch(table, [{ rowId: realKey, column: 'v', value: 'edited' }]));
+                await assert.rejects(() => crafted.deleteRows(table, [realKey]));
+                const chunks: string[] = [];
+                await streamTableExport(crafted, table, ['v'], { format: 'csv', rowIds: [realKey] }, {
+                    write: async chunk => { chunks.push(chunk); }
+                });
+                assert.strictEqual(chunks.join(''), 'v');
+            }
+            assert.deepStrictEqual(await stored(), before);
+        }
+    });
+
+    it('refuses a TEXT identity whose column was later declared numeric, beside its numeric twin', async () => {
+        // A TEXT identity binds as text, which a column declared INTEGER or
+        // REAL compares as a number. Each identity must name only its own row.
+        const crafted = await createRedeclaredEngine(
+            'CREATE TABLE crafted_int (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_int VALUES (1, 'number'), ('1', 'text'), (2, 'other'); " +
+            'CREATE TABLE crafted_real (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_real VALUES (1.5, 'number'), ('1.5', 'text'), (2.5, 'other'); " +
+            'CREATE TABLE crafted_pair (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_pair VALUES (1, 'x', 'number'), ('1', 'x', 'text'), (2, 'x', 'other')",
+            [
+                ['crafted_int', 'CREATE TABLE crafted_int (k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID'],
+                ['crafted_real', 'CREATE TABLE crafted_real (k REAL PRIMARY KEY, v TEXT) WITHOUT ROWID'],
+                ['crafted_pair', 'CREATE TABLE crafted_pair (a INTEGER, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID']
+            ]
+        );
+        for (const [table, columns] of [
+            ['crafted_int', ['k', 'v']],
+            ['crafted_real', ['k', 'v']],
+            ['crafted_pair', ['a', 'b', 'v']]
+        ] as const) {
+            const stored = async () => (await crafted.executeQuery(
+                `SELECT typeof(${columns[0]}), v FROM ${table} ORDER BY v`
+            ))[0].rows;
+            const before = await stored();
+            const page = await crafted.fetchTableData(table, { columns: ['rowid', ...columns], limit: 10, offset: 0 });
+            const textKey = page.rows.find(row => row[columns.length] === 'text')![0] as RecordId;
+            assert.match(decodeURIComponent(String(textKey)), /\["text","1(\.5)?"\]/);
+            await assert.rejects(() => crafted.updateCell(table, textKey, 'v', 'edited'));
+            await assert.rejects(() => crafted.updateCellBatch(table, [{ rowId: textKey, column: 'v', value: 'edited' }]));
+            await assert.rejects(() => crafted.getCellMetadata({ table, rowId: textKey, column: 'v' }));
+            await assert.rejects(() => crafted.deleteRows(table, [textKey]));
+            const chunks: string[] = [];
+            await streamTableExport(crafted, table, ['v'], { format: 'csv', rowIds: [textKey] }, {
+                write: async chunk => { chunks.push(chunk); }
+            });
+            assert.strictEqual(chunks.join(''), 'v');
+            assert.deepStrictEqual(await stored(), before, table);
+        }
+    });
+
+    it('refuses a delete whose identity matches another row, or two rows beside a missing one', async () => {
+        // A key declared COLLATE NOCASE over rows stored under BINARY holds
+        // 'A' and 'a'. Each identity must match exactly one row.
+        const crafted = await createRedeclaredEngine(
+            "CREATE TABLE folded (a TEXT, v TEXT, PRIMARY KEY (a)) WITHOUT ROWID; " +
+            "INSERT INTO folded VALUES ('A', 'upper'), ('a', 'lower'), ('c', 'other')",
+            [['folded', 'CREATE TABLE folded (a TEXT, v TEXT, PRIMARY KEY (a COLLATE NOCASE)) WITHOUT ROWID']]
+        );
+        const stored = async () => (await crafted.executeQuery('SELECT a, v FROM folded ORDER BY v'))[0].rows;
+        const before = await stored();
+        const page = await crafted.fetchTableData('folded', { columns: ['rowid', 'a', 'v'], limit: 10, offset: 0 });
+        const lower = page.rows.find(row => row[2] === 'lower')![0] as RecordId;
+        const missing = encodePrimaryKeyRecordId([{ identifier: 'a', declaredType: 'TEXT', position: 1 }], [5n]);
+        await assert.rejects(() => crafted.deleteRows('folded', [lower, missing]), /more than one row|no longer exist/);
+        assert.deepStrictEqual(await stored(), before);
+        await assert.rejects(() => crafted.deleteRows('folded', [lower]));
+        assert.deepStrictEqual(await stored(), before);
+    });
+
+    it('edits, exports, deletes and restores TEXT keys under the TEXT storage check', async () => {
+        await engine.executeQuery(
+            "CREATE TABLE text_keys (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; " +
+            "INSERT INTO text_keys VALUES ('1', 'text'), ('b', 'other'); " +
+            'CREATE TABLE typeless_text_keys (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO typeless_text_keys VALUES ('1', 'text'), (1, 'integer'), ('b', 'other')"
+        );
+        for (const table of ['text_keys', 'typeless_text_keys']) {
+            const rows = async () => (await engine.executeQuery(
+                `SELECT typeof(k), CAST(k AS TEXT), v FROM ${table} ORDER BY v`
+            ))[0].rows;
+            const before = await rows();
+            const page = await engine.fetchTableData(table, { columns: ['rowid', 'k', 'v'], limit: 10, offset: 0 });
+            const textKey = page.rows.find(row => row[2] === 'text')![0] as RecordId;
+            assert.match(decodeURIComponent(String(textKey)), /\["text","1"\]/);
+
+            const chunks: string[] = [];
+            await streamTableExport(engine, table, ['v'], { format: 'csv', rowIds: [textKey] }, {
+                write: async chunk => { chunks.push(chunk); }
+            });
+            assert.strictEqual(chunks.join(''), 'v\ntext');
+            const affectedCells = await engine.updateCellBatch(table, [{ rowId: textKey, column: 'v', value: 'text-edited' }]);
+            assert.deepStrictEqual(
+                await rows(),
+                before.map(row => row[2] === 'text' ? [row[0], row[1], 'text-edited'] : row).sort((l, r) => String(l[2]).localeCompare(String(r[2])))
+            );
+            await engine.undoModification({
+                description: 'Undo the TEXT key edit',
+                modificationType: 'cell_update',
+                targetTable: table,
+                affectedCells
+            });
+            assert.deepStrictEqual(await rows(), before);
+            const deletedRows = await engine.deleteRows(table, [textKey]);
+            assert.strictEqual(deletedRows.length, 1);
+            assert.deepStrictEqual(await rows(), before.filter(row => row[2] !== 'text'));
+            await engine.undoModification({
+                description: 'Restore the TEXT key row',
+                modificationType: 'row_delete',
+                targetTable: table,
+                deletedRows
+            });
+            assert.deepStrictEqual(await rows(), before);
+        }
+    });
+
+    it('resolves the stored TEXT identity after writing a number into a TEXT primary key', async () => {
+        // The identity re-read after a key edit carries the class of the value
+        // written, which the column's affinity may have changed.
+        await engine.executeQuery(
+            "CREATE TABLE text_key (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; INSERT INTO text_key VALUES ('x', 'row')"
+        );
+        const page = await engine.fetchTableData('text_key', { columns: ['rowid', 'k', 'v'], limit: 10, offset: 0 });
+        const edited = await engine.updateCell('text_key', page.rows[0][0] as RecordId, 'k', 5) as RecordId;
+        assert.match(decodeURIComponent(String(edited)), /\["text","5"\]/);
+        const [batch] = await engine.updateCellBatch('text_key', [
+            { rowId: edited, column: 'k', value: 6.5 },
+            { rowId: edited, column: 'v', value: 'batch' }
+        ]);
+        assert.match(decodeURIComponent(String(batch.newRowId)), /\["text","6.5"\]/);
+        assert.deepStrictEqual(
+            (await engine.executeQuery('SELECT typeof(k), k, v FROM text_key'))[0].rows,
+            [['text', '6.5', 'batch']]
+        );
+    });
+
+    it('addresses a row under its primary key collation when the column collation is looser', async () => {
+        // 'A' and 'a' are distinct keys under the key's BINARY collation, and
+        // equal under the column's NOCASE. Each identity must name one row.
+        await engine.executeQuery(
+            'CREATE TABLE cased (a TEXT COLLATE NOCASE, v TEXT, PRIMARY KEY (a COLLATE BINARY)) WITHOUT ROWID; ' +
+            "INSERT INTO cased VALUES ('A', 'upper'), ('a', 'lower'), ('c', 'other'); " +
+            'CREATE TABLE padded (k TEXT COLLATE RTRIM, n INTEGER, v TEXT, PRIMARY KEY (k COLLATE BINARY, n)) WITHOUT ROWID; ' +
+            "INSERT INTO padded VALUES ('x', 1, 'plain'), ('x ', 1, 'padded'), ('y', 1, 'other')"
+        );
+        const cases = [
+            ['cased', ['a', 'v'], 'lower', encodePrimaryKeyRecordId(
+                [{ identifier: 'a', declaredType: 'TEXT', position: 1 }],
+                ['zz']
+            )],
+            ['padded', ['k', 'n', 'v'], 'padded', encodePrimaryKeyRecordId(
+                [{ identifier: 'k', declaredType: 'TEXT', position: 1 }, { identifier: 'n', declaredType: 'INTEGER', position: 2 }],
+                ['zz', 1n]
+            )]
+        ] as const;
+        for (const [table, columns, label, missing] of cases) {
+            const stored = async () => (await engine.executeQuery(`SELECT v FROM ${table} ORDER BY v`))[0].rows.map(row => row[0]);
+            const before = await stored();
+            const page = await engine.fetchTableData(table, { columns: ['rowid', ...columns], limit: 10, offset: 0 });
+            const rowId = page.rows.find(row => row[columns.length] === label)![0] as RecordId;
+
+            await assert.rejects(() => engine.deleteRows(table, [rowId, missing]));
+            assert.deepStrictEqual(await stored(), before, `${table}: delete with a missing identity`);
+            assert.deepStrictEqual(
+                await engine.getCellMetadata({ table, rowId, column: 'v' }),
+                { storageClass: 'text', byteLength: label.length, textEncoding: 'utf-8' }
+            );
+            const chunks: string[] = [];
+            await streamTableExport(engine, table, ['v'], { format: 'csv', rowIds: [rowId] }, {
+                write: async chunk => { chunks.push(chunk); }
+            });
+            assert.strictEqual(chunks.join(''), `v\n${label}`);
+            await engine.updateCell(table, rowId, 'v', `${label}-edited`);
+            await engine.updateCellBatch(table, [{ rowId, column: 'v', value: `${label}-batch` }]);
+            assert.deepStrictEqual(
+                await stored(),
+                before.map(value => value === label ? `${label}-batch` : value).sort()
+            );
+            const deleted = await engine.deleteRows(table, [rowId]);
+            assert.strictEqual(deleted.length, 1);
+            assert.deepStrictEqual(await stored(), before.filter(value => value !== label));
+        }
+    });
+
+    it('reads key collations past a generated column and exports in key order', async () => {
+        // table_info leaves generated columns out of its cid numbering, which
+        // the key index's own numbering includes.
+        await engine.executeQuery(
+            "CREATE TABLE gen_cased (g TEXT GENERATED ALWAYS AS ('x' || v) VIRTUAL, a TEXT COLLATE NOCASE, " +
+            'b TEXT, v TEXT, PRIMARY KEY (a COLLATE BINARY, b COLLATE NOCASE)) WITHOUT ROWID; ' +
+            "INSERT INTO gen_cased (a, b, v) VALUES ('A', 'x', 'upper'), ('a', 'x', 'lower'), " +
+            "('B', 'y', 'upper-b'), ('b', 'Y', 'lower-b'), ('c', 'x', 'other')"
+        );
+        const schemaIdentity = (await engine.fetchSchema()).tables
+            .find(table => table.identifier === 'gen_cased')?.identity;
+        const expected = [
+            { identifier: 'a', declaredType: 'TEXT', position: 1, collation: 'BINARY' },
+            { identifier: 'b', declaredType: 'TEXT', position: 2, collation: 'NOCASE' }
+        ];
+        assert.deepStrictEqual(schemaIdentity, { kind: 'primaryKey', columns: expected });
+        assert.deepStrictEqual(
+            (await engine.getTableInfo('gen_cased'))
+                .filter(column => column.primaryKeyPosition > 0)
+                .map(column => column.primaryKeyCollation),
+            ['BINARY', 'NOCASE']
+        );
+
+        const exportCsv = async (rowIds?: RecordId[]) => {
+            const chunks: string[] = [];
+            await streamTableExport(engine, 'gen_cased', ['v'], { format: 'csv', ...(rowIds ? { rowIds } : {}) }, {
+                write: async chunk => { chunks.push(chunk); }
+            });
+            return chunks.join('');
+        };
+        const oracle = (await engine.executeQuery(
+            'SELECT v FROM gen_cased ORDER BY a COLLATE BINARY, b COLLATE NOCASE'
+        ))[0].rows.map(row => row[0]);
+        assert.strictEqual(await exportCsv(), ['v', ...oracle].join('\n'));
+        const page = await engine.fetchTableData('gen_cased', { columns: ['rowid', 'a', 'b', 'v'], limit: 10, offset: 0 });
+        const lower = page.rows.find(row => row[3] === 'lower')![0] as RecordId;
+        assert.strictEqual(await exportCsv([lower]), 'v\nlower');
+    });
+
+    it('keeps guarded multi-row identity predicates on the key index', async () => {
+        await engine.executeQuery(
+            'CREATE TABLE plan_typeless (k PRIMARY KEY, v) WITHOUT ROWID; ' +
+            'CREATE TABLE plan_integer (k INTEGER PRIMARY KEY, v) WITHOUT ROWID; ' +
+            'CREATE TABLE plan_pair (a, b, v, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+            'CREATE TABLE plan_rowid (id INTEGER PRIMARY KEY, v); ' +
+            'CREATE TABLE plan_nocase (k TEXT COLLATE NOCASE PRIMARY KEY, v) WITHOUT ROWID; ' +
+            'CREATE TABLE plan_text (k TEXT PRIMARY KEY, v) WITHOUT ROWID; ' +
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000) " +
+            "INSERT INTO plan_text SELECT 'k' || x, x FROM n; " +
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000) " +
+            "INSERT INTO plan_nocase SELECT 'k' || x, x FROM n; " +
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000) ' +
+            'INSERT INTO plan_typeless SELECT x, x FROM n; ' +
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000) ' +
+            'INSERT INTO plan_integer SELECT x, x FROM n; ' +
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000) ' +
+            'INSERT INTO plan_pair SELECT x, x, x FROM n; ' +
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000) ' +
+            'INSERT INTO plan_rowid SELECT x, x FROM n; ' +
+            'ANALYZE'
+        );
+        const ids = (columns: PrimaryKeyColumn[], rows: (string | bigint)[][]) => (
+            rows.map(values => encodePrimaryKeyRecordId(columns, values))
+        );
+        const cases: Array<[string, ReturnType<typeof buildRecordIdentitiesPredicate>]> = [
+            ['plan_rowid', buildRecordIdentitiesPredicate([1, 2], { kind: 'rowid' })]
+        ];
+        // Identities read from the schema carry their key's collation.
+        for (const collation of [undefined, 'BINARY']) {
+            const key = (identifier: string, position = 1): PrimaryKeyColumn => (
+                { identifier, declaredType: '', position, ...(collation ? { collation } : {}) }
+            );
+            cases.push(
+                ['plan_typeless', buildRecordIdentitiesPredicate(
+                    ids([key('k')], [[1n], [2n]]),
+                    { kind: 'primaryKey', columns: [key('k')] }
+                )],
+                ['plan_typeless', buildRecordIdentitiesPredicate(
+                    ids([key('k')], [[1n], ['1'], [2n]]),
+                    { kind: 'primaryKey', columns: [key('k')] }
+                )],
+                ['plan_integer', buildRecordIdentitiesPredicate(
+                    ids([key('k')], [[1n], [2n]]),
+                    { kind: 'primaryKey', columns: [key('k')] }
+                )],
+                ['plan_pair', buildRecordIdentitiesPredicate(
+                    ids([key('a'), key('b', 2)], [[1n, 1n], [2n, 2n]]),
+                    { kind: 'primaryKey', columns: [key('a'), key('b', 2)] }
+                )],
+                ['plan_pair', buildRecordIdentitiesPredicate(
+                    ids([key('a'), key('b', 2)], [[1n, 1n], ['1', 1n]]),
+                    { kind: 'primaryKey', columns: [key('a'), key('b', 2)] }
+                )]
+            );
+        }
+        const nocase: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: 'TEXT', position: 1, collation: 'NOCASE' }];
+        cases.push(
+            ['plan_nocase', buildRecordIdentitiesPredicate(ids(nocase, [['k1'], ['k2']]), { kind: 'primaryKey', columns: nocase })],
+            ['plan_nocase', buildRecordIdentityPredicate(ids(nocase, [['k1']])[0], { kind: 'primaryKey', columns: nocase })]
+        );
+        // A TEXT member carries a TEXT storage check, which stays a filter.
+        const text: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: 'TEXT', position: 1, collation: 'BINARY' }];
+        cases.push(
+            ['plan_text', buildRecordIdentitiesPredicate(ids(text, [['k1'], ['k2']]), { kind: 'primaryKey', columns: text })],
+            ['plan_text', buildRecordIdentitiesPredicate(ids(text, [['k1'], [3n]]), { kind: 'primaryKey', columns: text })],
+            ['plan_text', buildRecordIdentityPredicate(ids(text, [['k1']])[0], { kind: 'primaryKey', columns: text })]
+        );
+        for (const [table, predicate] of cases) {
+            for (const statement of [`SELECT v FROM ${table}`, `DELETE FROM ${table}`]) {
+                const plan = (await engine.executeQuery(
+                    `EXPLAIN QUERY PLAN ${statement} WHERE ${predicate.sql}`,
+                    predicate.params
+                ))[0].rows.map(row => String(row[3]));
+                assert.ok(
+                    plan.some(detail => detail.startsWith(`SEARCH ${table} USING `) && detail.includes('PRIMARY KEY')),
+                    `${statement} WHERE ${predicate.sql}: ${plan.join(' / ')}`
+                );
+                assert.ok(
+                    !plan.some(detail => detail.startsWith(`SCAN ${table}`)),
+                    `${statement} WHERE ${predicate.sql}: ${plan.join(' / ')}`
+                );
+            }
+        }
+
+        // The selected-row export join reads each identity through the key.
+        const statements: Array<{ sql: string; params: unknown[] }> = [];
+        const recording = new Proxy(engine, {
+            get(target, property, receiver) {
+                if (property === 'executeQuery') {
+                    return (sql: string, params?: unknown[]) => {
+                        statements.push({ sql, params: params ?? [] });
+                        return target.executeQuery(sql, params as never);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+        const page = await engine.fetchTableData('plan_text', { columns: ['rowid', 'k', 'v'], limit: 2, offset: 0 });
+        await streamTableExport(recording, 'plan_text', ['v'], {
+            format: 'csv',
+            rowIds: page.rows.map(row => row[0] as RecordId)
+        }, { write: async () => {} });
+        const join = statements.find(statement => statement.sql.includes('__sqlite_explorer_export_selected'));
+        assert.ok(join, 'selected-row export join');
+        const joinPlan = (await engine.executeQuery(`EXPLAIN QUERY PLAN ${join.sql}`, join.params as never))[0].rows
+            .map(row => String(row[3]));
+        assert.ok(
+            joinPlan.some(detail => /^SEARCH .*plan_text|^SEARCH __sqlite_explorer_export_source USING PRIMARY KEY/.test(detail)),
+            joinPlan.join(' / ')
+        );
+        assert.ok(!joinPlan.some(detail => /^SCAN (main\.)?(plan_text|__sqlite_explorer_export_source)\b/.test(detail)), joinPlan.join(' / '));
+    });
+
+    it('targets an INTEGER key beside its numeric-looking TEXT twin in a typeless primary key', async () => {
+        // INTEGER 1 and TEXT '1' are distinct keys of a typeless column. An
+        // identity predicate that applied NUMERIC affinity matched both, so
+        // the one-row guards refused every edit and delete of either row.
+        await engine.executeQuery(
+            'CREATE TABLE typeless_twins (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO typeless_twins VALUES (1, 'integer'), ('1', 'text'), (2, 'other'); " +
+            'CREATE TABLE typeless_composite_twins (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+            'INSERT INTO typeless_composite_twins VALUES ' +
+            "(1, 1, 'ii'), ('1', 1, 'ti'), (1, '1', 'it'), ('1', '1', 'tt'), (2, 2, 'x')"
+        );
+        const identityOf = async (table: string, columns: string[], label: string) => {
+            const page = await engine.fetchTableData(table, {
+                columns: ['rowid', ...columns],
+                limit: 10,
+                offset: 0
+            });
+            const row = page.rows.find(candidate => candidate[columns.length] === label);
+            assert.ok(row, `${table}: no row labelled ${label}`);
+            return row[0] as RecordId;
+        };
+
+        const twinRows = async () => (await engine.executeQuery(
+            'SELECT typeof(k), k, v FROM typeless_twins ORDER BY k'
+        ))[0].rows;
+        const integerTwin = await identityOf('typeless_twins', ['k', 'v'], 'integer');
+        assert.deepStrictEqual(
+            await engine.getCellMetadata({ table: 'typeless_twins', rowId: integerTwin, column: 'v' }),
+            { storageClass: 'text', byteLength: 7, textEncoding: 'utf-8' }
+        );
+        const affectedCells = await engine.updateCellBatch('typeless_twins', [{
+            rowId: integerTwin,
+            column: 'v',
+            value: 'batch-edited'
+        }]);
+        assert.deepStrictEqual(
+            await twinRows(),
+            [['integer', 1, 'batch-edited'], ['integer', 2, 'other'], ['text', '1', 'text']]
+        );
+        await engine.undoModification({
+            description: 'Undo the INTEGER twin edit',
+            modificationType: 'cell_update',
+            targetTable: 'typeless_twins',
+            affectedCells
+        });
+        assert.deepStrictEqual(
+            await twinRows(),
+            [['integer', 1, 'integer'], ['integer', 2, 'other'], ['text', '1', 'text']]
+        );
+        await engine.updateCell('typeless_twins', integerTwin, 'v', 'integer-edited');
+        await engine.updateCell(
+            'typeless_twins',
+            await identityOf('typeless_twins', ['k', 'v'], 'text'),
+            'v',
+            'text-edited'
+        );
+        assert.deepStrictEqual(
+            await twinRows(),
+            [['integer', 1, 'integer-edited'], ['integer', 2, 'other'], ['text', '1', 'text-edited']]
+        );
+
+        const columns = ['a', 'b', 'v'];
+        const single = await engine.deleteRows('typeless_composite_twins', [
+            await identityOf('typeless_composite_twins', columns, 'ii')
+        ]);
+        assert.strictEqual(single?.length, 1);
+        const pair = await engine.deleteRows('typeless_composite_twins', [
+            await identityOf('typeless_composite_twins', columns, 'it'),
+            await identityOf('typeless_composite_twins', columns, 'x')
+        ]);
+        assert.strictEqual(pair?.length, 2);
+        assert.deepStrictEqual(
+            (await engine.executeQuery(
+                'SELECT typeof(a), a, typeof(b), b, v FROM typeless_composite_twins ORDER BY v'
+            ))[0].rows,
+            [['text', '1', 'integer', 1, 'ti'], ['text', '1', 'text', '1', 'tt']]
+        );
     });
 
     it('returns primary-key identity for insert and restores a deleted row', async () => {

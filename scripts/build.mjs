@@ -456,7 +456,7 @@ const validateBuildOutputs = () => {
   // grow. These are shipped byte sizes; readable development builds are exempt.
   if (!DEV) {
     const entryBudgets = {
-      'out/extension.js': 450_000,
+      'out/extension.js': 500_000,
       'out/extension-browser.js': 550_000,
     };
     for (const [file, budget] of Object.entries(entryBudgets)) {

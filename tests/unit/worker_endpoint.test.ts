@@ -134,6 +134,41 @@ describe('Worker Endpoint', () => {
         await endpoint.closeQueryReadSession(querySession.sessionId);
     });
 
+    it('ends a query read after the row that fills its byte limit', async () => {
+        await endpoint.initializeDatabase('test.db', {
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false,
+            wasmBinary
+        });
+        // Ten characters each: 20 bytes as held, plus 8 for the integer.
+        await endpoint.runQuery(
+            'CREATE TABLE sized (id INTEGER PRIMARY KEY, body TEXT); ' +
+            "INSERT INTO sized VALUES (1, 'aaaaaaaaaa'), (2, 'bbbbbbbbbb'), (3, 'cccccccccc'), (4, 'dddddddddd'), (5, 'eeeeeeeeee')"
+        );
+        const session = await endpoint.openQueryReadSession('SELECT id, body FROM sized ORDER BY id');
+        try {
+            // 28 bytes a row: the second row reaches 50, and it stays in the batch.
+            const first = await endpoint.readQueryRows(session.sessionId, 128, 50);
+            assert.deepStrictEqual(first.rows.map(row => row[0]), [1, 2]);
+            assert.strictEqual(first.done, false);
+            // A limit one row already exceeds still returns that row.
+            const second = await endpoint.readQueryRows(session.sessionId, 128, 1);
+            assert.deepStrictEqual(second.rows.map(row => row[0]), [3]);
+            assert.strictEqual(second.done, false);
+            // Without a limit the row count alone ends the read.
+            const rest = await endpoint.readQueryRows(session.sessionId, 128);
+            assert.deepStrictEqual(rest.rows.map(row => row[0]), [4, 5]);
+            assert.strictEqual(rest.done, true);
+            await assert.rejects(
+                () => endpoint.readQueryRows(session.sessionId, 1, 0),
+                /byte limit must be a positive integer/
+            );
+        } finally {
+            await endpoint.closeQueryReadSession(session.sessionId);
+        }
+    });
+
     it('fails closed when view undo history is missing its definition', async () => {
         const logs: Array<{ level: string; args: unknown[] }> = [];
         endpoint = createWorkerEndpoint((level, ...args) => {
@@ -230,7 +265,13 @@ describe('Worker Endpoint', () => {
         const count = await endpoint.fetchTableCount('users', {});
         assert.deepStrictEqual(count, { count: 1, isExact: true });
 
-        await endpoint.writeToFile('/tmp/test_dump.db');
+        // Not a fixed /tmp path: Windows has no such folder.
+        const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-explorer-dump-'));
+        try {
+            await endpoint.writeToFile(path.join(tempDirectory, 'test_dump.db'));
+        } finally {
+            fs.rmSync(tempDirectory, { recursive: true, force: true });
+        }
     });
 
     it('does not replace a file when a worker save cancellation flag is set', async () => {

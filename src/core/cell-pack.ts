@@ -4,7 +4,7 @@ import {
   MAX_UTF8_BYTES_PER_CODE_POINT,
   type CellContainmentQuery
 } from './cell-containment';
-import type { CellValue } from './types';
+import type { CellValue, ExactIntegerTextMap } from './types';
 
 /**
  * Row-packed transport for 'checked' grid pages (spike). One
@@ -18,6 +18,7 @@ import type { CellValue } from './types';
 export const CELL_PACK_FUNCTION = 'sqlite_explorer_cell_pack';
 const PACK_SOURCE_ALIAS = '__sqlite_explorer_cell_pack_source';
 const PACK_VALUE_PREFIX = '__sqlite_explorer_cell_pack_value_';
+const PACK_CHUNK_PREFIX = '__sqlite_explorer_cell_pack_';
 const PACK_VERSION = 1;
 const PACK_HEADER_BYTES = 6;
 const MAX_SQLITE_BYTES = 0x7fffffff;
@@ -29,10 +30,15 @@ export function cellPackApplies(query: CellContainmentQuery): boolean {
     && !query.metadataTrailer;
 }
 
-/** One pack call per chunk of at most 100 value expressions. */
+/**
+ * One pack call per chunk of at most 100 value expressions. A direct select
+ * leaves the calls unaliased: its ORDER BY and WHERE names could bind to an
+ * alias instead of the table column they name.
+ */
 export function buildCellPackSelectList(
   valueExpressions: readonly string[],
-  query: Pick<CellContainmentQuery, 'effectiveInlineCellBytes' | 'valueColumnCount'>
+  query: Pick<CellContainmentQuery, 'effectiveInlineCellBytes' | 'valueColumnCount'>,
+  aliased = false
 ): string {
   if (valueExpressions.length !== query.valueColumnCount || valueExpressions.length < 1) {
     throw new Error('Cell packing requires one expression per value column');
@@ -41,9 +47,13 @@ export function buildCellPackSelectList(
   const calls: string[] = [];
   for (let offset = 0; offset < valueExpressions.length; offset += HELPER_METADATA_CHUNK_COLUMNS) {
     const chunk = valueExpressions.slice(offset, offset + HELPER_METADATA_CHUNK_COLUMNS);
-    // Unaliased: ORDER BY and WHERE names in a direct select can never bind
-    // to a pack column instead of the table column they name.
-    calls.push(`${CELL_PACK_FUNCTION}(${query.effectiveInlineCellBytes}, ${characters}, ${chunk.join(', ')})`);
+    // An unaliased call is named by its whole text, about 4,000 characters
+    // for 100 values. The native binding builds each row as an object keyed
+    // by column name and hashes that name again for every row.
+    calls.push(
+      `${CELL_PACK_FUNCTION}(${query.effectiveInlineCellBytes}, ${characters}, ${chunk.join(', ')})` +
+      (aliased ? ` AS ${escapeIdentifier(`${PACK_CHUNK_PREFIX}${calls.length}`)}` : '')
+    );
   }
   return calls.join(', ');
 }
@@ -66,7 +76,8 @@ export function buildCellPackWrappedQuery(
   const source = escapeIdentifier(PACK_SOURCE_ALIAS);
   return `WITH ${source} (${names.join(', ')}) AS (\n` +
     (sourceEndsWithOffset ? `${sourceSql}\n)\n` : `SELECT * FROM (\n${sourceSql}\n) LIMIT -1 OFFSET 0\n)\n`) +
-    `SELECT ${buildCellPackSelectList(names, query)} FROM ${source}`;
+    // Nothing after the select list names a column here, so aliases are safe.
+    `SELECT ${buildCellPackSelectList(names, query, true)} FROM ${source}`;
 }
 
 // sql.js getString(): Emscripten's UTF8ToString over the stored byte length
@@ -86,6 +97,71 @@ function malformed(rowIndex: number, chunk: number, detail: string): Error {
   return new Error(`Packed cell row ${rowIndex}, chunk ${chunk} is malformed: ${detail}`);
 }
 
+function checkRealText(source: Uint8Array, start: number, end: number, rowIndex: number, chunk: number): void {
+  for (let index = start; index < end; index++) {
+    const code = source[index];
+    // SQLite's REAL text is printable ASCII: digits, sign, '.', 'e', "Inf".
+    if (code < 0x21 || code > 0x7e) throw malformed(rowIndex, chunk, 'REAL text is not ASCII');
+  }
+}
+
+// Literals: every power up to 1e22 is an exact double.
+const EXACT_POWERS_OF_TEN = [
+  1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+  1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+];
+
+/**
+ * Whether the bytes [start, end) are String(value), decided without
+ * formatting value: 1 if they are, 0 if they are not, -1 when the bytes
+ * alone cannot tell (the caller then compares with String(value)).
+ *
+ * Only a plain decimal "-?(0|[1-9][0-9]*)\.[0-9]*[1-9]" with at most 15
+ * significant digits is decided. Its digits as an integer M are below
+ * 2^53 and 10^f is exact for f <= 22, so M / 10^f is Number(text),
+ * correctly rounded. If that is not value, the text is not
+ * String(value), which always reads back as value: 0.
+ * If it is value and the text has at most five zeros after "0.", value is
+ * at least 1e-6, a normal double. A normal double's rounding interval is
+ * narrower than the gap between any two decimals of at most 15
+ * significant digits, so this text is the only such decimal that reads
+ * back as value. String(value) uses the fewest digits that read back,
+ * so it has these digits and this decimal point, and for a non-integer
+ * from 1e-6 to below 1e21 it writes them in this same plain form: 1.
+ */
+export function realTextIsOwn(source: Uint8Array, start: number, end: number, value: number): number {
+  // An integral REAL's "N.0" goes to the caller's '.0' check.
+  if (start >= end || source[end - 1] === 0x30) return -1;
+  let index = start;
+  const negative = source[index] === 0x2d;
+  if (negative) index++;
+  let mantissa = 0;
+  let digits = 0;
+  const integerStart = index;
+  while (index < end && source[index] >= 0x30 && source[index] <= 0x39) {
+    mantissa = mantissa * 10 + (source[index] - 0x30);
+    if (mantissa > 0) digits++;
+    index++;
+  }
+  const integerDigits = index - integerStart;
+  if (integerDigits === 0 || index === end || source[index] !== 0x2e) return -1;
+  index++;
+  const fractionStart = index;
+  while (index < end && source[index] >= 0x30 && source[index] <= 0x39) {
+    mantissa = mantissa * 10 + (source[index] - 0x30);
+    if (mantissa > 0) digits++;
+    index++;
+  }
+  const fractionDigits = index - fractionStart;
+  if (index !== end || fractionDigits === 0 || digits > 15 || fractionDigits > 22) return -1;
+  const parsed = mantissa / EXACT_POWERS_OF_TEN[fractionDigits];
+  if ((negative ? -parsed : parsed) !== value) return 0;
+  if (integerDigits > 1 && source[integerStart] === 0x30) return -1;
+  // Below 1, digits after "0." beyond the fraction's significant ones are zeros.
+  if (integerDigits === 1 && source[integerStart] === 0x30 && fractionDigits - digits > 5) return -1;
+  return 1;
+}
+
 // Plain cells of at least this many bytes are decoded on their own. A slice
 // of a shared decoded area is a SlicedString, and every later per-character
 // pass over it (utf8ByteLength, wire estimates) pays the indirection; for
@@ -97,9 +173,11 @@ const RAW_SLAB_BYTES = 64 * 1024;
 
 /**
  * Rebuilds 'checked' containment transport rows from packed chunks: values,
- * the metadata token string or NULL, raw-TEXT slots for rawTextColumnIndices,
- * then one packed REAL text column per 100 values. INTEGERs are BigInt, as
- * sql.js returns them with useBigInt.
+ * the metadata token string or NULL, then raw-TEXT slots for
+ * rawTextColumnIndices. INTEGERs are BigInt, as sql.js returns them with
+ * useBigInt. When the query carries REAL text, the SQLite text of each REAL
+ * that differs from String(value) goes to exactTexts instead of a packed
+ * REAL text column: what normalizeIntegerRowsForTransport keeps of those.
  *
  * decodeRow reads each chunk at [start, start + length) of one byte source.
  * The source may be a view of the WASM heap that is only valid until the next
@@ -110,10 +188,9 @@ export class CellPackDecoder {
   readonly chunkCount: number;
   private readonly valueCount: number;
   private readonly limit: number;
-  private readonly realChunkCount: number;
+  private readonly keepRealTexts: boolean;
   private readonly rawSlotOfColumn: Int32Array;
   private readonly rawStart: number;
-  private readonly realStart: number;
   private readonly width: number;
   // Column, UTF-16 length, byte length and area offset of each plain cell in a chunk.
   private readonly areaColumns = new Int32Array(HELPER_METADATA_CHUNK_COLUMNS);
@@ -123,6 +200,8 @@ export class CellPackDecoder {
   private slabOffset = 0;
   /** TEXT values decoded lossily or from non-plain bytes, in sql.js's way. */
   nonPlainTextValues = 0;
+  /** Row index -> value column -> SQLite text, for each REAL whose text differs from String(value). */
+  exactTexts: ExactIntegerTextMap | undefined;
 
   constructor(query: CellContainmentQuery) {
     if (!cellPackApplies(query)) {
@@ -134,18 +213,19 @@ export class CellPackDecoder {
       throw new Error(`Invalid cell window ${this.limit}`);
     }
     this.chunkCount = Math.ceil(this.valueCount / HELPER_METADATA_CHUNK_COLUMNS);
-    this.realChunkCount = query.numericTransport.packedRealTextColumnCount ?? 0;
-    if (this.realChunkCount !== 0 && this.realChunkCount !== this.chunkCount) {
+    const realChunkCount = query.numericTransport.packedRealTextColumnCount ?? 0;
+    if (realChunkCount !== 0 && realChunkCount !== this.chunkCount) {
       throw new Error('Packed REAL text columns do not match the value chunks');
     }
+    // Without the sidecar the page has no REAL text, as on the helper path.
+    this.keepRealTexts = realChunkCount > 0;
     if (query.rawTextColumnStart !== this.valueCount + 1) {
       throw new Error('Raw TEXT slots must follow the metadata column');
     }
     this.rawSlotOfColumn = new Int32Array(this.valueCount).fill(-1);
     query.rawTextColumnIndices.forEach((columnIndex, slot) => { this.rawSlotOfColumn[columnIndex] = slot; });
     this.rawStart = query.rawTextColumnStart;
-    this.realStart = this.rawStart + query.rawTextColumnCount;
-    this.width = this.realStart + this.realChunkCount;
+    this.width = this.rawStart + query.rawTextColumnCount;
   }
 
   private keepRawBytes(source: Uint8Array, start: number, length: number): Uint8Array {
@@ -167,10 +247,11 @@ export class CellPackDecoder {
     lengths: ArrayLike<number>,
     rowIndex: number
   ): TransportValue[] {
-    const { valueCount, limit, rawSlotOfColumn, rawStart, realStart, areaColumns, areaUnits, areaLengths } = this;
-    const out: TransportValue[] = new Array(this.width);
-    for (let slot = rawStart; slot < realStart; slot++) out[slot] = null;
+    const { valueCount, limit, keepRealTexts, rawSlotOfColumn, rawStart, width, areaColumns, areaUnits, areaLengths } = this;
+    const out: TransportValue[] = new Array(width);
+    for (let slot = rawStart; slot < width; slot++) out[slot] = null;
     let tokens: string[] | undefined;
+    let realTexts: Record<number, string> | undefined;
 
     for (let chunk = 0; chunk < this.chunkCount; chunk++) {
       const begin = starts[chunk];
@@ -190,7 +271,6 @@ export class CellPackDecoder {
       let offset = begin + PACK_HEADER_BYTES;
       let areaCells = 0;
       let areaBytes = 0;
-      let realTexts: string | null = null;
 
       // Hot loop: no closures, so offset stays in a register. Every length
       // is checked against the descriptor end before it is used.
@@ -234,19 +314,39 @@ export class CellPackDecoder {
         } else if (tag === 0) {
           out[column] = null;
         } else if (tag === 2) {
-          out[column] = view.getFloat64(offset, true);
+          const value = view.getFloat64(offset, true);
+          out[column] = value;
           const length = source[offset + 8];
           offset += 9;
           if (length < 1 || length > areaStart - offset) throw malformed(rowIndex, chunk, 'bad REAL text length');
-          let text = '';
-          for (let index = offset; index < offset + length; index++) {
-            const code = source[index];
-            // SQLite's REAL text is printable ASCII: digits, sign, '.', 'e', "Inf".
-            if (code < 0x21 || code > 0x7e) throw malformed(rowIndex, chunk, 'REAL text is not ASCII');
-            text += String.fromCharCode(code);
+          if (keepRealTexts) {
+            // Decide from the bytes alone where that is exact, else compare
+            // with String(value) in place; build a string only for a text
+            // that differs.
+            const verdict = realTextIsOwn(source, offset, offset + length, value);
+            let differs = verdict === 0;
+            if (verdict < 0) {
+              const own = String(value);
+              const ownLength = own.length;
+              let same = 0;
+              while (same < ownLength && same < length && source[offset + same] === own.charCodeAt(same)) same++;
+              if (same === ownLength && length === ownLength + 2
+                && source[offset + same] === 0x2e && source[offset + same + 1] === 0x30) {
+                // An integral value: SQLite adds '.0'.
+                (realTexts ??= {})[column] = `${own}.0`;
+              } else {
+                differs = same !== ownLength || length !== ownLength;
+              }
+            }
+            if (differs) {
+              // Printable ASCII once checked, which UTF-8 decodes as itself.
+              checkRealText(source, offset, offset + length, rowIndex, chunk);
+              (realTexts ??= {})[column] = plainDecoder.decode(source.subarray(offset, offset + length));
+            }
+          } else {
+            checkRealText(source, offset, offset + length, rowIndex, chunk);
           }
           offset += length;
-          realTexts = realTexts === null ? `${column}:${text}` : `${realTexts}|${column}:${text}`;
         } else {
           // Tags 4, 6, 7 and 8 carry their bytes inline.
           let stored = 0;
@@ -329,9 +429,9 @@ export class CellPackDecoder {
         position += runBytes;
         index = last + 1;
       }
-      if (this.realChunkCount > 0) out[realStart + chunk] = realTexts;
     }
     out[valueCount] = tokens ? tokens.join('|') : null;
+    if (realTexts) (this.exactTexts ??= {})[rowIndex] = realTexts;
     return out;
   }
 }

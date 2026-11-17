@@ -48,12 +48,24 @@ const read = (sql, ...params) => {
   finally { db.close(); }
 };
 const labelIs = value => waitForValue(() => read('SELECT label FROM upload_target WHERE id=1'), [{ label: value }], `independent label ${value}`);
+// The host answers each edit and each Undo with a reload of the grid, which
+// ends with the row count in the status bar. A drop while it runs is not
+// taken (onDrop in dnd.js says so in the status bar), so a step that drops
+// after one waits for that count.
+const statusCount = () => frame.evaluate(() => window.uploadStatuses.length);
+const reloaded = async since => {
+  await waitForValue(() => frame.evaluate(since => window.uploadStatuses.slice(since).some(status => /\brecords?$/.test(status.text)), since),
+    true, 'the reload after the change finished');
+  await waitForValue(() => frame.locator('#btnExport').isEnabled(), true, 'the grid takes drops again');
+};
 const changeLabel = async value => {
+  const since = await statusCount();
   await cell(1, 1).dblclick();
   const input = cell(1, 1).locator('textarea');
   await input.fill(value); await input.press('Enter');
   await labelIs(value);
   await waitForValue(() => cell(1, 1).textContent(), value, 'authoritative grid label');
+  await reloaded(since);
 };
 const drop = async (name, row = 1) => {
   await cell(row, 2).click();
@@ -72,17 +84,17 @@ try {
   await run('U00', 'private fixture and actual installed backend', async () => {
     frame = await openDatabase(page, 'drop-qa.db');
     await selectTable(frame, 'upload_target');
-    const logs = path.join(output, 'profile/logs');
-    await waitForValue(() => fs.readdirSync(logs, { recursive: true }).filter(file => file.endsWith('SQLite Explorer.log'))
-      .some(file => fs.readFileSync(path.join(logs, file), 'utf8').includes(`Using ${backend === 'native' ? 'native' : 'WebAssembly'} SQLite backend`)), true, 'actual backend');
-  });
-  await run('U01', 'five MiB drop persists exact BLOB bytes and records elapsed time', async () => {
     await frame.evaluate(() => {
       window.uploadStatuses = [];
       const status = document.getElementById('statusText');
       new MutationObserver(() => window.uploadStatuses.push({ text: status.textContent, at: performance.now() }))
         .observe(status, { childList: true });
     });
+    const logs = path.join(output, 'profile/logs');
+    await waitForValue(() => fs.readdirSync(logs, { recursive: true }).filter(file => file.endsWith('SQLite Explorer.log'))
+      .some(file => fs.readFileSync(path.join(logs, file), 'utf8').includes(`Using ${backend === 'native' ? 'native' : 'WebAssembly'} SQLite backend`)), true, 'actual backend');
+  });
+  await run('U01', 'five MiB drop persists exact BLOB bytes and records elapsed time', async () => {
     await drop('five-mib.bin');
     await waitForValue(() => read('SELECT typeof(payload) AS storage,length(payload) AS length FROM upload_target WHERE id=1'),
       [{ storage: 'blob', length: payload.length }], 'full file persisted', 20_000);
@@ -121,8 +133,10 @@ try {
       await labelIs('before cancelled read'); assertCancelledTarget();
       assert.equal(await frame.evaluate(() => window.uploadReaderAbortCalls), 1);
       // A second ordinary Undo must still own the edit that preceded the drop.
+      const since = await statusCount();
       await page.keyboard.press(`${modifier}+Z`);
       await labelIs('initial'); assertCancelledTarget();
+      await reloaded(since);
       await screenshot('cancelled-file-read');
     } finally { await frame.evaluate(() => window.restoreUploadReader()); }
   });
@@ -145,7 +159,9 @@ try {
       await frame.evaluate(() => { window.restoreUploadChannel(); window.releaseUploadEncoding(); });
       await waitForValue(() => frame.locator('#statusText').textContent(), 'Upload cancelled', 'encoding cancelled');
       await labelIs('before cancelled encoding'); assertCancelledTarget();
+      const since = await statusCount();
       await page.keyboard.press(`${modifier}+Z`); await labelIs('initial');
+      await reloaded(since);
       await screenshot('cancelled-binary-preparation');
     } finally { await frame.evaluate(() => window.restoreUploadChannel()); }
   });
@@ -193,7 +209,15 @@ try {
       db.prepare('UPDATE upload_target SET label=? WHERE id=1').run('replacement file'); db.close();
       const expected = sha256(fs.readFileSync(replacement));
       const oldInode = fs.statSync(database, { bigint: true }).ino;
-      fs.renameSync(replacement, database);
+      try { fs.renameSync(replacement, database); }
+      catch (error) {
+        // Windows lets no program replace a file the native engine has open.
+        if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+        assert.equal(fs.statSync(database, { bigint: true }).ino, oldInode);
+        await labelIs('native still writable');
+        console.log('Windows refused replacement of the open file; unchanged database verified.');
+        return;
+      }
       assert.notEqual(fs.statSync(database, { bigint: true }).ino, oldInode);
       await frame.getByRole('button', { name: 'Open table second_table', exact: true }).click();
       const reload = frame.getByRole('button', { name: 'Reload Database', exact: true });

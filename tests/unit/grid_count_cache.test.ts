@@ -180,7 +180,7 @@ describe('grid count cache', () => {
 
             // An OFFSET fallback on that full final page has the same ambiguity.
             state.currentPageIndex = 2;
-            state.keysetAnchors = { table: 'items', pageIndex: 0, first: 'F0', last: 'L0' };
+            state.keysetAnchors = { table: 'items', pageIndex: 0, pageSize: 20, first: 'F0', last: 'L0' };
             await loadTableData(false, false, 'next');
             assert.strictEqual(dataRequests.at(-1).keyset, undefined);
             assert.strictEqual(dataRequests.at(-1).offset, 40);
@@ -1392,6 +1392,7 @@ describe('grid count cache', () => {
             assert.deepStrictEqual(state.keysetAnchors, {
                 table: 'one_sparse_forward_page',
                 pageIndex: 0,
+                pageSize: 5000,
                 first: 'F1',
                 last: 'L5000'
             });

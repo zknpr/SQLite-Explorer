@@ -59,7 +59,24 @@ async function refreshContentOnce(filename, connectionResult, contentChange) {
     // the connection. Clear every positional/targeted intent synchronously,
     // before the first schema await exposes the stale grid again.
     clearSelection();
-    state.pinnedRowIds.clear();
+    // Pins name records. A history change names the records it removed or
+    // moved, so pins stay on theirs; any other change clears them.
+    const rowIdentity = connectionResult ? undefined : contentChange?.rowIdentity;
+    if (!rowIdentity) {
+        state.pinnedRowIds.clear();
+    } else if (rowIdentity.table === state.selectedTable && state.pinnedRowIds.size > 0) {
+        const pins = new Map(Array.from(state.pinnedRowIds, id => [String(id), id]));
+        for (const id of rowIdentity.removedRowIds) pins.delete(String(id));
+        // Every move reads the pins as they were: a batch can shift keys
+        // along a chain (2 -> 3, 3 -> 4).
+        const moved = [];
+        for (const [before, after] of rowIdentity.movedRowIds) {
+            if (pins.delete(String(before))) moved.push(after);
+        }
+        state.pinnedRowIds.clear();
+        for (const id of [...pins.values(), ...moved]) state.pinnedRowIds.add(id);
+        persistState();
+    }
     state.editingCellInfo = null;
     state.activeCellInput = null;
     updateToolbarButtons();

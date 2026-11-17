@@ -3,14 +3,17 @@ import '../unit/vscode_mock_setup'; // Must be first
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { it } from 'node:test';
+import { after, it } from 'node:test';
 import * as vscode from 'vscode';
 
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import { createNativeDatabaseConnection, isNativeAvailable } from '../../src/nativeWorker';
+import { createNativeDatabaseConnection, isNativeAvailable, nativeRequestsWrittenByV8 } from '../../src/nativeWorker';
 import { runReadSnapshot } from '../../src/core/operation-serializer';
 import { importRowsAtomically } from '../../src/core/bulk-import';
 import type { CellValue, DatabaseOperations, ModificationEntry, RecordId } from '../../src/core/types';
+
+// Every request to the native engine is written by the extension itself (`nativeRequestFormat.ts`).
+after(() => { assert.strictEqual(nativeRequestsWrittenByV8.count, 0, 'no request was left to the editor\'s V8 to write'); });
 
 // Differential fuzz of the history-tracked mutation API: the same inserts,
 // batch edits, key edits, JSON patches, deletes, imports, undos and redos run

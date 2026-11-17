@@ -17,6 +17,13 @@ const READ_ONLY_PRIMARY_KEY_RECORD_ID_VERSION = 1;
  * Set-based identity metadata used by every schema-loading backend. SQLite's
  * special `pragma` schema is required here: unqualified or `main` names can
  * resolve to ordinary user tables that shadow the PRAGMA virtual tables.
+ * Key members also report their primary key's collation, as
+ * TABLE_XINFO_WITH_ROWID_ALIAS_SQL does. They match the key index by name:
+ * table_info leaves generated columns out of its cid numbering.
+ * table_info is asked only about the WITHOUT ROWID tables whose columns are
+ * read (a NULL name returns no row). SQLite runs it for every joined row
+ * before the ON clause, and for a virtual table whose module the build lacks
+ * it fails with "no such module", which failed the whole schema load.
  */
 export const TABLE_IDENTITY_METADATA_SQL = `
 SELECT
@@ -26,9 +33,16 @@ SELECT
   ti."cid" AS column_ordinal,
   ti."name" AS column_name,
   ti."type" AS declared_type,
-  ti."pk" AS primary_key_position
+  ti."pk" AS primary_key_position,
+  CASE WHEN ti."pk" > 0 THEN (
+    SELECT key."coll" FROM pragma.pragma_index_list(tl."name", tl."schema") AS pk_index
+    JOIN pragma.pragma_index_xinfo(pk_index."name", tl."schema") AS key
+    WHERE pk_index."origin" = 'pk' AND key."name" = ti."name" AND key."key" = 1 LIMIT 1
+  ) END AS primary_key_collation
 FROM pragma.pragma_table_list AS tl
-LEFT JOIN pragma.pragma_table_info(tl."name", tl."schema") AS ti
+LEFT JOIN pragma.pragma_table_info(
+  CASE WHEN tl."type" IN ('table', 'shadow') AND tl."wr" = 1 THEN tl."name" END, tl."schema"
+) AS ti
   ON tl."type" IN ('table', 'shadow') AND tl."wr" = 1
 WHERE tl."schema" = 'main' AND tl."name" NOT LIKE 'sqlite_%'
 ORDER BY tl."name", ti."cid"`;
@@ -66,6 +80,8 @@ export interface RecordIdentityPredicate {
   primaryKey?: DecodedPrimaryKeyRecordId;
   /** Per-member CAST flags for structured native locators; never raw SQL. */
   primaryKeyIntegerCasts?: boolean[];
+  /** Per-member storage classes, for joins that apply buildStorageClassGuards. */
+  primaryKeyStorageClasses?: EncodedPrimaryKeyValue[0][];
 }
 
 /**
@@ -702,18 +718,78 @@ export function replacePrimaryKeyRecordIdValues(
  * Unsafe INTEGER identities decode to decimal strings. Match the keyset seek
  * discipline and restore the encoded storage class explicitly at every bind;
  * this also covers affinity-less STRICT ANY columns without extra metadata.
+ * The unary plus drops the CAST's INTEGER affinity, which would compare a
+ * typeless key under NUMERIC affinity: INTEGER 1 would also match TEXT '1',
+ * and the one-row guards would refuse both rows.
  */
 function primaryKeyBindPlaceholder(
   storageClass: EncodedPrimaryKeyValue[0]
 ): string {
   return storageClass === 'integer'
-    ? 'CAST(? AS INTEGER)'
+    ? '+CAST(? AS INTEGER)'
     : '?';
 }
 
+/**
+ * An identity names storage of its own class only. Its placeholder carries no
+ * affinity, so the column applies its own: a column declared TEXT compares a
+ * number as text, and one declared INTEGER or REAL compares numeric-looking
+ * text as a number. The class check keeps an identity to storage of its
+ * own class.
+ * A REAL identity also accepts INTEGER: the native engine reports an integer
+ * key up to 2^53 as a number, which does not say whether it is stored INTEGER
+ * or REAL. BLOB is never converted for a comparison and is not checked.
+ */
+function storageClassGuard(
+  escapedColumn: string,
+  storageClass: EncodedPrimaryKeyValue[0]
+): string | undefined {
+  if (storageClass === 'integer') return `typeof(${escapedColumn}) = 'integer'`;
+  if (storageClass === 'real') return `typeof(${escapedColumn}) IN ('integer', 'real')`;
+  if (storageClass === 'text') return `typeof(${escapedColumn}) = 'text'`;
+  return undefined;
+}
+
+/** The storage-class guards an identity's members need, over the given column expressions. */
+export function buildStorageClassGuards(
+  columnSql: readonly string[],
+  storageClasses: readonly EncodedPrimaryKeyValue[0][]
+): string[] {
+  return columnSql.flatMap((column, index) => (
+    storageClassGuard(column, storageClasses[index]) ?? []
+  ));
+}
+
+/**
+ * A key member as a comparison or ORDER BY operand, under the collation its
+ * primary key compares it with. The column's own collation can be looser,
+ * such as NOCASE on a column whose key is BINARY: a bare comparison then names
+ * every row that differs only in case, and cannot search the key's index.
+ */
+export function primaryKeyColumnSql(column: PrimaryKeyColumn, qualifier = ''): string {
+  const escaped = qualifier + escapeIdentifier(column.identifier);
+  return column.collation === undefined
+    ? escaped
+    : `${escaped} COLLATE ${escapeIdentifier(column.collation)}`;
+}
+
+/** A balanced OR keeps the expression depth logarithmic in the term count. */
+function joinWithOr(terms: readonly string[]): string {
+  if (terms.length === 1) return terms[0];
+  const middle = Math.ceil(terms.length / 2);
+  return `(${joinWithOr(terms.slice(0, middle))} OR ${joinWithOr(terms.slice(middle))})`;
+}
+
+/**
+ * `writtenColumns` names key members just written, whose identity value has
+ * the class of the value written rather than the class the column's affinity
+ * stored, such as a number written to a TEXT key. Re-reading the row after
+ * that write compares those members without the storage-class check.
+ */
 export function buildRecordIdentityPredicate(
   recordId: RecordId,
-  identity: TableIdentity
+  identity: TableIdentity,
+  writtenColumns: readonly string[] = []
 ): RecordIdentityPredicate {
   assertMutableRecordId(recordId);
   if (identity.kind === 'rowid') {
@@ -726,12 +802,18 @@ export function buildRecordIdentityPredicate(
     decoded.storageClasses[index]
   ));
   return {
-    sql: expectedColumns.map((column, index) => (
-      `${escapeIdentifier(column)} = ${placeholders[index]}`
-    )).join(' AND '),
+    sql: expectedColumns.map((column, index) => {
+      const escaped = escapeIdentifier(column);
+      const guard = writtenColumns.includes(column)
+        ? undefined
+        : storageClassGuard(escaped, decoded.storageClasses[index]);
+      return `${primaryKeyColumnSql(identity.columns[index])} = ${placeholders[index]}` +
+        (guard ? ` AND ${guard}` : '');
+    }).join(' AND '),
     params: decoded.values,
     primaryKey: { columns: decoded.columns, values: decoded.values },
-    primaryKeyIntegerCasts: placeholders.map(placeholder => placeholder !== '?')
+    primaryKeyIntegerCasts: placeholders.map(placeholder => placeholder !== '?'),
+    primaryKeyStorageClasses: decoded.storageClasses
   };
 }
 
@@ -753,27 +835,103 @@ export function buildRecordIdentitiesPredicate(
     recordId => decodeDeclaredPrimaryKeyRecordId(recordId, identity)
   );
   const escapedColumns = identity.columns.map(column => escapeIdentifier(column.identifier));
-  const params = decodedIdentities.flatMap(decoded => decoded.values);
-  if (escapedColumns.length === 1) {
-    return {
-      sql: `${escapedColumns[0]} IN (${decodedIdentities.map(decoded => (
-        primaryKeyBindPlaceholder(
-          decoded.storageClasses[0]
-        )
-      )).join(', ')})`,
-      params
-    };
+  // Each identity needs the storage-class guards of buildRecordIdentityPredicate.
+  // Identities that need the same guards share one IN, so an ordinary table,
+  // whose keys usually share their classes, keeps a single IN that seeks.
+  const groups = new Map<string, { guards: string[]; identities: DecodedPrimaryKeyRecordIdInternal[] }>();
+  for (const decoded of decodedIdentities) {
+    const guards = buildStorageClassGuards(escapedColumns, decoded.storageClasses);
+    const key = guards.join(' AND ');
+    const group = groups.get(key);
+    if (group) group.identities.push(decoded);
+    else groups.set(key, { guards, identities: [decoded] });
   }
 
-  const tuplePlaceholders = decodedIdentities.map(decoded => (
-    `(${decoded.storageClasses.map(storageClass => (
-      primaryKeyBindPlaceholder(storageClass)
-    )).join(', ')})`
+  // With key collations, a row-value IN, or an IN joined by OR, compares under
+  // the collations of a subquery's columns: on the left side they keep it from
+  // searching the key's index. A lone single-column IN searches with them on
+  // the left, also when they differ from the column's own.
+  const subqueryCollations = identity.columns.some(column => column.collation !== undefined)
+    && (escapedColumns.length > 1 || groups.size > 1);
+  const valueColumns = identity.columns.map((column, index) => (
+    column.collation === undefined
+      ? `column${index + 1}`
+      : `column${index + 1} COLLATE ${escapeIdentifier(column.collation)}`
   ));
+  const keyColumns = escapedColumns.length === 1 ? escapedColumns[0] : `(${escapedColumns.join(', ')})`;
+  const terms = [...groups.values()].map(({ guards, identities }) => {
+    const rows = identities.map(decoded => (
+      `(${decoded.storageClasses.map(primaryKeyBindPlaceholder).join(', ')})`
+    ));
+    let membership: string;
+    if (subqueryCollations) {
+      membership = `${keyColumns} IN (SELECT ${valueColumns.join(', ')} FROM (VALUES ${rows.join(', ')}))`;
+    } else if (escapedColumns.length === 1) {
+      membership = `${primaryKeyColumnSql(identity.columns[0])} IN (${identities.map(decoded => (
+        primaryKeyBindPlaceholder(decoded.storageClasses[0])
+      )).join(', ')})`;
+    } else {
+      membership = `${keyColumns} IN (VALUES ${rows.join(', ')})`;
+    }
+    return [membership, ...guards].join(' AND ');
+  });
   return {
-    sql: `(${escapedColumns.join(', ')}) IN (VALUES ${tuplePlaceholders.join(', ')})`,
-    params
+    sql: terms.length === 1
+      ? terms[0]
+      : joinWithOr(terms.map(term => `(${term})`)),
+    params: [...groups.values()].flatMap(({ identities }) => (
+      identities.flatMap(decoded => decoded.values)
+    ))
   };
+}
+
+/**
+ * An identity's members as its predicate matches them: numbers by value,
+ * whatever their class, since a REAL member also matches INTEGER storage.
+ */
+function identityMatchKey(recordId: RecordId): string {
+  return JSON.stringify(decodePrimaryKeyRecordIdInternal(recordId).encodedValues.map(
+    ([storageClass, value]) => {
+      if (storageClass === 'integer') return ['number', value];
+      if (storageClass === 'real') {
+        return ['number', typeof value === 'number' && Number.isInteger(value)
+          ? BigInt(value).toString()
+          : String(value)];
+      }
+      return [storageClass, value];
+    }
+  ));
+}
+
+/**
+ * Require one matched row per requested primary-key identity. `matched` are
+ * the identities of the rows the requested predicates selected. Each
+ * identity is counted on its own.
+ */
+export function assertOneRowPerIdentity(
+  table: string,
+  requested: readonly RecordId[],
+  matched: readonly RecordId[]
+): void {
+  const counts = new Map<string, number>();
+  for (const recordId of matched) {
+    const key = identityMatchKey(recordId);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  for (const recordId of requested) {
+    const key = identityMatchKey(recordId);
+    const count = counts.get(key) ?? 0;
+    if (count === 0) {
+      throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+    }
+    if (count > 1) {
+      throw new Error(`Cannot delete from ${table}: a row identity matched more than one row`);
+    }
+    counts.delete(key);
+  }
+  if (counts.size > 0) {
+    throw new Error(`Cannot delete from ${table}: a row identity matched a row it does not name`);
+  }
 }
 
 /**
@@ -839,6 +997,7 @@ export function buildTableIdentityMap(
       identifier: string;
       declaredType: string;
       primaryKeyPosition: number;
+      primaryKeyCollation?: string;
     }>;
   }>();
 
@@ -865,7 +1024,8 @@ export function buildTableIdentityMap(
       entry.columns.push({
         identifier: row[4],
         declaredType: row[5],
-        primaryKeyPosition: Number(row[6])
+        primaryKeyPosition: Number(row[6]),
+        ...(typeof row[7] === 'string' ? { primaryKeyCollation: row[7] } : {})
       });
     }
   }
@@ -890,6 +1050,7 @@ export function primaryKeyColumnsFromTableInfo(
     identifier: string;
     declaredType: string;
     primaryKeyPosition: number;
+    primaryKeyCollation?: string;
   }[]
 ): PrimaryKeyColumn[] {
   return columns
@@ -897,7 +1058,8 @@ export function primaryKeyColumnsFromTableInfo(
     .map(column => ({
       identifier: column.identifier,
       declaredType: column.declaredType,
-      position: column.primaryKeyPosition
+      position: column.primaryKeyPosition,
+      ...(column.primaryKeyCollation !== undefined ? { collation: column.primaryKeyCollation } : {})
     }))
     .sort((left, right) => left.position - right.position);
 }

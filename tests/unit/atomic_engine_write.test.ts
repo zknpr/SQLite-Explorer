@@ -13,6 +13,7 @@ import {
   createNativeDatabaseConnection,
   NativeWorkerProcess
 } from '../../src/nativeWorker';
+import { NO_FILE_SYMLINKS } from './helpers/symlinks';
 
 async function withScratchDirectory(
   run: (directory: string) => Promise<void>
@@ -218,6 +219,70 @@ describe('atomic engine writeToFile integration', () => {
     });
   });
 
+  it('creates the WASM snapshot with the mode the save chooses, then takes an existing target mode', async t => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX permission bits');
+      return;
+    }
+    // The common umask.
+    const previousUmask = process.umask(0o022);
+    try {
+      await withScratchDirectory(async directory => {
+        const privateTarget = path.join(directory, 'private.sqlite');
+        const sharedTarget = path.join(directory, 'shared.sqlite');
+        const newTarget = path.join(directory, 'new.sqlite');
+        await seedSqliteFile(privateTarget, 'private_seed');
+        await fs.promises.chmod(privateTarget, 0o600);
+        await seedSqliteFile(sharedTarget, 'shared_seed');
+        await fs.promises.chmod(sharedTarget, 0o644);
+
+        const originalWriteFile = fs.promises.writeFile;
+        const writtenModes: number[] = [];
+        (fs.promises as unknown as { writeFile: typeof fs.promises.writeFile }).writeFile =
+          (async (candidatePath: fs.PathLike, ...args: unknown[]) => {
+            await (originalWriteFile as (...writeArgs: unknown[]) => Promise<void>)(
+              candidatePath,
+              ...args
+            );
+            // Every byte of the image is in the file here, before the helper
+            // restores the target's metadata.
+            if (String(candidatePath).includes('.sqlite-explorer-')) {
+              writtenModes.push((await fs.promises.stat(candidatePath)).mode & 0o777);
+            }
+          }) as typeof fs.promises.writeFile;
+        try {
+          await withMemoryEngine(async engine => {
+            await engine.executeQuery("CREATE TABLE secret (value TEXT); INSERT INTO secret VALUES ('s')");
+            await engine.writeToFile(privateTarget);
+            await engine.writeToFile(sharedTarget);
+            await engine.writeToFile(newTarget);
+          });
+        } finally {
+          (fs.promises as unknown as {
+            writeFile: typeof fs.promises.writeFile;
+          }).writeFile = originalWriteFile;
+        }
+
+        assert.deepStrictEqual(
+          writtenModes.map(mode => mode.toString(8)),
+          // A new target has no mode to protect: it gets the umask default,
+          // as the final file always did.
+          ['600', '600', '644']
+        );
+        assert.strictEqual((await fs.promises.stat(privateTarget)).mode & 0o777, 0o600);
+        assert.strictEqual((await fs.promises.stat(sharedTarget)).mode & 0o777, 0o644);
+        assert.strictEqual((await fs.promises.stat(newTarget)).mode & 0o777, 0o644);
+        assert.deepStrictEqual(
+          await querySavedFile(privateTarget, 'SELECT value FROM secret'),
+          [['s']]
+        );
+        await assertNoAtomicArtifacts(directory);
+      });
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
   it('honors already-aborted and mid-export WASM signals without replacing the target', async () => {
     await withScratchDirectory(async directory => {
       const targetPath = path.join(directory, 'cancelled.sqlite');
@@ -285,7 +350,8 @@ describe('atomic engine writeToFile integration', () => {
       const targetPath = path.join(directory, 'native-target.sqlite');
       const sourceAliasPath = path.join(directory, 'native-source-alias.sqlite');
       await fs.promises.writeFile(sourcePath, new Uint8Array());
-      await fs.promises.symlink(path.basename(sourcePath), sourceAliasPath);
+      if (NO_FILE_SYMLINKS) testContext.diagnostic(`The save through an alias is left out: ${NO_FILE_SYMLINKS}`);
+      else await fs.promises.symlink(path.basename(sourcePath), sourceAliasPath);
       await seedSqliteFile(targetPath, 'old_native_target');
 
       let bundle: Awaited<ReturnType<typeof createNativeDatabaseConnection>> | undefined;
@@ -371,13 +437,17 @@ describe('atomic engine writeToFile integration', () => {
         );
         const sameSourceResult = await engine.writeToFile(sourcePath);
         assert.deepStrictEqual(sameSourceResult, { requiresReopen: true });
-        assert.strictEqual((await fs.promises.lstat(sourceAliasPath)).isSymbolicLink(), true);
+        if (!NO_FILE_SYMLINKS) {
+          assert.strictEqual((await fs.promises.lstat(sourceAliasPath)).isSymbolicLink(), true);
+        }
         await assertNoAtomicArtifacts(directory);
 
-        const aliasResult = await engine.writeToFile(sourceAliasPath);
-        assert.deepStrictEqual(aliasResult, { requiresReopen: true });
-        assert.strictEqual((await fs.promises.lstat(sourceAliasPath)).isSymbolicLink(), true);
-        assert.strictEqual(await fs.promises.readlink(sourceAliasPath), path.basename(sourcePath));
+        if (!NO_FILE_SYMLINKS) {
+          const aliasResult = await engine.writeToFile(sourceAliasPath);
+          assert.deepStrictEqual(aliasResult, { requiresReopen: true });
+          assert.strictEqual((await fs.promises.lstat(sourceAliasPath)).isSymbolicLink(), true);
+          assert.strictEqual(await fs.promises.readlink(sourceAliasPath), path.basename(sourcePath));
+        }
         assert.deepStrictEqual(
           await querySavedFile(sourcePath, 'SELECT id, value FROM native_saved'),
           [[1, 'native-wal']]
@@ -387,5 +457,124 @@ describe('atomic engine writeToFile integration', () => {
         bundle?.workerMethods[Symbol.dispose]();
       }
     });
+  });
+
+  it('keeps the native snapshot owner-only while it is written', async testContext => {
+    const repoRoot = process.cwd();
+    const nativeBinary = getBundledNativeBinary(repoRoot);
+    const workerScript = path.join(repoRoot, 'natives', 'native-worker.js');
+    if (process.platform === 'win32') {
+      testContext.skip('POSIX permission bits');
+      return;
+    }
+    if (!nativeBinary || !fs.existsSync(workerScript)) {
+      testContext.skip(`no bundled txiki worker for ${process.platform}-${process.arch}`);
+      return;
+    }
+
+    // The umask the worker inherits when it starts.
+    const previousUmask = process.umask(0o022);
+    try {
+      await withScratchDirectory(async directory => {
+        const sourcePath = path.join(directory, 'source.sqlite');
+        const targetPath = path.join(directory, 'private.sqlite');
+        await fs.promises.writeFile(sourcePath, new Uint8Array());
+        await seedSqliteFile(targetPath, 'old_private_target');
+        await fs.promises.chmod(targetPath, 0o600);
+        const snapshotPrefix = `.${path.basename(targetPath)}.sqlite-explorer-`;
+
+        // Sample the mode bits of every snapshot entry beside the target, and
+        // the search bits of the folders above it, for as long as the save runs.
+        interface Sample { inFlight: boolean; size: number; exposed: number }
+        const samples: Sample[] = [];
+        let inFlight = false;
+        let saving = true;
+        const sample = async (entryPath: string, searchable: number): Promise<void> => {
+          let stats: fs.Stats;
+          try {
+            stats = await fs.promises.lstat(entryPath);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+            throw error;
+          }
+          if (stats.isDirectory()) {
+            let entries: string[];
+            try {
+              entries = await fs.promises.readdir(entryPath);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+              throw error;
+            }
+            for (const entry of entries) {
+              await sample(path.join(entryPath, entry), searchable & (stats.mode & 0o011) * 4);
+            }
+            return;
+          }
+          samples.push({ inFlight, size: stats.size, exposed: searchable & stats.mode & 0o044 });
+        };
+        const watcher = (async () => {
+          while (saving) {
+            for (const entry of await fs.promises.readdir(directory)) {
+              if (entry.startsWith(snapshotPrefix)) await sample(path.join(directory, entry), 0o044);
+            }
+            await new Promise(resolve => setImmediate(resolve));
+          }
+        })();
+
+        let bundle: Awaited<ReturnType<typeof createNativeDatabaseConnection>> | undefined;
+        const prototype = NativeWorkerProcess.prototype as unknown as {
+          call: (...args: unknown[]) => Promise<unknown>;
+        };
+        const originalCall = prototype.call;
+        prototype.call = async function(this: NativeWorkerProcess, ...args: unknown[]) {
+          if (args[0] !== 'vacuumInto') return originalCall.apply(this, args);
+          inFlight = true;
+          try {
+            return await originalCall.apply(this, args);
+          } finally {
+            inFlight = false;
+          }
+        };
+        try {
+          bundle = await createNativeDatabaseConnection(vscode.Uri.file(repoRoot));
+          const engine = (await bundle.establishConnection(
+            vscode.Uri.file(sourcePath),
+            path.basename(sourcePath)
+          )).databaseOps;
+          // 64 MiB keeps VACUUM INTO writing long enough to sample it.
+          await engine.executeQuery(
+            'CREATE TABLE secret (payload BLOB); '
+            + 'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1024) '
+            + 'INSERT INTO secret SELECT randomblob(65536) FROM n'
+          );
+          assert.deepStrictEqual(await engine.writeToFile(targetPath), { requiresReopen: false });
+        } finally {
+          saving = false;
+          await watcher;
+          prototype.call = originalCall;
+          bundle?.workerMethods[Symbol.dispose]();
+        }
+
+        assert.ok(
+          samples.some(entry => entry.inFlight && entry.size > 0),
+          'the snapshot must be observed while VACUUM INTO writes it'
+        );
+        const exposed = samples.filter(entry => entry.exposed !== 0);
+        assert.deepStrictEqual(
+          exposed.slice(0, 3).map(entry => ({ ...entry, exposed: entry.exposed.toString(8) })),
+          [],
+          `${exposed.length} of ${samples.length} samples had group or other read bits, up to `
+          + `${Math.max(0, ...exposed.filter(entry => entry.inFlight).map(entry => entry.size))} bytes in flight`
+        );
+        assert.strictEqual((await fs.promises.stat(targetPath)).mode & 0o777, 0o600);
+        assert.deepStrictEqual(
+          await querySavedFile(targetPath, 'SELECT count(*) FROM secret'),
+          [[1024]]
+        );
+        await assertNoAtomicArtifacts(directory);
+      });
+    } finally {
+      process.umask(previousUmask);
+    }
   });
 });

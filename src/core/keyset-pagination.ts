@@ -67,6 +67,33 @@ export interface KeysetKey {
    */
   nullableSortKey: boolean;
   direction: 'ASC' | 'DESC';
+  /**
+   * Per key column, the collation of the WITHOUT ROWID key member it names;
+   * present when the identity was read with its collations.
+   */
+  keyCollations?: (string | undefined)[];
+}
+
+/**
+ * The collation each WITHOUT ROWID key member is compared and ordered with,
+ * by column name. Its rows are distinct only under these: a key BINARY on a
+ * NOCASE column holds 'A' and 'a', which the column's own collation ties.
+ */
+export function primaryKeyCollations(identity: TableIdentity | undefined): Map<string, string> {
+  const collations = new Map<string, string>();
+  if (identity?.kind === 'primaryKey') {
+    for (const column of identity.columns) {
+      if (column.collation !== undefined) collations.set(column.identifier, column.collation);
+    }
+  }
+  return collations;
+}
+
+/** An ORDER BY or seek operand: the column, under its key collation when it has one. */
+export function keyColumnOrderSql(column: string, collation: string | undefined): string {
+  return collation === undefined
+    ? escapeIdentifier(column)
+    : `${escapeIdentifier(column)} COLLATE ${escapeIdentifier(collation)}`;
 }
 
 /**
@@ -88,20 +115,37 @@ export interface ResolvedKeysetPlan extends KeysetKey {
   values?: CellValue[];
   /**
    * Storage class per anchor value slot, aligned with `values`. INTEGER slots
-   * bind through CAST(? AS INTEGER): int64 values beyond 2^53 decode to
+   * bind through +CAST(? AS INTEGER): int64 values beyond 2^53 decode to
    * decimal strings (validateRowId), and a raw TEXT bind would rely on column
    * affinity — absent on a NONE-affinity sort column, where TEXT never
    * compares equal-class with INTEGER storage and the seek silently misses.
+   * The unary plus keeps the CAST's affinity out of the comparison; see
+   * buildKeysetPredicate.
    * Absent (all-plain '?') only for hand-built plans without decoded anchors.
    */
   valueClasses?: KeysetAnchorValueClass[];
-  /** Effective LIMIT: the page size, or the remainder row count for 'last'. */
+  /** Effective LIMIT: the request's limit, or the remainder row count for 'last'. */
   limit: number;
+}
+
+/**
+ * The page size that phases a request's pages: `pageSize`, or `limit` when the
+ * caller pages by its limit. Null when that value is not a safe integer, and
+ * when the LIMIT exceeds it: such a request reads into the next page, so its
+ * anchors must never match a request that can seek.
+ */
+function keysetPageSize(options: TableQueryOptions): number | null {
+  const pageSize = options.pageSize ?? options.limit;
+  if (typeof pageSize !== 'number' || !Number.isSafeInteger(pageSize)) return null;
+  return typeof options.limit === 'number' && options.limit > pageSize ? null : pageSize;
 }
 
 /**
  * Canonical identity of a grid query for anchor validity: everything that
  * determines row membership and order, and the page size that phases pages.
+ * The page size, not the LIMIT, because the grid bounds a final page's LIMIT
+ * to the rows left on it: anchors from that page must still seek the page
+ * before it, and must not seek pages of a page size equal to that remainder.
  * Projection and byte-budget fields are deliberately excluded. Compared only
  * within one engine instance, so it just has to be internally deterministic.
  */
@@ -121,15 +165,12 @@ export function computeKeysetQueryTag(table: string, options: TableQueryOptions)
     ? options.orderBy
     : null;
   const direction = orderBy !== null && options.orderDir === 'DESC' ? 'DESC' : 'ASC';
-  const limit = typeof options.limit === 'number' && Number.isSafeInteger(options.limit)
-    ? options.limit
-    : null;
   return JSON.stringify([
     KEYSET_ANCHOR_VERSION,
     table,
     orderBy,
     direction,
-    limit,
+    keysetPageSize(options),
     activeFilters,
     globalFilter,
     globalFilterColumns
@@ -156,6 +197,12 @@ export function computeKeysetKey(
     ? ['rowid']
     : identity.columns.map(column => column.identifier);
   if (identityColumns.length === 0) return undefined;
+  // Key members order and seek under their key collations, the only order in
+  // which the key is unique. A sort by a member takes it too.
+  const collations = primaryKeyCollations(identity);
+  const collated = (key: KeysetKey): KeysetKey => collations.size === 0
+    ? key
+    : { ...key, keyCollations: key.keyColumns.map(column => collations.get(column)) };
 
   const orderBy = typeof options.orderBy === 'string' && options.orderBy !== ''
     ? options.orderBy
@@ -163,29 +210,29 @@ export function computeKeysetKey(
   // Unsorted grids display B-tree scan order, which equals rowid/PK order;
   // orderDir is meaningless without a sort column.
   if (orderBy === undefined) {
-    return { keyColumns: identityColumns, nullableSortKey: false, direction: 'ASC' };
+    return collated({ keyColumns: identityColumns, nullableSortKey: false, direction: 'ASC' });
   }
 
   const direction = options.orderDir === 'DESC' ? 'DESC' : 'ASC';
   // Only the prepended synthetic slot means identity order. A later `rowid`
   // projection is an ordinary declared column on a WITHOUT ROWID table.
   if (ordersBySyntheticRowId(options)) {
-    return { keyColumns: identityColumns, nullableSortKey: false, direction };
+    return collated({ keyColumns: identityColumns, nullableSortKey: false, direction });
   }
   // Sorting by an identity member keeps the key NOT NULL and unique; dedupe so
   // ORDER BY stays satisfiable by the PK index without repeated terms.
   if (identityColumns.includes(orderBy)) {
-    return {
+    return collated({
       keyColumns: [orderBy, ...identityColumns.filter(column => column !== orderBy)],
       nullableSortKey: false,
       direction
-    };
+    });
   }
-  return {
+  return collated({
     keyColumns: [orderBy, ...identityColumns],
     nullableSortKey: true,
     direction
-  };
+  });
 }
 
 /**
@@ -316,9 +363,12 @@ export function decodeKeysetAnchor(anchor: unknown): {
  *
  * Returns undefined — the caller falls back to the unchanged LIMIT/OFFSET
  * query — for every legitimate staleness signal: no request, non-anchorable
- * object, missing/invalid page size, tag mismatch (sort/filter/table/page-size
- * changed since minting), key arity mismatch (schema changed under a matching
- * tag), or an out-of-range explicit 'last' remainder. A 'last' request may
+ * object, missing/invalid limit or page size, a limit beyond the page size,
+ * tag mismatch (sort/filter/table/page-size changed since minting), key arity
+ * mismatch (schema changed under a matching tag), or an out-of-range explicit
+ * 'last' remainder. The LIMIT may be lower than the page size, which is how
+ * the grid bounds a final page; the anchor tag holds the page size, so such a
+ * page's anchors still seek its neighbours. A 'last' request may
  * omit its remainder when the count is only an upper bound; that reverse seek
  * reads one full page without trusting the bound for page phase. Structurally malformed or
  * unmintable tokens (bad encoding, NULL in an identity slot) throw instead:
@@ -340,6 +390,7 @@ export function resolveKeysetPlan(
     ? options.limit
     : undefined;
   if (limit === undefined) return undefined;
+  if (keysetPageSize(options) === null) return undefined;
 
   if (request.mode === 'first') {
     return { ...key, mode: 'first', limit };
@@ -392,10 +443,17 @@ function tupleCompare(
  * is NULL, so the NULL run — first in ASC, last in DESC — is handled by
  * explicit IS NULL / IS NOT NULL terms on both sides of the anchor.
  *
- * INTEGER-class slots bind through CAST(? AS INTEGER): SQLite parses a
+ * INTEGER-class slots bind through +CAST(? AS INTEGER): SQLite parses a
  * decimal-string bind to its exact int64 (the decoder range-checked it), so
  * values beyond 2^53 seek correctly even on NONE-affinity columns where a
- * raw TEXT bind would never compare equal-class with INTEGER storage.
+ * raw TEXT bind would never compare equal-class with INTEGER storage. The
+ * unary plus strips the CAST's INTEGER affinity, which would make SQLite
+ * compare a column of BLOB or no affinity (no declared type, a type
+ * containing BLOB, STRICT ANY) under NUMERIC affinity: stored TEXT '7' would
+ * compare as 7 while ORDER BY keeps every TEXT after every number, so seeks
+ * would skip or repeat rows, and an index on such a column could not serve
+ * the comparison. Without it the column's own affinity decides, as for a
+ * plain '?' bind.
  */
 function buildKeysetPredicate(plan: ResolvedKeysetPlan): { sql: string; params: CellValue[] } {
   const values = plan.values!;
@@ -406,9 +464,15 @@ function buildKeysetPredicate(plan: ResolvedKeysetPlan): { sql: string; params: 
   const operator = (executionDirection === 'ASC' ? '>' : '<')
     + (plan.mode === 'atOrAfter' ? '=' : '');
   const escapedColumns = plan.keyColumns.map(escapeIdentifier);
-  const placeholders = plan.keyColumns.map((_, slot) =>
-    plan.valueClasses?.[slot] === 'integer' ? 'CAST(? AS INTEGER)' : '?'
-  );
+  // A key collation goes on the anchor value: on the column it would keep a
+  // row-value comparison from seeking the key's index.
+  const placeholders = plan.keyColumns.map((_, slot) => {
+    const placeholder = plan.valueClasses?.[slot] === 'integer' ? '+CAST(? AS INTEGER)' : '?';
+    const collation = plan.keyCollations?.[slot];
+    return collation === undefined
+      ? placeholder
+      : `${placeholder} COLLATE ${escapeIdentifier(collation)}`;
+  });
 
   if (!plan.nullableSortKey) {
     return { sql: tupleCompare(escapedColumns, operator, placeholders), params: values };
@@ -517,7 +581,9 @@ export function assembleKeysetSelect(input: {
     params.push(...predicate.params);
   }
 
-  const escapedKeyColumns = plan.keyColumns.map(escapeIdentifier);
+  const escapedKeyColumns = plan.keyColumns.map((column, slot) => (
+    keyColumnOrderSql(column, plan.keyCollations?.[slot])
+  ));
   const orderBySql = (direction: 'ASC' | 'DESC') =>
     escapedKeyColumns.map(column => `${column} ${direction}`).join(', ');
 

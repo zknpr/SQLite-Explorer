@@ -7,9 +7,10 @@ import * as vscode from 'vscode';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { createNativeDatabaseConnection, nativeGridRowPack, NativeWorkerProcess } from '../../src/nativeWorker';
 import { buildCellContainmentQuery, mergeCellContainmentMetadataRows } from '../../src/core/cell-containment';
-import { buildCellPackSelectList, buildCellPackWrappedQuery, decodeCellPackRows } from '../../src/core/cell-pack';
+import { buildCellPackSelectList, buildCellPackWrappedQuery, CellPackDecoder, decodeCellPackRows } from '../../src/core/cell-pack';
+import { parsePackedRealTexts } from '../../src/core/integer-utils';
 import { buildSelectQuery } from '../../src/core/query-builder';
-import type { QueryResultSet, TableQueryOptions } from '../../src/core/types';
+import type { ExactIntegerTextMap, QueryResultSet, TableQueryOptions } from '../../src/core/types';
 
 // Row-packed grid pages (sqlite_explorer_cell_pack) against the 'checked'
 // helper path they replace: every fetchTableData result must be identical.
@@ -291,12 +292,46 @@ describe('row-packed grid pages on WASM', () => {
                 const { sql } = buildSelectQuery('f', options);
                 const query = buildCellContainmentQuery(sql, columns.length, options, columns.map((_, index) => index),
                     'checked', true, true);
-                const expected = mergeCellContainmentMetadataRows(rowsOf(query.numericTransport.sql), undefined, query);
-                assert.equal(expected.length, 60);
+                const helperRows = mergeCellContainmentMetadataRows(rowsOf(query.numericTransport.sql), undefined, query);
+                assert.equal(helperRows.length, 60);
+                // Decoded rows end before the helpers' packed REAL text columns;
+                // the decoder keeps those texts that differ from their values.
+                const transportWidth = query.primaryTransportColumnCount;
+                const expected = helperRows.map(row => row.slice(0, transportWidth));
+                let expectedTexts: ExactIntegerTextMap | undefined;
+                helperRows.forEach((row, rowIndex) => {
+                    for (const [column, text] of parsePackedRealTexts(row.slice(transportWidth), transportWidth, rowIndex) ?? []) {
+                        if (text !== String(row[column])) ((expectedTexts ??= {})[rowIndex] ??= {})[column] = text;
+                    }
+                });
+                assert.ok(expectedTexts, 'the page has REAL text that differs from its values');
+                const decode = (rows: unknown[][]) => {
+                    const decoder = new CellPackDecoder(query);
+                    return [decodeCellPackRows(rows, query, decoder), decoder.exactTexts];
+                };
                 const direct = buildSelectQuery('f', options, undefined, expressions => buildCellPackSelectList(expressions, query)).sql;
                 assert.ok(!direct.includes('WITH'), direct.slice(0, 80));
-                assert.deepStrictEqual(decodeCellPackRows(rowsOf(buildCellPackWrappedQuery(sql, query, true)), query), expected);
-                assert.deepStrictEqual(decodeCellPackRows(rowsOf(direct), query), expected);
+                // A direct select's ORDER BY could bind to an alias, so its
+                // pack calls have none. The wrapped form names each chunk
+                // shortly: unaliased, a column is named by the whole call,
+                // which the native binding hashes again for every row.
+                assert.ok(!/sqlite_explorer_cell_pack\([^)]*\) AS /.test(direct), 'direct pack calls stay unaliased');
+                const wrapped = buildCellPackWrappedQuery(sql, query, true);
+                const chunks = Math.ceil(query.valueColumnCount / 100);
+                for (let chunk = 0; chunk < chunks; chunk++) {
+                    assert.ok(wrapped.includes(`) AS "__sqlite_explorer_cell_pack_${chunk}"`), `chunk ${chunk} is aliased`);
+                }
+                const wrappedStatement = instance.prepare(wrapped);
+                try {
+                    assert.deepStrictEqual(
+                        wrappedStatement.getColumnNames(),
+                        Array.from({ length: chunks }, (_, chunk) => `__sqlite_explorer_cell_pack_${chunk}`)
+                    );
+                } finally {
+                    wrappedStatement.free();
+                }
+                assert.deepStrictEqual(decode(rowsOf(wrapped)), [expected, expectedTexts]);
+                assert.deepStrictEqual(decode(rowsOf(direct)), [expected, expectedTexts]);
             } finally {
                 engine.shutdown();
             }
@@ -389,7 +424,7 @@ describe('row-packed grid pages on WASM', () => {
                 _sqlite3_column_blob: () => pointer + steps * 8,
                 _sqlite3_column_bytes: () => packed.byteLength
             };
-            const rows = (engine as any).readPackedRows(fakeStatement, 'packed page', { module }, query);
+            const rows = (engine as any).readPackedRows(fakeStatement, 'packed page', { module }, new CellPackDecoder(query));
             assert.equal(rows.length, 3);
             const expected = decodeCellPackRows([[packed]], query)[0];
             for (const row of rows) assert.deepStrictEqual(row, expected);
@@ -467,10 +502,13 @@ describe('row-packed grid pages on WASM', () => {
             assert.ok(statement.step());
             const packed: Uint8Array = statement.get(null, { useBigInt: true })[0];
             statement.free();
-            const decoded = decodeCellPackRows([[packed]], query);
+            const decoder = new CellPackDecoder(query);
+            const decoded = decodeCellPackRows([[packed]], query, decoder);
+            // SQLite's text for 0.5 is String(0.5): nothing to keep.
+            assert.equal(decoder.exactTexts, undefined);
             assert.deepStrictEqual(decoded[0], [
                 null, 7n, 0.5, 'p', '\ufffd', 'a', new Uint8Array([1, 2]), new Uint8Array(4), 'é',
-                '|||t5||t10||b9|', null, null, null, 0n, new Uint8Array([0xff]), 0n, null, null, null, '2:0.5'
+                '|||t5||t10||b9|', null, null, null, 0n, new Uint8Array([0xff]), 0n, null, null, null
             ]);
             const corrupt = (edit: (bytes: Uint8Array) => Uint8Array) => () => decodeCellPackRows([[edit(packed.slice())]], query);
             const tagAt = (tag: number) => {
@@ -505,6 +543,51 @@ describe('row-packed grid pages on WASM', () => {
             assert.throws(() => decodeCellPackRows([['text']], query), /not a BLOB/);
         } finally {
             engine.shutdown();
+        }
+    });
+
+    it('keep REAL text only where it differs from the number, and reject malformed REAL text', () => {
+        const query = buildCellContainmentQuery('SELECT 1, 2 LIMIT 1 OFFSET 0', 2, { limit: 1, maxInlineCellBytes: 8 },
+            [0, 1], 'checked', true, true);
+        // Two REAL cells; length overrides the length byte of the second.
+        const realPack = (first: [number, string], second: [number, number[]], length = second[1].length) => {
+            const cells = [[first[0], [...Buffer.from(first[1], 'latin1')]] as const, second];
+            const bytes = 6 + cells.reduce((sum, [, text]) => sum + 10 + text.length, 0);
+            const pack = new Uint8Array(bytes);
+            const view = new DataView(pack.buffer);
+            pack[0] = 1;
+            pack[1] = 2;
+            view.setUint32(2, bytes, true);
+            let offset = 6;
+            cells.forEach(([value, text], index) => {
+                pack[offset] = 2;
+                view.setFloat64(offset + 1, value, true);
+                pack[offset + 9] = index === 1 ? length : text.length;
+                pack.set(text, offset + 10);
+                offset += 10 + text.length;
+            });
+            return pack;
+        };
+        const ascii = (text: string) => [...Buffer.from(text, 'latin1')];
+        const decode = (pack: Uint8Array) => {
+            const decoder = new CellPackDecoder(query);
+            return [decodeCellPackRows([[pack]], query, decoder)[0].slice(0, 2), decoder.exactTexts];
+        };
+        assert.deepStrictEqual(decode(realPack([0.5, '0.5'], [1 / 3, ascii('0.33333333333333332')])),
+            [[0.5, 1 / 3], { 0: { 1: '0.33333333333333332' } }]);
+        assert.deepStrictEqual(decode(realPack([2, '2.0'], [-0, ascii('0.0')])), [[2, -0], { 0: { 0: '2.0', 1: '0.0' } }]);
+        assert.deepStrictEqual(decode(realPack([1e21, '1.0e+21'], [Infinity, ascii('Inf')])),
+            [[1e21, Infinity], { 0: { 0: '1.0e+21', 1: 'Inf' } }]);
+        assert.deepStrictEqual(decode(realPack([2.45e21, '2.45e+21'], [0.1, ascii('0.1')])), [[2.45e21, 0.1], undefined]);
+        // A prefix of the number's text, and its text with more than '.0'.
+        assert.deepStrictEqual(decode(realPack([25, '2'], [25, ascii('25.00')])), [[25, 25], { 0: { 0: '2', 1: '25.00' } }]);
+        for (const [label, text, length, error] of [
+            ['a byte past ASCII in a text that differs', [0x32, 0x2e, 0xb0], undefined, /REAL text is not ASCII/],
+            ['a control byte where the number has none', [0x32, 0x2e, 0x30, 0x0a], undefined, /REAL text is not ASCII/],
+            ['an empty text', [], 0, /bad REAL text length/],
+            ['a length past the descriptors', ascii('2.0'), 4, /bad REAL text length/]
+        ] as const) {
+            assert.throws(() => decode(realPack([0.5, '0.5'], [2, [...text]], length)), error, label);
         }
     });
 });

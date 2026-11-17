@@ -312,8 +312,12 @@ it('shares one document, engine, and edit history across both editor view types 
             [1, 1, 1],
             'both same-view panels and the optional-view panel must refresh once'
         );
-        // The webview keeps table row counts only for this entry type.
-        assert.deepStrictEqual(refreshChanges, [{ modificationType: 'cell_update' }]);
+        // The webview keeps table row counts only for this entry type, and
+        // keeps pinned rows on the records the entry did not remove or move.
+        assert.deepStrictEqual(refreshChanges, [{
+            modificationType: 'cell_update',
+            rowIdentity: { table: 'items', removedRowIds: [], movedRowIds: [] }
+        }]);
 
         await first.dispose();
         assert.strictEqual(workerDisposalCount, 0);
@@ -330,6 +334,91 @@ it('shares one document, engine, and edit history across both editor view types 
         await second.dispose();
         defaultProvider.dispose();
         optionalProvider.dispose();
+    }
+});
+
+it('tells panels which records each change and its undo or redo removed or moved', async () => {
+    const provider = createProvider('sqlite-explorer.view');
+    const uri = fileUri('/workspace/row-identity.sqlite');
+    const document = await provider.openCustomDocument(uri, openContext);
+    const panel = createPanel();
+    const changes: unknown[] = [];
+    const history: Array<{ undo: () => any; redo: () => any }> = [];
+    provider.webviews.add(uri, panel, 'row-identity');
+    provider.webviewBridges.set(panel, {
+        updateColorScheme: async () => {},
+        updateCellEditBehavior: async () => {},
+        refreshContent: async (_filename: string, _connection: unknown, change: unknown) => {
+            changes.push(change);
+        }
+    });
+    provider.onDidChangeCustomDocument(event => history.push({ undo: event.undo, redo: event.redo }));
+    const settle = () => new Promise(resolve => setImmediate(resolve));
+    const record = async (modification: LabeledModification) => {
+        document.recordExternalModification(modification);
+        await settle();
+    };
+    const identity = (removedRowIds: unknown[], movedRowIds: unknown[]) => ({ table: 'items', removedRowIds, movedRowIds });
+
+    try {
+        await record({
+            label: 'Edit value', description: 'Edit value', modificationType: 'cell_update',
+            targetTable: 'items', targetRowId: 1, targetColumn: 'value', priorValue: 'a', newValue: 'b'
+        });
+        await record({
+            label: 'Edit key', description: 'Edit key', modificationType: 'cell_update',
+            targetTable: 'items', targetRowId: 5, newTargetRowId: 500, targetColumn: 'id', priorValue: 5, newValue: 500
+        });
+        await record({
+            label: 'Batch', description: 'Batch', modificationType: 'cell_update', targetTable: 'items',
+            affectedCells: [
+                { rowId: 2, newRowId: 3, columnName: 'id' },
+                { rowId: 3, newRowId: 4, columnName: 'id' },
+                { rowId: 7, columnName: 'value' }
+            ]
+        });
+        await record({
+            label: 'Insert', description: 'Insert', modificationType: 'row_insert', targetTable: 'items',
+            rowData: { value: 'new' }, insertedRow: { rowId: 11, row: { id: 11, value: 'new' } }
+        });
+        await record({
+            label: 'Delete', description: 'Delete', modificationType: 'row_delete', targetTable: 'items',
+            affectedRowIds: [7, 8], deletedRows: [{ rowId: 7, row: {} }, { rowId: 8, row: {} }]
+        });
+        for (const index of [4, 3, 2, 1]) await history[index].undo();
+        for (const index of [1, 2, 3, 4]) await history[index].redo();
+        await settle();
+
+        assert.deepStrictEqual(changes, [
+            { modificationType: 'cell_update', rowIdentity: identity([], []) },
+            { modificationType: 'cell_update', rowIdentity: identity([], [[5, 500]]) },
+            { modificationType: 'cell_update', rowIdentity: identity([], [[2, 3], [3, 4]]) },
+            { modificationType: 'row_insert', rowIdentity: identity([], []) },
+            { modificationType: 'row_delete', rowIdentity: identity([7, 8], []) },
+            // Undo restores the deleted rows, removes the inserted one and
+            // moves the edited keys back; redo repeats each change.
+            { modificationType: 'row_delete', rowIdentity: identity([], []) },
+            { modificationType: 'row_insert', rowIdentity: identity([11], []) },
+            { modificationType: 'cell_update', rowIdentity: identity([], [[3, 2], [4, 3]]) },
+            { modificationType: 'cell_update', rowIdentity: identity([], [[500, 5]]) },
+            { modificationType: 'cell_update', rowIdentity: identity([], [[5, 500]]) },
+            { modificationType: 'cell_update', rowIdentity: identity([], [[2, 3], [3, 4]]) },
+            { modificationType: 'row_insert', rowIdentity: identity([], []) },
+            { modificationType: 'row_delete', rowIdentity: identity([7, 8], []) }
+        ]);
+
+        // A change naming more records than a refresh should carry names none,
+        // which the webview treats as unknown.
+        changes.length = 0;
+        const many = Array.from({ length: 200_000 }, (_, index) => index + 1);
+        await record({
+            label: 'Delete many', description: 'Delete many', modificationType: 'row_delete',
+            targetTable: 'items', affectedRowIds: many, deletedRows: []
+        });
+        assert.deepStrictEqual(changes, [{ modificationType: 'row_delete' }]);
+    } finally {
+        await document.dispose();
+        provider.dispose();
     }
 });
 

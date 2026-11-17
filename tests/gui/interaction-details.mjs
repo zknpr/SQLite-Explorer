@@ -337,7 +337,8 @@ try {
     const sql = "SELECT 'SAVED QUERY ' || upper(name) AS binding_result FROM markers;\n";
     await page.keyboard.insertText(sql); await page.keyboard.press(`${modifier}+Shift+S`);
     const saved = path.join(workspace, 'ordinary-query.sql'); await fileDialog(saved);
-    await waitForValue(() => fs.existsSync(saved), true, 'ordinary SQL saved to disk'); assert.equal(fs.readFileSync(saved, 'utf8'), sql);
+    // VS Code creates the file before it writes it: wait for the text, not only for the file.
+    await waitForValue(() => fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : undefined, sql, 'ordinary SQL saved to disk');
     const tab = page.locator('.tabs-container .tab[data-resource-name="ordinary-query.sql"]'); await tab.waitFor();
     await command(page, 'SQLite Explorer: Choose Query Database');
     await page.locator('.quick-input-widget .label-name').filter({ hasText: /^qa\.db$/ }).click();

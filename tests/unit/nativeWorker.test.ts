@@ -936,6 +936,84 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('gives native reads the configured statement deadline and leaves writes at the fixed one', async () => {
+        // The worker arms each request's frame deadline when it starts it. The
+        // count reply arrives after that deadline but inside the transport
+        // margin, as a worker's own timeout error would.
+        const queryTimeout = 20;
+        const connection = await createRecordingConnection(async call => {
+            if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+            if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(1);
+            const sql = String(call.args[0]);
+            if (call.method === 'query' && sql.startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')) {
+                return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
+            }
+            if (call.method === 'queryNumeric') {
+                // Two values, one empty containment token each, raw-text slots.
+                const transportColumns = call.args[2] as string[];
+                return {
+                    result: {
+                        columns: transportColumns,
+                        values: [[1, 2, '|', ...transportColumns.slice(3).map(() => null)]]
+                    }
+                };
+            }
+            if (call.method === 'query' && sql.startsWith('SELECT COUNT(*) as count FROM')) {
+                await new Promise(resolve => setTimeout(resolve, 600));
+                return { result: { columns: ['count'], values: [[1]] } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        }, undefined, queryTimeout);
+
+        try {
+            connection.calls.length = 0;
+            await connection.databaseOps.fetchTableData('items', { columns: ['rowid', 'name'], limit: 1, offset: 0 });
+            assert.deepStrictEqual(
+                await connection.databaseOps.fetchTableCount('items', {}),
+                { count: 1, isExact: true }
+            );
+            await connection.databaseOps.executeQuery('SELECT name FROM items');
+            const reads = connection.calls.filter(call => (
+                call.method === 'queryNumeric'
+                || (call.method === 'query' && (
+                    call.args[0] === ROWID_TABLE_AUTHORITY_SQL
+                    || String(call.args[0]).startsWith('SELECT COUNT(*) as count FROM')
+                    || call.args[0] === 'SELECT name FROM items'
+                ))
+            ));
+            assert.deepStrictEqual(
+                reads.map(call => [call.method, call.timeoutMs]),
+                [
+                    ['query', queryTimeout],
+                    ['queryNumeric', queryTimeout],
+                    ['query', queryTimeout],
+                    ['query', queryTimeout]
+                ]
+            );
+
+            // A read snapshot's SAVEPOINT and RELEASE also go through
+            // executeQuery, and that RELEASE commits an import run inside it.
+            connection.calls.length = 0;
+            await connection.databaseOps.runReadSnapshot!(async () => {});
+            assert.deepStrictEqual(
+                connection.calls.map(call => [String(call.args[0]).split(' ')[0], call.timeoutMs]),
+                [['SAVEPOINT', 30000], ['RELEASE', 30000]]
+            );
+
+            // Edits keep the fixed limit, including the reads inside them: an
+            // interrupted write rolls back the whole transaction.
+            connection.calls.length = 0;
+            await connection.databaseOps.updateCell('items', 1, 'name', 'two');
+            assert.ok(connection.calls.some(call => call.method === 'run' && /^UPDATE /.test(String(call.args[0]))));
+            assert.deepStrictEqual(
+                connection.calls.filter(call => call.timeoutMs !== 30000).map(call => call.method),
+                []
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('preserves typeless INTEGER cast flags in native primary-key cell locators', async () => {
         const metadata = { storageClass: 'blob', byteLength: 4 };
         const connection = await createRecordingConnection(call => {
@@ -1013,9 +1091,31 @@ describe('createNativeDatabaseConnection', () => {
                 { escapeCellIdentifier, isCellBinding }
             );
             assert.deepStrictEqual(buildCellLocator(expectedLocator), {
-                sql: '"id" = CAST(? AS INTEGER) AND "shard" = ?',
+                sql: `"id" = +CAST(? AS INTEGER) AND typeof("id") = 'integer' AND "shard" = ? AND typeof("shard") = 'text'`,
                 params: ['9007199254740993', 'a']
             });
+            // A REAL identity arrives as a number and names numeric storage.
+            assert.deepStrictEqual(buildCellLocator({
+                ...expectedLocator,
+                values: [1, 'a'],
+                integerCasts: [false, false]
+            }), {
+                sql: `"id" = ? AND typeof("id") IN ('integer', 'real') AND "shard" = ? AND typeof("shard") = 'text'`,
+                params: [1, 'a']
+            });
+            // Members compare under their key's collation, quoted as identifiers.
+            assert.deepStrictEqual(buildCellLocator({
+                ...expectedLocator,
+                collations: ['BINARY', 'x"y']
+            }), {
+                sql: `"id" COLLATE "BINARY" = +CAST(? AS INTEGER) AND typeof("id") = 'integer' ` +
+                    `AND "shard" COLLATE "x""y" = ? AND typeof("shard") = 'text'`,
+                params: ['9007199254740993', 'a']
+            });
+            assert.throws(
+                () => buildCellLocator({ ...expectedLocator, collations: ['BINARY'] }),
+                /invalid collation/
+            );
             assert.throws(
                 () => buildCellLocator({ ...expectedLocator, integerCasts: [true, '?'] }),
                 /invalid INTEGER cast flag/
@@ -3731,6 +3831,117 @@ describe('NativeWorkerProcess', () => {
 
         assert.strictEqual(errorLogged, true, 'Should log error on bad deserialization');
     });
+
+    function createStartupChild() {
+        const child = new EventEmitter() as any;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.stdin = new EventEmitter();
+        child.stdin.write = () => true;
+        // A real kill ends the process, which then reports its exit.
+        child.kill = () => { setImmediate(() => child.emit('exit', null, 'SIGTERM')); };
+        mock.method(require('node:child_process'), 'spawn', () => child);
+        mock.method(console, 'warn', () => {});
+        mock.method(console, 'error', () => {});
+        return child;
+    }
+
+    async function settledWithin<T>(promise: Promise<T>, ms: number): Promise<{ value?: T; error?: unknown } | 'pending'> {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+            return await Promise.race([
+                promise.then(value => ({ value }), error => ({ error })),
+                new Promise<'pending'>(resolve => { timer = setTimeout(() => resolve('pending'), ms); })
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    it('names what the worker wrote to stderr when it exits before ready', async () => {
+        const child = createStartupChild();
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        const starting = worker.start();
+
+        child.stderr.emit('data', Buffer.from(
+            "tjs: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by tjs)\r\n" +
+            '\u001b[31mred\u0007\tend\n'
+        ));
+        // Node can report the exit before it has read the rest of stderr.
+        child.emit('exit', 127, null);
+        child.stderr.emit('data', Buffer.from(`${'x'.repeat(3000)}\n`));
+        child.emit('close', 127, null);
+
+        const outcome = await settledWithin(starting, 2000);
+        assert.notStrictEqual(outcome, 'pending');
+        const message = String((outcome as { error?: Error }).error?.message);
+        assert.match(
+            message,
+            /^Native worker process exited with code 127; stderr: tjs: \/lib\/x86_64-linux-gnu\/libc\.so\.6: version `GLIBC_2\.38' not found \(required by tjs\)\n\uFFFD\[31mred\uFFFD\tend\nx+…$/
+        );
+        assert.ok(message.length < 2100, `excerpt is bounded: ${message.length}`);
+        assert.doesNotMatch(message, /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/);
+    });
+
+    it('stops keeping stderr once the worker is ready', async () => {
+        const child = createStartupChild();
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        const starting = worker.start();
+        child.stderr.emit('data', Buffer.from('startup warning\n'));
+        child.stdout.emit('data', encodeNativeMessage({ ready: true }));
+        await starting;
+        const pending = worker.call('query', [], 5_000);
+
+        child.stderr.emit('data', Buffer.from('later noise\n'));
+        child.emit('exit', 1, null);
+
+        await assert.rejects(pending, error => (error as Error).message === 'Native worker process exited with code 1');
+    });
+
+    it('names the startup failure of a stub that exits like a loader missing GLIBC', async (testContext) => {
+        if (process.platform === 'win32') {
+            testContext.skip('POSIX shell stub');
+            return;
+        }
+        fs.mkdirSync(path.join(process.cwd(), '.tmp'), { recursive: true });
+        const directory = fs.mkdtempSync(path.join(process.cwd(), '.tmp', 'native-startup-stderr-'));
+        try {
+            const stub = path.join(directory, 'tjs');
+            fs.writeFileSync(stub, [
+                '#!/bin/sh',
+                "echo \"tjs: /lib/x86_64-linux-gnu/libc.so.6: version \\`GLIBC_2.38' not found (required by tjs)\" >&2",
+                'exit 127',
+                ''
+            ].join('\n'), { mode: 0o755 });
+            mock.method(console, 'warn', () => {});
+            mock.method(console, 'error', () => {});
+            const worker = new NativeWorkerProcess(stub, path.join(directory, 'native-worker.js'));
+
+            await assert.rejects(
+                worker.start(),
+                /^Error: Native worker process exited with code 127; stderr: tjs: \/lib\/x86_64-linux-gnu\/libc\.so\.6: version `GLIBC_2\.38' not found \(required by tjs\)$/
+            );
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    for (const [name, frame, cause] of [
+        ['oversized', Buffer.from([0xff, 0xff, 0xff, 0xff]), /response frame 4294967295 bytes exceeds/],
+        ['undecodable', Buffer.from([0, 0, 0, 3, 0xff, 0x0f, 0x6f]), /response frame could not be deserialized/]
+    ] as const) {
+        it(`rejects start at once when the first frame is ${name}`, async () => {
+            const child = createStartupChild();
+            const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+            const starting = worker.start();
+
+            child.stdout.emit('data', frame);
+
+            const outcome = await settledWithin(starting, 2000);
+            assert.notStrictEqual(outcome, 'pending', 'start() must not wait for the initialization timeout');
+            assert.match(String((outcome as { error?: Error }).error?.message), cause);
+        });
+    }
 
     it('rejects pending requests at once when a response frame cannot be deserialized', async () => {
         const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');

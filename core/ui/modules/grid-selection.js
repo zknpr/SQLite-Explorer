@@ -13,7 +13,24 @@ export function syncSelectionDOM() {
             lastSelectedCellIds.add(`cell-${cell.rowIdx}-${cell.colIdx}`);
         });
     }
+    syncSelectedRowsDOM();
+}
 
+/**
+ * The ids of the cells the DOM marks selected: the cell selection as of the
+ * last sync, which updateSelectionStates diffs against. A virtual window move
+ * builds its new cells from it, so the move costs nothing per selected cell
+ * and leaves it as it is. Read only.
+ */
+export function getMarkedCellIds() {
+    return lastSelectedCellIds;
+}
+
+/**
+ * Re-read the selected rows from the DOM. The row baseline holds only built
+ * rows after a render, so a window move that builds rows must call this.
+ */
+export function syncSelectedRowsDOM() {
     lastSelectedRowIds.clear();
     if (state.selectedRowIds.size > 0) {
         const rows = document.querySelectorAll('.data-row.selected');

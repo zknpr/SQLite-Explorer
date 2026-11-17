@@ -30,12 +30,15 @@ declare global {
                 pinnedColumns: Set<string>;
                 pinnedRowIds: Set<number>;
                 editingCellInfo: unknown;
+                selectedCells: { rowIdx: number; colIdx: number; rowId: number; value: unknown }[];
+                selectedRowIds: Set<number>;
             };
             renderDataGrid(): void;
             updateVirtualGridWindow(): boolean;
             getVirtualColumnBounds(): { start: number; end: number } | null;
             getVirtualWindowBounds(): { start: number; end: number } | null;
             startCellEdit(rowIdx: number, colIdx: number, rowId: number): void;
+            updateSelectionStates(): void;
         };
     }
 }
@@ -65,7 +68,8 @@ describe('grid column window', {
                     import { state } from './core/ui/modules/state.js';
                     import { renderDataGrid, updateVirtualGridWindow, getVirtualColumnBounds, getVirtualWindowBounds } from './core/ui/modules/grid-render.js';
                     import { startCellEdit } from './core/ui/modules/edit.js';
-                    window.__columnHarness = { state, renderDataGrid, updateVirtualGridWindow, getVirtualColumnBounds, getVirtualWindowBounds, startCellEdit };
+                    import { updateSelectionStates } from './core/ui/modules/grid-selection.js';
+                    window.__columnHarness = { state, renderDataGrid, updateVirtualGridWindow, getVirtualColumnBounds, getVirtualWindowBounds, startCellEdit, updateSelectionStates };
                 `,
                 resolveDir: root
             },
@@ -591,6 +595,86 @@ describe('grid column window', {
             await scrollRowsTo(page, 3000);
             await scrollRowsTo(page, 0);
             assert.deepEqual(await readFocus(page), { active: 'cell-3-1', tabstops: ['cell-3-1'] });
+        } finally { await page.close(); }
+    });
+
+    /** Built cells and rows whose selection mark disagrees with state, and how many are marked. */
+    function readSelectionMarks(page: Page) {
+        return page.evaluate(() => {
+            const { state } = window.__columnHarness;
+            const selectedCells = new Set(state.selectedCells.map(cell => `${cell.rowIdx},${cell.colIdx}`));
+            const wrong: string[] = [];
+            let markedCells = 0;
+            let markedRows = 0;
+            for (const tr of document.querySelectorAll<HTMLElement>('#gridContainer tbody tr.data-row')) {
+                const rowSelected = state.selectedRowIds.has(Number(tr.dataset.rowid));
+                if (tr.classList.contains('selected')) markedRows++;
+                if (tr.classList.contains('selected') !== rowSelected) wrong.push(tr.id);
+                for (const td of tr.querySelectorAll<HTMLElement>('td.data-cell:not(.row-number)')) {
+                    const marked = td.classList.contains('cell-selected');
+                    if (marked) markedCells++;
+                    if (marked !== selectedCells.has(`${td.dataset.rowidx},${td.dataset.colidx}`)) wrong.push(td.id);
+                }
+            }
+            return { wrong: wrong.slice(0, 5), markedCells, markedRows };
+        });
+    }
+
+    it('marks the selected cells the windows build, and clears them with the next selection', async () => {
+        const page = await openGrid(300);
+        try {
+            // A rectangle past both windows: rows 0-119, columns 1-200.
+            await page.evaluate(() => {
+                const { state, updateSelectionStates } = window.__columnHarness;
+                const cells = [];
+                for (let rowIdx = 0; rowIdx < 120; rowIdx++) {
+                    for (let colIdx = 1; colIdx <= 200; colIdx++) {
+                        cells.push({ rowIdx, colIdx, rowId: rowIdx + 1, value: state.gridData[rowIdx][colIdx + 1] });
+                    }
+                }
+                state.selectedCells = cells;
+                updateSelectionStates();
+            });
+            for (const [left, top] of [[8000, 0], [8000, 2600], [16000, 2600], [16000, 0], [0, 0]]) {
+                await scrollTo(page, left);
+                await scrollRowsTo(page, top);
+                const marks = await readSelectionMarks(page);
+                assert.deepEqual(marks.wrong, [], `at ${left},${top}`);
+                if (left < 16000) assert.ok(marks.markedCells > 100, `at ${left},${top}: ${marks.markedCells} marked`);
+            }
+            await scrollTo(page, 8000);
+            await scrollRowsTo(page, 2600);
+            // A plain click replaces the selection; the diff must reach the
+            // cells the moves built.
+            const cell = await page.evaluate(() => {
+                const box = document.getElementById('gridContainer')!.getBoundingClientRect();
+                return [...document.querySelectorAll<HTMLElement>('#gridContainer td.data-cell:not(.row-number)')]
+                    .find(td => {
+                        const rect = td.getBoundingClientRect();
+                        return rect.left > box.left + 150 && rect.right < box.right && rect.top > box.top + 80 && rect.bottom < box.bottom;
+                    })!.id;
+            });
+            await page.locator(`#${cell}`).click();
+            assert.deepEqual(await readSelectionMarks(page), { wrong: [], markedCells: 1, markedRows: 0 });
+        } finally { await page.close(); }
+    });
+
+    it('marks the selected rows the row window builds, and clears them', async () => {
+        const page = await openGrid(300);
+        try {
+            await page.locator('.row-select-all-button').click();
+            // After a render the row baseline holds only built rows, so rows
+            // the window builds later must join it.
+            await page.evaluate(() => window.__columnHarness.renderDataGrid());
+            for (const top of [2600, 4000, 0]) {
+                await scrollRowsTo(page, top);
+                const marks = await readSelectionMarks(page);
+                assert.deepEqual(marks.wrong, [], `at ${top}`);
+                assert.ok(marks.markedRows > 20, `at ${top}: ${marks.markedRows} rows marked`);
+            }
+            await scrollRowsTo(page, 2600);
+            await page.locator('.row-select-all-button').click();
+            assert.deepEqual(await readSelectionMarks(page), { wrong: [], markedCells: 0, markedRows: 0 });
         } finally { await page.close(); }
     });
 

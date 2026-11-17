@@ -469,6 +469,8 @@ static void real_texts(sqlite3_context *context, int argc, sqlite3_value **argv)
  */
 #define PACK_MAX_VALUES 100
 #define PACK_MAX_REAL_TEXT 255
+/* SQLite's text for a REAL below 2^53 in magnitude takes at most 24 bytes. */
+#define PACK_REAL_TEXT_ROOM 32
 
 struct pack_cell {
     int tag;
@@ -477,6 +479,7 @@ struct pack_cell {
     int stored;   /* stored byte length of an oversized value */
     int units;    /* UTF-16 length of plain text */
     sqlite3_value *copy;
+    char real[PACK_REAL_TEXT_ROOM];
 };
 
 static unsigned char *put_u32(unsigned char *out, sqlite3_uint64 value) {
@@ -514,12 +517,28 @@ static void cell_pack(sqlite3_context *context, int argc, sqlite3_value **argv) 
             cell->tag = 1;
             descriptors += 9;
         } else if (type == SQLITE_FLOAT) {
-            /* real_texts' conversion, on a copy so the argument stays REAL. */
             cell->tag = 2;
-            cell->copy = sqlite3_value_dup(value);
-            cell->bytes = cell->copy ? sqlite3_value_text(cell->copy) : 0;
-            if (!cell->bytes) { failed = SQLITE_NOMEM; ready++; break; }
-            cell->length = sqlite3_value_bytes(cell->copy);
+            /* real_texts' text. SQLite writes a REAL as "%!.*g" with 17 digits
+             * (the copy below has no connection, and neither engine changes a
+             * connection's SQLITE_DBCONFIG_FP_DIGITS), but an integer it holds
+             * as REAL (MEM_IntReal) as that integer and ".0"; no API tells the
+             * two apart. They agree below 2^53 in magnitude, so such a value is
+             * formatted here, without the copy and its allocations. */
+            double real = sqlite3_value_double(value);
+            cell->length = 0;
+            if (real > -9007199254740992.0 && real < 9007199254740992.0) {
+                sqlite3_snprintf(PACK_REAL_TEXT_ROOM, cell->real, "%!.*g", 17, real);
+                while (cell->real[cell->length]) cell->length++;
+                cell->bytes = (const unsigned char *) cell->real;
+            }
+            /* Any other value, or a text that could have been cut short, is
+             * converted on a copy so the argument stays REAL. */
+            if (cell->length < 1 || cell->length >= PACK_REAL_TEXT_ROOM - 1) {
+                cell->copy = sqlite3_value_dup(value);
+                cell->bytes = cell->copy ? sqlite3_value_text(cell->copy) : 0;
+                if (!cell->bytes) { failed = SQLITE_NOMEM; ready++; break; }
+                cell->length = sqlite3_value_bytes(cell->copy);
+            }
             if (cell->length < 1 || cell->length > PACK_MAX_REAL_TEXT) { failed = SQLITE_ERROR; ready++; break; }
             descriptors += 10 + (sqlite3_uint64) cell->length;
         } else if (type == SQLITE_TEXT) {

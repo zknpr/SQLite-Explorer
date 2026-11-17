@@ -50,6 +50,10 @@ function onUploadUndo(event) {
         || !(event.ctrlKey || event.metaKey) || event.key?.toLowerCase() !== 'z') return;
     const target = event.target;
     if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable) return;
+    // A cancelled upload stays the active one until its read or encoding has
+    // stopped. It cannot post any more (the request checks the signal before
+    // it posts), so a further Undo is for the edit made before the drop.
+    if (activeUpload.controller.signal.aborted) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     if (activeUpload.committing) {
@@ -110,7 +114,11 @@ async function onDrop(e) {
     // Ignore drops while a grid reload is in flight: the targeted cell belongs to
     // the stale result set about to be replaced, so the upload would land on the
     // wrong row/column once the new data renders.
-    if (state.isReadOnly || state.isGridReloading || state.isRefreshingContent) return;
+    if (state.isReadOnly) return;
+    if (state.isGridReloading || state.isRefreshingContent) {
+        reportDropDuringReload();
+        return;
+    }
 
     const cell = e.target.closest('.data-cell');
     if (!cell || cell.classList.contains('row-number')) {
@@ -162,6 +170,33 @@ async function onDrop(e) {
     } finally {
         if (activeUpload === context) activeUpload = null;
         isUploading = false;
+    }
+}
+
+const DROP_DURING_RELOAD = 'The dropped file was not uploaded because the table was reloading: drop it again.';
+let reportingDropDuringReload = false;
+
+/**
+ * Say why a drop was not taken. The reload ends by writing its own status
+ * (the row count, or its error), which would replace a message written now
+ * within a moment, so the reason is written again after it, beside that
+ * status, where it stays to be read.
+ */
+async function reportDropDuringReload() {
+    if (reportingDropDuringReload) return;
+    reportingDropDuringReload = true;
+    try {
+        updateStatus(DROP_DURING_RELOAD);
+        // A minute at most: a reload that never ends has the message above.
+        for (let waited = 0; waited < 1200 && (state.isGridReloading || state.isRefreshingContent); waited++) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        const status = document.getElementById('statusText')?.textContent ?? '';
+        if (!status.includes(DROP_DURING_RELOAD)) {
+            updateStatus(status ? `${status.replace(/[.\s]+$/, '')}. ${DROP_DURING_RELOAD}` : DROP_DURING_RELOAD);
+        }
+    } finally {
+        reportingDropDuringReload = false;
     }
 }
 

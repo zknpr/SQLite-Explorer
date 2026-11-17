@@ -20,7 +20,9 @@ export async function launchInstalledVsix({ vsix, output, executable, version = 
     'workbench.editor.enablePreview': false, 'chat.disableAIFeatures': true,
     'git.openRepositoryInParentFolders': 'never',
     'window.dialogStyle': 'custom',
-    'sqliteExplorer.defaultPageSize': 100, 'sqliteExplorer.instantCommit': 'never', ...settings
+    'sqliteExplorer.defaultPageSize': 100, 'sqliteExplorer.instantCommit': 'never',
+    // For the machine the suites run on, such as a zoom level for a small screen.
+    ...JSON.parse(process.env.GUI_SETTINGS ?? '{}'), ...settings
   }, null, 2));
   const env = { ...process.env };
   for (const name of ['ELECTRON_RUN_AS_NODE', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_IPC_HOOK', 'NODE_OPTIONS']) delete env[name];
@@ -79,8 +81,20 @@ export async function launchInstalledVsix({ vsix, output, executable, version = 
 }
 
 export async function command(page, label) {
-  await page.keyboard.press('F1');
-  await page.locator('.quick-input-widget input').fill(`>${label}`);
+  // A key pressed in the instant the editor's webview takes focus back after a refresh is not
+  // always heard (seen on Linux under Xvfb: the palette never showed, and the step timed out).
+  // The palette is asked for until it shows.
+  const input = page.locator('.quick-input-widget input');
+  for (let attempt = 0; ; attempt++) {
+    await page.keyboard.press('F1');
+    try {
+      await input.waitFor({ state: 'visible', timeout: 1500 });
+      break;
+    } catch (error) {
+      if (error.name !== 'TimeoutError' || attempt === 5) throw error;
+    }
+  }
+  await input.fill(`>${label}`);
   const item = page.locator('.quick-input-widget .label-name').filter({ hasText: label });
   await item.first().waitFor();
   await item.first().click();
@@ -99,7 +113,24 @@ export async function viewerFrame(page, timeout = 15_000) {
 }
 
 export async function openDatabase(page, filename) {
-  await page.getByRole('treeitem', { name: filename, exact: true }).dblclick();
+  // The Explorer's hover for the row the pointer rests on can cover the row
+  // below it and take the double-click. Leaving the Explorer dismisses it.
+  // The Explorer redraws when files appear in the workspace, and a row that
+  // moves between the two clicks opens its neighbour. The tab that becomes
+  // active says which file opened; the wrong one is clicked past.
+  const opened = page.locator('.tabs-container .tab.active').filter({
+    hasText: new RegExp(`^${filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)
+  });
+  for (let attempt = 0; ; attempt++) {
+    await page.mouse.move(0, 0);
+    await page.getByRole('treeitem', { name: filename, exact: true }).dblclick();
+    try {
+      await opened.waitFor({ timeout: 4000 });
+      break;
+    } catch (error) {
+      if (attempt === 2) throw error;
+    }
+  }
   const frame = await viewerFrame(page);
   await frame.locator('#tablesList .list-item').first().waitFor();
   return frame;

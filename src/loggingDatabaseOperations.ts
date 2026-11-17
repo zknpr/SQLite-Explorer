@@ -64,9 +64,9 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
                 this.log('Opening incremental query read');
                 return openQueryReadSession.call(wrapped, sql);
             };
-            this.readQueryRows = async (sessionId: string, maxRows: number) => {
+            this.readQueryRows = async (sessionId: string, maxRows: number, maxBytes?: number) => {
                 this.log(`Reading up to ${maxRows} incremental query rows`);
-                return readQueryRows.call(wrapped, sessionId, maxRows);
+                return readQueryRows.call(wrapped, sessionId, maxRows, maxBytes);
             };
             this.closeQueryReadSession = async (sessionId: string) => {
                 this.log('Closing incremental query read');

@@ -27,7 +27,7 @@ import { WEBVIEW_TRANSPORT_SURFACES, assertWebviewTransportPayload } from './cor
 import { WebviewMessageHandler } from './webviewMessageHandler';
 import { HostBridge } from './hostBridge';
 import type { CellMaterializationService } from './cellMaterialization';
-import type { ModificationType } from './core/types';
+import type { ModificationEntry, ModificationType, RecordId } from './core/types';
 import { confirmFileReplacement } from './fileReplacementConfirmation';
 import { withPlainErrors } from './notificationText';
 
@@ -144,8 +144,59 @@ interface WebviewBridgeFunctions {
     filename: string,
     connection?: { connected: boolean; readOnly: boolean; connectionGeneration: number; reloadRequiredReason?: string },
     /** The history entry type this change applied or undid, when there is one. */
-    change?: { modificationType: ModificationType }
+    change?: { modificationType: ModificationType; rowIdentity?: RowIdentityChange }
   ): Promise<void>;
+}
+
+/** The records of one table a history change removed, or moved to another identity. */
+interface RowIdentityChange {
+  table: string | undefined;
+  removedRowIds: RecordId[];
+  movedRowIds: [before: RecordId, after: RecordId][];
+}
+
+// A refresh carries at most this many characters of record ids. A larger
+// change names none, and the webview then clears its pins as for any change
+// it cannot account for; this keeps the echo far below the transport limit.
+const MAX_ROW_IDENTITY_CHANGE_CHARS = 1024 * 1024;
+
+/**
+ * The records a history entry, applied forward or undone, removed from its
+ * table or moved to another rowid or key, so the webview keeps its pinned rows
+ * on their records. Only the entry's own rows are known: rows that triggers or
+ * foreign-key actions change are not reported.
+ */
+function historyRowIdentityChange(
+  modification: ModificationEntry,
+  direction: 'forward' | 'undo'
+): RowIdentityChange | undefined {
+  const undo = direction === 'undo';
+  const removedRowIds: RecordId[] = [];
+  const movedRowIds: [RecordId, RecordId][] = [];
+  if (modification.modificationType === 'cell_update') {
+    const moves = (modification.affectedCells ?? []).map(cell => [cell.rowId, cell.newRowId] as const);
+    if (modification.targetRowId !== undefined) {
+      moves.unshift([modification.targetRowId, modification.newTargetRowId]);
+    }
+    for (const [before, after] of moves) {
+      if (after === undefined || after === before) continue;
+      movedRowIds.push(undo ? [after, before] : [before, after]);
+    }
+  } else if (modification.modificationType === 'row_delete' && !undo) {
+    for (const id of modification.affectedRowIds ?? modification.deletedRows?.map(row => row.rowId) ?? []) {
+      removedRowIds.push(id);
+    }
+  } else if (modification.modificationType === 'row_insert' && undo) {
+    for (const row of [modification.insertedRow, ...(modification.insertedRows ?? [])]) {
+      if (row) removedRowIds.push(row.rowId);
+    }
+  }
+  let chars = 0;
+  for (const id of [removedRowIds, movedRowIds].flat(2)) {
+    chars += String(id).length + 1;
+    if (chars > MAX_ROW_IDENTITY_CHANGE_CHARS) return undefined;
+  }
+  return { table: modification.targetTable, removedRowIds, movedRowIds };
 }
 
 // VS Code environment data passed to webview
@@ -349,8 +400,21 @@ export class DatabaseViewerProvider extends Disposable implements vsc.CustomRead
       hostBridge = new HostBridge(this, document);
       this.#hostBridges.set(document, hostBridge);
     }
+    // A request can settle after its panel closed, when reading `webview`
+    // throws. Drop that reply; the request's work stands and nothing is left to
+    // tell. Registered before any await so a close during resolve counts.
+    let panelDisposed = false;
+    let droppedReplyLogged = false;
+    webviewPanel.onDidDispose(() => { panelDisposed = true; });
     const messageHandler = new WebviewMessageHandler(
-      (msg) => webviewPanel.webview.postMessage(msg),
+      (msg) => {
+        if (!panelDisposed) return webviewPanel.webview.postMessage(msg);
+        if (!droppedReplyLogged) {
+          droppedReplyLogged = true;
+          this.outputChannel?.appendLine('[Webview] A reply was dropped because its editor had closed.');
+        }
+        return Promise.resolve(false);
+      },
       hostBridge,
       pendingMap
     );
@@ -525,6 +589,10 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
     document.registerLifecycleDisposable(document.onDidChange(edit => {
       this.#editEventEmitter.fire({ document, ...edit });
     }));
+    // An event without undo/redo keeps VS Code's model dirty until Save or Revert.
+    document.registerLifecycleDisposable(document.onDidKeepUnsavedChanges(() => {
+      this.#editEventEmitter.fire({ document });
+    }));
 
     // Update webviews when document content changes
     document.registerLifecycleDisposable(document.onDidChangeContent(change => {
@@ -539,7 +607,12 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
           }
         : undefined;
       const modificationType = change.modification?.modificationType;
-      const contentChange = modificationType ? { modificationType } : undefined;
+      const rowIdentity = change.modification
+        ? historyRowIdentityChange(change.modification, change.modificationDirection ?? 'forward')
+        : undefined;
+      const contentChange = modificationType
+        ? { modificationType, ...(rowIdentity ? { rowIdentity } : {}) }
+        : undefined;
       for (const panel of this.webviews.get(document.uri)) {
         const bridge = this.webviewBridges.get(panel);
         // A suspended webview can hold an RPC open until its timeout. Dispatch
@@ -558,9 +631,14 @@ export class DatabaseEditorProvider extends DatabaseViewerProvider implements vs
     }));
   }
 
-  // Edit event emitter for VS Code
-  readonly #editEventEmitter = new vsc.EventEmitter<vsc.CustomDocumentEditEvent<DatabaseDocument>>();
-  readonly onDidChangeCustomDocument = this.#editEventEmitter.event;
+  // Edit events for VS Code, plus a content change after a refused Undo. The
+  // API asks a provider for one kind only; VS Code 1.145's extension host
+  // routes each event by whether it carries undo and redo.
+  readonly #editEventEmitter = new vsc.EventEmitter<
+    vsc.CustomDocumentEditEvent<DatabaseDocument> | vsc.CustomDocumentContentChangeEvent<DatabaseDocument>
+  >();
+  readonly onDidChangeCustomDocument =
+    this.#editEventEmitter.event as vsc.Event<vsc.CustomDocumentEditEvent<DatabaseDocument>>;
 
   /**
    * Save the document.

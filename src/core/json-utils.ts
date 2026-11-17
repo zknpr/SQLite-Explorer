@@ -31,6 +31,14 @@ export function prepareCellUpdateForStorage(
     ) {
         return { value, operation: 'set' };
     }
+    // A patch is printed from parsed numbers and carries every array whole, so
+    // it would rewrite a number JSON.parse cannot hold exactly, such as an
+    // integer past 2^53, even in a member the edit left alone. Comparing
+    // parsed values can also miss a change between two such numbers. Store the
+    // typed text as it is.
+    if (hasPrecisionRiskyNumber(value) || hasPrecisionRiskyNumber(priorValue)) {
+        return { value, operation: 'set' };
+    }
     try {
         const originalObject = JSON.parse(priorValue);
         const newObject = JSON.parse(value);

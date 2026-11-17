@@ -12,7 +12,7 @@ import {
     getCellMutationBlockReason,
     getOrderedColumnIndices
 } from './data-utils.js';
-import { syncSelectionDOM } from './grid-selection.js';
+import { getMarkedCellIds, syncSelectedRowsDOM, syncSelectionDOM } from './grid-selection.js';
 
 const OVERSIZED_BLOB_PREVIEW_BYTES = 16;
 export const MIN_COLUMN_WIDTH = 30;
@@ -52,6 +52,12 @@ export const VIRTUAL_SMALL_PAGE_FACTOR = 1.5;
 // render was a full render (small page / unknown viewport) or no grid is
 // mounted. Reset at the top of every renderDataGrid call.
 let virtualWindow = null;
+
+// The tbody and page of the last render that built neither a row nor a column
+// window. Like a window's gridDataRef, it lets updateVirtualGridWindow render
+// a page that loadTableData committed under its inline-edit render skip once
+// the edit ends. Reset at the top of every renderDataGrid call.
+let fullGrid = null;
 
 function readViewportHeight(container) {
     const height = container ? container.clientHeight : undefined;
@@ -208,6 +214,21 @@ function parkFocusLeaving(element) {
     // A div takes script focus only with a tabindex; -1 keeps it out of Tab order.
     if (!container.hasAttribute('tabindex')) container.tabIndex = -1;
     container.focus?.({ preventScroll: true });
+}
+
+/**
+ * A render replaces every row, so focus in one would fall to <body> as well.
+ * Park it, and return the focused data cell with its record's id so the new
+ * grid can give focus back; null when no data cell of this table had focus.
+ */
+function parkFocusForRender() {
+    const mounted = virtualWindow ?? columnWindow ?? fullGrid;
+    if (!mounted) return null;
+    parkFocusLeaving(mounted.tbody);
+    if (!parkedFocus || state.renderedTable !== state.selectedTable
+        || document.activeElement !== document.getElementById('gridContainer')) return null;
+    const row = mounted.gridDataRef[parkedFocus.rowIdx];
+    return row ? { ...parkedFocus, rowId: String(getRowId(row, parkedFocus.rowIdx)) } : null;
 }
 
 function restoreParkedFocus() {
@@ -570,18 +591,20 @@ function createTableHeader(rowNumWidth, orderedColumns, pinnedColumnOffsets) {
  * Selection keys and the active match are the only row inputs that can change
  * between the initial render and later window materializations, so they are
  * recomputed per render pass instead of being cached in the row context.
+ * A window move passes the cell ids the DOM marks selected instead: building
+ * them from state costs time per selected cell (up to 100,000) on every move.
  */
-function computeDynamicRowState() {
-    const selectedCellKeys = new Set();
-    if (state.selectedCells.length > 0) {
+function computeDynamicRowState(selectedCellIds = null) {
+    if (!selectedCellIds) {
+        selectedCellIds = new Set();
         for (const cell of state.selectedCells) {
-            selectedCellKeys.add(`${cell.rowIdx},${cell.colIdx}`);
+            selectedCellIds.add(`cell-${cell.rowIdx}-${cell.colIdx}`);
         }
     }
     const activeMatch = state.matchNav.currentIndex >= 0
         ? state.matchNav.matches[state.matchNav.currentIndex]
         : null;
-    return { selectedCellKeys, activeMatch };
+    return { selectedCellIds, activeMatch };
 }
 
 /**
@@ -682,7 +705,7 @@ function buildDataCell(ctx, dyn, row, rowIdx, rowNumVal, displayColIdx) {
     const originalColIdx = ctx.columnIndexMap.get(col.name);
     const value = getCellValue(row, originalColIdx);
     const isNull = value === null || value === undefined;
-    const isCellSelected = dyn.selectedCellKeys.has(`${rowIdx},${originalColIdx}`);
+    const isCellSelected = dyn.selectedCellIds.has(`cell-${rowIdx}-${originalColIdx}`);
     const isColPinned = state.pinnedColumns.has(col.name);
     const oversizedMetadata = getOversizedCellMetadata(rowIdx, originalColIdx);
     // A bounded grid value is still viewable through the snapshot-backed
@@ -860,7 +883,7 @@ function createTableBody(ctx, hasActiveFilters) {
  * live element, so a reused row is always current.
  */
 function renderWindowRows(vw, newStart, newEnd) {
-    const dyn = computeDynamicRowState();
+    const dyn = computeDynamicRowState(getMarkedCellIds());
     const pinnedCount = vw.pinnedCount;
     const newRows = new Map();
     for (let j = newStart; j < newEnd; j++) {
@@ -890,7 +913,7 @@ function renderWindowRows(vw, newStart, newEnd) {
     vw.windowRows = newRows;
     vw.start = newStart;
     vw.end = newEnd;
-    syncSelectionDOM();
+    syncSelectedRowsDOM();
 }
 
 /**
@@ -914,12 +937,14 @@ function editorHoldsWindow() {
  * its edges. No-ops while an inline cell edit is live — the DOM must stay
  * frozen so the editor's <textarea> survives (mirrors the render-skip in
  * loadTableData); cleanupCellEdit schedules a revalidation when the edit ends.
+ * A grid rendered in full has no window, but is re-rendered here too when a
+ * commit replaced its page under that render skip.
  * Returns true when it changed the DOM.
  */
 export function updateVirtualGridWindow() {
     const vw = virtualWindow;
     const cw = columnWindow;
-    const mounted = vw ?? cw;
+    const mounted = vw ?? cw ?? fullGrid;
     if (!mounted) return false;
     // The container was wiped (spinner, error view, table switch) since this
     // window was built: the metadata is dead, and rendering from it would
@@ -927,6 +952,7 @@ export function updateVirtualGridWindow() {
     if (mounted.tbody.isConnected === false) {
         virtualWindow = null;
         columnWindow = null;
+        fullGrid = null;
         return false;
     }
     if (editorHoldsWindow()) return false;
@@ -975,14 +1001,13 @@ function updateColumnWindow(cw, container) {
         return false;
     }
     const next = windowFromVisible(visible, bounds.total, VIRTUAL_COLUMN_OVERSCAN);
-    const dyn = computeDynamicRowState();
+    const dyn = computeDynamicRowState(getMarkedCellIds());
     for (const tr of Array.from(cw.tbody.children)) {
         const cells = windowedRowCells.get(tr);
         if (cells) patchRowColumns(cw.ctx, dyn, tr, cells, next.start, next.end);
     }
     bounds.start = next.start;
     bounds.end = next.end;
-    syncSelectionDOM();
     return true;
 }
 
@@ -1036,7 +1061,8 @@ let windowUpdateScheduled = false;
  * assertions deterministic.
  */
 export function scheduleVirtualGridUpdate() {
-    if (!virtualWindow && !columnWindow) return;
+    if (!virtualWindow && !columnWindow
+        && (!fullGrid || fullGrid.gridDataRef === state.gridData)) return;
     if (typeof requestAnimationFrame !== 'function') {
         updateVirtualGridWindow();
         return;
@@ -1060,7 +1086,13 @@ export function scheduleVirtualGridUpdate() {
  */
 export function ensureGridRowMaterialized(rowIdx) {
     let vw = virtualWindow;
-    if (!vw) return;
+    if (!vw) {
+        // Every row is built, but possibly from a page an inline edit kept off
+        // screen: render the committed one before the caller (the next editor,
+        // started before the frame cleanupCellEdit scheduled) addresses it.
+        if (fullGrid) updateVirtualGridWindow();
+        return;
+    }
     if (editorHoldsWindow()) return;
     if (vw.tbody.isConnected === false) {
         virtualWindow = null;
@@ -1144,12 +1176,14 @@ export function noteColumnWidthsChanged() {
 // ================================================================
 
 export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
+    const focusedCell = parkFocusForRender();
     // Whatever window described the previous DOM is invalid the moment we
     // rebuild (or bail before rebuilding).
     virtualWindow = null;
     columnWindow = null;
+    fullGrid = null;
     parkedFocus = null;
-    // The new grid's tab stop is always a built cell.
+    // The new grid's tab stop is a built cell, unless it keeps focus below.
     syncContainerTabStop();
 
     const headerHeight = GRID_HEADER_HEIGHT;
@@ -1297,7 +1331,17 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
     );
     const fallbackRowIdx = pinnedRowIndices[0]
         ?? unpinnedRowIndices[ctx.windowBounds?.start ?? 0];
-    ctx.keyboardTarget = {
+    // The record whose cell had keyboard focus keeps it, wherever the new
+    // page puts it; a record the page no longer has leaves it to its position.
+    let focusTarget = null;
+    if (focusedCell && orderedColumnIndices.includes(focusedCell.colIdx)) {
+        const recordRowIdx = state.gridData.findIndex((row, index) => (
+            String(getRowId(row, index)) === focusedCell.rowId
+        ));
+        const rowIdx = recordRowIdx >= 0 ? recordRowIdx : focusedCell.rowIdx;
+        if (rowIdx < state.gridData.length) focusTarget = { rowIdx, colIdx: focusedCell.colIdx };
+    }
+    ctx.keyboardTarget = focusTarget ?? {
         rowIdx: preferredRowIsRendered ? preferred.rowIdx : fallbackRowIdx,
         colIdx: preferred && orderedColumnIndices.includes(preferred.colIdx)
             && columnIsRendered(preferred.colIdx)
@@ -1337,11 +1381,20 @@ export function renderDataGrid(savedScrollTop = null, savedScrollLeft = null) {
             gridDataRef: state.gridData
         };
     }
+    if (!virtualWindow && !columnWindow) fullGrid = { tbody, gridDataRef: state.gridData };
 
     container.appendChild(table);
 
     container.scrollLeft = finalScrollLeft;
     container.scrollTop = finalScrollTop;
+
+    if (focusTarget) {
+        // Focus is parked on the container: the cell takes it back if it was
+        // built, and otherwise stays parked, as after a window move.
+        parkedFocus = focusTarget;
+        restoreParkedFocus();
+        syncContainerTabStop();
+    }
 
     syncSelectionDOM();
 }

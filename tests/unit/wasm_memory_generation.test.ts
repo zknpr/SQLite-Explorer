@@ -1,10 +1,17 @@
 import './vscode_mock_setup';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it, mock } from 'node:test';
+import { stagedSnapshotAccess } from '../../src/atomicDatabaseWrite';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
+
+// These tests intercept the save's snapshot by the name of its private directory. On Linux a
+// save can reach it through a descriptor instead
+// (atomic_database_write.test.ts holds that route), so the route by name is asked for here.
+stagedSnapshotAccess.throughDescriptor = false;
 
 const changed = /database file changed on disk|database save target changed/i;
 let directory: string;
@@ -72,8 +79,11 @@ function assertNoTemporaryFiles() {
 
 describe('small local WASM file generations', () => {
   beforeEach(() => {
-    const root = path.resolve('.tmp/unit-wasm-memory-generation');
-    fs.mkdirSync(root, { recursive: true }); directory = fs.mkdtempSync(path.join(root, 'run-'));
+    // Under the temporary folder, not the checkout, where a save can take another route: these
+    // tests follow its snapshot by the private directory's name.
+    // Resolved as a save resolves its target: on Windows the temporary folder's name can differ from
+    // what is on disk in the case of its letters, and these tests compare paths.
+    directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-explorer-wasm-memory-generation-')));
     warnings.length = 0;
   });
   afterEach(() => {
@@ -97,6 +107,21 @@ describe('small local WASM file generations', () => {
     assert.deepEqual(fs.readFileSync(source), externalBytes);
     await assert.rejects(() => engine.writeToFile(source), changed);
     assertNoTemporaryFiles();
+  });
+
+  it('saves a WAL database as a WAL database that SQLite reads back intact', async () => {
+    const source = fixture();
+    const writer = new DatabaseSync(source);
+    try { assert.equal(writer.prepare('PRAGMA journal_mode = WAL').get()!.journal_mode, 'wal'); }
+    finally { writer.close(); }
+    const engine = await open(source); await edit(engine, 'saved in WAL mode');
+    await engine.writeToFile(source);
+    const reader = new DatabaseSync(source);
+    try {
+      assert.equal(reader.prepare('PRAGMA journal_mode').get()!.journal_mode, 'wal');
+      assert.equal(reader.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
+      assert.equal(reader.prepare('SELECT value FROM items WHERE id=1').get()!.value, 'saved in WAL mode');
+    } finally { reader.close(); }
   });
 
   it('refuses an in-place external SQLite edit even when the file identity and size are unchanged', async () => {
@@ -242,7 +267,10 @@ describe('small local WASM file generations', () => {
     assertNoTemporaryFiles();
   });
 
-  it('does not accept the old descriptor when the pathname is replaced during metadata verification', async () => {
+  it('does not accept the old descriptor when the pathname is replaced during metadata verification', async t => {
+    // Node's rename fails there with EPERM while this process has the file
+    // open, so the replacement this test makes cannot be made.
+    if (process.platform === 'win32') { t.skip('Windows refuses a rename onto a file that is open.'); return; }
     const source = fixture(); const incoming = fixture('incoming.db', 'replacement during verification');
     const engine = await open(source); await edit(engine);
     changeOnlyMetadata(source);
@@ -306,8 +334,17 @@ describe('small local WASM file generations', () => {
     const source = fixture(); const engine = await open(source);
     await engine.executeQuery('CREATE TABLE child(parent INTEGER REFERENCES items(id)); PRAGMA foreign_keys=ON');
     await edit(engine);
-    const instance = (engine as unknown as { instance: { exec(sql: string): unknown[] } }).instance;
+    const instance = (engine as unknown as { instance: { exec(sql: string): unknown[]; export(): Uint8Array } }).instance;
     const exec = instance.exec.bind(instance);
+    // sql.js exports on the open connection, so its PRAGMAs survive a save.
+    // An export that resets one, as the older close-and-reopen export did,
+    // still has to reach the restore this test guards.
+    const exportImage = instance.export.bind(instance);
+    const resettingExport = mock.method(instance, 'export', () => {
+      const image = exportImage();
+      exec('PRAGMA foreign_keys = 0');
+      return image;
+    });
     const failure = mock.method(instance, 'exec', (sql: string) => {
       if (/^PRAGMA foreign_keys = 1$/.test(sql)) throw new Error('controlled PRAGMA restore failure');
       return exec(sql);
@@ -315,6 +352,7 @@ describe('small local WASM file generations', () => {
     await assert.rejects(engine.serializeDatabase(), /controlled PRAGMA restore failure/);
     await assert.rejects(engine.executeQuery('INSERT INTO child VALUES(999)'), /controlled PRAGMA restore failure/);
     failure.mock.restore();
+    resettingExport.mock.restore();
     assert.equal((await engine.getPragmas()).foreign_keys, 1);
     assert.deepEqual((await engine.executeQuery('SELECT * FROM child'))[0].rows, []);
     assert.equal(await memoryValue(engine), 'unsaved overlay');

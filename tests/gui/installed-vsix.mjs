@@ -306,7 +306,8 @@ try {
   await step('I05 cancel import confirmation leaves database untouched', async () => {
     await command(page, 'SQLite Explorer: Import CSV or JSON'); await pick('qa.db'); await pick('import_target');
     await fileDialog(fixtures.csv); await pick('Use matching column names');
-    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    // The confirmation's own button: the import's progress notification has a Cancel too, when it shows in time.
+    await page.locator('.monaco-dialog-box').getByRole('button', { name: 'Cancel', exact: true }).click();
     assert.deepEqual(rows('SELECT id FROM import_target ORDER BY id'), [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }]);
   });
   await step('X01 table export uses actual format and destination', async () => {
@@ -352,6 +353,12 @@ try {
   });
   await step(backend === 'native' ? 'L01 external replacement refuses stale view work and Reload recovers' : 'L01 Reload replaces the WASM snapshot after external replacement', async () => {
     await views(); await viewAction('Edit', 'active_contacts');
+    // The native engine checks the file again after each read, so a file
+    // replaced while the definition is still being read retires the
+    // connection before the editor opens. Replace it once the editor shows
+    // the definition: this step is about work started after the replacement.
+    await frame.locator('#viewModal').waitFor();
+    await waitForValue(async () => (await frame.locator('#viewSelectSql').inputValue()).length > 0, true, 'view definition loaded');
     const replacement = path.join(workspace, 'replacement.db'); fs.copyFileSync(fixtures.secondary, replacement);
     try { fs.renameSync(replacement, fixtures.primary); }
     catch (error) {

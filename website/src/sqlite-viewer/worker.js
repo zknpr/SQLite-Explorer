@@ -93,9 +93,12 @@ import {
   assertMutableRecordId,
   assertNoApplicableUpdateTriggerTargetWrites,
   assertNoUntrackedMutationPrograms,
+  assertOneRowPerIdentity,
+  buildInsertTriggerProbeSql,
   buildRecordIdentityPredicateChunks,
   buildRecordIdentityPredicate,
   buildTableIdentityMap,
+  buildUpdateTriggerProbeSql,
   classifyTableIdentity,
   decodePrimaryKeyRecordId,
   encodePrimaryKeyRecordId,
@@ -112,6 +115,7 @@ import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
   collectRowIdExactRealTexts,
+  foldSqliteIdentifier,
   hasUnsafeBigIntAtColumn,
   normalizeIntegerRowsForTransport,
   parseRowIdAliasColumn,
@@ -140,14 +144,17 @@ import {
   buildRowIdLookupSelect,
   computeKeysetKey,
   computeKeysetQueryTag,
+  keyColumnOrderSql,
   keysetFallbackOrder,
   mintKeysetAnchors,
   ordersBySyntheticRowId,
+  primaryKeyCollations,
   resolveKeysetPlan,
   ROW_ID_LOOKUP_ROW,
   rowIdLookupApplies
 } from '../../../src/core/keyset-pagination.ts';
 import { buildFilterConditions } from '../../../src/core/query-builder.ts';
+import { isReadStatement } from '../../../src/core/read-statement.ts';
 import { normalizeTablePageOptions } from '../../../src/core/table-pagination.ts';
 import {
   decodeCellMetadata,
@@ -418,8 +425,23 @@ function executeWithProgressHandler(operation, cancellationFlag) {
   }
 }
 
+/**
+ * Step a read while SQLite refuses every write on the connection. `read` is
+ * synchronous, so no other request sees the flag, and callers put the
+ * deadline handler inside it so the flag is restored after a timeout.
+ */
+function readRefusingWrites(read) {
+  const queryOnly = Number(db.exec('PRAGMA query_only')[0]?.values[0]?.[0]) === 1;
+  if (!queryOnly) db.exec('PRAGMA query_only = ON');
+  try {
+    return read();
+  } finally {
+    if (!queryOnly) db.exec('PRAGMA query_only = OFF');
+  }
+}
+
 function querySingleStatement(sql, cancellationFlag) {
-  return executeWithProgressHandler(() => {
+  return readRefusingWrites(() => executeWithProgressHandler(() => {
     const sourceStatement = prepareSingleStatement(sql);
     const headers = sourceStatement.getColumnNames();
     sourceStatement.free();
@@ -438,7 +460,7 @@ function querySingleStatement(sql, cancellationFlag) {
     } finally {
       statement.free();
     }
-  }, cancellationFlag);
+  }, cancellationFlag));
 }
 
 function resolveGlobalFilterColumns(columns, globalFilterColumns) {
@@ -1061,10 +1083,11 @@ async function runQuery(sql, params = [], cancellationFlag) {
   }
 
   try {
-    const results = executeWithProgressHandler(
+    const run = () => executeWithProgressHandler(
       () => db.exec(sql, params),
       cancellationFlag
     );
+    const results = isReadStatement(sql) ? readRefusingWrites(run) : run();
 
     // Convert to our result format
     return results.map(result => ({
@@ -1082,8 +1105,8 @@ async function executeReadQuery(sql, parameterText = '[]', cancellationFlag) {
   if (typeof sql !== 'string' || typeof parameterText !== 'string') {
     throw new TypeError('SQL and parameter JSON must be strings');
   }
-  const prepared = prepareReadQuery(sql);
   const params = parseQueryParameters(parameterText);
+  const prepared = prepareReadQuery(sql, params);
   if (params.length !== prepared.parameterCount) {
     throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
   }
@@ -1121,18 +1144,26 @@ async function executeReadQuery(sql, parameterText = '[]', cancellationFlag) {
       }
     }
   }
-  return executeWithProgressHandler(() => {
-    const transport = buildReadTransport(prepared.sql, headers.length);
-    const statement = prepareSingleStatement(transport.sql);
-    try {
-      statement.bind(params);
-      const rows = [];
-      while (rows.length <= SQL_RESULT_ROWS && statement.step()) {
-        rows.push(statement.get(null, { useBigInt: true }));
-      }
-      return decodeReadTransport(headers, rows, transport);
-    } finally { statement.free(); }
-  }, cancellationFlag);
+  // Match the WASM engine: query_only makes SQLite refuse every write, nested
+  // statements included. Hold it around the user's statement only and restore
+  // it outside the deadline.
+  if (!queryOnly) runSingleStatement('PRAGMA query_only = ON');
+  try {
+    return executeWithProgressHandler(() => {
+      const transport = buildReadTransport(prepared.sql, headers.length);
+      const statement = prepareSingleStatement(transport.sql);
+      try {
+        statement.bind(prepared.params);
+        const rows = [];
+        while (rows.length <= SQL_RESULT_ROWS && statement.step()) {
+          rows.push(statement.get(null, { useBigInt: true }));
+        }
+        return decodeReadTransport(headers, rows, transport);
+      } finally { statement.free(); }
+    }, cancellationFlag);
+  } finally {
+    if (!queryOnly) runSingleStatement('PRAGMA query_only = OFF');
+  }
 }
 
 /**
@@ -1160,9 +1191,18 @@ async function exportDatabase(_name) {
     throw limitError();
   }
 
+  // A writable page-on-demand database is never in WAL mode.
+  const walMode = !writablePaged && db.exec('PRAGMA journal_mode')[0]?.values[0]?.[0] === 'wal';
   let exported;
   try {
     exported = db.export();
+    // sql.js exports through the backup API and marks the copy as a
+    // rollback-journal file; download a WAL database in WAL mode, as the
+    // extension's save writes it.
+    if (walMode && exported.length >= 20) {
+      exported[18] = 2;
+      exported[19] = 2;
+    }
   } catch (error) {
     const message = getErrorMessage(error);
     if (writablePaged && /transaction is open|while a transaction/i.test(message)) {
@@ -1227,9 +1267,12 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
     predicateChunks = buildRecordIdentityPredicateChunks(uniqueRowIds, identity);
   }
 
-  const selectedColumns = columns && columns.length > 0
+  const requestedColumns = columns && columns.length > 0
     ? columns
     : getExportProjectionColumns(table);
+  const selectedColumns = format === 'sql'
+    ? await withoutGeneratedColumns(table, requestedColumns)
+    : requestedColumns;
   if (selectedColumns.length > SQLITE_MAX_RESULT_COLUMNS) {
     throw new Error(`Cannot export more than ${SQLITE_MAX_RESULT_COLUMNS} columns`);
   }
@@ -1272,10 +1315,10 @@ async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOpt
     }
     for (const predicate of predicateChunks) {
       const whereSql = predicate.sql ? ` WHERE ${predicate.sql}` : '';
-      const results = db.exec(
+      const results = readRefusingWrites(() => db.exec(
         `SELECT ${projection} FROM ${escapeMainIdentifier(table)}${whereSql}`,
         predicate.params
-      );
+      ));
       if (results.length > 0) {
         rawRows.push(...results[0].values);
       }
@@ -1348,6 +1391,25 @@ function getExportProjectionColumns(table) {
   } finally {
     statement.free();
   }
+}
+
+// SQLite refuses an INSERT that names a VIRTUAL or STORED generated column, so
+// SQL exports list only the other columns, as sqlite3's .dump does; loading
+// the file recomputes the generated values.
+async function withoutGeneratedColumns(table, columns) {
+  const generated = new Set(
+    (await getTableInfo(table))
+      .filter(column => column.isGenerated)
+      .map(column => foldSqliteIdentifier(column.identifier))
+  );
+  const insertable = columns.filter(column => !generated.has(foldSqliteIdentifier(column)));
+  if (insertable.length === 0) {
+    throw new Error(
+      `Cannot export ${table} as SQL: every selected column is generated, and SQLite ` +
+      'computes generated values itself. Select at least one other column.'
+    );
+  }
+  return insertable;
 }
 
 function decodeWebDemoExportHex(payload, expectedBytes, context) {
@@ -1577,7 +1639,10 @@ function exportToCsv(headers, rows, includeHeader, output) {
   let wroteLine = false;
   const writeLine = cells => {
     if (wroteLine) output.append('\n');
-    output.append(cells.join(','));
+    // A record of one empty field is written as "": as a blank line it would
+    // be no record at all to CSV readers at the end of the file, and to many
+    // readers anywhere.
+    output.append(cells.join(',') || '""');
     wroteLine = true;
   };
   if (includeHeader) {
@@ -1698,31 +1763,6 @@ function readRowIdAliasColumn(table) {
   return parseRowIdAliasColumn(result[0]?.values ?? [], table);
 }
 
-function buildMainUpdateTriggerProbeSql(table, columns, hasIntrinsicRowId = true) {
-  // The browser UI browses main.sqlite_schema. Its safety probe must compile
-  // against that same object even when arbitrary SQL created a TEMP shadow.
-  const uniqueColumns = [...new Set(columns)];
-  if (uniqueColumns.length === 0) {
-    throw new Error('UPDATE trigger probe requires at least one column');
-  }
-  const assignments = uniqueColumns.map(column => {
-    const quoted = escapeIdentifier(column);
-    return `${quoted} = ${quoted}`;
-  });
-  const predicate = hasIntrinsicRowId ? 'rowid = ?' : '0';
-  return `EXPLAIN UPDATE ${escapeMainIdentifier(table)} ` +
-    `SET ${assignments.join(', ')} WHERE ${predicate}`;
-}
-
-function buildMainInsertTriggerProbeSql(table, columns) {
-  const insert = columns.length === 0
-    ? `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`
-    : `INSERT INTO ${escapeMainIdentifier(table)} ` +
-      `(${columns.map(escapeIdentifier).join(', ')}) VALUES ` +
-      `(${columns.map(() => 'NULL').join(', ')})`;
-  return `EXPLAIN ${insert}`;
-}
-
 function buildMainDeleteTriggerProbeSql(table) {
   return `EXPLAIN DELETE FROM ${escapeMainIdentifier(table)} WHERE 0`;
 }
@@ -1742,7 +1782,7 @@ function assertUpdateHasNoTargetTableTriggerWrites(
     table
   );
   const result = db.exec(
-    buildMainUpdateTriggerProbeSql(table, columns, hasIntrinsicRowId),
+    buildUpdateTriggerProbeSql(table, columns, hasIntrinsicRowId),
     normalizeBindParams(hasIntrinsicRowId ? [0] : []),
     { useBigInt: true }
   );
@@ -1756,7 +1796,7 @@ function assertUpdateHasNoTargetTableTriggerWrites(
 
 function assertMutationHasNoUntrackedPrograms(operation, table, columns = []) {
   const sql = operation === 'INSERT'
-    ? buildMainInsertTriggerProbeSql(table, columns)
+    ? buildInsertTriggerProbeSql(table, columns)
     : buildMainDeleteTriggerProbeSql(table);
   const result = db.exec(sql, [], { useBigInt: true });
   assertNoUntrackedMutationPrograms(operation, table, result[0]?.values ?? []);
@@ -1866,7 +1906,7 @@ function updateRowIdAliasCellBatchWithinSavepoint(
         ? `json_patch(COALESCE(${escapedColumn}, '{}'), ?)`
         : bindPlaceholder(preparedUpdate.storedValue);
       db.run(
-        `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${expression} ` +
+        `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${expression} ` +
         'WHERE rowid = ?',
         normalizeBindParams([storedBindValue, newRowId])
       );
@@ -2041,8 +2081,10 @@ async function fetchTableData(table, options = {}) {
       };
     }
     if (orderedColumns.length > 0) {
+      // Key members order under their key collations, as in buildSelectQuery.
+      const keyCollations = primaryKeyCollations(tableIdentity);
       querySql += ` ORDER BY ${orderedColumns
-        .map(column => `${escapeIdentifier(column)} ${direction}`)
+        .map(column => `${keyColumnOrderSql(column, keyCollations.get(column))} ${direction}`)
         .join(', ')}`;
     }
 
@@ -2120,14 +2162,14 @@ async function fetchTableData(table, options = {}) {
     true
   );
   const transportQuery = containmentQuery.numericTransport;
-  const results = db.exec(transportQuery.sql, params, { useBigInt: true });
+  const results = readRefusingWrites(() => db.exec(transportQuery.sql, params, { useBigInt: true }));
   const valueSourceRows = mergeCellContainmentMetadataRows(
     results[0]?.values ?? [],
     undefined,
     containmentQuery
   );
   const rowIdResults = rowIdQuery
-    ? db.exec(rowIdQuery.sql, rowIdQuery.params, { useBigInt: true })
+    ? readRefusingWrites(() => db.exec(rowIdQuery.sql, rowIdQuery.params, { useBigInt: true }))
     : undefined;
   const rowIdRows = rowIdResults?.[0]?.values;
   if (rowIdRows && rowIdRows.length !== valueSourceRows.length) {
@@ -2164,7 +2206,7 @@ async function fetchTableData(table, options = {}) {
       headers,
       sourceRows.map(row => row[0])
     )) {
-      const result = db.exec(query.sql, query.params, { useBigInt: true });
+      const result = readRefusingWrites(() => db.exec(query.sql, query.params, { useBigInt: true }));
       companionResults.push({ query, rows: result[0]?.values ?? [] });
     }
   }
@@ -2378,7 +2420,7 @@ async function fetchTableCount(table, options = {}) {
     }
   }
 
-  const results = db.exec(sql, params);
+  const results = readRefusingWrites(() => db.exec(sql, params));
 
   if (results.length === 0 || results[0].values.length === 0) {
     return { count: 0, isExact: true };
@@ -2459,7 +2501,8 @@ async function getTableInfo(table) {
       defaultExpression: row[4],
       primaryKeyPosition: row[5],
       isGenerated: Number(row[6] ?? 0) === 2 || Number(row[6] ?? 0) === 3,
-      isRowidAlias: Number(row[7] ?? 0) === 1
+      isRowidAlias: Number(row[7] ?? 0) === 1,
+      ...(typeof row[8] === 'string' ? { primaryKeyCollation: row[8] } : {})
     }));
 }
 
@@ -2689,8 +2732,12 @@ async function updateCell(
     const rowIdAliasColumn = readRowIdAliasColumn(table);
     assertUpdateHasNoTargetTableTriggerWrites(table, [column]);
     const escapedColumn = escapeIdentifier(column);
+    // Every edit write in this worker says OR ABORT, as the extension's do. It
+    // overrides a schema ON CONFLICT clause: REPLACE would delete a colliding
+    // row history never saw, IGNORE would skip a write reported as done. The
+    // shared trigger probes compile the same OR ABORT.
     db.run(
-      `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ` +
+      `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ` +
       `${bindPlaceholder(value)} WHERE rowid = ?` +
       (enforcePriorPolicy
         ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
@@ -2757,7 +2804,7 @@ async function replaceOversizedCell(
   const escapedColumn = escapeIdentifier(column);
   const applyGuardedUpdate = () => {
     db.run(
-      `UPDATE ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${bindPlaceholder(value)} ` +
+      `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${bindPlaceholder(value)} ` +
       `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
       `AND length(CAST(${escapedColumn} AS BLOB)) = ?`,
       normalizeBindParams([
@@ -2788,7 +2835,7 @@ async function replaceOversizedCell(
     return readPrimaryKeyRecordId(
       table,
       identity,
-      buildRecordIdentityPredicate(candidateId, identity),
+      buildRecordIdentityPredicate(candidateId, identity, keyIndex >= 0 ? [column] : []),
       unresolvableTriggeredPrimaryKeyUpdateError(table)
     );
   };
@@ -2839,12 +2886,12 @@ async function insertRowInternal(
   let insertSql;
 
   if (columns.length === 0) {
-    insertSql = `INSERT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`;
+    insertSql = `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`;
   } else {
     const columnList = columns.map(escapeIdentifier).join(', ');
     const placeholders = values.map(bindPlaceholder).join(', ');
 
-    insertSql = `INSERT INTO ${escapeMainIdentifier(table)} (${columnList}) VALUES (${placeholders})`;
+    insertSql = `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} (${columnList}) VALUES (${placeholders})`;
   }
 
   if (identity.kind === 'primaryKey') {
@@ -3115,9 +3162,7 @@ async function deleteRows(table, rowIds) {
           };
         }));
       }
-      if (deletedRows.length !== rowIds.length) {
-        throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
-      }
+      assertOneRowPerIdentity(table, rowIds, deletedRows.map(row => row.rowId));
       for (const predicate of predicates) {
         db.run(
           `DELETE FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
@@ -3833,7 +3878,7 @@ async function restoreRowHistorySnapshots(table, snapshots) {
         params.unshift(entry.snapshot.rowId);
       }
       db.run(
-        `INSERT INTO ${escapeMainIdentifier(table)} ` +
+        `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} ` +
         `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
         normalizeBindParams(params)
       );
@@ -3993,7 +4038,7 @@ async function replayCellHistory(table, modification, direction) {
         bindPlaceholder
       ));
       db.run(
-        `UPDATE ${escapeMainIdentifier(table)} SET ` +
+        `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ` +
         `${rowCells.map((cell, index) => (
           `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`
         )).join(', ')} WHERE ${currentPredicate.sql} AND ` +
@@ -4300,7 +4345,7 @@ async function updateCellBatch(
           `${escapeIdentifier(update.column)} = ${bindPlaceholder(storedValue)}`
         )).join(', ');
         db.run(
-          `UPDATE ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
+          `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
           normalizeBindParams([
             ...preparedUpdates.map(update => update.storedValue),
             ...oldPredicate.params
@@ -4330,7 +4375,11 @@ async function updateCellBatch(
         const newRowId = readPrimaryKeyRecordId(
           table,
           identity,
-          buildRecordIdentityPredicate(candidateId, identity),
+          buildRecordIdentityPredicate(
+            candidateId,
+            identity,
+            primaryKeyReplacements.map(replacement => replacement.column)
+          ),
           unresolvableTriggeredPrimaryKeyUpdateError(table)
         );
         const newPredicate = buildRecordIdentityPredicate(newRowId, identity);
@@ -4475,8 +4524,8 @@ async function updateCellBatch(
     for (const update of processedUpdates) {
       const escapedColumn = escapeIdentifier(update.column);
       const sql = update.operation === 'json_patch'
-        ? `UPDATE ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
-        : `UPDATE ${escapedTable} SET ${escapedColumn} = ${bindPlaceholder(update.value)} WHERE rowid = ?`;
+        ? `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
+        : `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = ${bindPlaceholder(update.value)} WHERE rowid = ?`;
       db.run(sql, normalizeBindParams([update.value, update.rowId]));
     }
     const remainingRowIds = new Set();
