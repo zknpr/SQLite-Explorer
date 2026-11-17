@@ -32,8 +32,9 @@ accessEntryTools.use = null;
 // no Ruby: what they leave out is what these tests hold. One test below asks for the stored list.
 accessEntryTools.storedLists = false;
 
+// The tracked runtime; assets/sqlite3.wasm is a build output the native CI lane lacks.
 const wasmBinary = new Uint8Array(
-  fs.readFileSync(path.resolve(process.cwd(), 'assets/sqlite3.wasm'))
+  fs.readFileSync(path.resolve(process.cwd(), 'vendor/sql.js/sql-wasm.wasm'))
 ).buffer;
 
 let SqlJsModule: WasmEngineModule;

@@ -220,20 +220,21 @@ describe('saving twice onto a file that has access-control entries of its own (m
     for (const journal of ['delete', 'wal'] as const) {
         it(`the native engine, Save As onto its own file${journal === 'wal' ? ', in WAL mode' : ''}`, async t => {
             const { file, closing, own, forgeable } = fixture(t, journal);
-            const id = fs.statSync(file, { bigint: true }).ino;
             const log: string[] = [];
             const engine = await nativeEngine(t, file, log, closing);
             if (!engine) return;
 
             for (const [save, value] of [[1, 'first'], [2, 'second']] as const) {
+                const id = fs.statSync(file, { bigint: true }).ino;
                 await engine.updateCell('entries', 2, 'value', value);
                 await engine.writeToFile!(file);
                 assert.equal(valueOf(file, 2), value, `save ${save}`);
                 assert.deepEqual(await page(engine), [[1, 'one'], [2, value]], `save ${save}`);
+                // Replaced by a new file. Compared save by save: a filesystem can give a later file the number of one that is gone.
+                assert.notEqual(fs.statSync(file, { bigint: true }).ino, id, `save ${save}`);
             }
 
-            // Replaced by a new file, which has the old one's entries.
-            assert.notEqual(fs.statSync(file, { bigint: true }).ino, id);
+            // The new file has the old one's entries.
             assert.deepEqual(entriesForOther(file), forgeable ? [] : own);
             assert.equal(log.some(line => notKept.test(line)), forgeable);
             assert.deepEqual(log.filter(line => /could not be reopened|replaced, moved, deleted|could not be verified|could not be looked at/.test(line)), []);
@@ -242,20 +243,20 @@ describe('saving twice onto a file that has access-control entries of its own (m
 
     it('the WebAssembly engine, Save onto the file it opened', async t => {
         const { file, closing, own, forgeable } = fixture(t, 'delete');
-        const id = fs.statSync(file, { bigint: true }).ino;
         const warnings: string[] = [];
         const engine = (await createDatabaseEngine({ content: null, filePath: file, maxSize: 0, readOnlyMode: false },
             (level, ...args) => { if (level === 'warn') warnings.push(args.map(String).join(' ')); })).operations as WasmDatabaseEngine;
         closing.push(() => engine.shutdown());
 
         for (const [save, value] of [[1, 'first'], [2, 'second']] as const) {
+            const id = fs.statSync(file, { bigint: true }).ino;
             await engine.updateCell('entries', 2, 'value', value);
             // A second save is refused when the first could not vouch for the file it left.
             await engine.writeToFile(file);
             assert.equal(valueOf(file, 2), value, `save ${save}`);
+            assert.notEqual(fs.statSync(file, { bigint: true }).ino, id, `save ${save}`);
         }
 
-        assert.notEqual(fs.statSync(file, { bigint: true }).ino, id);
         assert.deepEqual(entriesForOther(file), forgeable ? [] : own);
         assert.deepEqual(warnings.filter(message => !/durability/.test(message) && !notKept.test(message)), []);
     });
