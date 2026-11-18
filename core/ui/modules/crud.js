@@ -7,7 +7,7 @@ import { updateStatus, updateToolbarButtons } from './ui.js';
 import { openModal, closeModal, registerModalCloseHandler } from './modals.js';
 import { loadTableData, loadTableColumns, reloadAfterOwnMutation } from './grid.js';
 import { refreshSchema } from './sidebar.js';
-import { getErrorMessage, parseGridInputValue } from './utils.js';
+import { formatCellValueAsText, getErrorMessage, parseGridInputValue } from './utils.js';
 import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
 import { assertUsableSqlIdentifier } from '../../../src/core/sql-utils.ts';
@@ -160,7 +160,8 @@ export function openAddRowModal() {
         } else if (isRequired) {
             input.placeholder = 'Required';
         } else if (hasDefault) {
-            input.placeholder = `Default: ${col.dflt_value}`;
+            // Schema text of any length, shortened as a grid cell is.
+            input.placeholder = `Default: ${formatCellValueAsText(col.dflt_value)}`;
         } else {
             input.placeholder = 'Default (SQL NULL)';
         }

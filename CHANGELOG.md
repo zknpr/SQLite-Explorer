@@ -93,7 +93,7 @@
 - The query console runs a statement whose parameter is followed directly by a word, such as `1=?AND 1`.
 - New Query and Refresh Query Completions work on a database in which one table or view cannot list its columns, such as a view over a dropped table or a virtual table whose module is missing. The SQL editor offered no completions there.
 - On the native engine, the SQL editor runs queries on a database that has a table named `pragma_table_info`. Every query there failed with "'pragma_table_info' is not a function".
-- Selecting a cell that holds megabytes of text no longer stalls the viewer. The Batch Update field in the sidebar showed the whole value as its placeholder, and the browser laid all of it out. The field now shows the first 100 characters, as the grid cell does.
+- Selecting a cell that holds megabytes of text no longer stalls the viewer. The Batch Update field in the sidebar showed the whole value as its placeholder, and the browser laid all of it out. The field now shows the first 100 characters, as the grid cell does. The Add Row dialog shortens a long column default the same way.
 
 ### Accessibility
 
