@@ -65,6 +65,11 @@ describe('summarizeColumnValue', () => {
   it('shows (mixed values) when the selection spans differing values', () => {
     assert.strictEqual(summarizeColumnValue(new Set(['a', 'b'])), '(mixed values)');
   });
+  it('shortens a long value as a grid cell does', () => {
+    assert.strictEqual(summarizeColumnValue(new Set(['x'.repeat(100)])), 'x'.repeat(100));
+    assert.strictEqual(summarizeColumnValue(new Set(['x'.repeat(101)])), 'x'.repeat(100) + '...');
+    assert.strictEqual(summarizeColumnValue(new Set(['é😀\n'.repeat(400_000)])), 'é😀\n'.repeat(25) + '...');
+  });
 });
 
 describe('prepareBatchUpdates', () => {

@@ -388,6 +388,8 @@ describe('webview focus and reconstructed view state', {
             });
             await page.locator('#cell-0-1').dblclick();
             await page.getByRole('spinbutton', { name: 'Text preview page' }).waitFor();
+            // The batch field names the selected value in its placeholder, which the browser lays out whole.
+            assert.equal(await page.locator('#batchInput_1').getAttribute('placeholder'), 'é😀\n'.repeat(25) + '...');
             for (let load = 0; load < 3; load++) {
                 await page.locator('#blob-load-more-btn').click();
                 await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('#blob-load-more-btn')?.disabled

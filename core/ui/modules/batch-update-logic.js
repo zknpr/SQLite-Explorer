@@ -38,7 +38,9 @@ export function groupSelectedCellsByColumn(selectedCells, tableColumns) {
 /**
  * Placeholder text describing a column's current selected value(s):
  * '(mixed values)' when the selection spans differing values, otherwise the
- * single shared value rendered as NULL / [BLOB] / its string form.
+ * single shared value rendered as NULL / [BLOB] / its string form. A long
+ * string is shortened as a grid cell shortens it: the browser lays a
+ * placeholder out whole, however little of it the field shows.
  */
 export function summarizeColumnValue(values) {
     const uniqueValues = Array.from(values || []);
@@ -48,6 +50,7 @@ export function summarizeColumnValue(values) {
     if (val === null) return 'NULL';
     if (val instanceof Uint8Array) return '[BLOB]';
     if (val === '') return '(empty string)';
+    if (typeof val === 'string' && val.length > 100) return val.substring(0, 100) + '...';
     return String(val);
 }
 
