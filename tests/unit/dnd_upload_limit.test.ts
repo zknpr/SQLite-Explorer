@@ -527,3 +527,106 @@ it('cancels an Explorer upload while workspace file retrieval is pending', async
         read.mock.restore(); update.mock.restore();
     }
 });
+
+it('leaves a second Undo to the document while a cancelled upload is still stopping', async () => {
+    const listeners = new Map<string, (event: any) => unknown>();
+    const status = { textContent: '' };
+    const cell: any = {
+        dataset: { rowidx: '0', colidx: '0' },
+        classList: { contains: () => false, remove() {} }, closest: () => cell
+    };
+    (globalThis as any).document = {
+        addEventListener(type: string, listener: (event: any) => unknown) { listeners.set(type, listener); },
+        getElementById(id: string) {
+            if (id === 'gridContainer') return this;
+            if (id === 'statusText') return status;
+            if (id === 'vscode-env') return {};
+            return null;
+        }
+    };
+    const { backendApi } = await import(apiModulePath);
+    const { state } = await import(stateModulePath);
+    state.selectedTable = 'drop_target';
+    state.selectedTableType = 'table';
+    state.tableColumns = [{ name: 'payload', type: 'TEXT' }];
+    state.gridData = [[1, new Uint8Array([0])]];
+    const retrieved = createDeferred<Uint8Array>();
+    const read = mock.method(backendApi, 'readWorkspaceFileUri', async () => retrieved.promise);
+    const update = mock.method(backendApi, 'updateCell', async () => 1);
+    const { initDragAndDrop } = await import(dndModulePath);
+    initDragAndDrop();
+    const pending = listeners.get('drop')!({ preventDefault() {}, target: cell,
+        dataTransfer: { files: [], getData: () => 'file:///private/cancelled-then-undone.bin' } });
+    try {
+        let prevented = 0;
+        const undo = { key: 'z', ctrlKey: true, target: cell,
+            preventDefault() { prevented++; }, stopImmediatePropagation() {} };
+        listeners.get('keydown')!(undo);
+        assert.equal(prevented, 1, 'the first Undo cancels the upload and goes no further');
+        assert.match(status.textContent, /Upload cancelled/);
+        // The file read has not settled, so the cancelled upload is still
+        // the active one. It can no longer write: this Undo is for the edit
+        // made before the drop, and VS Code has to receive it.
+        listeners.get('keydown')!(undo);
+        assert.equal(prevented, 1, 'the second Undo is not taken by the cancelled upload');
+        retrieved.resolve(new Uint8Array([1, 2]));
+        await pending;
+        assert.equal(update.mock.callCount(), 0, 'the cancelled upload wrote nothing');
+    } finally {
+        retrieved.resolve(new Uint8Array([1, 2])); await pending;
+        read.mock.restore(); update.mock.restore();
+    }
+});
+
+it('says why a drop was not taken while the grid reloaded, beside the status the reload wrote', async t => {
+    const containerListeners = new Map<string, (event: any) => unknown>();
+    const status = { textContent: 'Saved' };
+    (globalThis as any).document = {
+        addEventListener() {},
+        getElementById(id: string) {
+            if (id === 'gridContainer') return { addEventListener(type: string, listener: (event: any) => unknown) { containerListeners.set(type, listener); } };
+            if (id === 'statusText') return status;
+            return null;
+        }
+    };
+    let fileReads = 0;
+    (globalThis as any).FileReader = class { readAsArrayBuffer() { fileReads++; } };
+    const { state } = await import(stateModulePath);
+    const { initDragAndDrop } = await import(dndModulePath);
+    initDragAndDrop();
+    const notice = 'The dropped file was not uploaded because the table was reloading: drop it again.';
+    const drop = () => containerListeners.get('drop')!({
+        preventDefault() {},
+        target: { closest: () => ({ classList: { contains: () => false }, dataset: { rowidx: '0', colidx: '0' } }) },
+        dataTransfer: { files: [{ name: 'dropped.bin', size: 1 }], getData: () => '' }
+    });
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const settle = async () => { for (let turn = 0; turn < 5; turn++) await Promise.resolve(); };
+
+    // The reload the host asks for after an edit is in flight.
+    state.isRefreshingContent = true;
+    drop();
+    drop();
+    await settle();
+    // At once, for a reload that takes long.
+    assert.equal(status.textContent, notice);
+    assert.equal(fileReads, 0);
+
+    // The reload ends and writes the row count over it.
+    status.textContent = '2 records';
+    state.isRefreshingContent = false;
+    t.mock.timers.tick(50);
+    await settle();
+    assert.equal(status.textContent, `2 records. ${notice}`);
+
+    // A reload that failed keeps its error.
+    state.isGridReloading = true;
+    drop();
+    await settle();
+    status.textContent = 'Refresh failed: disk I/O error';
+    state.isGridReloading = false;
+    t.mock.timers.tick(50);
+    await settle();
+    assert.equal(status.textContent, `Refresh failed: disk I/O error. ${notice}`);
+    assert.equal(fileReads, 0);
+});

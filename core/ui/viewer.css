@@ -492,6 +492,22 @@ button.section-title:focus-visible,
     flex: 1;
     overflow: auto;
     position: relative;
+    border: 2px solid transparent;
+}
+
+/* The container holds focus parked from a cell that left the rendered window,
+   or the tab stop. Keys act on the grid then, so keyboard users see a ring;
+   a click on empty grid area shows none. The ring is the container's own
+   border, always there and transparent until then: an outline drawn inside
+   the container is painted over by whatever is positioned in it (the sticky
+   header and row numbers, and every cell's border and text), and a border
+   is the one thing its content cannot reach. */
+.grid-container:focus {
+    outline: none;
+}
+
+.grid-container:focus-visible {
+    border-color: var(--accent-color);
 }
 
 .data-grid {
@@ -1053,6 +1069,11 @@ button.section-title:focus-visible,
     align-items: center;
     gap: 4px;
     white-space: nowrap;
+}
+
+.page-size-note {
+    color: var(--text-secondary);
+    font-size: 11px;
 }
 
 .page-selector select {

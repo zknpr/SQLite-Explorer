@@ -67,7 +67,8 @@ export default function Installation() {
             Get started in seconds
           </h2>
           <p className="text-lg text-(--ui-subtle-fg) max-w-2xl mx-auto">
-            Install from the VS Code Marketplace or use the command line.
+            Install from the VS Code Marketplace, use the command line, or download
+            the desktop app.
           </p>
         </div>
 
@@ -114,6 +115,46 @@ export default function Installation() {
                 label="Terminal"
               />
             </div>
+          </div>
+
+          {/* Method 3: Desktop app */}
+          <div className="space-y-4">
+            <h3 className="text-xl font-semibold flex items-center gap-3">
+              <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-(--ui-accent) text-(--ui-accent-fg) text-sm font-bold">
+                3
+              </span>
+              Desktop App
+            </h3>
+            <p className="text-(--ui-subtle-fg) ml-11">
+              The same viewer as a standalone app, no VS Code required. Packages for
+              macOS (Apple Silicon <code>.dmg</code>), Linux (x86-64 <code>.deb</code>)
+              and Windows (x86-64 installer).
+            </p>
+            <div className="ml-11">
+              {/* releases/latest, not a versioned asset URL: asset names embed the App version */}
+              <a
+                href="https://github.com/zknpr/SQLite-Explorer-App/releases/latest"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg border border-(--ui-edge) bg-(--ui-bg) font-medium hover:bg-(--ui-subtle) transition-colors"
+              >
+                Download Desktop App
+                <ExternalLink className="w-4 h-4" strokeWidth={2.25} />
+              </a>
+            </div>
+            <p className="text-sm text-(--ui-subtle-fg) ml-11">
+              The packages are not signed with a publisher identity yet, so macOS and
+              Windows warn on first launch. The{' '}
+              <a
+                href="https://github.com/zknpr/SQLite-Explorer-App#install"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline hover:text-(--ui-accent) transition-colors"
+              >
+                install notes
+              </a>{' '}
+              cover the first-launch steps and checksum verification.
+            </p>
           </div>
 
           {/* Quick start */}

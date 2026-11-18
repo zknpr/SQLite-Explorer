@@ -199,6 +199,7 @@ it('preserves exact Add Row text and distinguishes default, empty string, and SQ
             notnull: 0, dflt_value: null
         },
         { name: 'with_default', type: 'TEXT', isPrimaryKey: false, notnull: 1, dflt_value: "'x'" },
+        { name: 'long_default', type: 'TEXT', isPrimaryKey: false, notnull: 0, dflt_value: `'${'y'.repeat(5000)}'` },
         { name: 'literal_null', type: 'TEXT', isPrimaryKey: false, notnull: 0, dflt_value: null },
         { name: 'spaced', type: 'TEXT', isPrimaryKey: false, notnull: 0, dflt_value: null },
         { name: 'empty_value', type: 'TEXT', isPrimaryKey: false, notnull: 0, dflt_value: null },
@@ -222,6 +223,10 @@ it('preserves exact Add Row text and distinguishes default, empty string, and SQ
         };
         assert.strictEqual(byName('id').disabled, true);
         assert.strictEqual(byName('with_default').dataset.required, 'false');
+        assert.strictEqual(byName('with_default').placeholder, "Default: 'x'");
+        // A default is schema text of any length; the field shows it shortened as a grid cell is.
+        assert.strictEqual(byName('long_default').placeholder, `Default: '${'y'.repeat(99)}...`);
+        assert.strictEqual(byName('long_default').dataset.valuePlaceholder, byName('long_default').placeholder);
         setValue('literal_null', 'NuLl');
         setValue('spaced', '  keep me  ');
         setValue('__proto__', 'safe own value');

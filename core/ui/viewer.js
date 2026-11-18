@@ -29,6 +29,7 @@ import {
 import {
     loadTableData,
     loadTableColumns,
+    recordCountStatus,
     initGridInteraction,
     initGridControls
 } from './modules/grid.js';
@@ -185,7 +186,7 @@ async function restoreSavedState() {
             container.scrollTop = savedScroll.top;
         }
 
-        updateStatus(`${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`);
+        updateStatus(recordCountStatus());
     } else {
         if (savedState) renderSidebar();
         updateStatus('Ready');

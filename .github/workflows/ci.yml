@@ -7,6 +7,11 @@ on:
     branches: [main, dev]
   push:
     branches: [main]
+  # Nightly on main, the released code: a new VS Code release can change what
+  # the extension host sends the native engine, and nothing else would run the
+  # desktop lane against it between releases.
+  schedule:
+    - cron: '41 4 * * *'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -38,3 +43,34 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+  # The extension host of a real VS Code, on the oldest version the extension
+  # supports and on the current one: the editor's runtime changes with its
+  # version, and unit tests run under Node cannot show what that changes.
+  desktop:
+    name: Desktop (VS Code ${{ matrix.vscode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vscode: oldest supported
+            script: test:desktop
+          - vscode: stable
+            script: test:desktop:stable
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build extension, worker & WASM
+        run: node scripts/build.mjs
+
+      - name: Desktop tests
+        run: xvfb-run -a npm run ${{ matrix.script }}

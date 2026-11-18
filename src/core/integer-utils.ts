@@ -23,10 +23,11 @@ export const SQLITE_MAX_VARIABLE_NUMBER = 32766;
  * PK-origin index and is therefore rejected with every other shadowing column.
  * The `pragma` schema prevents same-named user tables from shadowing the
  * metadata virtual tables themselves.
- * Binds the table name twice.
+ * Binds the table name twice. The one row it returns holds the table's
+ * pragma_table_list type: 'table', 'shadow' or 'virtual'.
  */
 export const ROWID_TABLE_AUTHORITY_SQL =
-  `SELECT 1 FROM pragma.pragma_table_list AS target ` +
+  `SELECT "type" FROM pragma.pragma_table_list AS target ` +
   `WHERE "schema" = 'main' AND "name" = ? AND (` +
   `("type" IN ('table', 'shadow') AND "wr" = 0) OR "type" = 'virtual') ` +
   `AND (NOT EXISTS (SELECT 1 FROM pragma.pragma_table_info(?, 'main') ` +
@@ -66,6 +67,10 @@ export const ROWID_ALIAS_COLUMN_SQL =
  * Native files can receive external schema commits between RPCs, so callers
  * must not combine a separate table_xinfo read with ROWID_ALIAS_COLUMN_SQL.
  * Binds the main-schema relation name once.
+ *
+ * A WITHOUT ROWID key column also reports the collation its primary key
+ * compares it with, which can differ from the column's own: rows are distinct
+ * under the key's collation, so identities must compare and order with it.
  */
 export const TABLE_XINFO_WITH_ROWID_ALIAS_SQL =
   `SELECT info."cid", info."name", info."type", info."notnull", ` +
@@ -75,7 +80,12 @@ export const TABLE_XINFO_WITH_ROWID_ALIAS_SQL =
   `AND (SELECT count(*) FROM pragma.pragma_table_info(target."name", 'main') ` +
   `WHERE "pk" > 0) = 1 ` +
   `AND NOT EXISTS (SELECT 1 FROM pragma.pragma_index_list(target."name", 'main') ` +
-  `WHERE "origin" = 'pk') THEN 1 ELSE 0 END AS is_rowid_alias ` +
+  `WHERE "origin" = 'pk') THEN 1 ELSE 0 END AS is_rowid_alias, ` +
+  `CASE WHEN target."wr" = 1 AND info."pk" > 0 THEN (` +
+  `SELECT key."coll" FROM pragma.pragma_index_list(target."name", 'main') AS pk_index ` +
+  `JOIN pragma.pragma_index_xinfo(pk_index."name", 'main') AS key ` +
+  `WHERE pk_index."origin" = 'pk' AND key."cid" = info."cid" AND key."key" = 1 LIMIT 1` +
+  `) END AS primary_key_collation ` +
   `FROM pragma.pragma_table_list AS target ` +
   `JOIN pragma.pragma_table_xinfo(target."name", 'main') AS info ` +
   `WHERE target."schema" = 'main' AND target."name" = ? ORDER BY info."cid"`;
@@ -94,6 +104,8 @@ export function parseRowIdAliasColumn(
 
 /** SQLite folds ASCII identifier case but leaves non-ASCII bytes alone. */
 export function foldSqliteIdentifier(identifier: string): string {
+  // Row history folds every column of every row; most names have no capital.
+  if (!/[A-Z]/.test(identifier)) return identifier;
   return identifier.replace(/[A-Z]/g, character => (
     String.fromCharCode(character.charCodeAt(0) + 0x20)
   ));
@@ -103,11 +115,69 @@ export function sqliteIdentifiersEqual(left: string, right: string): boolean {
   return foldSqliteIdentifier(left) === foldSqliteIdentifier(right);
 }
 
+/**
+ * Both engines bind a whole JS number past int32 as a double (sql.js's rule,
+ * and V8's serialization to txiki), so a column without INTEGER affinity keeps
+ * it as REAL and a TEXT column as '….0'. As a BigInt it binds as INTEGER, as
+ * SQLite stores the same literal. Edits and imports pass values through here.
+ */
+export function bindableIntegerValue(value: CellValue): CellValue {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value !== (value | 0)
+    ? BigInt(value)
+    : value;
+}
+
 export interface ExactNumericTextQuery {
   sql: string;
   transportColumns: string[];
   /** Present only when a second, SQLite-text companion exists per value. */
   valueColumnCount?: number;
+  /**
+   * Leading columns that have a companion, when fewer than valueColumnCount.
+   * The companions follow all valueColumnCount columns.
+   */
+  realTextColumnCount?: number;
+  /**
+   * Instead of one companion per value, this many columns after the values
+   * hold sqlite_explorer_real_texts() output: "index:text" joined by '|'.
+   */
+  packedRealTextColumnCount?: number;
+}
+
+/**
+ * Read one row's packed REAL text columns into column index -> SQLite text.
+ * Indices must be canonical, in range and strictly increasing.
+ */
+export function parsePackedRealTexts(
+  packedColumns: readonly unknown[],
+  valueColumnCount: number,
+  rowIndex: number
+): Map<number, string> | undefined {
+  let texts: Map<number, string> | undefined;
+  let previous = -1;
+  for (const packed of packedColumns) {
+    if (packed === null || packed === undefined) continue;
+    if (typeof packed !== 'string' || packed === '') {
+      throw new Error(`Packed REAL text at row ${rowIndex} is not text`);
+    }
+    for (const entry of packed.split('|')) {
+      const separator = entry.indexOf(':');
+      const indexText = entry.slice(0, separator);
+      const columnIndex = Number(indexText);
+      if (
+        separator < 1
+        || separator === entry.length - 1
+        || !/^(?:0|[1-9][0-9]*)$/.test(indexText)
+        || columnIndex >= valueColumnCount
+        || columnIndex <= previous
+      ) {
+        throw new Error(`Packed REAL text at row ${rowIndex} has an invalid entry`);
+      }
+      previous = columnIndex;
+      (texts ??= new Map()).set(columnIndex, entry.slice(separator + 1));
+    }
+  }
+  return texts;
 }
 
 export interface RowIdExactRealTextQuery {
@@ -328,14 +398,34 @@ export function collectRowIdExactRealTexts(
  * BigInts and REALs whose SQLite text differs from JavaScript's String(value).
  * The protocol field retains its legacy exactIntegerTexts name, but the sparse
  * string sidecar now covers both cases and remains JSON/RPC-safe.
+ *
+ * decodedExactTexts is CellPackDecoder.exactTexts for these rows: its texts
+ * were compared with these REAL values while the pack was decoded, so the map
+ * is taken over as the sidecar, without checking each text again.
  */
 export function normalizeIntegerRowsForTransport(
   sourceRows: readonly (readonly unknown[])[],
   valueColumnCount?: number,
   transportedExactTexts?: ExactIntegerTextMap,
-  exactIntegerIdentityColumn?: number
+  exactIntegerIdentityColumn?: number,
+  realTextColumnCount = valueColumnCount,
+  packedRealTextColumnCount?: number,
+  decodedExactTexts?: ExactIntegerTextMap
 ): { rows: CellValue[][]; exactIntegerTexts?: ExactIntegerTextMap } {
-  let exactIntegerTexts: ExactIntegerTextMap | undefined;
+  if (packedRealTextColumnCount !== undefined) {
+    if (valueColumnCount === undefined || !Number.isInteger(packedRealTextColumnCount) || packedRealTextColumnCount < 1) {
+      throw new Error(`Invalid packed REAL text column count: ${packedRealTextColumnCount}`);
+    }
+    realTextColumnCount = 0;
+  } else if (
+    valueColumnCount !== undefined
+    && (!Number.isInteger(realTextColumnCount) || realTextColumnCount! < 1
+      || realTextColumnCount! > valueColumnCount)
+  ) {
+    throw new Error(`Invalid exact numeric text column count: ${realTextColumnCount}`);
+  }
+  const sidecarColumnCount = packedRealTextColumnCount ?? realTextColumnCount ?? 0;
+  let exactIntegerTexts: ExactIntegerTextMap | undefined = decodedExactTexts;
   const setExactText = (rowIndex: number, columnIndex: number, text: string) => {
     exactIntegerTexts ??= {};
     exactIntegerTexts[rowIndex] ??= {};
@@ -344,14 +434,31 @@ export function normalizeIntegerRowsForTransport(
 
   const rows = sourceRows.map((sourceRow, rowIndex) => {
     const logicalColumnCount = valueColumnCount ?? sourceRow.length;
-    if (valueColumnCount !== undefined && sourceRow.length < valueColumnCount * 2) {
+    if (valueColumnCount !== undefined && sourceRow.length < valueColumnCount + sidecarColumnCount) {
       throw new Error(
         `Exact numeric text row ${rowIndex} has ${sourceRow.length} values; ` +
-        `expected at least ${valueColumnCount * 2}`
+        `expected at least ${valueColumnCount + sidecarColumnCount}`
       );
     }
+    const packedTexts = packedRealTextColumnCount !== undefined
+      ? parsePackedRealTexts(
+          sourceRow.slice(valueColumnCount, valueColumnCount! + packedRealTextColumnCount),
+          valueColumnCount!,
+          rowIndex
+        )
+      : undefined;
 
-    return sourceRow.slice(0, logicalColumnCount).map((value, columnIndex) => {
+    // A loop, not slice().map(): this runs for every cell of every page.
+    // Rows are built by push so they stay packed arrays, which structured
+    // clone (worker to host) copies densely; map() also returned packed rows.
+    const normalizedRow: CellValue[] = [];
+    for (let columnIndex = 0; columnIndex < logicalColumnCount; columnIndex++) {
+      // map() left a hole where the source row has one.
+      if (!(columnIndex in sourceRow)) {
+        normalizedRow.length = columnIndex + 1;
+        continue;
+      }
+      const value = sourceRow[columnIndex];
       let normalizedValue = value as CellValue | bigint;
       if (typeof value === 'bigint') {
         const numericValue = Number(value);
@@ -371,8 +478,10 @@ export function normalizeIntegerRowsForTransport(
         }
       }
 
-      if (valueColumnCount !== undefined) {
-        const exactRealText = sourceRow[valueColumnCount + columnIndex];
+      if (valueColumnCount !== undefined && (packedTexts || columnIndex < realTextColumnCount!)) {
+        const exactRealText = packedTexts
+          ? packedTexts.get(columnIndex)
+          : sourceRow[valueColumnCount + columnIndex];
         if (exactRealText !== null && exactRealText !== undefined) {
           if (typeof exactRealText !== 'string') {
             throw new Error(
@@ -384,8 +493,9 @@ export function normalizeIntegerRowsForTransport(
           }
         }
       }
-      return normalizedValue as CellValue;
-    });
+      normalizedRow.push(normalizedValue as CellValue);
+    }
+    return normalizedRow;
   });
 
   if (transportedExactTexts) {

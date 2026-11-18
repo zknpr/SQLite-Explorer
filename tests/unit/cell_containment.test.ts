@@ -2,6 +2,7 @@ import './vscode_mock_setup';
 
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import v8 from 'node:v8';
 import { describe, it } from 'node:test';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import {
@@ -255,6 +256,56 @@ describe('grid cell containment limits', () => {
         }
     });
 
+    it('evaluates a source that ends with OFFSET once per row without its own wrapper', async () => {
+        const { buildCellContainmentQuery, decodeCellContainment } = await loadContainmentModule();
+        const { assembleKeysetSelect } = await import('../../src/core/keyset-pagination');
+        const database = new DatabaseSync(':memory:');
+        try {
+            database.exec("CREATE TABLE t (k INTEGER PRIMARY KEY, v BLOB); INSERT INTO t VALUES (1, x'00'), (2, x'00'), (3, x'00')");
+            let evaluations = 0;
+            database.function('volatile_blob', { deterministic: false }, () => {
+                evaluations += 1;
+                return Buffer.alloc(evaluations % 2 ? 900 : 1, 0x41);
+            });
+            const keyset = (mode: 'first' | 'last') => assembleKeysetSelect({
+                selectListSql: '"k", volatile_blob() AS "v"',
+                escapedTable: '"t"',
+                whereClauses: [],
+                filterParams: [],
+                plan: { mode, keyColumns: ['k'], direction: 'ASC', limit: 3 } as any
+            }).sql;
+            const sources = [
+                'SELECT "k", volatile_blob() AS "v" FROM "t" ORDER BY "k" LIMIT 3 OFFSET 0',
+                keyset('first'),
+                keyset('last')
+            ];
+            for (const source of sources) {
+                const query = buildCellContainmentQuery(
+                    source, 2, { limit: 3, maxInlineCellBytes: 64, maxPageResponseBytes: 1024 }, [], 'blob', false, true
+                );
+                assert.ok(query.sql.includes(`AS (\n${source}\n)\n`), 'the source runs without the wrapper');
+                evaluations = 0;
+                const statement = database.prepare(query.sql);
+                statement.setReturnArrays(true);
+                const decoded = decodeCellContainment(statement.all() as unknown as unknown[][], 2, undefined, 1024);
+                // Flattening would evaluate the call once per reference.
+                assert.strictEqual(evaluations, 3, source);
+                for (const [rowIndex, row] of decoded.rows.entries()) {
+                    const byteLength = decoded.oversizedCells?.[rowIndex]?.[1]?.byteLength
+                        ?? (row[1] as Uint8Array).byteLength;
+                    assert.ok(byteLength === 900 || byteLength === 1, `${source}: row ${rowIndex}`);
+                    if (byteLength === 900) assert.strictEqual((row[1] as Uint8Array).byteLength, query.effectiveInlineCellBytes);
+                }
+            }
+            assert.throws(
+                () => buildCellContainmentQuery('SELECT 1 LIMIT 1', 1, { limit: 1 }, [], 'blob', false, true),
+                /does not end with an OFFSET clause/
+            );
+        } finally {
+            database.close();
+        }
+    });
+
     it('downgrades the payload tail after actual UTF-8 bytes exhaust the page budget', async () => {
         const { decodeCellContainment } = await loadContainmentModule();
         const decoded = decodeCellContainment([
@@ -276,6 +327,46 @@ describe('grid cell containment limits', () => {
             ),
             9
         );
+    });
+
+    it('measures exact UTF-8 bytes once three bytes per UTF-16 unit reach a budget', async () => {
+        const { decodeCellContainment } = await loadContainmentModule();
+        // '€' is one UTF-16 unit and three UTF-8 bytes: the bound is exact for it.
+        assert.deepStrictEqual(decodeCellContainment([['€€€', '']], 1, undefined, 9).rows, [['€€€']]);
+        const clipped = decodeCellContainment([['€€€', '']], 1, undefined, 8);
+        assert.deepStrictEqual(clipped.rows, [['']]);
+        assert.deepStrictEqual(clipped.oversizedCells, { 0: { 0: { storageClass: 'text', byteLength: 9 } } });
+        // 12 bytes by the bound, 6 exact: the page fits and keeps every value.
+        const fits = decodeCellContainment([['éé', ''], ['ab', '']], 1, undefined, 6);
+        assert.deepStrictEqual(fits, { rows: [['éé'], ['ab']] });
+    });
+
+    it('drops previews from the tail when only the wire size passes the transport budget', async () => {
+        const { decodeCellContainment } = await loadContainmentModule();
+        // 25.6 MB of BLOB previews fit a 64 MiB page budget, but their
+        // Base64 form passes the aggregate transport budget.
+        const columnCount = 50;
+        const value = new Uint8Array(256);
+        const transportedRow = [...Array(columnCount).fill(value), '|'.repeat(columnCount - 1)];
+        const decoded = decodeCellContainment(Array(2000).fill(transportedRow), columnCount, undefined, 64 * 1024 * 1024);
+        assert.deepStrictEqual(decoded.rows[0][0], value);
+        assert.deepStrictEqual(decoded.rows[1999][columnCount - 1], new Uint8Array(0));
+        assert.deepStrictEqual(decoded.oversizedCells?.[1999]?.[columnCount - 1], { storageClass: 'blob', byteLength: 256 });
+        assert.ok(!decoded.oversizedCells?.[0], 'the earliest previews stay inline');
+    });
+
+    it('normalizes rows into packed arrays and keeps a source row\'s holes', async () => {
+        const { normalizeIntegerRowsForTransport } = await import('../../src/core/integer-utils.ts');
+        const dense = normalizeIntegerRowsForTransport([[4n, 'x', null]]).rows[0];
+        assert.deepStrictEqual(dense, [4, 'x', null]);
+        // Structured clone (worker to host) writes a packed array densely ('A').
+        // Checked before the hole below: V8 then starts later rows of the
+        // same literal holey.
+        assert.equal(v8.serialize(dense)[2], 0x41);
+        const sparse = normalizeIntegerRowsForTransport([[1n, , 3n]]).rows[0];
+        assert.equal(sparse.length, 3);
+        assert.equal(1 in sparse, false);
+        assert.deepStrictEqual(sparse, [1, , 3]);
     });
 
     it('keeps the 32 MiB aggregate transport guard unreachable for contained pages', async () => {
@@ -374,6 +465,92 @@ describe('grid cell containment limits', () => {
             response,
             { surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse }
         ));
+    });
+
+    it('returns the same REAL text from the containment statement as from a second numeric layer', async () => {
+        const { buildCellContainmentQuery } = await loadContainmentModule();
+        const { buildExactNumericTextQuery, normalizeIntegerRowsForTransport } =
+            await import('../../src/core/integer-utils.ts');
+        const database = new DatabaseSync(':memory:');
+        try {
+            database.exec('CREATE TABLE t (r REAL, i INTEGER, s TEXT, b BLOB, n)');
+            database.exec(
+                "INSERT INTO t VALUES " +
+                "(0.1, 9007199254740993, 'short', x'00ff', NULL), " +
+                "(1.0 / 3, -1, printf('%.*c', 600, 'é'), zeroblob(700), 2.5), " +
+                "(1e300, 0, 'x', NULL, -0.0), " +
+                "(2.0, NULL, NULL, x'', 'text in an untyped column')"
+            );
+            const execute = (sql: string): unknown[][] => {
+                const statement = database.prepare(sql);
+                statement.setReturnArrays(true);
+                statement.setReadBigInts(true);
+                return statement.all() as unknown as unknown[][];
+            };
+            const source = 'SELECT r, i, s, b, n FROM t ORDER BY rowid';
+            const options = { limit: 4, maxInlineCellBytes: 300, maxPageResponseBytes: 16 * 1024 * 1024 };
+            const rawColumns = [0, 1, 2, 3, 4];
+            const merged = buildCellContainmentQuery(source, 5, options, rawColumns, 'blob', true);
+            const plain = buildCellContainmentQuery(source, 5, options, rawColumns, 'blob');
+            const layered = buildExactNumericTextQuery(plain.sql, plain.primaryTransportColumnCount);
+
+            assert.strictEqual(plain.numericTransport.valueColumnCount, undefined);
+            assert.strictEqual(merged.numericTransport.valueColumnCount, merged.primaryTransportColumnCount);
+            assert.strictEqual(merged.numericTransport.realTextColumnCount, 5);
+            assert.strictEqual(
+                merged.numericTransport.transportColumns.length,
+                merged.primaryTransportColumnCount + 5
+            );
+            const fromMerged = normalizeIntegerRowsForTransport(
+                execute(merged.sql),
+                merged.numericTransport.valueColumnCount,
+                undefined,
+                undefined,
+                merged.numericTransport.realTextColumnCount
+            );
+            const fromLayered = normalizeIntegerRowsForTransport(
+                execute(layered.sql),
+                layered.valueColumnCount
+            );
+            assert.deepStrictEqual(fromMerged, fromLayered);
+            // SQLite 3.53 prints 1/3 with 17 digits where 3.50 printed 15.
+            const third = (database.prepare('SELECT CAST(1.0 / 3 AS TEXT) AS t').get() as { t: string }).t;
+            assert.deepStrictEqual(fromMerged.exactIntegerTexts, {
+                0: { 1: '9007199254740993' },
+                1: { 0: third },
+                2: { 0: '1.0e+300', 4: '0.0' },
+                3: { 0: '2.0' }
+            });
+            // The oversized TEXT and BLOB of row 1 keep their metadata.
+            assert.deepStrictEqual(
+                fromMerged.rows.map(row => row[merged.metadataColumnIndex]),
+                ['||||', '||t1200|b700|', '||||', '||||']
+            );
+        } finally {
+            database.close();
+        }
+    });
+
+    it('reports an oversized cell in any metadata chunk of a wide row', async () => {
+        const { buildCellContainmentQuery, decodeCellContainment } = await loadContainmentModule();
+        const database = new DatabaseSync(':memory:');
+        try {
+            const columns = Array.from({ length: 450 }, (_, index) => (
+                index === 420 ? `zeroblob(5000) AS c${index}` : `${index} AS c${index}`
+            ));
+            const query = buildCellContainmentQuery(`SELECT ${columns.join(', ')}`, 450, {
+                limit: 1, maxInlineCellBytes: 1024, maxPageResponseBytes: 16 * 1024 * 1024
+            });
+            const statement = database.prepare(query.sql);
+            statement.setReturnArrays(true);
+            const rows = statement.all() as unknown as unknown[][];
+            const decoded = decodeCellContainment(rows, 450, undefined, 16 * 1024 * 1024);
+            assert.deepStrictEqual(decoded.oversizedCells, {
+                0: { 420: { storageClass: 'blob', byteLength: 5000 } }
+            });
+        } finally {
+            database.close();
+        }
     });
 
     it('keeps 5000 rows of 50 ordinary UUID cells inline through SQLite', async () => {

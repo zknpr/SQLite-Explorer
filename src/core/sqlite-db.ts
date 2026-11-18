@@ -45,7 +45,9 @@ import {
   type DatabaseFileGeneration
 } from '../atomicDatabaseWrite';
 import {
+  registerWasmPackHeap,
   WasmDatabaseEngine,
+  type WasmPackHeap,
   type WasmDatabaseInstance,
   type WasmEngineModule,
   type WasmEngineLogHandler,
@@ -104,6 +106,10 @@ export async function createDatabaseEngine(
   }
 
   const SqlJsModule = await loadEngine(engineConfig) as unknown as WasmEngineModule;
+  // Spike: the runtime build exports the heap view, so packed grid rows can
+  // be read in place. A glue without it keeps the cell helper transport.
+  const heapModule = SqlJsModule as unknown as WasmPackHeap['module'];
+  if (heapModule.HEAPU8 instanceof Uint8Array) registerWasmPackHeap(SqlJsModule.Database, { module: heapModule });
   return createEngineFromModule(SqlJsModule, config, logger);
 }
 
@@ -816,8 +822,8 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().openQueryReadSession(sql);
     },
 
-    async readQueryRows(sessionId: string, maxRows: number): Promise<QueryReadChunk> {
-      return requireEngine().readQueryRows(sessionId, maxRows);
+    async readQueryRows(sessionId: string, maxRows: number, maxBytes?: number): Promise<QueryReadChunk> {
+      return requireEngine().readQueryRows(sessionId, maxRows, maxBytes);
     },
 
     async closeQueryReadSession(sessionId: string): Promise<void> {
@@ -918,6 +924,20 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
       return requireEngine().insertRowWithHistory(
         table,
         data,
+        maxEditValueBytes,
+        maxUndoSnapshotBytes
+      );
+    },
+
+    async insertRowsWithHistory(
+      table: string,
+      rows: Record<string, CellValue>[],
+      maxEditValueBytes?: number,
+      maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow[]> {
+      return requireEngine().insertRowsWithHistory(
+        table,
+        rows,
         maxEditValueBytes,
         maxUndoSnapshotBytes
       );
@@ -1046,6 +1066,10 @@ export function createWorkerEndpoint(logger?: WasmEngineLogHandler) {
 
     async fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet> {
       return requireEngine().fetchTableData(table, options);
+    },
+
+    async prepareCellHelpers(): Promise<boolean> {
+      return requireEngine().prepareCellHelpers();
     },
 
     async fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult> {

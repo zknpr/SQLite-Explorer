@@ -70,7 +70,8 @@ describe('grid data match cache', () => {
             { name: 'padded', type: 'TEXT' }
         ];
         state.currentPageIndex = 0;
-        state.rowsPerPage = 500;
+        // One row fills the first page, so the load requests its count too.
+        state.rowsPerPage = 1;
         state.columnFilters = { blank: '   ', padded: ' needle ' };
         state.filterQuery = '\t ';
         state.isLoadingData = false;

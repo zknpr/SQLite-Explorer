@@ -86,6 +86,25 @@ describe('keyset query tag', () => {
     );
   });
 
+  it('names the page size, not a final page bounded below it', () => {
+    const paged = { ...base, pageSize: 50 };
+    // Omitted, the page size is the limit.
+    assert.strictEqual(computeKeysetQueryTag('t', paged), computeKeysetQueryTag('t', base));
+    assert.strictEqual(
+      computeKeysetQueryTag('t', paged),
+      computeKeysetQueryTag('t', { ...paged, limit: 3 })
+    );
+    // A page size equal to that remainder is another paging.
+    assert.notStrictEqual(
+      computeKeysetQueryTag('t', { ...paged, limit: 3 }),
+      computeKeysetQueryTag('t', { ...base, limit: 3 })
+    );
+    assert.notStrictEqual(
+      computeKeysetQueryTag('t', { ...paged, limit: 3 }),
+      computeKeysetQueryTag('t', { ...base, limit: 3, pageSize: 3 })
+    );
+  });
+
   it('normalizes direction when unsorted', () => {
     const unsorted = { ...base, orderBy: undefined };
     assert.strictEqual(
@@ -293,7 +312,7 @@ describe('resolveKeysetPlan', () => {
       assert.strictEqual(resolved?.limit, 5);
       assert.deepStrictEqual(resolved?.values, [7]);
       // Storage classes ride along so the predicate can bind INTEGER slots
-      // through CAST(? AS INTEGER).
+      // through +CAST(? AS INTEGER).
       assert.deepStrictEqual(resolved?.valueClasses, ['integer']);
     }
   });
@@ -355,6 +374,36 @@ describe('resolveKeysetPlan', () => {
         undefined
       );
     }
+    // A limit beyond the page size, or a page size that is not an integer.
+    for (const pageSize of [4, 0, 5.5, Number.NaN, '5' as never]) {
+      for (const keyset of [{ mode: 'first' as const }, { mode: 'after' as const, anchor }]) {
+        assert.strictEqual(
+          resolveKeysetPlan('t', { ...options, pageSize, keyset }, ROWID_IDENTITY),
+          undefined,
+          `pageSize ${String(pageSize)} ${keyset.mode}`
+        );
+      }
+    }
+  });
+
+  it('seeks from a final page bounded below the page size', () => {
+    const paged: TableQueryOptions = { ...options, pageSize: 5 };
+    // Minted on a final page whose limit was its 3-row remainder.
+    const anchor = anchorFor('t', { ...paged, limit: 3 }, [7n]);
+    for (const limit of [5, 3]) {
+      const plan = resolveKeysetPlan('t', { ...paged, limit, keyset: { mode: 'before', anchor } }, ROWID_IDENTITY);
+      assert.strictEqual(plan?.mode, 'before');
+      assert.strictEqual(plan?.limit, limit);
+    }
+    // Not for paging by 3, or by the limit with no page size.
+    assert.strictEqual(
+      resolveKeysetPlan('t', { ...options, limit: 3, pageSize: 3, keyset: { mode: 'atOrAfter', anchor } }, ROWID_IDENTITY),
+      undefined
+    );
+    assert.strictEqual(
+      resolveKeysetPlan('t', { ...options, limit: 3, keyset: { mode: 'atOrAfter', anchor } }, ROWID_IDENTITY),
+      undefined
+    );
   });
 
   it('throws on malformed tokens and forged NULL identity slots', () => {
@@ -437,30 +486,30 @@ describe('keyset SQL assembly', () => {
       plan('t', { ...rowidOptions, keyset: { mode: 'first' } })
     );
     assert.deepStrictEqual(first, {
-      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" ORDER BY "rowid" ASC LIMIT 50',
+      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" ORDER BY "rowid" ASC LIMIT 50 OFFSET 0',
       params: []
     });
 
-    // rowid slots are INTEGER-class: they bind through CAST(? AS INTEGER) so
+    // rowid slots are INTEGER-class: they bind through +CAST(? AS INTEGER) so
     // int64 values beyond 2^53 (decoded to decimal strings) seek exactly.
     assert.deepStrictEqual(build(rowidOptions, ROWID_IDENTITY, 'after', [100n]), {
-      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" > CAST(? AS INTEGER) ' +
-        'ORDER BY "rowid" ASC LIMIT 50',
+      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" > +CAST(? AS INTEGER) ' +
+        'ORDER BY "rowid" ASC LIMIT 50 OFFSET 0',
       params: [100]
     });
     assert.deepStrictEqual(build(rowidOptions, ROWID_IDENTITY, 'atOrAfter', [100n]), {
-      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" >= CAST(? AS INTEGER) ' +
-        'ORDER BY "rowid" ASC LIMIT 50',
+      sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" >= +CAST(? AS INTEGER) ' +
+        'ORDER BY "rowid" ASC LIMIT 50 OFFSET 0',
       params: [100]
     });
     assert.deepStrictEqual(build(rowidOptions, ROWID_IDENTITY, 'before', [100n]), {
-      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" < CAST(? AS INTEGER) ' +
-        'ORDER BY "rowid" DESC LIMIT 50) ORDER BY "rowid" ASC',
+      sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "rowid" < +CAST(? AS INTEGER) ' +
+        'ORDER BY "rowid" DESC LIMIT 50 OFFSET 0) ORDER BY "rowid" ASC LIMIT -1 OFFSET 0',
       params: [100]
     });
     assert.deepStrictEqual(build(rowidOptions, ROWID_IDENTITY, 'last', undefined, 7), {
       sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "value" FROM main."t" ' +
-        'ORDER BY "rowid" DESC LIMIT 7) ORDER BY "rowid" ASC',
+        'ORDER BY "rowid" DESC LIMIT 7 OFFSET 0) ORDER BY "rowid" ASC LIMIT -1 OFFSET 0',
       params: []
     });
   });
@@ -470,8 +519,8 @@ describe('keyset SQL assembly', () => {
     // Per-slot binding: TEXT stays a plain placeholder, INTEGER gets CAST.
     assert.deepStrictEqual(build(options, COMPOSITE_IDENTITY, 'after', ['north', 7n]), {
       sql: 'SELECT "tenant", "seq", "value" FROM main."t" ' +
-        'WHERE ("tenant", "seq") > (?, CAST(? AS INTEGER)) ' +
-        'ORDER BY "tenant" ASC, "seq" ASC LIMIT 10',
+        'WHERE ("tenant", "seq") > (?, +CAST(? AS INTEGER)) ' +
+        'ORDER BY "tenant" ASC, "seq" ASC LIMIT 10 OFFSET 0',
       params: ['north', 7]
     });
   });
@@ -484,7 +533,7 @@ describe('keyset SQL assembly', () => {
     };
     assert.deepStrictEqual(build(options, ROWID_IDENTITY, 'after', [42n]), {
       sql: 'SELECT "rowid" AS "rowid", "value" FROM main."t" WHERE "value" LIKE ? ESCAPE \'\\\' ' +
-        'AND "rowid" > CAST(? AS INTEGER) ORDER BY "rowid" ASC LIMIT 10',
+        'AND "rowid" > +CAST(? AS INTEGER) ORDER BY "rowid" ASC LIMIT 10 OFFSET 0',
       params: ['%needle%', 42]
     });
   });
@@ -494,14 +543,14 @@ describe('keyset SQL assembly', () => {
     // REAL compares numerically with INTEGER storage in every affinity; only
     // the INTEGER class needs the CAST rescue.
     assert.deepStrictEqual(build(options, ROWID_IDENTITY, 'after', [1.5, 9n]), {
-      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ("s", "rowid") > (?, CAST(? AS INTEGER)) ' +
-        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4',
+      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ("s", "rowid") > (?, +CAST(? AS INTEGER)) ' +
+        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4 OFFSET 0',
       params: [1.5, 9]
     });
     assert.deepStrictEqual(build(options, ROWID_IDENTITY, 'after', [9007199254740993n, 9n]), {
       sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" ' +
-        'WHERE ("s", "rowid") > (CAST(? AS INTEGER), CAST(? AS INTEGER)) ' +
-        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4',
+        'WHERE ("s", "rowid") > (+CAST(? AS INTEGER), +CAST(? AS INTEGER)) ' +
+        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4 OFFSET 0',
       params: ['9007199254740993', 9]
     });
   });
@@ -512,57 +561,57 @@ describe('keyset SQL assembly', () => {
 
     // ASC, non-NULL anchor: NULLs sort first and are already behind us.
     assert.deepStrictEqual(build(asc, ROWID_IDENTITY, 'after', ['m', 9n]), {
-      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ("s", "rowid") > (?, CAST(? AS INTEGER)) ' +
-        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4',
+      sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ("s", "rowid") > (?, +CAST(? AS INTEGER)) ' +
+        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4 OFFSET 0',
       params: ['m', 9]
     });
     // ASC, NULL anchor: the rest of the NULL run, then every non-NULL row.
     // The CAST rides into the NULL-decomposed identity compare too.
     assert.deepStrictEqual(build(asc, ROWID_IDENTITY, 'after', [null, 9n]), {
       sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
-        '(("s" IS NULL AND "rowid" > CAST(? AS INTEGER)) OR "s" IS NOT NULL) ' +
-        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4',
+        '(("s" IS NULL AND "rowid" > +CAST(? AS INTEGER)) OR "s" IS NOT NULL) ' +
+        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4 OFFSET 0',
       params: [9]
     });
     // ASC 'before' runs reversed (DESC), where the NULL run lies ahead.
     assert.deepStrictEqual(build(asc, ROWID_IDENTITY, 'before', ['m', 9n]), {
       sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
-        '(("s", "rowid") < (?, CAST(? AS INTEGER)) OR "s" IS NULL) ' +
-        'ORDER BY "s" DESC, "rowid" DESC LIMIT 4) ORDER BY "s" ASC, "rowid" ASC',
+        '(("s", "rowid") < (?, +CAST(? AS INTEGER)) OR "s" IS NULL) ' +
+        'ORDER BY "s" DESC, "rowid" DESC LIMIT 4 OFFSET 0) ORDER BY "s" ASC, "rowid" ASC LIMIT -1 OFFSET 0',
       params: ['m', 9]
     });
     assert.deepStrictEqual(build(asc, ROWID_IDENTITY, 'before', [null, 9n]), {
       sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
-        '("s" IS NULL AND "rowid" < CAST(? AS INTEGER)) ' +
-        'ORDER BY "s" DESC, "rowid" DESC LIMIT 4) ORDER BY "s" ASC, "rowid" ASC',
+        '("s" IS NULL AND "rowid" < +CAST(? AS INTEGER)) ' +
+        'ORDER BY "s" DESC, "rowid" DESC LIMIT 4 OFFSET 0) ORDER BY "s" ASC, "rowid" ASC LIMIT -1 OFFSET 0',
       params: [9]
     });
 
     // DESC, non-NULL anchor: the NULL run sorts last and lies ahead.
     assert.deepStrictEqual(build(desc, ROWID_IDENTITY, 'after', ['m', 9n]), {
       sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
-        '(("s", "rowid") < (?, CAST(? AS INTEGER)) OR "s" IS NULL) ' +
-        'ORDER BY "s" DESC, "rowid" DESC LIMIT 4',
+        '(("s", "rowid") < (?, +CAST(? AS INTEGER)) OR "s" IS NULL) ' +
+        'ORDER BY "s" DESC, "rowid" DESC LIMIT 4 OFFSET 0',
       params: ['m', 9]
     });
     // DESC, NULL anchor: only the rest of the NULL run remains.
     assert.deepStrictEqual(build(desc, ROWID_IDENTITY, 'after', [null, 9n]), {
       sql: 'SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
-        '("s" IS NULL AND "rowid" < CAST(? AS INTEGER)) ' +
-        'ORDER BY "s" DESC, "rowid" DESC LIMIT 4',
+        '("s" IS NULL AND "rowid" < +CAST(? AS INTEGER)) ' +
+        'ORDER BY "s" DESC, "rowid" DESC LIMIT 4 OFFSET 0',
       params: [9]
     });
     // DESC 'before' runs reversed (ASC): larger values, NULLs excluded.
     assert.deepStrictEqual(build(desc, ROWID_IDENTITY, 'before', ['m', 9n]), {
       sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
-        '("s", "rowid") > (?, CAST(? AS INTEGER)) ' +
-        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4) ORDER BY "s" DESC, "rowid" DESC',
+        '("s", "rowid") > (?, +CAST(? AS INTEGER)) ' +
+        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4 OFFSET 0) ORDER BY "s" DESC, "rowid" DESC LIMIT -1 OFFSET 0',
       params: ['m', 9]
     });
     assert.deepStrictEqual(build(desc, ROWID_IDENTITY, 'before', [null, 9n]), {
       sql: 'SELECT * FROM (SELECT "rowid" AS "rowid", "s" FROM main."t" WHERE ' +
-        '(("s" IS NULL AND "rowid" > CAST(? AS INTEGER)) OR "s" IS NOT NULL) ' +
-        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4) ORDER BY "s" DESC, "rowid" DESC',
+        '(("s" IS NULL AND "rowid" > +CAST(? AS INTEGER)) OR "s" IS NOT NULL) ' +
+        'ORDER BY "s" ASC, "rowid" ASC LIMIT 4 OFFSET 0) ORDER BY "s" DESC, "rowid" DESC LIMIT -1 OFFSET 0',
       params: [9]
     });
   });
@@ -766,7 +815,7 @@ describe('assembleKeysetSelect input hygiene', () => {
     });
     assert.deepStrictEqual(assembled, {
       sql: 'SELECT "rowid" AS "rowid", "v" FROM "t" WHERE "v" LIKE ? ESCAPE \'\\\' ' +
-        'AND "rowid" > ? ORDER BY "rowid" ASC LIMIT 3',
+        'AND "rowid" > ? ORDER BY "rowid" ASC LIMIT 3 OFFSET 0',
       params: ['%x%', 5]
     });
   });

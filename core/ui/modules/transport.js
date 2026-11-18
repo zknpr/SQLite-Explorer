@@ -3,6 +3,7 @@ import {
     WEBVIEW_TRANSPORT_SURFACES,
     assertWebviewTransportPayload,
     fromWebviewPayloadLimitErrorData,
+    measureWebviewTransportPayload,
     toWebviewPayloadLimitErrorData
 } from '../../../src/core/webview-transport.ts';
 import {
@@ -22,6 +23,7 @@ export {
     WEBVIEW_TRANSPORT_SURFACES,
     assertWebviewTransportPayload,
     fromWebviewPayloadLimitErrorData,
+    measureWebviewTransportPayload,
     toWebviewPayloadLimitErrorData
 };
 export {

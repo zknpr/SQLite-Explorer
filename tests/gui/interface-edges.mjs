@@ -83,8 +83,9 @@ try {
   await recorder.step('E03 empty database remains usable and corrupt bytes fail visibly without modification', async () => {
     await page.getByRole('treeitem', { name: 'empty.db', exact: true }).dblclick();
     frame = await viewerFrame(page);
-    await frame.locator('#btnOpenCreateTable').waitFor();
-    assert.equal(await frame.locator('#btnOpenCreateTable').isDisabled(), false);
+    // The button is part of the page and stays disabled until the database
+    // has connected, so its presence alone says nothing yet.
+    await waitForValue(() => frame.locator('#btnOpenCreateTable').isDisabled(), false, 'an empty database accepts a new table');
     await closeEditor();
     await page.getByRole('treeitem', { name: 'corrupt.db', exact: true }).dblclick();
     await waitForValue(async () => /not a database|invalid database|failed to open/i.test(await visibleMessages()), true, 'visible corrupt database error');
@@ -159,7 +160,16 @@ try {
     await modalClose();
     assert.deepEqual(readRows(fixtures.primary, 'SELECT id FROM active_contacts'), [{ id: 2 }]);
   });
-  await recorder.step('E04 file size refusal retries in the same editor after the setting changes', async () => {
+  await recorder.step(backend === 'native' ? 'E04 the native engine opens a file above the configured size limit' : 'E04 file size refusal retries in the same editor after the setting changes', async () => {
+    if (backend === 'native') {
+      // The native engine reads the file in place and does not apply
+      // maxFileSize: the limit bounds what WebAssembly loads into memory.
+      frame = await openDatabase(page, 'limited.db'); await selectTable(frame, 'size_guard');
+      await contains(frame.locator('#gridContainer'), 'BLOB');
+      assert.equal(await frame.locator('#btnOpenCreateTable').isDisabled(), false);
+      await closeEditor();
+      return;
+    }
     await page.getByRole('treeitem', { name: 'limited.db', exact: true }).click();
     await waitForValue(async () => /maximum|maxFileSize|exceeds|too large/i.test(await visibleMessages()), true, 'configured file size refusal');
     frame = await viewerFrame(page);

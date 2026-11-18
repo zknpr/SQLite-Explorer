@@ -5,11 +5,12 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createPinnedArtifactPolicy } from './lib/pinned-artifacts.mjs';
+import { patchSqliteMath } from './lib/sqlite-math-patch.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const sourceCommit = '35ac205b7f9470d9aa7696ceb9cdab5dec4b6ed3';
+const sourceCommit = '53f08bc0011b622f7462894dafd486990a32b63c';
 const manifestPath = 'vendor/query-plan-manifest.json';
-const sourceFiles = ['src/runtime/query-plan.c', 'scripts/build-query-plan.mjs'];
+const sourceFiles = ['src/runtime/query-plan.c', 'scripts/build-query-plan.mjs', 'scripts/lib/sqlite-math-patch.mjs'];
 const nativeTargets = [
   ['aarch64-macos', 'aarch64-macos', 'dylib'],
   ['x86_64-macos', 'x86_64-macos', 'dylib'],
@@ -121,11 +122,22 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     // extension-functions.c asserts embed __FILE__; map the random build
     // directory (and the checkout) to fixed names so outputs reproduce.
     const prefixMaps = [`-ffile-prefix-map=${build}=/query-plan-build`, `-ffile-prefix-map=${root}=/sqlite-explorer`];
+    // R*Tree opens GeoPackage files. The math functions give SQLite's results:
+    // the fork's legacy-functions.c leaves every name and argument count that
+    // SQLite defines to SQLite.
     const compileFlags = ['-Oz', ...prefixMaps, '-DSQLITE_OMIT_LOAD_EXTENSION', '-DSQLITE_DISABLE_LFS', '-DSQLITE_ENABLE_FTS3', '-DSQLITE_ENABLE_FTS3_PARENTHESIS',
-      '-DSQLITE_ENABLE_FTS5', '-DSQLITE_THREADSAFE=0', '-DSQLITE_ENABLE_NORMALIZE', '-DSQLITE_LIKE_DOESNT_MATCH_BLOBS'];
+      '-DSQLITE_ENABLE_FTS5', '-DSQLITE_ENABLE_RTREE', '-DSQLITE_ENABLE_MATH_FUNCTIONS', '-DSQLITE_THREADSAFE=0', '-DSQLITE_ENABLE_NORMALIZE',
+      '-DSQLITE_LIKE_DOESNT_MATCH_BLOBS'];
+    // The WebAssembly libm can differ from a native one in the last digit, so
+    // this SQLite neither stores a math function's result in an index or a
+    // generated column nor reads an index that depends on one
+    // (scripts/lib/sqlite-math-patch.mjs).
+    const amalgamationPath = path.join(headers, 'sqlite3.c');
+    const amalgamation = patchSqliteMath(readFileSync(amalgamationPath, 'utf8'));
+    writeFileSync(amalgamationPath, amalgamation);
     for (const [input, name, flags] of [
-      [path.join(headers, 'sqlite3.c'), 'sqlite3', compileFlags],
-      [path.join(headers, 'extension-functions.c'), 'extension-functions', compileFlags],
+      [amalgamationPath, 'sqlite3', compileFlags],
+      [path.join(source, 'src/legacy-functions.c'), 'extension-functions', [...compileFlags, '-DSQLJS_SILENT_LEGACY_FUNCTIONS']],
       [path.join(source, 'src/vfs.c'), 'vfs', compileFlags],
       [helper, 'query-plan', ['-Oz', ...prefixMaps, '-DSQLITE_CORE']]
     ]) run(options.emcc, [...flags, '-I', headers, '-c', input, '-o', path.join(out, `${name}.o`)]);
@@ -133,8 +145,25 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     const exported = JSON.parse(readFileSync(exportsPath, 'utf8'));
     exported.push('_sqlite_explorer_register_query_plan');
     writeFileSync(exportsPath, JSON.stringify(exported));
+    // Packed grid rows are read in place, which needs the heap view; the
+    // glue reassigns an exported view whenever memory grows.
+    const runtimeMethodsPath = path.join(source, 'src/exported_runtime_methods.json');
+    const runtimeMethods = JSON.parse(readFileSync(runtimeMethodsPath, 'utf8'));
+    runtimeMethods.push('HEAPU8');
+    writeFileSync(runtimeMethodsPath, JSON.stringify(runtimeMethods));
+    // The reader also needs each statement's pointer, which sql.js keeps in a
+    // property Closure renames; export an accessor beside its own methods.
+    const apiPath = path.join(source, 'src/api.js');
+    const api = readFileSync(apiPath, 'utf8');
+    const freeExport = '    Statement.prototype["free"] = Statement.prototype.free;\n';
+    if (api.split(freeExport).length !== 2) throw new Error('sql.js src/api.js no longer exports Statement.prototype["free"] exactly once');
+    writeFileSync(apiPath, api.replace(freeExport,
+      `${freeExport}    Statement.prototype["sqliteExplorerPointer"] = function () { return this.stmt; };\n`));
     // The Makefile's object prerequisites download tools that are unnecessary
     // here: all three upstream sources were verified and compiled above.
+    // Its own extension-functions.o would compile src/legacy-functions.c with
+    // a deprecation warning on every call of those functions; this build
+    // compiles it with SQLJS_SILENT_LEGACY_FUNCTIONS, so nothing warns.
     run('make', ['dist/sql-wasm.js', `EMCC=${options.emcc}`, 'BITCODE_FILES=out/sqlite3.o out/extension-functions.o out/vfs.o out/query-plan.o',
       '-o', 'out/sqlite3.o', '-o', 'out/extension-functions.o', '-o', 'out/vfs.o'], { cwd: source });
     for (const [file, copies] of Object.entries(wasmCopies)) {

@@ -1,20 +1,51 @@
 name: Native fuzz
 
-# Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/) against the
-# bundled native worker on all five shipped txiki.js targets (CI's native lanes
-# run on Linux x64 only). Opt-in: manual, or on dev pushes and pull requests to
-# dev that change the harness, the runtimes, the worker client it drives, the
-# toolchain or this workflow.
+# Differential ATTACH/DETACH/VACUUM INTO fuzz (tests/fuzz/), the grid page
+# differential and the memory-map choice against the bundled native worker on
+# all five shipped txiki.js targets (CI's native lanes run on Linux x64 only). Opt-in: manual, or on dev pushes and pull requests to
+# dev that change the harness, the runtimes, any source under src/ (the lanes
+# import most of it), the toolchain or this workflow.
+# A separate job compiles the runtime's grid helpers (src/runtime/query-plan.c)
+# with AddressSanitizer and UndefinedBehaviorSanitizer against the pinned
+# SQLite source and runs them over generated values; no shipped build is
+# sanitized, and the native one reads stored bytes outside any sandbox.
 on:
   workflow_dispatch:
   push:
     branches: [dev]
     paths:
       - 'tests/fuzz/**'
+      - 'tests/runtime/**'
+      - 'scripts/test-runtime-sanitizers.mjs'
+      - 'scripts/build-query-plan.mjs'
+      - 'tests/unit/grid_cell_helpers.test.ts'
+      - 'tests/unit/grid_cell_pack.test.ts'
+      - 'tests/unit/native_memory_map.test.ts'
+      - 'tests/unit/global_filter_like_any.test.ts'
+      - 'tests/unit/sorted_page_rowid_lookup.test.ts'
+      - 'tests/unit/schema_trigger_presence.test.ts'
+      - 'tests/unit/history_statement_cache.test.ts'
+      - 'tests/unit/native_number_binding.test.ts'
+      - 'tests/unit/native_cell_history_batch.test.ts'
+      - 'tests/unit/native_history_shared_texts.test.ts'
+      - 'tests/unit/fts_row_history.test.ts'
+      - 'tests/unit/native_view_export_batches.test.ts'
+      - 'tests/unit/wasm_exact_math_parity.test.ts'
+      - 'tests/unit/wasm_math_schema.test.ts'
+      - 'tests/unit/wasm_rtree_math_functions.test.ts'
+      - 'tests/unit/schema_identity_missing_module.test.ts'
+      - 'tests/unit/native_module_fallback.test.ts'
+      - 'tests/unit/native_worker_end.test.ts'
+      - 'tests/unit/native_large_value_history.test.ts'
+      - 'tests/unit/atomic_database_write.test.ts'
+      - 'tests/unit/paged_writable_save.test.ts'
+      - 'tests/unit/sql_workspace_completions.test.ts'
+      - 'tests/unit/windows_access_list.test.ts'
+      - 'scripts/lib/sqlite-math-patch.mjs'
+      - 'src/**'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
-      - 'src/nativeWorker.ts'
       - 'package.json'
       - 'package-lock.json'
       - '.nvmrc'
@@ -23,10 +54,37 @@ on:
     branches: [dev]
     paths:
       - 'tests/fuzz/**'
+      - 'tests/runtime/**'
+      - 'scripts/test-runtime-sanitizers.mjs'
+      - 'scripts/build-query-plan.mjs'
+      - 'tests/unit/grid_cell_helpers.test.ts'
+      - 'tests/unit/grid_cell_pack.test.ts'
+      - 'tests/unit/native_memory_map.test.ts'
+      - 'tests/unit/global_filter_like_any.test.ts'
+      - 'tests/unit/sorted_page_rowid_lookup.test.ts'
+      - 'tests/unit/schema_trigger_presence.test.ts'
+      - 'tests/unit/history_statement_cache.test.ts'
+      - 'tests/unit/native_number_binding.test.ts'
+      - 'tests/unit/native_cell_history_batch.test.ts'
+      - 'tests/unit/native_history_shared_texts.test.ts'
+      - 'tests/unit/fts_row_history.test.ts'
+      - 'tests/unit/native_view_export_batches.test.ts'
+      - 'tests/unit/wasm_exact_math_parity.test.ts'
+      - 'tests/unit/wasm_math_schema.test.ts'
+      - 'tests/unit/wasm_rtree_math_functions.test.ts'
+      - 'tests/unit/schema_identity_missing_module.test.ts'
+      - 'tests/unit/native_module_fallback.test.ts'
+      - 'tests/unit/native_worker_end.test.ts'
+      - 'tests/unit/native_large_value_history.test.ts'
+      - 'tests/unit/atomic_database_write.test.ts'
+      - 'tests/unit/paged_writable_save.test.ts'
+      - 'tests/unit/sql_workspace_completions.test.ts'
+      - 'tests/unit/windows_access_list.test.ts'
+      - 'scripts/lib/sqlite-math-patch.mjs'
+      - 'src/**'
       - 'tests/unit/vscode_mock_setup.ts'
       - 'tests/unit/mocks/**'
       - 'natives/**'
-      - 'src/nativeWorker.ts'
       - 'package.json'
       - 'package-lock.json'
       - '.nvmrc'
@@ -85,6 +143,87 @@ jobs:
           set -o pipefail
           npm run test:native-fuzz 2>&1 | tee native-fuzz.log
 
+      # Grid pages with the runtime's cell helpers on and off, packed pages
+      # against the helpers, global filters against LIKE, sorted pages
+      # against the plain page SQL, the schema batch's trigger answer, and
+      # batched row history with reused statements, through the production
+      # worker. No other
+      # CI lane loads natives/<target>'s query-plan library.
+      - name: Native grid pages
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/grid_cell_helpers.test.ts tests/unit/grid_cell_pack.test.ts tests/unit/global_filter_like_any.test.ts tests/unit/sorted_page_rowid_lookup.test.ts tests/unit/schema_trigger_presence.test.ts tests/unit/history_statement_cache.test.ts
+
+      # Integers bound beside fractional numbers keep the INTEGER class, as
+      # on WebAssembly, through the production worker.
+      - name: Native number binding
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/native_number_binding.test.ts
+
+      # Batched cell undo and redo: set reads by rowid, chunk bounds and
+      # guarded writes, through the production worker.
+      - name: Native cell history batches
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/native_cell_history_batch.test.ts tests/unit/native_history_shared_texts.test.ts tests/unit/fts_row_history.test.ts
+
+      # A view export reads its spool with statements the worker checks
+      # character for character; the exporter and the bundled worker must agree.
+      - name: Native view export batches
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/native_view_export_batches.test.ts
+
+      # Where the WebAssembly and native engines must agree or deliberately
+      # differ: the math functions that cannot round differently, bit for bit
+      # (a WebAssembly index on one is read by this target's native engine);
+      # schemas that use the others; a schema with a missing virtual-table
+      # module; the engine choice for FTS3/FTS4 files; what closing a
+      # connection leaves on disk; and history of rows with large values.
+      - name: Engine parity and shutdown
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/wasm_exact_math_parity.test.ts tests/unit/wasm_math_schema.test.ts tests/unit/wasm_rtree_math_functions.test.ts tests/unit/schema_identity_missing_module.test.ts tests/unit/native_module_fallback.test.ts tests/unit/native_worker_end.test.ts tests/unit/native_large_value_history.test.ts
+
+      # A save that replaces the file, where platforms differ (Windows cannot
+      # flush a folder, and a file ID can read as negative there), and the SQL
+      # editor's completions on both engines.
+      - name: Saves and SQL editor
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/atomic_database_write.test.ts tests/unit/paged_writable_save.test.ts tests/unit/sql_workspace_completions.test.ts tests/unit/windows_access_list.test.ts
+
+      # The native engine beside another connection that holds the file for a
+      # moment or for good: each binary's SQLite must wait in steps shorter
+      # than a second, and stop.
+      - name: Locks held by another program
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: node --import tsx --test tests/unit/native_lock_wait.test.ts
+
+      # The same history-tracked mutations, and column adds and drops through
+      # HostBridge, on WebAssembly and native in lockstep: outcomes, schema,
+      # storage classes and stored bytes must match, and undo must restore.
+      - name: Engine history differential fuzz
+        shell: bash
+        env:
+          FUZZ_EXPECT_TARGET: ${{ matrix.target }}
+        run: npm run test:history-fuzz
+
+      # Which databases the worker reads through a memory map, and that reading
+      # one leaves its ctime unchanged. Only Linux maps.
+      - name: Native memory-mapped reads
+        shell: bash
+        run: node --import tsx --test tests/unit/native_memory_map.test.ts
+
       - name: Summary
         if: always()
         shell: bash
@@ -98,3 +237,25 @@ jobs:
             grep -F '[native fuzz]' native-fuzz.log || echo 'no [native fuzz] lines: the harness did not reach the worker'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  runtime-sanitizers:
+    name: Runtime helpers under sanitizers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      # The scripts use Node built-ins only, so nothing is installed.
+      - name: Grid helpers under ASan and UBSan
+        run: node scripts/test-runtime-sanitizers.mjs
+
+      # Control arm: each defect injected into a copy of the helpers must
+      # fail the same run.
+      - name: Injected defects are caught
+        run: node scripts/test-runtime-sanitizers.mjs --mutations

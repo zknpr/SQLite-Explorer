@@ -11,6 +11,7 @@ import { DatabaseEditorProvider } from './editorController';
 import { GlobalOutputChannel } from './main';
 import { exportTableToLocalFileForTests } from './tableExporter';
 import {
+  nativeRequestsLeftToV8,
   setDesktopTestDatabaseBackend,
   setDesktopTestPagedOpenThresholdBytes
 } from './workerFactory';
@@ -25,6 +26,8 @@ export interface DesktopTestApi extends vsc.Disposable {
   readonly version: 1;
   setBackend(backend: 'native' | 'wasm'): void;
   setPagedOpenThresholdBytes(thresholdBytes: number | undefined): void;
+  /** How many requests to the native engine were written by the editor's V8, not by the extension. */
+  nativeRequestsLeftToV8(): number;
   inspectDocument(uri: string): Promise<DesktopTestDocumentSnapshot | null>;
   inspectLifecycle(documentId: string): DesktopTestDocumentSnapshot | null;
   openCustomDocument(
@@ -41,6 +44,7 @@ export interface DesktopTestApi extends vsc.Disposable {
     column: string,
     value: CellValue
   ): Promise<RecordId | void>;
+  setPragma(target: string, pragma: string, value: CellValue): Promise<void>;
   save(target: string): Promise<void>;
   revert(target: string): Promise<void>;
   backup(target: string, destination: string): Promise<string>;
@@ -86,6 +90,11 @@ class DesktopTestController implements DesktopTestApi {
       throw new Error('Close every database document before changing the desktop test backend');
     }
     setDesktopTestDatabaseBackend(backend);
+  }
+
+  nativeRequestsLeftToV8(): number {
+    this.#assertActive();
+    return nativeRequestsLeftToV8();
   }
 
   setPagedOpenThresholdBytes(thresholdBytes: number | undefined): void {
@@ -146,6 +155,10 @@ class DesktopTestController implements DesktopTestApi {
     value: CellValue
   ): Promise<RecordId | void> {
     return this.#resolveDocument(target).hostBridge.updateCell(table, rowId, column, value);
+  }
+
+  async setPragma(target: string, pragma: string, value: CellValue): Promise<void> {
+    await this.#resolveDocument(target).hostBridge.setPragma(pragma, value);
   }
 
   async save(target: string): Promise<void> {

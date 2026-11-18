@@ -3,7 +3,7 @@
   "name": "sqlite-explorer",
   "displayName": "SQLite Explorer",
   "description": "A powerful SQLite database viewer and editor for VS Code",
-  "version": "1.8.3",
+  "version": "1.9.0",
   "publisher": "zknpr",
   "license": "MIT",
   "repository": {
@@ -272,6 +272,7 @@
     "test": "npx tsx --tsconfig tsconfig.test.json --test tests/unit/*.test.ts",
     "compile:desktop-tests": "rm -rf .desktop-test-out && tsc -p tsconfig.desktop.json",
     "test:desktop": "npm run compile:desktop-tests && node scripts/run-desktop-tests.mjs",
+    "test:desktop:stable": "npm run compile:desktop-tests && node scripts/run-desktop-tests.mjs --vscode stable",
     "test:gui": "node tests/gui/installed-vsix.mjs",
     "test:gui:lifecycle": "node tests/gui/lifecycle.mjs",
     "test:gui:grid": "node tests/gui/grid-query.mjs",
@@ -282,19 +283,22 @@
     "test:gui:interactions": "node tests/gui/interaction-details.mjs",
     "test:gui:contention": "node tests/gui/native-contention.mjs",
     "test:gui:uploads": "node tests/gui/drop-upload.mjs",
+    "test:gui:web": "node tests/gui/web-save.mjs",
     "test:native-smoke": "node --import tsx --test tests/unit/native_real_smoke.test.ts",
-    "test:native-fuzz": "node --import tsx --test tests/fuzz/native_attach_fuzz.test.ts"
+    "test:native-fuzz": "node --import tsx --test tests/fuzz/native_attach_fuzz.test.ts",
+    "test:history-fuzz": "node --import tsx --test tests/fuzz/engine_history_differential.test.ts tests/fuzz/engine_column_history_differential.test.ts",
+    "test:runtime-sanitizers": "node scripts/test-runtime-sanitizers.mjs && node scripts/test-runtime-sanitizers.mjs --mutations"
   },
   "devDependencies": {
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "@types/vscode": "=1.110.0",
     "@vscode/test-electron": "^3.1.0",
-    "@vscode/vsce": "^4.0.0",
+    "@vscode/vsce": "^4.1.1",
     "esbuild": "^0.28.2",
     "esbuild-plugin-polyfill-node": "^0.3.0",
     "mocha": "^12.0.3",
-    "ovsx": "1.3.0",
-    "playwright-core": "1.64.1",
+    "ovsx": "1.4.0",
+    "playwright-core": "1.65.1",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3"
@@ -303,11 +307,12 @@
     "@scure/base": "^2.4.0",
     "@vscode/codicons": "^0.0.45",
     "@vscode/extension-telemetry": "^1.5.2",
-    "sql.js": "^1.15.0"
+    "sql.js": "^1.16.0"
   },
   "overrides": {
     "qs": "^6.16.0",
     "js-yaml@^4.0.0": "^4.3.2",
-    "serialize-javascript": ">=7.0.5"
+    "serialize-javascript": ">=7.1.3",
+    "@azure/msal-node": "^7.1.0"
   }
 }

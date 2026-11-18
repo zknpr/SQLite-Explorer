@@ -270,6 +270,30 @@ describe('configured-size WASM refusal custom-document recovery', () => {
     assert.equal(await value(restored), 'saved value');
   });
 
+  it('restores more unsaved edits than the undo entry limit from a hot-exit backup', async () => {
+    maximumMb = 0;
+    const uri = await fixture('restore-many.db', false);
+    const original = await open(uri);
+    // One more than the document keeps as undo entries. The backup holds only
+    // history, so each of these has to be in it for restore to replay.
+    const editCount = 101;
+    for (let edit = 1; edit <= editCount; edit++) {
+      await original.hostBridge.updateCell('items', 1, 'name', `unsaved edit ${edit}`);
+    }
+    const backupUri = vscode.Uri.file(path.join(directory, 'many.backup'));
+    await original.backup(backupUri, token);
+    await close(original);
+    const failures = mock.method(vscode.window, 'showErrorMessage', async () => undefined);
+
+    const restored = await open(uri, { ...openContext, backupId: backupUri.toString() });
+
+    assert.equal(failures.mock.callCount(), 0);
+    assert.equal(await value(restored), `unsaved edit ${editCount}`);
+    assert.equal(restored.isReadOnlyMode, false);
+    await restored.revert(token);
+    assert.equal(await value(restored), 'saved value');
+  });
+
   it('notifies once per failed autosave episode and preserves the pending retry and dirty edits', async () => {
     const document = await open(await fixture('autosave.db', false));
     document.autoCommitEnabled = true;

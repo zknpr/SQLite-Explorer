@@ -30,7 +30,7 @@ it('pools actual SQLite raw TEXT companions into bounded backing slabs', async t
         { limit: 1000 }, columns.map((_, index) => index), 'hex');
     const rows = (await engine.executeQuery(query.sql))[0].rows;
     assert.equal(typeof rows[0][query.rawTextColumnStart], 'string');
-    const raw = decodeRawTextColumns(rows, query);
+    const raw = decodeRawTextColumns(rows, query) as Array<Array<Uint8Array | null>>;
     const buffers = new Set(raw.flat().filter(value => value !== null).map(value => value.buffer));
     assert.equal(buffers.size, 1, 'short cell companions share one 64 KiB slab, not one ArrayBuffer per cell');
     assert.ok([...buffers].every(buffer => buffer.byteLength <= 64 * 1024));
@@ -79,7 +79,7 @@ for (const [encoding, malformed, nul] of [
         );
         const query = buildCellContainmentQuery('SELECT value FROM cells ORDER BY id', 1, { limit: 6 }, [0], 'hex');
         const transport = (await engine.executeQuery(query.sql))[0].rows;
-        const raw = decodeRawTextColumns(transport, query);
+        const raw = decodeRawTextColumns(transport, query) as Array<Array<Uint8Array | null>>;
         assert.deepEqual(raw[0][0], new Uint8Array(Buffer.from(malformed, 'hex')));
         assert.deepEqual(raw[1][0], new Uint8Array(Buffer.from(nul, 'hex')));
         assert.equal(raw[2][0]?.byteLength, 0);
@@ -154,7 +154,7 @@ it('keeps the default native raw TEXT transport as BLOBs', async t => {
 it('handles slab rollover and isolates a large cell without reserving a complete page', () => {
     const query = buildCellContainmentQuery('SELECT value FROM cells', 1, { limit: 3 }, [0], 'hex');
     const hexRows = [40000, 40000, 70000].map(length => [null, '', 'ab'.repeat(length)]);
-    const raw = decodeRawTextColumns(hexRows, query);
+    const raw = decodeRawTextColumns(hexRows, query) as Array<Array<Uint8Array | null>>;
     assert.equal(raw[0][0]?.buffer.byteLength, 64 * 1024);
     assert.equal(raw[1][0]?.buffer.byteLength, 64 * 1024);
     assert.equal(raw[2][0]?.buffer.byteLength, 70000);
@@ -171,7 +171,7 @@ it('rejects malformed or over-window hexadecimal transport before retaining byte
 
 it('copies a retained malformed TEXT prefix so its pooled backing slab cannot escape', () => {
     const query = buildCellContainmentQuery('SELECT a, b FROM cells', 2, { limit: 1 }, [0, 1], 'hex');
-    const raw = decodeRawTextColumns([['�', '�', '', '80', 'EFBFBD']], query);
+    const raw = decodeRawTextColumns([['�', '�', '', '80', 'EFBFBD']], query) as Array<Array<Uint8Array | null>>;
     const contained = containUnrepresentableTextCells({
         sourceRows: [['�', '�']], rawTextRows: raw, rawTextColumnIndices: [0, 1],
         textEncoding: 'utf-8', contained: { rows: [['�', '�']] }

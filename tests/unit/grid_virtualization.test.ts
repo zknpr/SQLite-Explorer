@@ -302,6 +302,30 @@ describe('grid row virtualization', () => {
     });
 
     describe('window math', () => {
+        it('computes visible column ranges right of the sticky columns', async () => {
+            const { computeVisibleColumnRange } = await import(gridRenderModulePath);
+            const prefix = [0, 100, 200, 300, 400, 500];
+            // 350px viewport, 50px of sticky columns: a 300px unpinned band.
+            assert.deepStrictEqual(computeVisibleColumnRange(0, 350, 50, prefix), { first: 0, last: 2 });
+            assert.deepStrictEqual(computeVisibleColumnRange(250, 350, 50, prefix), { first: 2, last: 4 });
+            // A band edge exactly on a column boundary does not include the next column.
+            assert.deepStrictEqual(computeVisibleColumnRange(100, 250, 50, prefix), { first: 1, last: 2 });
+            // Scrolled past the end clamps to the last column.
+            assert.deepStrictEqual(computeVisibleColumnRange(900, 350, 50, prefix), { first: 4, last: 4 });
+        });
+
+        it('windows columns only from 100 unpinned columns with a measured width', async () => {
+            const { planVirtualColumnWindow } = await import(gridRenderModulePath);
+            const prefixOf = (count: number) => Array.from({ length: count + 1 }, (_, k) => k * 100);
+            assert.strictEqual(planVirtualColumnWindow(0, 1000, 0, prefixOf(99)), null);
+            assert.strictEqual(planVirtualColumnWindow(0, null, 0, prefixOf(300)), null);
+            assert.deepStrictEqual(planVirtualColumnWindow(0, 1000, 0, prefixOf(100)), { start: 0, end: 20, total: 100 });
+            assert.deepStrictEqual(
+                planVirtualColumnWindow(15000, 1000, 0, prefixOf(300)),
+                { start: 140, end: 170, total: 300 }
+            );
+        });
+
         it('computes visible row ranges under sticky header and pinned-row occlusion', async () => {
             const { computeVisibleRowRange } = await import(gridRenderModulePath);
             // 520px viewport: 468px of usable band below the 52px header.

@@ -10,6 +10,48 @@ const entry = (label: string): LabeledModification => ({
 });
 
 describe('ModificationTracker hot-exit persistence', () => {
+  it('keeps the sign of -0 and leaves a string with the sentinel text a string', () => {
+    const tracker = new ModificationTracker<LabeledModification>();
+    tracker.record({
+      ...entry('negative zero'),
+      priorValue: -0,
+      newValue: '~sqlite-explorer-negative-zero',
+      priorState: { storageClass: 'real', value: -0 },
+      postState: { storageClass: 'text', value: '~sqlite-explorer-negative-zero' }
+    });
+
+    const [restored] = ModificationTracker.deserialize<LabeledModification>(tracker.serialize())
+      .getUncommittedEntries();
+    assert.ok(Object.is(restored.priorValue, -0));
+    assert.ok(Object.is(restored.priorState?.value, -0));
+    assert.strictEqual(restored.newValue, '~sqlite-explorer-negative-zero');
+    assert.strictEqual(restored.postState?.value, '~sqlite-explorer-negative-zero');
+  });
+
+  it('records that an unpinned tracker evicted an unsaved entry until the next checkpoint', async () => {
+    const tracker = new ModificationTracker<LabeledModification>(2);
+    tracker.record(entry('saved'));
+    await tracker.createCheckpoint();
+    tracker.record(entry('unsaved 1'));
+    tracker.record(entry('unsaved 2'));
+    assert.strictEqual(tracker.hasEvictedUncommittedEntries, false, 'only a saved entry was evicted');
+
+    tracker.record(entry('unsaved 3'));
+    assert.strictEqual(tracker.hasEvictedUncommittedEntries, true);
+    assert.strictEqual(
+      ModificationTracker.deserialize<LabeledModification>(tracker.serialize(), 2).hasEvictedUncommittedEntries,
+      true
+    );
+
+    await tracker.createCheckpoint();
+    assert.strictEqual(tracker.hasEvictedUncommittedEntries, false);
+
+    const pinned = new ModificationTracker<LabeledModification>(2);
+    pinned.pinUncommittedEntries(true);
+    for (let index = 0; index < 3; index++) pinned.record(entry(`pinned ${index}`));
+    assert.strictEqual(pinned.hasEvictedUncommittedEntries, false);
+  });
+
   it('keeps an at-cap unsaved barrier segment complete through hot-exit serialization', () => {
     const tracker = new ModificationTracker<LabeledModification>(100);
     const barrier: LabeledModification = {

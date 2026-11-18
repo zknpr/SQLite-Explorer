@@ -62,6 +62,15 @@ describe('getQueryTimeout', () => {
     assert.strictEqual(getQueryTimeout(), 1000);
   });
 
+  it('clamps hand-edited values above the configuration schema maximum', () => {
+    // Past 2^31 - 1 ms a Node timer fires after 1 ms instead, so the host
+    // deadline built on this value would stop the engine on every read.
+    configStore.set('queryTimeout', 3_000_000_000);
+    assert.strictEqual(getQueryTimeout(), 600000);
+    configStore.set('queryTimeout', 600001);
+    assert.strictEqual(getQueryTimeout(), 600000);
+  });
+
   it('uses the default for a non-numeric hand-edited value', () => {
     configStore.set('queryTimeout', 'not-a-number');
     assert.strictEqual(getQueryTimeout(), 30000);

@@ -12,11 +12,16 @@ export function getRowDataOffset() {
     return state.selectedTableType === 'table' ? 1 : 0;
 }
 
+/** Rows per page of the displayed page, which places its rows in the whole result. */
+export function getPageSize() {
+    return state.pageSize ?? state.rowsPerPage;
+}
+
 export function getRowId(row, rowIdx) {
     if (state.selectedTableType === 'table') {
         return row[0]; // SQLite rowid
     }
-    return state.currentPageIndex * state.rowsPerPage + rowIdx;
+    return state.currentPageIndex * getPageSize() + rowIdx;
 }
 
 export function resolveDisplayedCell(targetTable, rowId, columnName) {

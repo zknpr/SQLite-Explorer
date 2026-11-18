@@ -134,6 +134,8 @@ export interface PrimaryKeyColumn {
   identifier: string;
   declaredType: string;
   position: number;
+  /** The collation the primary key compares this member with, when read from the schema. */
+  collation?: string;
 }
 
 /** The database identity mechanism for rows in one table. */
@@ -199,6 +201,8 @@ export interface ColumnMetadata {
   isGenerated?: boolean;
   /** True only when this exact INTEGER PRIMARY KEY aliases the table rowid. */
   isRowidAlias?: boolean;
+  /** The collation a WITHOUT ROWID primary key compares this member with. */
+  primaryKeyCollation?: string;
 }
 
 /**
@@ -288,6 +292,12 @@ export interface SchemaSnapshot {
   views: ViewMetadata[];
   /** All indexes in database */
   indexes: IndexMetadata[];
+  /**
+   * Whether main or TEMP holds a trigger or a virtual table. Without either,
+   * a cell edit cannot change any table's row count, so the webview keeps
+   * those counts.
+   */
+  hasTriggers?: boolean;
 }
 
 // ============================================================================
@@ -419,6 +429,12 @@ export interface ModificationEntry {
       name: string;
       type: string;
       data: { rowId: RecordId; value: CellValue }[];
+      /**
+       * One storage-class letter per data entry (columnDropValueStates); a
+       * TEXT value is then its bytes when they are not plain UTF-8. History
+       * from older versions has none and restores values as given.
+       */
+      storageClasses?: string;
   }[];
   /** Exact guarded schema transition for positional column-drop undo. */
   columnDropSnapshot?: ColumnDropSnapshot;
@@ -468,7 +484,19 @@ export interface DatabaseOperations {
     operation: (snapshotOperations: DatabaseOperations) => Promise<T>
   ): Promise<T>;
 
-  /** Execute one bounded SELECT or its query plan; never a write/script. */
+  /**
+   * Whether the runtime's cell helpers can be called on this connection and
+   * read its TEXT as stored, which holds only for a UTF-8 database. The
+   * native engine loads them on first use.
+   */
+  prepareCellHelpers?(): Promise<boolean>;
+
+  /**
+   * Execute one bounded SELECT or its query plan; never a write/script.
+   * Unlike the other methods, a bigint parameter binds as INTEGER and every
+   * number as REAL, whole or not, as the console's literals are typed
+   * (parseQueryParameters).
+   */
   executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, signal?: AbortSignal): Promise<QueryResultSet>;
 
   /** Execute SQL query */
@@ -497,8 +525,12 @@ export interface DatabaseOperations {
   /** Open one SELECT for incremental reads when the backend exposes a cursor. */
   openQueryReadSession?(sql: string): Promise<QueryReadSession>;
 
-  /** Step a bounded number of rows from an open query read session. */
-  readQueryRows?(sessionId: string, maxRows: number): Promise<QueryReadChunk>;
+  /**
+   * Step a bounded number of rows from an open query read session. With
+   * maxBytes, the read also stops after the row that brings its values to
+   * that many bytes, so rows of unknown size can be read in batches.
+   */
+  readQueryRows?(sessionId: string, maxRows: number, maxBytes?: number): Promise<QueryReadChunk>;
 
   /** Idempotently finalize an incremental query read session. */
   closeQueryReadSession?(sessionId: string): Promise<void>;
@@ -565,6 +597,18 @@ export interface DatabaseOperations {
     maxEditValueBytes?: number,
     maxUndoSnapshotBytes?: number
   ): Promise<DeletedRow>;
+
+  /**
+   * Insert rows atomically with the same guards and post-image history as
+   * insertRowWithHistory. maxUndoSnapshotBytes is the budget for all returned
+   * snapshots, accounted in order like successive single-row calls.
+   */
+  insertRowsWithHistory?(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
 
   /** Insert multiple rows in a batch */
   insertRowBatch(
@@ -735,6 +779,13 @@ export interface TableQueryOptions {
   orderDir?: 'ASC' | 'DESC';
   limit?: number;
   offset?: number;
+  /**
+   * Rows per page of the paging this request belongs to, when `limit` can be
+   * lower: the grid bounds a final page's LIMIT to the rows its count leaves.
+   * Keyset anchors are tagged with it, so they stay valid across such a page.
+   * Omitted, the page size is `limit`.
+   */
+  pageSize?: number;
   filters?: {
     column: string;
     value: string;

@@ -7,8 +7,15 @@ import {
   type PagedWritableOverlaySnapshot
 } from './core/paged-writable-overlay';
 import { WAL_HEADER_SIZE_BYTES } from './core/paged-open';
+import { othersCanRenameIn } from './folderAccess';
+import { descriptorsReach, makeFileInside } from './insideDirectory';
+import { keepAccessEntries } from './posixAccessEntries';
+import { ReplacedFileAccessList, type AccessListHost } from './windowsAccessList';
 import {
+  isUnsupportedFolderFlush,
   ordinaryPermissionMode,
+  patiently,
+  refusedReplacement,
   replacementFileMetadataFromStats,
   restoreTemporaryMetadata,
   type OwnershipPreservationFailure,
@@ -185,9 +192,13 @@ function validateBaseIdentity(identity: unknown): asserts identity is PagedFileI
       );
     }
   }
-  if (candidate.dev! < 0n || candidate.ino! < 0n || candidate.size! < 0n || candidate.mode! < 0n) {
+  // dev and ino are identifiers and are only compared for equality. Node
+  // reports them as signed 64-bit integers, and an NTFS file ID has its top
+  // bit set once the file's record has been reused 32,768 times, so a real
+  // file's ino can be negative. Refusing those failed every save of such a file.
+  if (candidate.size! < 0n || candidate.mode! < 0n) {
     throw new Error(
-      'Malformed paged writable snapshot: baseIdentity fields except mtimeNs must be non-negative'
+      'Malformed paged writable snapshot: baseIdentity size and mode must be non-negative'
     );
   }
 }
@@ -522,6 +533,16 @@ function assertNoSiblingWalFramesSync(
 }
 
 /**
+ * A path as `node:sqlite` takes it. On Windows SQLite does not open a path
+ * past 260 characters as it is given ("unable to open database file"), and
+ * it adds up to eight characters for its journal. Such a path goes in its
+ * extended form, `\\?\C:\...`, which SQLite opens; shorter ones and every
+ * path on other platforms go as they are.
+ */
+export const pathForSqlite = (filePath: string): string =>
+  filePath.length < 240 ? filePath : path.toNamespacedPath(filePath);
+
+/**
  * Hold SQLite's own exclusive lock through the final identity/WAL gate and, where
  * the platform permits renaming an open database, through the rename itself.
  *
@@ -548,10 +569,12 @@ export function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock
 
   let database: import('node:sqlite').DatabaseSync | undefined;
   try {
-    database = new DatabaseSync(databasePath);
+    database = new DatabaseSync(pathForSqlite(databasePath));
     // Do not busy-wait on the extension-host thread. Any connection that keeps
-    // SQLite's main-file lock makes this save fail immediately and leaves both
-    // its transaction and our paged overlay intact for an explicit retry.
+    // SQLite's main-file lock makes this attempt fail immediately. The save
+    // tries again after short waits that leave the thread free (`patiently`),
+    // and then fails, leaving both that connection's transaction and our paged
+    // overlay intact for an explicit retry.
     database.exec(
       'PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE'
     );
@@ -562,11 +585,14 @@ export function acquireSqliteWriteLock(databasePath: string): PagedSaveWriteLock
       // Preserve the lock-acquisition error; a failed constructor/BEGIN owns no
       // successful save that a secondary close error could usefully describe.
     }
-    throw new Error(
+    // SQLITE_BUSY: another connection holds a lock, perhaps a reader that is
+    // done in a moment.
+    const momentary = (Number((error as { errcode?: unknown } | null)?.errcode) & 0xff) === 5;
+    throw Object.assign(new Error(
       'Cannot acquire the exclusive SQLite lock required for an atomic database save; '
       + 'close other connections and retry.',
       { cause: error }
-    );
+    ), { momentary });
   }
 
   let released = false;
@@ -754,7 +780,8 @@ export async function writePagedWritableOverlayToFile(
   snapshot: PagedWritableOverlaySnapshot,
   logger?: PagedSaveLogger,
   acquireWriteLock: PagedSaveWriteLockAcquirer = acquireSqliteWriteLock,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  accessListHost?: AccessListHost
 ): Promise<DatabaseWriteResult> {
   signal?.throwIfAborted();
   validateSnapshot(snapshot);
@@ -801,12 +828,109 @@ export async function writePagedWritableOverlayToFile(
       path.dirname(target.replacementPath),
       `.${path.basename(target.replacementPath)}.sqlite-explorer-${crypto.randomUUID()}.tmp`
     );
-    temporary = await fs.promises.open(temporaryPath, 'wx', 0o600);
+    // Windows gives the new file the access list of its directory, so this
+    // save can only replace a target that has just that list. One with a list
+    // of its own would lose it, and nothing here writes a list back.
+    const accessList = ReplacedFileAccessList.read(
+      target.generation.exists ? target.replacementPath : undefined,
+      fs,
+      `${temporaryPath.slice(0, -4)}.new`,
+      () => assertTargetGenerationSync(fs, target),
+      accessListHost
+    );
+    if (accessList.keepsOwnList) {
+      const unknown = accessList.unknown;
+      throw new Error(
+        (unknown === undefined
+          ? `'${target.replacementPath}' has permissions of its own`
+          : `The permissions of '${target.replacementPath}' could not be compared with a new file's (${describeError(unknown)})`)
+        + ', and a database opened page by page is saved by replacing its file, which '
+        + `${unknown === undefined ? 'would' : 'could'} lose them. Use Save As to another file. The file was not changed.`,
+        { cause: unknown }
+      );
+    }
+    // Where `othersCanRenameIn` answers for the way to the destination, the
+    // file is made in the folder that is held open above: through its
+    // descriptor where the system has a path for one, and otherwise by a
+    // helper process from inside it (`insideDirectory.ts`).
+    const folderPath = path.dirname(target.replacementPath);
+    let othersCanRename = false;
+    if (process.platform !== 'win32' && replacementDirectory) {
+      try {
+        // macOS: with its look at the folders' entries. Elsewhere by owners and modes, every group counted.
+        othersCanRename = othersCanRenameIn(fs, folderPath, process.platform, process.platform === 'darwin' ? undefined : false) !== undefined;
+      } catch {
+        // Not known, so not trusted.
+        othersCanRename = true;
+      }
+    }
+    if (!othersCanRename || !replacementDirectory) {
+      temporary = await fs.promises.open(temporaryPath, 'wx', 0o600);
+    } else {
+      const changed = (cause?: unknown): Error => new Error('Save target changed on disk; retry the save.', { cause });
+      const name = path.basename(temporaryPath);
+      if (descriptorsReach(fs)) {
+        const through = `/proc/self/fd/${replacementDirectory.fd}`;
+        if (target.generation.exists) {
+          // The folder held is the one the destination's file is in.
+          let there: { dev: bigint; ino: bigint };
+          try {
+            there = fs.lstatSync(path.join(through, path.basename(target.replacementPath)), { bigint: true });
+          } catch (error) {
+            throw changed(error);
+          }
+          if (there.dev !== target.generation.fingerprint.dev || there.ino !== target.generation.fingerprint.ino) throw changed();
+        }
+        // From here on the copy is reached through the descriptor: looked at, renamed, and removed after a failure.
+        temporaryPath = path.join(through, name);
+        temporary = await fs.promises.open(temporaryPath, 'wx', 0o600);
+      } else {
+        const held = await replacementDirectory.stat({ bigint: true });
+        const inside = makeFileInside(folderPath, held, name);
+        if (inside === undefined) throw changed();
+        temporaryCreated = true;
+        try {
+          temporary = await fs.promises.open(temporaryPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+        } catch (error) {
+          throw changed(error);
+        }
+        const opened = await temporary.stat({ bigint: true });
+        // Only the very file the helper process made is this save's.
+        if (opened.dev !== inside.dev || opened.ino !== inside.ino) {
+          temporaryCreated = false;
+          throw changed();
+        }
+      }
+    }
     temporaryCreated = true;
     signal?.throwIfAborted();
 
     await assembleSnapshot(source, temporary, snapshot, signal);
-    ownershipPreservationFailure = await restoreTemporaryMetadata(temporary, target);
+    // What a mode does not carry (`posixAccessEntries.ts`), between the
+    // copy's owner and its mode: after its owner and group, and before its
+    // mode is made wider than owner-only.
+    const copy = { fd: temporary.fd, path: temporaryPath };
+    const generation = target.generation;
+    const keepEntries = !generation.exists ? undefined : (): void => {
+      const replaced = generation.fingerprint;
+      keepAccessEntries(
+        fs,
+        { path: target.replacementPath, dev: replaced.dev, ino: replaced.ino },
+        copy,
+        () => {
+          // Looked at above, where the folder could be opened.
+          if (replacementDirectory && process.platform === 'darwin') return othersCanRename;
+          try {
+            return othersCanRenameIn(fs, folderPath) !== undefined;
+          } catch {
+            // Not known, so not trusted.
+            return true;
+          }
+        },
+        (message, error) => logger?.('warn', message, error)
+      );
+    };
+    ownershipPreservationFailure = await restoreTemporaryMetadata(temporary, target, keepEntries);
     signal?.throwIfAborted();
     await temporary.sync();
     signal?.throwIfAborted();
@@ -834,17 +958,21 @@ export async function writePagedWritableOverlayToFile(
         // Keep the specific hot-WAL error while retaining the locked recheck in
         // assertReplacementReadySync as the authoritative commit gate.
         assertNoSiblingWalFramesSync(fs, activeBasePath);
-        writeLock = acquireWriteLock(activeBasePath);
+        writeLock = await patiently(() => acquireWriteLock(activeBasePath));
       } else if (target.requiresTargetWriteLock) {
         assertNoSiblingWalFramesSync(fs, target.replacementPath, 'saveAsTarget');
-        writeLock = acquireWriteLock(target.replacementPath);
+        const lockedPath = target.replacementPath;
+        writeLock = await patiently(() => acquireWriteLock(lockedPath));
       }
-      assertReplacementReadySync(
+      const copyPath = temporaryPath;
+      const copyFingerprint = completedTemporaryFingerprint;
+      const replacementPath = target.replacementPath;
+      const assertReady = (): void => assertReplacementReadySync(
         fs,
         activeBasePath,
         snapshot.baseIdentity,
-        temporaryPath,
-        completedTemporaryFingerprint,
+        copyPath,
+        copyFingerprint,
         target
       );
 
@@ -854,20 +982,25 @@ export async function writePagedWritableOverlayToFile(
         // synchronously immediately before rename. A different process can
         // still commit in the residual post-check/pre-rename window; unlike
         // POSIX, Windows cannot retain BEGIN IMMEDIATE across the swap.
+        assertReady();
         const lockToRelease = writeLock;
         writeLock = undefined;
         lockToRelease.release();
-        assertReplacementReadySync(
-          fs,
-          activeBasePath,
-          snapshot.baseIdentity,
-          temporaryPath,
-          completedTemporaryFingerprint,
-          target
-        );
       }
 
-      fs.renameSync(temporaryPath, target.replacementPath);
+      // Every gate runs again with each attempt, right before its rename.
+      // Only Windows refuses a rename for a moment, and there the lock is
+      // gone by now; any program that could change the file between two
+      // attempts has it open, which is what refuses the rename.
+      const replaced = patiently(() => {
+        assertReady();
+        try {
+          fs.renameSync(copyPath, replacementPath);
+        } catch (error) {
+          throw refusedReplacement(error, replacementPath);
+        }
+      });
+      if (replaced) await replaced;
       renamed = true;
     } catch (error) {
       replacementError = error;
@@ -916,11 +1049,13 @@ export async function writePagedWritableOverlayToFile(
       try {
         await replacementDirectory.sync();
       } catch (syncError) {
-        warnAfterSuccessfulRename(
-          logger,
-          'Paged save replaced the database, but parent-directory durability could not be confirmed:',
-          syncError
-        );
+        if (!isUnsupportedFolderFlush(syncError)) {
+          warnAfterSuccessfulRename(
+            logger,
+            'Paged save replaced the database, but parent-directory durability could not be confirmed:',
+            syncError
+          );
+        }
       }
       try {
         await replacementDirectory.close();
@@ -943,14 +1078,6 @@ export async function writePagedWritableOverlayToFile(
     return { requiresReopen: target.requiresReopen };
   } catch (error) {
     const cleanupErrors: unknown[] = [];
-    if (replacementDirectory) {
-      try {
-        await replacementDirectory.close();
-      } catch (closeError) {
-        cleanupErrors.push(closeError);
-      }
-      replacementDirectory = undefined;
-    }
     if (temporary) {
       try {
         await temporary.close();
@@ -973,6 +1100,15 @@ export async function writePagedWritableOverlayToFile(
       } catch (unlinkError) {
         if (errorCode(unlinkError) !== 'ENOENT') cleanupErrors.push(unlinkError);
       }
+    }
+    // After the copy is removed: its path can go through this descriptor.
+    if (replacementDirectory) {
+      try {
+        await replacementDirectory.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      }
+      replacementDirectory = undefined;
     }
     if (cleanupErrors.length > 0) {
       throw new AggregateError(

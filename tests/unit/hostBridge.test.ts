@@ -3,6 +3,7 @@ import './vscode_mock_setup';
 import { describe, it, mock, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { HostBridge, toWebviewQueryResultSet } from '../../src/hostBridge';
+import { LoggingDatabaseOperations } from '../../src/loggingDatabaseOperations';
 import * as vscode from 'vscode';
 import { createDeferred } from './helpers/deferred';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
@@ -78,6 +79,32 @@ describe('HostBridge', () => {
 
         assert.strictEqual(fetchTableData.mock.callCount(), 1);
         assert.strictEqual(fetchTableData.mock.calls[0].arguments[1].limit, MAX_TABLE_PAGE_ROWS);
+    });
+
+    it('delivers the grid page size and keyset request to the engine', async () => {
+        // Engines tag keyset anchors with pageSize; a hop that dropped it would
+        // tag them with a final page's bounded limit again.
+        const fetchTableData = mock.fn(async (_table: string, _options: any) => ({ headers: [], rows: [] }));
+        const output = { appendLine() {} } as unknown as vscode.OutputChannel;
+        const bridge = new HostBridge(
+            { webviews: new Map(), context: {} } as any,
+            {
+                databaseOperations: new LoggingDatabaseOperations({ fetchTableData } as any, 'items.db', output)
+            } as any
+        );
+        const keyset = { mode: 'before', anchor: 'ksa:anchor' };
+        const [table, options] = deserializeValue(serializeValue([
+            'items',
+            { columns: ['rowid', 'value'], limit: 3, offset: 15, pageSize: 5, keyset }
+        ])) as [string, any];
+
+        await bridge.fetchTableData(table, options);
+
+        assert.strictEqual(fetchTableData.mock.callCount(), 1);
+        const delivered = fetchTableData.mock.calls[0].arguments[1];
+        assert.strictEqual(delivered.limit, 3);
+        assert.strictEqual(delivered.pageSize, 5);
+        assert.deepStrictEqual(delivered.keyset, keyset);
     });
 
     it('delegates bounded cell read sessions without materializing the value', async () => {
@@ -2838,7 +2865,7 @@ describe('HostBridge', () => {
         const pending = bridge.deleteColumns('items', ['payload']);
         await rowsStarted.promise;
         connectionGeneration++;
-        rows.resolve([{ headers: ['rowid', 'payload'], rows: [[1, new Uint8Array([1])]] }]);
+        rows.resolve([{ headers: ['rowid', 'typeof', 'payload'], rows: [[1, 'blob', new Uint8Array([1])]] }]);
 
         await assert.rejects(pending, /document was reloaded/i);
         assert.strictEqual(dbOps.deleteColumns.mock.callCount(), 0);
@@ -3126,11 +3153,12 @@ describe('HostBridge', () => {
                 if (sql.includes('COUNT(*)')) {
                     return [{ headers: ['row_count', 'history_bytes'], rows: [[2, 20]] }];
                 }
+                // buildColumnDropValueProjection: class, then TEXT as its bytes.
                 return [{
-                    headers: ['rowid', 'payload'],
+                    headers: ['rowid', 'typeof', 'payload'],
                     rows: [
-                        ['7', 'safe'],
-                        ['9007199254740993', 'unsafe']
+                        ['7', 'text', new TextEncoder().encode('safe')],
+                        ['9007199254740993', 'text', new TextEncoder().encode('unsafe')]
                     ]
                 }];
             }),
@@ -3162,9 +3190,10 @@ describe('HostBridge', () => {
 
         const modification = recordExternalModification.mock.calls[0].arguments[0] as any;
         assert.strictEqual(modification.deletedColumns[0].type, '');
+        assert.strictEqual(modification.deletedColumns[0].storageClasses, 'tt');
         assert.deepStrictEqual(modification.deletedColumns[0].data, [
-            { rowId: 7, value: 'safe' },
-            { rowId: '9007199254740993', value: 'unsafe' }
+            { rowId: 7, value: new TextEncoder().encode('safe') },
+            { rowId: '9007199254740993', value: new TextEncoder().encode('unsafe') }
         ]);
     });
 
@@ -3223,8 +3252,8 @@ describe('HostBridge', () => {
                     return [{ headers: ['row_count', 'history_bytes'], rows: [[1, 16]] }];
                 }
                 return [{
-                    headers: ['rowid', 'payload'],
-                    rows: [[4, 'kept']]
+                    headers: ['rowid', 'typeof', 'payload'],
+                    rows: [[4, 'text', new TextEncoder().encode('kept')]]
                 }];
             }),
             deleteColumns: mock.fn(async () => {
@@ -3323,7 +3352,7 @@ describe('HostBridge', () => {
                 if (sql.includes('COUNT(*)')) {
                     return [{ headers: ['row_count', 'history_bytes'], rows: [[1, 16]] }];
                 }
-                return [{ headers: ['rowid', 'payload'], rows: [[1, 'kept']] }];
+                return [{ headers: ['rowid', 'typeof', 'payload'], rows: [[1, 'text', new TextEncoder().encode('kept')]] }];
             }),
             deleteColumns: mock.fn(async () => {
                 dropped = true;

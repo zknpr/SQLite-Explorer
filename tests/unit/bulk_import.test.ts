@@ -8,7 +8,8 @@ import { parseImport, mapImportRows, importRowsAtomically } from '../../src/core
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { createNativeDatabaseConnection } from '../../src/nativeWorker';
 import { serializeOperations } from '../../src/core/operation-serializer';
-import type { DatabaseOperations } from '../../src/core/types';
+import { streamTableExport } from '../../src/tableExportStreaming';
+import type { DatabaseOperations, ExportOptions } from '../../src/core/types';
 
 it('parses quoted CSV and maps exact text without implicit null or number conversion', () => {
     const parsed = parseImport('\ufeffkey,note\r\n9007199254740993,"line 1\nline ""2"""\r\n2,\r\n', 'csv');
@@ -18,6 +19,26 @@ it('parses quoted CSV and maps exact text without implicit null or number conver
     ]);
     for (const csv of ['id,id\n1,2', 'id,note\n1', 'id\n"unclosed', 'id\n"a"tail']) {
         assert.throws(() => parseImport(csv, 'csv'));
+    }
+});
+
+it('imports a CSV export back with every row when the last has one empty field', async () => {
+    // A trailing newline ends the last record, as RFC 4180 allows, so the
+    // exporter writes "" for a record of one empty field.
+    assert.equal(parseImport('a\nx\n', 'csv').rows.length, 1);
+    assert.deepEqual(parseImport('a\nx\n""', 'csv').rows, [{ a: 'x' }, { a: '' }]);
+    const wasm = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+    try {
+        await wasm.executeQuery("CREATE TABLE source (a TEXT); CREATE TABLE target (a TEXT); INSERT INTO source VALUES ('x'), (NULL)");
+        const chunks: string[] = [];
+        await streamTableExport(wasm, 'source', ['a'], { format: 'csv', header: true } as ExportOptions, {
+            write: async (chunk: string) => { chunks.push(chunk); }
+        });
+        const parsed = parseImport(chunks.join(''), 'csv');
+        await importRowsAtomically(serializeOperations(wasm), 'target', mapImportRows(parsed, ['a']), 1024 * 1024);
+        assert.deepEqual((await wasm.executeQuery('SELECT a FROM target ORDER BY rowid'))[0].rows, [['x'], ['']]);
+    } finally {
+        wasm.shutdown();
     }
 });
 

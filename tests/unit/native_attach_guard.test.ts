@@ -243,6 +243,13 @@ it('refuses ATTACH and DETACH at every SQL entry point of the native worker', as
         ['query: bound filename', (p, a) => f.query(`ATTACH ? AS ${a}`, [p])],
         ['queryNumeric', (p, a) => worker.call('queryNumeric', [`ATTACH ${sqlLiteral(p)} AS ${a}`, [], ['x']])],
         ['queryBatch: 2nd item', (p, a) => worker.call('queryBatch', [[{ sql: 'SELECT 1' }, { sql: `ATTACH ${sqlLiteral(p)} AS ${a}` }]])],
+        ['queryHistoryBatch: 2nd unit', (p, a) => worker.call('queryHistoryBatch', [
+            [{ sql: 'SELECT 1', params: [] }, { sql: `ATTACH ${sqlLiteral(p)} AS ${a}`, params: [] }], 1, 5000, 1000, 1 << 20
+        ])],
+        ['queryHistoryBatch: shared text', (p, a) => worker.call('queryHistoryBatch', [
+            [{ sql: 0, params: [] }, { sql: 1, params: [] }], 1, 5000, 1000, 1 << 20,
+            ['SELECT 1', `ATTACH ${sqlLiteral(p)} AS ${a}`]
+        ])],
         ['querySingle', (p, a) => worker.call('querySingle', [`ATTACH ${sqlLiteral(p)} AS ${a}\n${BOUNDARY}`, [], BOUNDARY])],
         ['run', (p, a) => worker.call('run', [`ATTACH ${sqlLiteral(p)} AS ${a}`])],
         ['runSingle', (p, a) => {
@@ -452,7 +459,7 @@ it('enforces the ATTACH refusal in the runtime itself, beneath the worker guard'
         copyAttach: unknown;
     };
 
-    assert.deepEqual(outcome.unpermitted, { errno: 23, message: 'authorization denied' },
+    assert.deepEqual(outcome.unpermitted, { errno: 23, message: 'not authorized' },
         'the runtime refuses ATTACH with SQLITE_AUTH even without the worker guard');
     // SQLITE_AUTH comes only from an authorizer, and the control arms rule out
     // the path and the syntax.

@@ -27,7 +27,7 @@ import { BlobInspector } from './blob-inspector.js';
 import { handleTextareaTab, resetTextareaTabFocusEscape } from './text-editor.js';
 import { revealGridCell } from './grid-reveal.js';
 import { resetMatchNav } from './match-nav.js';
-import { ensureGridRowMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
+import { ensureGridCellMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
 import { closeModal, openModal } from './modals.js';
 
 let blobInspector;
@@ -81,10 +81,20 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     const column = state.tableColumns[colIdx];
     if (!column) return;
 
-    // The target row may be outside the virtualized window (e.g. Tab from the
-    // page's last cell wraps to row 0 while scrolled to the bottom). Scroll it
-    // into the window first; no-op on fully rendered pages.
-    ensureGridRowMaterialized(rowIdx);
+    // The target row or column may be outside the virtualized window (e.g. Tab
+    // from the page's last cell wraps to row 0 while scrolled to the bottom).
+    // Scroll it into the window first; no-op on fully rendered pages.
+    ensureGridCellMaterialized(rowIdx, colIdx);
+
+    // The caller read rowId from the grid as it was drawn. A page committed
+    // under an open editor is drawn only by the call above, so this position
+    // can now hold another record: an editor here would show that record's
+    // value and save it to the row the caller named.
+    const row = state.gridData[rowIdx];
+    if (!row || String(getRowId(row, rowIdx)) !== String(rowId)) {
+        updateStatus('The rows changed. Select the cell again.');
+        return;
+    }
 
     // Find the cell element
     const cellEl = document.getElementById(`cell-${rowIdx}-${colIdx}`);
@@ -94,7 +104,6 @@ export function startCellEdit(rowIdx, colIdx, rowId) {
     // the unpinned viewport before replacing it with the inline textarea.
     revealGridCell(cellEl);
 
-    const row = state.gridData[rowIdx];
     const value = getCellValue(row, colIdx);
 
     // Don't edit BLOBs inline
@@ -207,7 +216,8 @@ export async function saveCellEdit() {
         rowId, columnName, column, identityKind,
         originalValue, originalText, table: targetTable
     } = editSession;
-    const newValue = state.activeCellInput.value;
+    const input = state.activeCellInput;
+    const newValue = input.value;
 
     const origStr = originalText ?? (originalValue === null ? '' : String(originalValue));
     if (newValue === origStr) {
@@ -257,6 +267,7 @@ export async function saveCellEdit() {
                 ? resolveDisplayedCell(targetTable, updatedRowId, columnName)
                 : null);
         remapDisplayedRowIdentity(targetTable, rowId, updatedRowId, currentCell);
+        renameDisplayedRow(targetTable, rowId, updatedRowId);
         editSession.updatedRowId = updatedRowId;
         if (currentCell) {
             state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
@@ -265,6 +276,7 @@ export async function saveCellEdit() {
         }
 
         if (state.editingCellInfo === editSession) cleanupCellEdit();
+        focusEditorCell(input);
 
         // Update UI immediately (preserves scroll)
         // refreshContent RPC will handle final consistency check
@@ -350,6 +362,7 @@ async function saveCellEditAndMove(direction) {
         }
     }
 
+    const contentGenerationBeforeSave = state.contentGeneration;
     if (!await saveCellEdit()) return;
     if (state.selectedTable !== targetTable) return;
     if (targetRowId === editSession.rowId && editSession.updatedRowId !== undefined) {
@@ -376,7 +389,12 @@ async function saveCellEditAndMove(direction) {
             if (state.selectedTable !== targetTable
                 || state.connectionGeneration !== targetConnectionGeneration
                 || state.editingCellInfo) return;
-            const loaded = await loadTableData(false);
+            // That echo reloaded rows after the write; only the web demo, or
+            // an echo that did not finish its reload, needs a load here.
+            const loaded = state.contentGeneration !== contentGenerationBeforeSave
+                && state.refreshedContentGeneration === state.contentGeneration
+                ? true
+                : await loadTableData(false);
             if (state.contentRefreshPromise) continue;
             if (loaded !== true) return;
             break;
@@ -394,9 +412,23 @@ async function saveCellEditAndMove(direction) {
 export function cancelCellEdit() {
     if (!state.editingCellInfo) return;
     const { rowIdx, colIdx, originalValue } = state.editingCellInfo;
+    const input = state.activeCellInput;
     cleanupCellEdit();
+    focusEditorCell(input);
     updateCellDom(rowIdx, colIdx, originalValue);
     clearSelection();
+}
+
+/**
+ * Removing the editor while it holds keyboard focus drops focus to <body>,
+ * where grid keys no longer reach the grid: hand it to the editor's cell
+ * first. An editor that lost focus already (a click elsewhere) leaves focus
+ * where the user put it.
+ */
+function focusEditorCell(input) {
+    if (input && document.activeElement === input) {
+        input.closest?.('.data-cell')?.focus?.({ preventScroll: true });
+    }
 }
 
 function cleanupCellEdit() {
@@ -824,6 +856,7 @@ async function saveCellPreviewOnce() {
                 ? resolveDisplayedCell(targetTable, updatedRowId, columnName)
                 : null);
         remapDisplayedRowIdentity(targetTable, rowId, updatedRowId, currentCell);
+        renameDisplayedRow(targetTable, rowId, updatedRowId);
         if (currentCell) {
             state.gridData[currentCell.rowIdx][currentCell.colIdx + getRowDataOffset()] = valueToSave;
             clearExactIntegerText(currentCell.rowIdx, currentCell.colIdx);
@@ -886,6 +919,18 @@ export function toggleCellPreviewWrap() {
     textarea.style.whiteSpace = state.cellPreviewWrapEnabled ? 'pre-wrap' : 'pre';
     textarea.style.overflowX = state.cellPreviewWrapEnabled ? 'hidden' : 'auto';
     wrapBtnEl.classList.toggle('active', state.cellPreviewWrapEnabled);
+}
+
+/**
+ * An edit of the key moved the record to another rowid. Clicks read the
+ * record from its row's data-rowid, so the row showing it takes the new one;
+ * without a reload (the web demo) the old id would stay on screen.
+ */
+function renameDisplayedRow(targetTable, oldRowId, newRowId) {
+    if (newRowId === undefined || newRowId === oldRowId || state.selectedTable !== targetTable) return;
+    for (const tr of document.querySelectorAll('#gridContainer tr.data-row')) {
+        if (tr.dataset.rowid === String(oldRowId)) tr.dataset.rowid = newRowId;
+    }
 }
 
 function updateCellDom(rowIdx, colIdx, value) {

@@ -11,6 +11,21 @@ Build and package first, then run from the repository with Node 24:
 GUI_VSIX=release/sqlite-explorer-darwin-arm64-1.8.0.vsix npm run test:gui
 ```
 
+On Linux without a desktop the suites run under a virtual display with a real
+screen size, for example
+`xvfb-run -a -s "-screen 0 1600x1000x24" npm run test:gui`. They have run that
+way on Ubuntu 24.04 x86_64 and in a `node:24-trixie` arm64 container started
+with `--security-opt seccomp=unconfined --shm-size=2g`; whether the container
+works without those two options was not tried.
+
+`GUI_SETTINGS` takes a JSON object of VS Code settings for the machine the
+suites run on. A Windows service session has a 1024x768 screen, where VS Code's
+empty secondary side bar and a second editor group leave no room for the table
+name. The suites ran there with
+`{"workbench.secondarySideBar.defaultVisibility":"hidden"}`. A zoom level does
+not help: it shrinks the picture without giving the workbench more room, and
+pointer steps then miss their targets.
+
 The default application version is the supported minimum, 1.110.0. The runner can
 download a separate test application, or use `VSCODE_TEST_EXECUTABLE_PATH` to point
 to its actual desktop executable. Set `GUI_VSCODE_VERSION` to an exact version

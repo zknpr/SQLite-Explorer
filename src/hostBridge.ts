@@ -34,8 +34,11 @@ import {
   assertColumnDropHistoryFitsUndoBudget,
   assertTableSchemaStateCurrent,
   buildColumnDropHistorySizePreflight,
+  buildColumnDropValueProjection,
+  columnDropPrimaryKeyRecordId,
   COLUMN_DROP_TABLE_STATE_SQL,
-  mapColumnDropTableState
+  mapColumnDropTableState,
+  readColumnDropValue
 } from './core/column-drop';
 import { runReadSnapshot } from './core/operation-serializer';
 import {
@@ -46,6 +49,7 @@ import {
 import { DEFAULT_MAX_PAGE_RESPONSE_BYTES } from './core/cell-containment';
 import { normalizeTablePageOptions } from './core/table-pagination';
 import { normalizeCellTextEncoding } from './core/cell-read';
+import { bindableIntegerValue } from './core/integer-utils';
 import { estimateUndoMemoryBytes } from './core/undo-history';
 import type { CellMaterializationService } from './cellMaterialization';
 import { openCellContentViewer } from './cellContentViewer';
@@ -536,6 +540,7 @@ export class HostBridge implements ToastService {
    * Update a single cell value.
    */
   async updateCell(table: string, rowId: RecordId, column: string, value: CellValue, _originalValue?: CellValue) {
+    value = bindableIntegerValue(value);
     const dbOps = this.ensureDatabaseInitialized();
     const connectionGeneration = this.captureConnectionGeneration();
 
@@ -752,6 +757,7 @@ export class HostBridge implements ToastService {
    * Insert a new row.
    */
   async insertRow(table: string, data: Record<string, CellValue>) {
+    data = Object.fromEntries(Object.entries(data).map(([column, value]) => [column, bindableIntegerValue(value)]));
     const dbOps = this.ensureDatabaseInitialized();
     const connectionGeneration = this.captureConnectionGeneration();
 
@@ -954,7 +960,9 @@ export class HostBridge implements ToastService {
         deletedColumns: columns.map(column => ({
           name: column,
           type: colMap.get(column)!,
-          data: [] as { rowId: RecordId; value: CellValue }[]
+          data: [] as { rowId: RecordId; value: CellValue }[],
+          // Its letters are counted per entry by the preflight.
+          storageClasses: ''
         })),
         // A drop removes schema text and objects. A separately owned copy of
         // the pre-drop state is therefore a conservative post-drop reserve.
@@ -975,6 +983,7 @@ export class HostBridge implements ToastService {
       }
 
       const colsData = columns.map(() => [] as { rowId: RecordId; value: CellValue }[]);
+      const storageClasses = columns.map(() => [] as string[]);
       if (columns.length > 0) {
         const preflight = buildColumnDropHistorySizePreflight(
           table,
@@ -999,32 +1008,39 @@ export class HostBridge implements ToastService {
           : [];
         const identityProjection = identityBefore.kind === 'rowid'
           ? ['CAST(rowid AS TEXT)']
-          : identityColumns.map(escapeIdentifier);
-        const valueProjection = columns.map(escapeIdentifier);
+          : identityColumns.map(buildColumnDropValueProjection);
+        const valueProjection = columns.map(buildColumnDropValueProjection);
         const result = await snapshotOps.executeQuery(
           `SELECT ${[...identityProjection, ...valueProjection].join(', ')} ` +
           `FROM ${escapeMainIdentifier(table)}`
         );
-        const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length;
+        const identityWidth = identityBefore.kind === 'rowid' ? 1 : identityColumns.length * 2;
+        // A TEXT key is decoded in the database encoding and must reproduce its bytes.
+        const keyEncoding = identityBefore.kind === 'primaryKey'
+          ? normalizeCellTextEncoding((await snapshotOps.executeQuery('PRAGMA encoding'))[0]?.rows[0]?.[0])
+          : undefined;
         for (const row of result[0]?.rows ?? []) {
           const rowId = identityBefore.kind === 'rowid'
             ? validateRowId(row[0] as RecordId)
-            : encodePrimaryKeyRecordId(
-                identityBefore.columns,
-                row.slice(0, identityWidth)
+            : columnDropPrimaryKeyRecordId(
+                identityBefore,
+                row.slice(0, identityWidth),
+                keyEncoding!,
+                `Cannot record undo for dropping ${columns.join(', ')} from ${table}`
               );
           for (let index = 0; index < columns.length; index++) {
-            colsData[index].push({
-              rowId,
-              value: row[identityWidth + index]
-            });
+            const offset = identityWidth + index * 2;
+            const cell = readColumnDropValue(row[offset], row[offset + 1], `${table}.${columns[index]}`);
+            colsData[index].push({ rowId, value: cell.value });
+            storageClasses[index].push(cell.code);
           }
         }
       }
       const deletedColumnsData = columns.map((column, index) => ({
         name: column,
         type: colMap.get(column)!,
-        data: colsData[index]
+        data: colsData[index],
+        storageClasses: storageClasses[index].join('')
       }));
       // Defend the DDL boundary even if a backend returns malformed aggregate
       // metadata. This exact check still runs before deleteColumns' savepoint.
@@ -1295,6 +1311,7 @@ export class HostBridge implements ToastService {
     updates: CellUpdate[],
     label: string
   ): Promise<Pick<CellUpdateResult, 'rowId' | 'newRowId' | 'columnName'>[] | undefined> {
+    updates = updates.map(update => ({ ...update, value: bindableIntegerValue(update.value) }));
     const dbOps = this.ensureDatabaseInitialized();
     const connectionGeneration = this.captureConnectionGeneration();
 

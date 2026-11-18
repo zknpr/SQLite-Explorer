@@ -4,16 +4,31 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { it, type TestContext } from 'node:test';
+import { after, it, type TestContext } from 'node:test';
 import * as vscode from 'vscode';
 import { createNativeDatabaseConnection, isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import type { ModificationEntry } from '../../src/core/types';
 
+// Windows holds a database file for a moment after its worker is stopped, and
+// a throwing t.after hook skips the hooks behind it. Removing a directory in
+// the same hook as its worker's disposal would leave a test's later workers
+// running and the process would never exit, so directories go last, here.
+const directories: string[] = [];
+after(() => {
+  for (const directory of directories) {
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
 async function fixture(t: TestContext, rows = 300) {
   const root = process.cwd();
-  if (!await isNativeAvailable(root)) { t.skip('Bundled native runtime unavailable'); return; }
+  if (!await isNativeAvailable(root)) {
+    if (process.env.FUZZ_EXPECT_TARGET) throw new Error(`Missing native runtime for ${process.env.FUZZ_EXPECT_TARGET}`);
+    t.skip('Bundled native runtime unavailable'); return;
+  }
   fs.mkdirSync(path.join(root, '.tmp'), { recursive: true });
   const directory = fs.mkdtempSync(path.join(root, '.tmp', 'native-history-batch-'));
+  directories.push(directory);
   const file = path.join(directory, 'history.sqlite');
   const seed = new DatabaseSync(file);
   try {
@@ -22,10 +37,7 @@ async function fixture(t: TestContext, rows = 300) {
       INSERT INTO items SELECT id, 'before-' || id, x'00FF' FROM rows`);
   } finally { seed.close(); }
   const bundle = await createNativeDatabaseConnection(vscode.Uri.file(root));
-  t.after(() => {
-    bundle.workerMethods[Symbol.dispose]();
-    fs.rmSync(directory, { recursive: true, force: true });
-  });
+  t.after(() => bundle.workerMethods[Symbol.dispose]());
   const { databaseOps: db } = await bundle.establishConnection(vscode.Uri.file(file), 'history.sqlite');
   const cells = await db.updateCellBatch('items', Array.from({ length: rows }, (_, index) => [
     { rowId: index + 1, column: 'value', value: index % 2 ? 9007199254740993n : null },
@@ -68,7 +80,8 @@ it('replays exact native cell batches without per-row IPC and respects an outer 
 it('rolls earlier history chunks back when a late cell was changed or deleted', async t => {
   for (const direction of ['undo', 'redo'] as const) {
     for (const conflict of ['changed', 'deleted'] as const) {
-      const f = await fixture(t); if (!f) return;
+      // Past 1,024 rows, so the conflict lands in a later chunk.
+      const f = await fixture(t, 2100); if (!f) return;
       if (direction === 'redo') await f.db.undoModification(f.modification);
       await f.db.executeQuery(conflict === 'changed'
         ? `UPDATE items SET value = 'external' WHERE id = ${f.rows}`
@@ -80,6 +93,34 @@ it('rolls earlier history chunks back when a late cell was changed or deleted', 
       assert.deepEqual(await f.read(), beforeAttempt, `${direction}/${conflict} must be atomic`);
     }
   }
+});
+
+it('splits a rowid replay by its values\' bytes as well as its rows', async t => {
+  const f = await fixture(t, 1); if (!f) return;
+  const mib = (fill: number) => new Uint8Array(1024 * 1024).fill(fill);
+  await f.db.executeQuery('CREATE TABLE big(id INTEGER PRIMARY KEY, v BLOB)');
+  for (let id = 1; id <= 24; id++) await f.db.executeQuery('INSERT INTO big VALUES (?, ?)', [id, mib(id)]);
+  const read = async () => (await f.db.executeQuery('SELECT id, length(v), hex(substr(v, 1, 1)) FROM big ORDER BY id'))[0].rows;
+  const before = await read();
+  const cells = await f.db.updateCellBatch('big', Array.from({ length: 24 }, (_, index) => (
+    { rowId: index + 1, column: 'v', value: mib(200 + index) }
+  )));
+  const after = await read();
+  const originalCall = NativeWorkerProcess.prototype.call;
+  let execBatches = 0;
+  t.mock.method(NativeWorkerProcess.prototype, 'call', function(this: NativeWorkerProcess, ...args: Parameters<typeof originalCall>) {
+    if (args[0] === 'execBatch') execBatches++;
+    return originalCall.apply(this, args);
+  });
+  const modification: ModificationEntry = {
+    modificationType: 'cell_update', targetTable: 'big', description: 'Large batch', affectedCells: cells
+  };
+  await f.db.undoModification(modification);
+  assert.deepEqual(await read(), before);
+  // 1 MiB per row against the 8 MiB response budget: three chunks of eight.
+  assert.equal(execBatches, 3);
+  await f.db.redoModification(modification);
+  assert.deepEqual(await read(), after);
 });
 
 it('validates post-write storage before committing a batched native replay', async t => {

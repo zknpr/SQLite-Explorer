@@ -1,8 +1,9 @@
 import { MessageCorrelationId, PendingInvocation, processProtocolMessage } from './core/rpc';
-import { deserializeArgs, serializeValue } from './core/serialization';
+import { deserializeArgs, serializeAssertedValue } from './core/serialization';
 import {
   WEBVIEW_TRANSPORT_SURFACES,
   assertWebviewTransportPayload,
+  measureWebviewTransportPayload,
   fromWebviewPayloadLimitErrorData,
   toWebviewPayloadLimitErrorData
 } from './core/webview-transport';
@@ -219,12 +220,11 @@ export class WebviewMessageHandler {
               data: result
             }
           };
-          assertWebviewTransportPayload(rawResponse, {
+          const { needsRewrite } = measureWebviewTransportPayload(rawResponse, {
             surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
           });
-          const serializedResult = serializeValue(result, {
-            surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
-          });
+          // postMessage serializes the message before anything can change it.
+          const serializedResult = needsRewrite ? serializeAssertedValue(result) : result;
           // postMessage can reject asynchronously (for example during JSON
           // serialization). Keep it in this chain so the caller gets a failure.
           return this.postMessage({
@@ -294,16 +294,14 @@ export class WebviewMessageHandler {
     Promise.resolve()
       .then(() => fn.apply(hostBridge, deserializedArgs))
       .then(result => {
-        assertWebviewTransportPayload({
+        const { needsRewrite } = measureWebviewTransportPayload({
           type: 'rpc-response',
           id: responseId,
           result
         }, {
           surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
         });
-        const serializedResult = serializeValue(result, {
-          surface: WEBVIEW_TRANSPORT_SURFACES.hostResponse
-        });
+        const serializedResult = needsRewrite ? serializeAssertedValue(result) : result;
         return this.postMessage({
           type: 'rpc-response',
           id: responseId,

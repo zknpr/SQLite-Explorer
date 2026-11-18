@@ -17,6 +17,14 @@ import {
 // ============================================================================
 
 /**
+ * JSON writes -0 as 0. A typeless column keeps REAL -0.0, and replay compares
+ * stored states with Object.is, so the sign must survive the backup. A user
+ * string with this text is written with an extra leading '~' by
+ * escapeJsonSafeNumberString, so it can never equal the sentinel.
+ */
+const NEGATIVE_ZERO_SENTINEL = '~sqlite-explorer-negative-zero';
+
+/**
  * JSON replacer function that handles Uint8Array and BigInt serialization.
  * Converts non-JSON cell values to marker objects that can be restored.
  *
@@ -25,6 +33,7 @@ import {
  * This replacer preserves the binary data as base64.
  */
 function binaryReplacer(_key: string, value: unknown): unknown {
+  if (Object.is(value, -0)) return NEGATIVE_ZERO_SENTINEL;
   if (typeof value === 'number' && !Number.isFinite(value)) {
     return encodeJsonSafeNonFiniteNumber(value);
   }
@@ -48,6 +57,8 @@ function binaryReplacer(_key: string, value: unknown): unknown {
  * Converts the special object format back to Uint8Array.
  */
 function binaryReviver(_key: string, value: unknown): unknown {
+  // Before unescaping: '~~sqlite-explorer-negative-zero' is a user string.
+  if (value === NEGATIVE_ZERO_SENTINEL) return -0;
   if (typeof value === 'string') return decodeJsonSafeNumberString(value);
   if (value && typeof value === 'object' && '__type' in value) {
     const typed = value as { __type: string; data?: unknown; text?: unknown };
@@ -196,6 +207,21 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   private currentSize: number = 0;
   /** Further edits must wait for Save once an unsaved barrier segment reaches a limit. */
   private historyRecordingBlockedByBarrierLimit: boolean = false;
+  /**
+   * Keep every entry after the checkpoint, whatever the limits say. A
+   * WebAssembly hot-exit backup holds only this history and restore replays it
+   * onto the saved file, so an evicted unsaved entry is an edit the restore
+   * loses. The native engine writes each edit to the file and replays nothing.
+   */
+  private pinUncommitted: boolean = false;
+  /**
+   * An entry after the checkpoint was evicted, so undoing every retained entry
+   * no longer reaches the saved state. Only an unpinned (native) tracker
+   * evicts such entries. Cleared when a checkpoint is set.
+   */
+  private uncommittedEntriesEvicted: boolean = false;
+  /** The engine named by the backup this tracker was deserialized from. */
+  private backupEngine: 'native' | 'wasm' | undefined;
   /** Monotonic counter advanced whenever the undo/redo history changes. */
   private mutationRevision: number = 0;
   /** Monotonic counter advanced when older checkpoint positions may no longer name the same saved state. */
@@ -219,11 +245,48 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
 
   /** Fail before a backend mutation when retaining its forward replay would exceed the cap. */
   ensureCanRecord(): void {
-    if (!this.historyRecordingBlockedByBarrierLimit) return;
-    throw new Error(
-      'Undo history reached its configured limit after a forward-only edit. '
-      + 'Save the database before making more changes.'
-    );
+    if (this.historyRecordingBlockedByBarrierLimit) {
+      throw new Error(
+        'Undo history reached its configured limit after a forward-only edit. '
+        + 'Save the database before making more changes.'
+      );
+    }
+    if (this.isHistoryRecordingBlockedByUncommittedLimit) {
+      throw new Error(
+        'Unsaved changes reached the undo history memory limit. '
+        + 'Save the database before making more changes.'
+      );
+    }
+  }
+
+  /**
+   * Choose whether entries after the checkpoint survive the retention limits.
+   * The document sets this for the engine it opened; see pinUncommitted.
+   */
+  pinUncommittedEntries(pinned: boolean): void {
+    this.pinUncommitted = pinned;
+  }
+
+  /**
+   * True while pinned unsaved history holds maxMemory or more. The entry
+   * limit does not apply to it: the entry that crosses the memory limit is
+   * kept whole and the next one waits for a save, which lets saved entries be
+   * evicted again. Redo entries are not counted, because the next edit
+   * discards them.
+   */
+  get isHistoryRecordingBlockedByUncommittedLimit(): boolean {
+    if (!this.pinUncommitted || this.historyRecordingBlockedByBarrierLimit) return false;
+    let bytes = 0;
+    for (let index = this.checkpointIndex; index < this.timelineSizes.length; index++) {
+      bytes += this.timelineSizes[index];
+    }
+    for (const size of this.revertOnRestoreSizes) bytes += size;
+    return bytes >= this.maxMemory;
+  }
+
+  /** True once the retained history can no longer take the database back to its checkpoint. */
+  get hasEvictedUncommittedEntries(): boolean {
+    return this.uncommittedEntriesEvicted;
   }
 
   /** True while another edit would make the replay-complete barrier segment unbounded. */
@@ -338,6 +401,14 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
         break;
       }
 
+      // The oldest retained entry is unsaved and this tracker's restore
+      // replays unsaved entries: keep it. Entries before the checkpoint are
+      // evicted first, so this is reached only once none are left.
+      if (this.checkpointIndex === 0 && this.pinUncommitted) {
+        break;
+      }
+
+      if (this.checkpointIndex === 0) this.uncommittedEntriesEvicted = true;
       const removedEntrySize = this.timelineSizes.shift();
       this.timeline.shift();
 
@@ -425,6 +496,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    */
   async createCheckpoint(): Promise<void> {
     this.checkpointIndex = this.timeline.length;
+    this.uncommittedEntriesEvicted = false;
     this.currentSize -= this.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
     this.revertOnRestore = [];
     this.revertOnRestoreSizes = [];
@@ -451,6 +523,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.checkpointIndex = 0;
     this.currentSize = 0;
     this.historyRecordingBlockedByBarrierLimit = false;
+    this.uncommittedEntriesEvicted = false;
     this.invalidateCapturedCheckpointPositions();
   }
 
@@ -493,6 +566,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
   createCheckpointAt(position: number): void {
     const relativePosition = position - this.timelineOffset;
     this.checkpointIndex = Math.max(0, Math.min(this.timeline.length, relativePosition));
+    this.uncommittedEntriesEvicted = false;
     this.currentSize -= this.revertOnRestoreSizes.reduce((a, b) => a + b, 0);
     this.revertOnRestore = [];
     this.revertOnRestoreSizes = [];
@@ -597,14 +671,18 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * Serialize tracker state for backup.
    * Uses a custom JSON replacer for Uint8Array and BigInt cell values.
    *
+   * @param engineKind - The engine the history was made on, which a hot-exit
+   *   restore must reopen (its entries are in the file only on native)
    * @returns Binary representation of state
    */
-  serialize(): Uint8Array {
+  serialize(engineKind?: 'native' | 'wasm'): Uint8Array {
     const payload = {
       timeline: this.timeline,
       checkpointIndex: this.checkpointIndex,
       futureStack: this.futureStack,
-      revertOnRestore: this.revertOnRestore
+      revertOnRestore: this.revertOnRestore,
+      uncommittedEntriesEvicted: this.uncommittedEntriesEvicted,
+      ...(engineKind === undefined ? {} : { engineKind })
     };
     // Preserve every non-JSON SQLite value used by undo and hot-exit replay.
     const jsonStr = JSON.stringify(payload, binaryReplacer);
@@ -634,6 +712,10 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     tracker.checkpointIndex = payload.checkpointIndex || 0;
     tracker.futureStack = payload.futureStack || [];
     tracker.revertOnRestore = payload.revertOnRestore || [];
+    tracker.uncommittedEntriesEvicted = payload.uncommittedEntriesEvicted === true;
+    tracker.backupEngine = payload.engineKind === 'native' || payload.engineKind === 'wasm'
+      ? payload.engineKind
+      : undefined;
 
     // Recalculate sizes for active timeline entries, redo entries, and captured
     // branch-revert entries so restored trackers enforce the same memory
@@ -654,6 +736,11 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
       );
 
     return tracker;
+  }
+
+  /** The engine a deserialized backup was written on; undefined before backups named it. */
+  get backupEngineKind(): 'native' | 'wasm' | undefined {
+    return this.backupEngine;
   }
 
   /**

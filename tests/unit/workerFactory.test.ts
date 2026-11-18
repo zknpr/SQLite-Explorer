@@ -30,6 +30,7 @@ let nativeBundleFactory: (() => Promise<any>) | undefined;
 let outputLines: string[] = [];
 let serializeOperationsCalls = 0;
 let maximumFileSizeBytes = 0;
+let queryTimeoutMs = 5000;
 let localFileWritable = true;
 let useRealWorkerRpc = false;
 let workerMessageHandler: ((data: unknown) => void) | undefined;
@@ -113,7 +114,7 @@ Module.prototype.require = function(id: string) {
     if (id.endsWith('config')) {
         return {
           getMaximumFileSizeBytes: () => maximumFileSizeBytes,
-          getQueryTimeout: () => 5000
+          getQueryTimeout: () => queryTimeoutMs
         };
     }
     if (id.endsWith('core/operation-serializer')) {
@@ -176,6 +177,7 @@ describe('workerFactory error path tests', () => {
     outputLines = [];
     serializeOperationsCalls = 0;
     maximumFileSizeBytes = 0;
+    queryTimeoutMs = 5000;
     localFileWritable = true;
     useRealWorkerRpc = false;
     workerMessageHandler = undefined;
@@ -372,6 +374,126 @@ describe('workerFactory error path tests', () => {
     bundle.workerMethods[Symbol.dispose]();
     assert.strictEqual(nativeDisposals, 1);
     assert.strictEqual(wasmWorkerTerminationCount, 1);
+  });
+
+  describe('a schema that uses a module only the WebAssembly build has', () => {
+    let nativeOpens = 0;
+    let nativeDisposals = 0;
+    let moduleChecks = 0;
+    let checkResult: () => Promise<unknown>;
+    const nativeConnection = () => ({
+      databaseOps: { engineKind: Promise.resolve('native') },
+      isReadOnly: false,
+      findTablesWithMissingModules: async (modules: readonly string[]) => {
+        moduleChecks++;
+        assert.deepStrictEqual(modules, ['fts3', 'fts3tokenize', 'fts4', 'fts4aux']);
+        return checkResult();
+      }
+    });
+
+    beforeEach(() => {
+      nativeAvailable = true;
+      nativeOpens = 0;
+      nativeDisposals = 0;
+      moduleChecks = 0;
+      checkResult = async () => ({ checked: true, tables: [{ table: 'docs_fts', module: 'fts4' }] });
+      workerProxy.runQuery = async () => [];
+      nativeBundleFactory = async () => ({
+        workerMethods: { [Symbol.dispose]: () => { nativeDisposals++; } },
+        establishConnection: async () => { nativeOpens++; return nativeConnection(); }
+      });
+      mock.method(mockVscode.workspace.fs, 'stat', async (uri: { path: string }) => ({ size: uri.path.endsWith('-wal') ? 0 : 2048 }));
+    });
+
+    const open = async (backupEngine?: 'native' | 'wasm') => {
+      const bundle = await workerFactory.createDatabaseConnection({ scheme: 'file', fsPath: '/test/extension' });
+      const connection = await bundle.establishConnection(testDbUri(), 'docs.db', false, false, backupEngine);
+      return { bundle, connection, engine: await connection.databaseOps.engineKind };
+    };
+
+    it('opens it with WASM under an unlimited maxFileSize and retires native once', async () => {
+      maximumFileSizeBytes = 0;
+      const { bundle, engine } = await open();
+      assert.strictEqual(engine, 'wasm');
+      assert.strictEqual(nativeDisposals, 1);
+      assert.strictEqual(wasmWorkerCreationCount, 1);
+      assert.deepStrictEqual(outputLines.filter(line => line.startsWith('[SQLite Explorer] docs.db: ')), [
+        '[SQLite Explorer] docs.db: table "docs_fts" uses fts4, which the native SQLite engine does not include; '
+        + 'opening it with the WebAssembly engine.'
+      ]);
+      bundle.workerMethods[Symbol.dispose]();
+      bundle.workerMethods[Symbol.dispose]();
+      assert.strictEqual(nativeDisposals, 1);
+      assert.strictEqual(wasmWorkerTerminationCount, 1);
+    });
+
+    it('keeps native without a WASM worker when maxFileSize refuses the file', async () => {
+      maximumFileSizeBytes = 1024;
+      const { bundle, engine } = await open();
+      try {
+        assert.strictEqual(engine, 'native');
+        assert.strictEqual(wasmWorkerCreationCount, 0);
+        assert.strictEqual(nativeDisposals, 0);
+        const logged = outputLines.filter(line => line.startsWith('[SQLite Explorer] docs.db: '));
+        assert.strictEqual(logged.length, 1);
+        assert.match(logged[0], /uses fts4.*larger than sqliteExplorer\.maxFileSize.*stays on the native engine/);
+      } finally { bundle.workerMethods[Symbol.dispose](); }
+    });
+
+    it('keeps the native connection open when the WASM open fails', async () => {
+      workerProxy.initializeDatabase = async () => { throw new Error('rollback journal needs recovery'); };
+      const { bundle, engine } = await open();
+      try {
+        assert.strictEqual(engine, 'native');
+        assert.strictEqual(nativeDisposals, 0);
+        assert.match(
+          outputLines.find(line => line.startsWith('[SQLite Explorer] docs.db: ')) ?? '',
+          /WebAssembly engine could not open it \(rollback journal needs recovery\), so the file stays on the native engine/
+        );
+      } finally { bundle.workerMethods[Symbol.dispose](); }
+    });
+
+    it('keeps native and says so when the check cannot finish or is past its bounds', async () => {
+      for (const [result, line] of [
+        [async () => { throw new Error('database is locked'); }, /could not check the schema .*\(database is locked\); using the native engine/],
+        [async () => ({ checked: false, reason: 'more than 256 virtual tables might use them' }), /did not check .*more than 256 virtual tables might use them/]
+      ] as const) {
+        checkResult = result;
+        outputLines = [];
+        const { bundle, engine } = await open();
+        try {
+          assert.strictEqual(engine, 'native');
+          assert.strictEqual(wasmWorkerCreationCount, 0);
+          assert.match(outputLines.find(entry => entry.startsWith('[SQLite Explorer] docs.db: ')) ?? '', line);
+        } finally { bundle.workerMethods[Symbol.dispose](); }
+      }
+    });
+
+    it('never checks or moves under the forced native test backend', async () => {
+      workerFactory.setDesktopTestDatabaseBackend('native');
+      try {
+        for (const backupEngine of [undefined, 'wasm'] as const) {
+          const { bundle, engine } = await open(backupEngine);
+          bundle.workerMethods[Symbol.dispose]();
+          assert.strictEqual(engine, 'native');
+        }
+        assert.strictEqual(moduleChecks, 0);
+        assert.strictEqual(wasmWorkerCreationCount, 0);
+      } finally {
+        workerFactory.setDesktopTestDatabaseBackend(undefined);
+      }
+    });
+
+    it('reopens the engine a hot-exit backup names without checking', async () => {
+      const wasm = await open('wasm');
+      wasm.bundle.workerMethods[Symbol.dispose]();
+      assert.strictEqual(wasm.engine, 'wasm');
+      assert.strictEqual(nativeOpens, 0);
+      const native = await open('native');
+      native.bundle.workerMethods[Symbol.dispose]();
+      assert.strictEqual(native.engine, 'native');
+      assert.strictEqual(moduleChecks, 0);
+    });
   });
 
   it('serializes the desktop worker-backed WASM facade as one operation queue', async () => {
@@ -1322,5 +1444,87 @@ describe('workerFactory error path tests', () => {
       workerTimeoutPolicy!('runQuery', ['SELECT 1']),
       DEFAULT_INVOCATION_TIMEOUT_MS
     );
+  });
+
+  it('scales the import batch deadline with its rows, as one insert call per row had', async () => {
+    const timeoutPolicy = await establishTimeoutPolicy();
+    const rows = (count: number) => Array.from({ length: count }, (_, index) => ({ id: index }));
+    assert.strictEqual(timeoutPolicy('insertRowsWithHistory', ['items', rows(1)]), DEFAULT_INVOCATION_TIMEOUT_MS);
+    assert.strictEqual(timeoutPolicy('insertRowsWithHistory', ['items', rows(3)]), 3 * DEFAULT_INVOCATION_TIMEOUT_MS);
+    assert.strictEqual(timeoutPolicy('insertRowsWithHistory', ['items', rows(500)]), 10 * DEFAULT_INVOCATION_TIMEOUT_MS);
+  });
+
+  // The worker stops a read at queryTimeout (WasmDatabaseEngine's progress
+  // handler); the host must wait at least that long, plus a margin, so the
+  // worker's own error arrives before the transport gives up.
+  const READ_METHODS = [
+    'executeReadQuery', 'previewViewDefinition', 'fetchTableData', 'fetchTableCount',
+    'fetchSchema', 'getTableInfo', 'getPragmas', 'readQueryRows'
+  ];
+
+  it('waits for a read that queryTimeout allows past the fixed 60 s transport limit', async () => {
+    queryTimeoutMs = 600_000;
+    useRealWorkerRpc = true;
+    const bundle: DatabaseConnectionBundle = await workerFactory.createDatabaseConnection(mockVscode.Uri.file('/test/extension'));
+    try {
+      const opening = bundle.establishConnection(testDbUri(), 'test.sqlite');
+      for (let turn = 0; turn < 100 && !postedWorkerMessages.some(message => message.methodName === 'initializeDatabase'); turn++) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      const initialize = postedWorkerMessages.find(message => message.methodName === 'initializeDatabase');
+      assert.ok(initialize, 'establishConnection did not initialize the worker');
+      workerMessageHandler!({ kind: 'result', correlationId: initialize.correlationId, payload: { isReadOnly: false } });
+      const { databaseOps } = await opening;
+
+      mock.timers.enable({ apis: ['setTimeout'] });
+      const settle = () => new Promise<void>(resolve => setImmediate(resolve));
+      let outcome: unknown = 'pending';
+      const reading = databaseOps.executeReadQuery('SELECT slow_read()', []).then(
+        value => { outcome = value; },
+        error => { outcome = error; }
+      );
+      const call = postedWorkerMessages.find(message => message.methodName === 'executeReadQuery');
+      assert.ok(call);
+      mock.timers.tick(DEFAULT_INVOCATION_TIMEOUT_MS + 1);
+      await settle();
+      assert.strictEqual(outcome, 'pending', 'a read within queryTimeout must not fail at the 60 s transport limit');
+      const rows = { headers: ['value'], rows: [[1]] };
+      workerMessageHandler!({ kind: 'result', correlationId: call.correlationId, payload: rows });
+      await reading;
+      assert.deepStrictEqual(outcome, rows);
+
+      // A worker that never answers still fails, once queryTimeout and the margin pass.
+      let counted: unknown = 'pending';
+      const counting = databaseOps.fetchTableCount('items', {} as never).then(
+        value => { counted = value; },
+        error => { counted = error; }
+      );
+      mock.timers.tick(601_999);
+      await settle();
+      assert.strictEqual(counted, 'pending');
+      mock.timers.tick(1);
+      await counting;
+      const timedOut = counted as unknown;
+      assert.ok(timedOut instanceof Error && timedOut.name === 'InvocationTimeoutError', String(timedOut));
+
+      const policy = workerTimeoutPolicy!;
+      for (const method of READ_METHODS) assert.strictEqual(policy(method, []), 602_000, method);
+      assert.strictEqual(policy('runQuery', ['  select count(*) FROM items']), 602_000);
+      // Writes, saves and history keep their limits.
+      assert.strictEqual(policy('runQuery', ['INSERT INTO items VALUES (1)']), DEFAULT_INVOCATION_TIMEOUT_MS);
+      assert.strictEqual(policy('runQuery', ['SAVEPOINT snapshot']), DEFAULT_INVOCATION_TIMEOUT_MS);
+      assert.strictEqual(policy('writeToFile', ['/test/db.sqlite']), DEFAULT_INVOCATION_TIMEOUT_MS);
+      assert.strictEqual(policy('updateCellBatch', ['items', []]), DEFAULT_INVOCATION_TIMEOUT_MS);
+      assert.strictEqual(policy('undoModification', [{ affectedRowIds: [1, 2, 3] }]), 3 * DEFAULT_INVOCATION_TIMEOUT_MS);
+      assert.strictEqual(policy('insertRowsWithHistory', ['items', [{}, {}]]), 2 * DEFAULT_INVOCATION_TIMEOUT_MS);
+    } finally {
+      mock.timers.reset();
+      bundle.workerMethods[Symbol.dispose]();
+    }
+  });
+
+  it('keeps reads at the 60 s transport limit when queryTimeout is shorter', async () => {
+    const timeoutPolicy = await establishTimeoutPolicy();
+    for (const method of READ_METHODS) assert.strictEqual(timeoutPolicy(method, []), DEFAULT_INVOCATION_TIMEOUT_MS, method);
   });
 });

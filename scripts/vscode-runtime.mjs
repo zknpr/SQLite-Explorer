@@ -34,11 +34,8 @@ export function applicationRoot(executablePath) {
   return fs.realpathSync(roots[0]);
 }
 
-/** Check an exact test-runtime version; a cache directory name is not evidence. */
-export function assertRuntimeVersion(executablePath, expectedVersion) {
-  if (typeof expectedVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(expectedVersion)) {
-    throw new Error(`Expected an exact VS Code runtime version, received ${expectedVersion}`);
-  }
+/** The version a desktop VS Code executable's own package states, and where it was read. */
+export function runtimeVersion(executablePath) {
   const manifestPath = path.join(applicationRoot(executablePath), 'package.json');
   let manifest;
   try {
@@ -46,7 +43,15 @@ export function assertRuntimeVersion(executablePath, expectedVersion) {
   } catch (error) {
     throw new Error(`Cannot read VS Code runtime version from ${manifestPath}: ${error.message}`, { cause: error });
   }
-  const actualVersion = typeof manifest?.version === 'string' ? manifest.version : '<missing version>';
+  return { version: typeof manifest?.version === 'string' ? manifest.version : '<missing version>', manifestPath };
+}
+
+/** Check an exact test-runtime version; a cache directory name is not evidence. */
+export function assertRuntimeVersion(executablePath, expectedVersion) {
+  if (typeof expectedVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(expectedVersion)) {
+    throw new Error(`Expected an exact VS Code runtime version, received ${expectedVersion}`);
+  }
+  const { version: actualVersion, manifestPath } = runtimeVersion(executablePath);
   if (actualVersion !== expectedVersion) {
     throw new Error(
       `VS Code runtime version mismatch: expected ${expectedVersion}, actual ${actualVersion} at ${manifestPath}. `

@@ -401,3 +401,87 @@ it('clears and persists selection when refresh removes the selected table', asyn
         state.lastSelectedRowIndex = null;
     }
 });
+
+it('keeps table row counts across a cell edit echo only while the schema has no trigger', async () => {
+    const apiModulePath = '../../core/ui/modules/api.js';
+    const rpcModulePath = '../../core/ui/modules/rpc.js';
+    const stateModulePath = '../../core/ui/modules/state.js';
+    const countCacheModulePath = '../../core/ui/modules/count-cache.js';
+    const { backendApi } = await import(apiModulePath);
+    const { refreshContent } = await import(rpcModulePath);
+    const { state } = await import(stateModulePath);
+    const countCache = await import(countCacheModulePath);
+    const originals = { fetchSchema: backendApi.fetchSchema };
+    let hasTriggers: boolean | undefined = false;
+    let schemaGate: Promise<void> | undefined;
+    backendApi.fetchSchema = async () => {
+        await schemaGate;
+        return {
+            tables: [{ identifier: 'items', identity: { kind: 'rowid' } }],
+            views: [{ identifier: 'recent' }],
+            indexes: [],
+            ...(hasTriggers === undefined ? {} : { hasTriggers })
+        };
+    };
+    const unfiltered = countCache.buildCountIdentity('items', [], undefined, ['value']);
+    const filtered = countCache.buildCountIdentity('items', [{ column: 'value', value: 'a' }], undefined, ['value']);
+    const view = countCache.buildCountIdentity('recent', [], undefined, ['value']);
+    const seed = () => {
+        countCache.invalidateAllCounts();
+        for (const [identity, count] of [[unfiltered, 60], [filtered, 30], [view, 10]] as const) {
+            assert.strictEqual(countCache.prepareCountStore(identity)({ count, isExact: true }), true);
+        }
+    };
+    const cached = () => [unfiltered, filtered, view].map(identity => countCache.getCachedCount(identity)?.count);
+    state.isDbConnected = true;
+    state.selectedTable = null;
+    try {
+        // The first refresh learns that the schema has no trigger.
+        await refreshContent('qa.db');
+        assert.strictEqual(state.schemaCache.hasTriggers, false);
+        seed();
+        await refreshContent('qa.db', undefined, { modificationType: 'cell_update' });
+        assert.deepStrictEqual(cached(), [60, undefined, undefined], 'only the table\'s unfiltered count survives');
+
+        for (const change of [{ modificationType: 'row_insert' }, { modificationType: 'row_delete' }, { modificationType: 'column_add' }, undefined]) {
+            seed();
+            await refreshContent('qa.db', undefined, change);
+            assert.deepStrictEqual(cached(), [undefined, undefined, undefined], JSON.stringify(change));
+        }
+
+        // A reconnect replaces the database.
+        seed();
+        await refreshContent('qa.db', { connected: true, readOnly: false, connectionGeneration: state.connectionGeneration }, { modificationType: 'cell_update' });
+        assert.deepStrictEqual(cached(), [undefined, undefined, undefined]);
+
+        // A schema with a trigger, or one that does not say, keeps nothing.
+        for (const value of [true, undefined]) {
+            hasTriggers = value;
+            await refreshContent('qa.db');
+            seed();
+            await refreshContent('qa.db', undefined, { modificationType: 'cell_update' });
+            assert.deepStrictEqual(cached(), [undefined, undefined, undefined], `hasTriggers ${value}`);
+        }
+
+        // An echo that overlaps a refresh still loading its schema keeps nothing:
+        // that schema may be the one that added a trigger.
+        hasTriggers = false;
+        await refreshContent('qa.db');
+        assert.strictEqual(state.schemaCache.hasTriggers, false);
+        let release!: () => void;
+        schemaGate = new Promise(resolve => { release = resolve; });
+        const pending = refreshContent('qa.db', undefined, { modificationType: 'column_add' });
+        seed();
+        const overlapping = refreshContent('qa.db', undefined, { modificationType: 'cell_update' });
+        assert.deepStrictEqual(cached(), [undefined, undefined, undefined]);
+        release();
+        schemaGate = undefined;
+        await Promise.all([pending, overlapping]);
+    } finally {
+        Object.assign(backendApi, originals);
+        countCache.invalidateAllCounts();
+        state.isDbConnected = false;
+        state.selectedTable = null;
+        state.schemaCache.hasTriggers = undefined;
+    }
+});

@@ -5,9 +5,9 @@ import { state } from './state.js';
 import { backendApi } from './api.js';
 import { updateStatus, updateToolbarButtons } from './ui.js';
 import { openModal, closeModal, registerModalCloseHandler } from './modals.js';
-import { loadTableData, loadTableColumns } from './grid.js';
+import { loadTableData, loadTableColumns, reloadAfterOwnMutation } from './grid.js';
 import { refreshSchema } from './sidebar.js';
-import { getErrorMessage, parseGridInputValue } from './utils.js';
+import { formatCellValueAsText, getErrorMessage, parseGridInputValue } from './utils.js';
 import { noteRowCountChanged, noteCellValuesChanged } from './count-cache.js';
 import { getSelectedRowActionEligibility } from './data-utils.js';
 import { assertUsableSqlIdentifier } from '../../../src/core/sql-utils.ts';
@@ -160,7 +160,8 @@ export function openAddRowModal() {
         } else if (isRequired) {
             input.placeholder = 'Required';
         } else if (hasDefault) {
-            input.placeholder = `Default: ${col.dflt_value}`;
+            // Schema text of any length, shortened as a grid cell is.
+            input.placeholder = `Default: ${formatCellValueAsText(col.dflt_value)}`;
         } else {
             input.placeholder = 'Default (SQL NULL)';
         }
@@ -292,6 +293,7 @@ async function submitAddRowOnce() {
 
     try {
         updateStatus('Inserting row...');
+        const contentGenerationBeforeInsert = state.contentGeneration;
         await backendApi.insertRow(targetTable, rowData);
         // VS Code retains this known delta until its refreshContent echo. The
         // demo cache drops it because INSERT triggers can ignore/add rows.
@@ -307,7 +309,7 @@ async function submitAddRowOnce() {
         // A host refresh may close the modal before the mutation reply arrives.
         // Modal ownership controls modal/status changes, not reconciliation of
         // the committed insert against the still-selected database target.
-        if (targetIsCurrent()) await loadTableData();
+        if (targetIsCurrent()) await reloadAfterOwnMutation(contentGenerationBeforeInsert, targetIsCurrent);
         if (ownsModal && addRowSession === null && targetIsCurrent()) {
             updateStatus('Row inserted - Ctrl+S to save');
         }
@@ -439,6 +441,7 @@ async function submitDeleteRows(session, isCurrentSession) {
     try {
         if (rowIds.length > LARGE_CHANGE_WARNING_THRESHOLD && !(await confirmLargeChange(rowIds.length, 'rows'))) return;
         updateStatus('Deleting rows...');
+        const contentGenerationBeforeDelete = state.contentGeneration;
         await backendApi.deleteRows(targetTable, rowIds);
         // VS Code retains this requested delta until its refreshContent echo.
         // The demo drops it because DELETE triggers can ignore/cascade rows.
@@ -456,7 +459,7 @@ async function submitDeleteRows(session, isCurrentSession) {
         // survive this older confirmation's reconciliation.
         if (targetIsCurrent()) {
             for (const rowId of rowIds) state.selectedRowIds.delete(rowId);
-            await loadTableData();
+            await reloadAfterOwnMutation(contentGenerationBeforeDelete, targetIsCurrent);
             updateToolbarButtons();
         }
         if (ownsModal && deleteSession === null && targetIsCurrent()) {

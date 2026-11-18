@@ -253,7 +253,11 @@ describe('CellMaterializationService', () => {
             materialized.checksumSha256,
             (await import('node:crypto')).createHash('sha256').update(actual).digest('hex')
         );
-        assert.strictEqual(fs.statSync(materialized.uri.fsPath).mode & 0o777, 0o600);
+        // Windows has no owner, group and other modes: Node reports 0o666 for
+        // any writable file.
+        if (process.platform !== 'win32') {
+            assert.strictEqual(fs.statSync(materialized.uri.fsPath).mode & 0o777, 0o600);
+        }
         assert.ok(operations.readSizes.every(size => size <= 3));
         assert.strictEqual(operations.closeCount, 1);
     });

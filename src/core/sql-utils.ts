@@ -18,12 +18,34 @@ import type { CellValue, RecordId } from './types';
  * @returns Safely escaped identifier wrapped in double quotes
  */
 export function escapeIdentifier(identifier: string): string {
-  return `"${identifier.replace(/"/g, '""')}"`;
+  // History SQL escapes each column once per row; skip the replace when there
+  // is no quote to double.
+  return identifier.includes('"')
+    ? `"${identifier.replace(/"/g, '""')}"`
+    : `"${identifier}"`;
 }
 
 /** Qualify a persistent object so a same-named TEMP object cannot intercept DDL/DML. */
 export function escapeMainIdentifier(identifier: string): string {
   return `main.${escapeIdentifier(identifier)}`;
+}
+
+const EXPRESSION_TERM_GROUP = 200;
+
+/**
+ * Join expression terms with a binary operator. SQLite refuses an expression
+ * nested more than 1,000 deep, which one flat chain over a wide table's
+ * columns reaches near that many terms, so a longer list is joined in
+ * parenthesized groups. Up to one group the text is the flat chain.
+ */
+export function joinExpressionTerms(terms: readonly string[], operator: 'AND' | '+'): string {
+  const separator = ` ${operator} `;
+  if (terms.length <= EXPRESSION_TERM_GROUP) return terms.join(separator);
+  const groups: string[] = [];
+  for (let start = 0; start < terms.length; start += EXPRESSION_TERM_GROUP) {
+    groups.push(`(${terms.slice(start, start + EXPRESSION_TERM_GROUP).join(separator)})`);
+  }
+  return groups.join(separator);
 }
 
 /**
@@ -73,6 +95,24 @@ export function validateSqlType(type: string): void {
 }
 
 /**
+ * A || chain holds two operators per NUL, and SQLite refuses an expression
+ * deeper than 1000 (SQLITE_MAX_EXPR_DEPTH). Text with more NULs than this is
+ * written as one quoted literal with each NUL escaped, which two nested
+ * replace() calls undo: U+E000 stands for itself followed by 'a' and for a
+ * NUL followed by 'b'. Every U+E000 in the escaped text is followed by its
+ * letter, so the 'b' pairs are exactly the NULs, and once they are gone the
+ * 'a' pairs are exactly the original U+E000s.
+ */
+export const SQL_NUL_CHAIN_MAX_NULS = 100;
+export const SQL_NUL_TEXT_PREFIX = "replace(replace('";
+export const SQL_NUL_TEXT_SUFFIX = "', char(57344, 98), char(0)), char(57344, 97), char(57344))";
+
+/** The quoted body between SQL_NUL_TEXT_PREFIX and SQL_NUL_TEXT_SUFFIX. */
+export function escapeSqlNulText(text: string): string {
+  return text.replace(/'/g, "''").replace(/\uE000/g, '\uE000a').replace(/\0/g, '\uE000b');
+}
+
+/**
  * Convert a CellValue to SQL literal representation.
  * Handles NULL, numbers, strings, and binary data.
  */
@@ -87,13 +127,16 @@ export function cellValueToSql(value: CellValue | undefined): string {
     return value.toString();
   }
   if (typeof value === 'string') {
-    // Check for NUL characters which are unsafe in SQL scripts
-    // If found, encode as hex blob and cast to TEXT
+    // A NUL is unsafe inside a SQL script. char(0) between quoted segments
+    // gives it back as TEXT in whatever encoding the target database uses;
+    // a CAST of hex bytes would be read as that encoding, so UTF-8 bytes
+    // replayed into a UTF-16 database would come back cut at the NUL.
     if (value.includes('\0')) {
-      const encoder = new TextEncoder();
-      const bytes = encoder.encode(value);
-      const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-      return `CAST(X'${hex}' AS TEXT)`;
+      const segments = value.split('\0');
+      if (segments.length - 1 > SQL_NUL_CHAIN_MAX_NULS) {
+        return `${SQL_NUL_TEXT_PREFIX}${escapeSqlNulText(value)}${SQL_NUL_TEXT_SUFFIX}`;
+      }
+      return `(${segments.map(segment => `'${segment.replace(/'/g, "''")}'`).join(' || char(0) || ')})`;
     }
     // Escape single quotes by doubling them (SQL standard)
     return `'${value.replace(/'/g, "''")}'`;

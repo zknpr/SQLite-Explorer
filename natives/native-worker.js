@@ -29,6 +29,18 @@ const CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS = 5 * 60_000;
 const MAX_SCHEMA_DEPENDENCY_PROBES = 1024;
 const MAX_QUERY_STATEMENTS = 1024;
 const MAX_NATIVE_ERROR_MESSAGE_LENGTH = 8192;
+/**
+ * How long a statement waits for a lock another program holds on the file
+ * before SQLite refuses it with "database is locked": an edit beside a
+ * reader, a read beside a writer that is committing. SQLite's own value is
+ * 0, which failed an edit whenever the database's application touched the
+ * file at that instant. Its busy handler sleeps in steps of 1 to 100 ms and
+ * the statement deadline cannot interrupt it, so this stays well under the
+ * two seconds the host allows a bounded request beyond its deadline. A
+ * request sent without that margin can answer this much late, after the host
+ * has given up on it, when it meets a lock in its deadline's last moments.
+ */
+const LOCK_WAIT_MS = 600;
 
 /** Bound untrusted SQLite/library failures before IPC and stderr forwarding. */
 function describeNativeError(error, fallback) {
@@ -295,6 +307,38 @@ let asyncCapabilitySupported = false;
 /** AbortControllers for async operations addressable by their request id. */
 const activeOperations = new Map();
 const queryPlanDatabases = new WeakSet();
+// Connections whose runtime library failed to load; the error is reported once.
+const runtimeLoadFailures = new WeakSet();
+// Connections whose loaded runtime library serves packed grid pages.
+const cellPackDatabases = new WeakSet();
+// Connections whose runtime has sqlite_explorer_like_any (global filters).
+const likeAnyDatabases = new WeakSet();
+// Probe failures of a loaded runtime that prepareGridPage has not reported.
+const unreportedRuntimeErrors = new WeakMap();
+
+/**
+ * Load the runtime library on a connection, then probe the functions the grid
+ * may lack. Explain loads it too, so whichever runs first probes; the grid
+ * reports the failures on its next page.
+ */
+function loadRuntimeLibrary(db, library) {
+  db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
+  queryPlanDatabases.add(db);
+  const errors = {};
+  try {
+    executeQuery(db, 'SELECT sqlite_explorer_cell_pack(1, 1, 2)', []);
+    cellPackDatabases.add(db);
+  } catch (error) {
+    errors.cellPackError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+    executeQuery(db, "SELECT sqlite_explorer_like_any('a', 'A')", []);
+    likeAnyDatabases.add(db);
+  } catch (error) {
+    errors.likeAnyError = error instanceof Error ? error.message : String(error);
+  }
+  if (errors.cellPackError || errors.likeAnyError) unreportedRuntimeErrors.set(db, errors);
+}
 
 /** TEMP export spools owned by the interruptible secondary connection. */
 const exportSpools = new Set();
@@ -307,6 +351,25 @@ let savepointCounter = 0;
 /** Dedicated, bracketed read connections keyed by opaque session id. */
 const cellReadSessions = new Map();
 const closedCellReadSessionIds = new Set();
+
+/** The wait set on the main connection; SQLite gives a new connection 0. */
+let mainLockWaitMs = 0;
+
+/**
+ * Give the main connection `LOCK_WAIT_MS`, except while a cell read session
+ * holds a snapshot on a handle of its own: only this thread can end that
+ * session, so a statement waiting for its lock would hold up the one thread
+ * that could and then fail as it does at once.
+ */
+function syncMainLockWait(database) {
+  let wanted = LOCK_WAIT_MS;
+  for (const session of cellReadSessions.values()) {
+    if (!session.usesMainConnection) { wanted = 0; break; }
+  }
+  if (wanted === mainLockWaitMs) return;
+  database.exec(`PRAGMA busy_timeout = ${wanted}`);
+  mainLockWaitMs = wanted;
+}
 
 // ============================================================================
 // Message Protocol
@@ -718,8 +781,15 @@ function closeAsyncDatabase() {
   })();
 }
 
-/** Open and probe the optional second connection without breaking sync use. */
-function openAsyncDatabase(path, readOnly) {
+/**
+ * Open and probe the optional second connection without breaking sync use.
+ * It reads the file and writes only its own TEMP spool, so it is opened
+ * read-only whatever the document is: a statement it steps cannot change the
+ * file, which `PRAGMA query_only` could not guarantee here because that also
+ * refuses the TEMP writes. VACUUM INTO writes its own output file and works
+ * on a read-only handle.
+ */
+function openAsyncDatabase(path) {
   return (async () => {
     await closeAsyncDatabase();
     if (asyncCapabilityProbed && !asyncCapabilitySupported) return;
@@ -731,7 +801,10 @@ function openAsyncDatabase(path, readOnly) {
 
     let candidate;
     try {
-      candidate = new AsyncDatabase(path, { readOnly });
+      candidate = new AsyncDatabase(path, { readOnly: true });
+      // Before the probe: its first statement reads the schema, and a
+      // refusal there turns this connection off until the worker restarts.
+      await candidate.all(`PRAGMA busy_timeout = ${LOCK_WAIT_MS}`, []);
       if (!asyncCapabilityProbed) {
         asyncCapabilitySupported = await probeAsyncDatabase(candidate);
         asyncCapabilityProbed = true;
@@ -759,6 +832,33 @@ function openAsyncDatabase(path, readOnly) {
 // ============================================================================
 
 /**
+ * V8 writes every number of a double-typed array as a double, integral or
+ * not, so [28, 2.5] arrives here as two floats, and txiki binds a float as
+ * REAL. `| 0` gives an int32 value txiki's integer tag, which binds INTEGER:
+ * sql.js's rule (`num === (num | 0)`), so both engines store the same class.
+ * Every bind of message parameters goes through here. -0 stays a float, as
+ * before: txiki binds it as REAL -0.0, which cell history writes back and
+ * compares exactly, where sql.js binds INTEGER 0.
+ *
+ * txiki also refuses a BigInt in the int32 range, which QuickJS tags apart
+ * from larger ones. WebAssembly history reads every INTEGER as a BigInt, and
+ * a hot-exit backup carries that history to whichever engine opens the file.
+ */
+function bindableParams(params) {
+  if (!Array.isArray(params)) return params;
+  for (let index = 0; index < params.length; index++) {
+    const value = params[index];
+    if (typeof value === 'number') {
+      const integer = value | 0;
+      if (integer === value && (integer !== 0 || 1 / value > 0)) params[index] = integer;
+    } else if (typeof value === 'bigint' && value >= -2147483648n && value <= 2147483647n) {
+      params[index] = Number(value) | 0;
+    }
+  }
+  return params;
+}
+
+/**
  * Execute a statement with parameters.
  *
  * @param {object} db - Database instance
@@ -779,7 +879,7 @@ function executeStatement(db, sql, params) {
     if (typeof stmt.run === 'function') {
       // txiki treats one object argument as a bindings container. Spreading
       // [null] or [Uint8Array] confuses a SQL value with that container.
-      const runResult = stmt.run(params ?? []);
+      const runResult = stmt.run(bindableParams(params ?? []));
       if (runResult && typeof runResult === 'object') {
         result.changes = runResult.changes !== undefined ? runResult.changes : 0;
         result.lastInsertRowId = runResult.lastInsertRowId !== undefined ? runResult.lastInsertRowId : 0;
@@ -789,7 +889,7 @@ function executeStatement(db, sql, params) {
         if (typeof stmt.bind !== 'function') {
           throw new Error('Native SQLite statement does not support parameter binding');
         }
-        stmt.bind(...params);
+        stmt.bind(...bindableParams(params));
       }
       stmt.step();
     } else if (typeof stmt.execute === 'function') {
@@ -797,7 +897,7 @@ function executeStatement(db, sql, params) {
         if (typeof stmt.bind !== 'function') {
           throw new Error('Native SQLite statement does not support parameter binding');
         }
-        stmt.bind(...params);
+        stmt.bind(...bindableParams(params));
       }
       stmt.execute();
     } else {
@@ -805,7 +905,7 @@ function executeStatement(db, sql, params) {
         if (typeof stmt.bind !== 'function') {
           throw new Error('Native SQLite statement does not support parameter binding');
         }
-        stmt.bind(...params);
+        stmt.bind(...bindableParams(params));
       }
       for (const _ of stmt) {}
     }
@@ -909,19 +1009,33 @@ function executeQuery(db, sql, params) {
     throw new Error('SQL query parameters must be an array');
   }
 
+  const rowsResult = rows => {
+    const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
+    return {
+      columns,
+      // Every row object has the same keys in the same order, so its values
+      // line up with `columns`; one native call beats a lookup per cell.
+      values: (rows || []).map(row => Object.values(row)),
+      rowCount: rows?.length ?? 0
+    };
+  };
+
   const hasParameters = Array.isArray(params) && params.length > 0;
   if (hasParameters) {
     const boundary = '/*sqlite_explorer_parameterized_query_boundary*/';
-    const validation = db.prepare(`${sql}\n${boundary}`);
+    // The checked statement is the one that runs. Preparing the query again
+    // without the boundary doubled the prepare cost of every bound query.
+    const statement = db.prepare(`${sql}\n${boundary}`);
     try {
-      const validatedSql = typeof validation.toString === 'function'
-        ? validation.toString().trimEnd()
+      const validatedSql = typeof statement.toString === 'function'
+        ? statement.toString().trimEnd()
         : '';
       if (!validatedSql.endsWith(boundary)) {
         throw new Error('Bound parameters require exactly one SQL statement');
       }
+      return rowsResult(statement.all(bindableParams(params)));
     } finally {
-      if (typeof validation.finalize === 'function') validation.finalize();
+      if (typeof statement.finalize === 'function') statement.finalize();
     }
   }
 
@@ -939,7 +1053,7 @@ function executeQuery(db, sql, params) {
     try {
       preparedSql = typeof stmt.toString === 'function' ? stmt.toString() : '';
       if (preparedSql.length === 0) break;
-      if (!hasParameters && !remaining.startsWith(preparedSql)) {
+      if (!remaining.startsWith(preparedSql)) {
         throw new Error(
           'Native SQLite did not preserve the prepared SQL prefix: ' +
           `input=${JSON.stringify(remaining.slice(0, 160))}, ` +
@@ -947,26 +1061,68 @@ function executeQuery(db, sql, params) {
         );
       }
 
-      const rows = statementCount === 0 && params && params.length > 0
-        ? stmt.all(params)
-        : stmt.all();
-      const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
-      lastResult = {
-        columns,
-        values: (rows || []).map(row => columns.map(column => row[column])),
-        rowCount: rows?.length ?? 0
-      };
-      if (columns.length > 0) resultSets.push(lastResult);
+      lastResult = rowsResult(stmt.all());
+      if (lastResult.columns.length > 0) resultSets.push(lastResult);
       statementCount++;
     } finally {
       if (typeof stmt.finalize === 'function') stmt.finalize();
     }
-    remaining = hasParameters ? '' : remaining.slice(preparedSql.length);
+    remaining = remaining.slice(preparedSql.length);
   }
 
   return statementCount > 1
     ? { ...lastResult, resultSets }
     : lastResult;
+}
+
+/** Statements one queryHistoryBatch request keeps prepared (runCachedHistoryQuery). */
+const MAX_HISTORY_STATEMENTS = 32;
+
+/**
+ * executeQuery for one generated row-history statement, reusing a statement
+ * prepared earlier in the same request. A batch's rows repeat a few SQL texts,
+ * and executeQuery prepares a parameterized one twice per call. Anything but
+ * exactly one statement goes through executeQuery unchanged. A statement that
+ * failed is never run again: the error ends the request, whose caller
+ * finalizes every cached statement. `key` is the request's index of a shared
+ * text, or the text itself, so a long text is not hashed once per row.
+ */
+function runCachedHistoryQuery(database, statements, key, sql, params) {
+  let statement = statements.get(key);
+  if (statement === undefined) {
+    if (typeof sql !== 'string' || statements.size >= MAX_HISTORY_STATEMENTS) {
+      return executeQuery(database, sql, params);
+    }
+    // executeQuery's single-statement check: toString() is the expanded SQL
+    // of the first statement only, so it ends with the trailing comment
+    // exactly when nothing follows. The comment does not change what runs.
+    const boundary = '/*sqlite_explorer_parameterized_query_boundary*/';
+    statement = database.prepare(`${sql}\n${boundary}`);
+    const preparedSql = typeof statement.toString === 'function' ? statement.toString().trimEnd() : '';
+    if (!preparedSql.endsWith(boundary)) {
+      if (typeof statement.finalize === 'function') statement.finalize();
+      return executeQuery(database, sql, params);
+    }
+    statements.set(key, statement);
+  }
+  const rows = Array.isArray(params) && params.length > 0 ? statement.all(bindableParams(params)) : statement.all();
+  return {
+    values: (rows || []).map(row => Object.values(row)),
+    rowCount: rows?.length ?? 0
+  };
+}
+
+/** Upper-bound estimate of the serialized size of result rows. */
+function approximateValuesBytes(values) {
+  let bytes = 0;
+  for (const row of values) {
+    for (const value of row) {
+      if (typeof value === 'string') bytes += 2 + value.length * 2;
+      else if (value instanceof Uint8Array) bytes += 8 + value.byteLength;
+      else bytes += 10;
+    }
+  }
+  return bytes;
 }
 
 function foreignKeyIntegerText(value) {
@@ -1183,10 +1339,41 @@ function buildCellLocator(locator) {
   if (locator.integerCasts.some(value => typeof value !== 'boolean')) {
     throw new Error('Cell read primary-key locator contains an invalid INTEGER cast flag');
   }
+  if (
+    locator.collations !== undefined &&
+    (
+      !Array.isArray(locator.collations) ||
+      locator.collations.length !== locator.columns.length ||
+      locator.collations.some(value => value !== null && typeof value !== 'string')
+    )
+  ) {
+    throw new Error('Cell read primary-key locator contains an invalid collation');
+  }
+  // As in primaryKeyColumnSql, each member compares under its key's collation.
+  const operands = columns.map((column, index) => {
+    const collation = locator.collations?.[index];
+    return typeof collation === 'string'
+      ? `${column} COLLATE ${escapeCellIdentifier(collation, 'primary-key collation')}`
+      : column;
+  });
+  // The unary plus drops the CAST's INTEGER affinity, so a typeless key's
+  // INTEGER never also matches its numeric-looking TEXT twin.
   return {
-    sql: columns.map((column, index) => (
-      `${column} = ${locator.integerCasts[index] ? 'CAST(? AS INTEGER)' : '?'}`
-    )).join(' AND '),
+    sql: columns.map((column, index) => {
+      // As in buildRecordIdentityPredicate, an INTEGER identity names INTEGER
+      // storage only, a REAL one, which arrives as a number, numeric storage
+      // only, and a TEXT one TEXT storage only, whatever affinity the column
+      // declares.
+      if (locator.integerCasts[index]) {
+        return `${operands[index]} = +CAST(? AS INTEGER) AND typeof(${column}) = 'integer'`;
+      }
+      if (typeof locator.values[index] === 'number') {
+        return `${operands[index]} = ? AND typeof(${column}) IN ('integer', 'real')`;
+      }
+      return typeof locator.values[index] === 'string'
+        ? `${operands[index]} = ? AND typeof(${column}) = 'text'`
+        : `${operands[index]} = ?`;
+    }).join(' AND '),
     params: locator.values
   };
 }
@@ -1319,9 +1506,11 @@ function replaceOversizedCellValue(
   const escapedTable = `main.${escapeCellIdentifier(table, 'table')}`;
   const escapedColumn = escapeCellIdentifier(column, 'column');
   const predicate = buildCellLocator(locator);
+  // OR ABORT overrides a schema ON CONFLICT clause, as every other write
+  // history records does: REPLACE would delete a row history never saw.
   executeStatement(
     connection,
-    `UPDATE ${escapedTable} SET ${escapedColumn} = ? ` +
+    `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = ? ` +
       `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
       `AND length(CAST(${escapedColumn} AS BLOB)) = ?`,
     [value, ...predicate.params, expected.storageClass, expected.byteLength]
@@ -1518,17 +1707,57 @@ function assertMainConnectionCellReadSessionAllows(method) {
   }
 }
 
+/**
+ * Read one row's sqlite_explorer_real_texts() columns ("index:text" joined by
+ * '|') into column index -> SQLite text. Mirrors parsePackedRealTexts in
+ * src/core/integer-utils.ts.
+ */
+function parsePackedRealTexts(packedColumns, valueColumnCount, rowIndex) {
+  let texts;
+  let previous = -1;
+  for (const packed of packedColumns) {
+    if (packed === null || packed === undefined) continue;
+    if (typeof packed !== 'string' || packed === '') {
+      throw new Error(`Packed REAL text at row ${rowIndex} is not text`);
+    }
+    for (const entry of packed.split('|')) {
+      const separator = entry.indexOf(':');
+      const indexText = entry.slice(0, separator);
+      const columnIndex = Number(indexText);
+      if (
+        separator < 1 ||
+        separator === entry.length - 1 ||
+        !/^(?:0|[1-9][0-9]*)$/.test(indexText) ||
+        columnIndex >= valueColumnCount ||
+        columnIndex <= previous
+      ) {
+        throw new Error(`Packed REAL text at row ${rowIndex} has an invalid entry`);
+      }
+      previous = columnIndex;
+      (texts ??= new Map()).set(columnIndex, entry.slice(separator + 1));
+    }
+  }
+  return texts;
+}
+
 /** Compact generated numeric metadata before crossing the V8 RPC boundary. */
-function compactExactNumericResult(result, transportColumns, valueColumnCount) {
+function compactExactNumericResult(result, transportColumns, valueColumnCount, realTextColumnCount = valueColumnCount, packedRealTextColumnCount) {
   if (!Array.isArray(transportColumns) || transportColumns.length < 1) {
     throw new Error('Invalid exact numeric transport column list');
   }
   const hasRealTextSidecar = valueColumnCount !== undefined;
   const logicalColumnCount = hasRealTextSidecar ? valueColumnCount : transportColumns.length;
+  const packed = packedRealTextColumnCount !== undefined && packedRealTextColumnCount !== null;
+  // A sidecar may cover only the leading columns, or be packed into a few
+  // columns; either way it follows all of them.
+  const sidecarColumnCount = !hasRealTextSidecar ? 0 : packed ? packedRealTextColumnCount : realTextColumnCount;
   if (
     !Number.isInteger(logicalColumnCount) ||
     logicalColumnCount < 1 ||
-    transportColumns.length !== logicalColumnCount * (hasRealTextSidecar ? 2 : 1)
+    !Number.isInteger(sidecarColumnCount) ||
+    (packed && !hasRealTextSidecar) ||
+    (hasRealTextSidecar && (sidecarColumnCount < 1 || (!packed && sidecarColumnCount > logicalColumnCount))) ||
+    transportColumns.length !== logicalColumnCount + sidecarColumnCount
   ) {
     throw new Error('Invalid exact numeric transport column list');
   }
@@ -1543,13 +1772,32 @@ function compactExactNumericResult(result, transportColumns, valueColumnCount) {
   if (mapping.some(index => index < 0)) {
     throw new Error('Native query result omitted exact numeric transport metadata');
   }
+  // Generated transport aliases normally arrive in projection order. Rows are
+  // then used as they are, cut to the logical columns after the sidecar check.
+  const inOrder = result.columns.length === mapping.length
+    && mapping.every((index, position) => index === position);
 
   for (let rowIndex = 0; rowIndex < result.values.length; rowIndex++) {
     const sourceRow = result.values[rowIndex];
-    const orderedRow = mapping.map(index => sourceRow[index]);
+    const orderedRow = inOrder ? sourceRow : mapping.map(index => sourceRow[index]);
     values.push(orderedRow.slice(0, logicalColumnCount));
     if (!hasRealTextSidecar) continue;
-    for (let columnIndex = 0; columnIndex < logicalColumnCount; columnIndex++) {
+    if (packed) {
+      const texts = parsePackedRealTexts(
+        orderedRow.slice(logicalColumnCount, logicalColumnCount + sidecarColumnCount),
+        logicalColumnCount,
+        rowIndex
+      );
+      if (!texts) continue;
+      for (const [columnIndex, exactText] of texts) {
+        if (exactText === String(orderedRow[columnIndex])) continue;
+        exactIntegerTexts ??= {};
+        exactIntegerTexts[rowIndex] ??= {};
+        exactIntegerTexts[rowIndex][columnIndex] = exactText;
+      }
+      continue;
+    }
+    for (let columnIndex = 0; columnIndex < sidecarColumnCount; columnIndex++) {
       const exactText = orderedRow[logicalColumnCount + columnIndex];
       if (exactText === null || exactText === undefined) continue;
       if (typeof exactText !== 'string') {
@@ -1582,10 +1830,10 @@ function executeSingleQuery(db, sql, params, requiredSuffix) {
     }
 
     if (typeof stmt.all === 'function') {
-      rows = stmt.all(params ?? []);
+      rows = stmt.all(bindableParams(params ?? []));
     } else {
       if (params && params.length > 0 && typeof stmt.bind === 'function') {
-        stmt.bind(...params);
+        stmt.bind(...bindableParams(params));
       }
       for (const row of stmt) rows.push(row);
     }
@@ -1770,6 +2018,21 @@ function parseExportSpoolStatement(sql) {
   ));
   if (match) return { kind: 'read', name: match[1] };
 
+  // A batch of rows: the next rows' sizes, then the rows up to a chosen rowid.
+  match = sql.match(new RegExp(
+    `^SELECT CAST\\(rowid AS TEXT\\), "__export_row_bytes" FROM "${namePattern}" ` +
+    'WHERE rowid > \\? ORDER BY rowid LIMIT 128$',
+    'i'
+  ));
+  if (match) return { kind: 'read', name: match[1] };
+
+  match = sql.match(new RegExp(
+    `^SELECT CAST\\(rowid AS TEXT\\), \\* FROM "${namePattern}" ` +
+    'WHERE rowid > \\? AND rowid <= \\? ORDER BY rowid$',
+    'i'
+  ));
+  if (match) return { kind: 'read', name: match[1] };
+
   match = sql.match(new RegExp(
     `^DROP TABLE IF EXISTS temp\\."${namePattern}"$`,
     'i'
@@ -1836,7 +2099,7 @@ function executeExportSpoolQuery(asyncDatabase, validationDb, requestId, markedS
       if (statement.kind === 'read') {
         const rows = await asyncDatabase.all(
           validatedSql,
-          params || [],
+          bindableParams(params || []),
           { signal: operation.controller.signal }
         );
         const columns = Array.isArray(rows) && rows.length > 0
@@ -1851,7 +2114,7 @@ function executeExportSpoolQuery(asyncDatabase, validationDb, requestId, markedS
 
       await asyncDatabase.run(
         validatedSql,
-        params || [],
+        bindableParams(params || []),
         { signal: operation.controller.signal }
       );
       if (statement.kind === 'create') exportSpools.add(statement.name);
@@ -1879,6 +2142,39 @@ function executeExportSpoolQuery(asyncDatabase, validationDb, requestId, markedS
 }
 
 /**
+ * Whether a request only reads through the primary handle. Grid pages and
+ * bounded reads always do; the host marks a generic or single checked
+ * statement, or a batch made only of them, when it is one SELECT
+ * (isReadStatement in src/core/read-statement.ts).
+ */
+function requestOnlyReads(method, args) {
+  switch (method) {
+    case 'queryNumeric':
+    case 'queryPacked':
+    case 'queryBounded':
+      return true;
+    case 'query':
+      return args[2] === true;
+    case 'querySingle':
+      return args[3] === true;
+    case 'queryBatch':
+      return args[1] === true;
+    default:
+      return false;
+  }
+}
+
+/** Whether SQLite already refuses every write on this handle. */
+function isQueryOnly(connection) {
+  const statement = connection.prepare('PRAGMA query_only');
+  try {
+    return Number(Object.values(statement.all()[0] ?? {})[0]) === 1;
+  } finally {
+    if (typeof statement.finalize === 'function') statement.finalize();
+  }
+}
+
+/**
  * Handle incoming RPC request.
  *
  * @param {object} request - RPC request { id, method, args }
@@ -1890,6 +2186,7 @@ async function handleRequest(request) {
   try {
     assertMainConnectionCellReadSessionAllows(method);
     const deadlineDatabase = db;
+    if (deadlineDatabase && databasePath !== null) syncMainLockWait(deadlineDatabase);
     const executeRequest = async () => {
     let result;
 
@@ -1900,17 +2197,21 @@ async function handleRequest(request) {
 
       case "open": {
         // Open a database file
-        // args: [path: string, readOnly?: boolean]
-        const [path, readOnly = false] = args;
+        // args: [path: string, readOnly?: boolean, mmapBytes?: number]
+        const [path, readOnly = false, mmapBytes = 0] = args;
+        if (!Number.isSafeInteger(mmapBytes) || mmapBytes < 0) throw new Error('Invalid memory map size');
         closeAllCellReadSessions();
         await closeAsyncDatabase();
         if (db) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
         db = new Database(path, { readOnly });
+        mainLockWaitMs = 0;
+        // The host maps only files on local disks (nativeMemoryMapBytes).
+        if (mmapBytes > 0) db.exec(`PRAGMA main.mmap_size = ${mmapBytes}`);
         databasePath = path;
         databaseReadOnly = readOnly;
-        await openAsyncDatabase(path, readOnly);
+        await openAsyncDatabase(path);
         result = { success: true };
         break;
       }
@@ -1924,6 +2225,7 @@ async function handleRequest(request) {
           try { db.close(); } catch (e) { /* ignore */ }
         }
         db = new Database(":memory:");
+        mainLockWaitMs = 0;
         databasePath = null;
         databaseReadOnly = false;
         result = { success: true };
@@ -1972,7 +2274,7 @@ async function handleRequest(request) {
           db.exec(`PRAGMA journal_mode = '${mode}'`);
           result = { success: true };
         } finally {
-          if (reopenAsync) await openAsyncDatabase(databasePath, databaseReadOnly);
+          if (reopenAsync) await openAsyncDatabase(databasePath);
         }
         break;
       }
@@ -1992,7 +2294,7 @@ async function handleRequest(request) {
 
       case "query": {
         // Execute SQL and return all results
-        // args: [sql: string, params?: any[]]
+        // args: [sql: string, params?: any[], onlyReads?: boolean]
         const [sql, params] = args;
         if (!db) throw new Error("Database not open");
 
@@ -2056,6 +2358,7 @@ async function handleRequest(request) {
         const savepointName = `sqlite_explorer_cell_read_${++savepointCounter}`;
         let bracketOpened = false;
         try {
+          if (!usesMainConnection) connection.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS}`);
           const snapshot = runWithQueryDeadline(connection, operationTimeoutMs, () => {
             connection.exec(`SAVEPOINT "${savepointName}"`);
             bracketOpened = true;
@@ -2153,14 +2456,70 @@ async function handleRequest(request) {
         break;
       }
 
+      case "prepareGridPage": {
+        // One round trip before a grid page: the text encoding its decoder
+        // needs, and the runtime's grid cell helpers on this connection.
+        const [library] = args;
+        if (!db) throw new Error("Database not open");
+        if (typeof library !== 'string') throw new Error('Invalid runtime library path');
+        // Read first: on a connection without its schema yet, the library's
+        // probes below read the file too, and one refused by another
+        // program's lock would leave its helper off for good.
+        const encoding = executeQuery(db, 'PRAGMA encoding', []).values[0]?.[0];
+        let cellHelperError;
+        if (!queryPlanDatabases.has(db) && !runtimeLoadFailures.has(db)) {
+          try {
+            loadRuntimeLibrary(db, library);
+          } catch (error) {
+            runtimeLoadFailures.add(db);
+            cellHelperError = error instanceof Error ? error.message : String(error);
+          }
+        }
+        const { cellPackError, likeAnyError } = unreportedRuntimeErrors.get(db) ?? {};
+        unreportedRuntimeErrors.delete(db);
+        result = {
+          encoding,
+          cellHelpers: queryPlanDatabases.has(db),
+          cellPack: cellPackDatabases.has(db),
+          likeAny: likeAnyDatabases.has(db),
+          ...(cellHelperError ? { cellHelperError } : {}),
+          ...(cellPackError ? { cellPackError } : {}),
+          ...(likeAnyError ? { likeAnyError } : {})
+        };
+        break;
+      }
+
       case "queryNumeric": {
-        const [sql, params, transportColumns, valueColumnCount] = args;
+        const [sql, params, transportColumns, valueColumnCount, realTextColumnCount, packedRealTextColumnCount] = args;
         if (!db) throw new Error("Database not open");
         result = compactExactNumericResult(
           executeQuery(db, sql, params),
           transportColumns,
-          valueColumnCount
+          valueColumnCount,
+          realTextColumnCount ?? valueColumnCount,
+          packedRealTextColumnCount ?? undefined
         );
+        break;
+      }
+
+      // A packed grid page: one BLOB per 100-value chunk of each row. Every
+      // packed cell carries a fixed-size descriptor, so a page of many short
+      // values can be several times its queryNumeric size; past maxBytes the
+      // host reads it through queryNumeric instead of receiving a frame near
+      // the response cap.
+      case "queryPacked": {
+        const [sql, params, maxBytes] = args;
+        if (!db) throw new Error("Database not open");
+        if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('Invalid packed page byte limit');
+        const values = executeQuery(db, sql, params).values;
+        let bytes = 0;
+        for (const row of values) {
+          for (const chunk of row) {
+            if (!(chunk instanceof Uint8Array)) throw new Error('Packed page chunk is not a BLOB');
+            bytes += chunk.byteLength;
+          }
+        }
+        result = bytes > maxBytes ? { tooLarge: true } : { values };
         break;
       }
 
@@ -2184,7 +2543,7 @@ async function handleRequest(request) {
           assertSingleStatementPayload(db, `${create}\n${boundary}`, create, boundary);
           db.exec(create);
           try {
-            const statement = db.prepare(`SELECT substr(name, 1, 4097) AS name FROM pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?`);
+            const statement = db.prepare(`SELECT substr(name, 1, 4097) AS name FROM pragma.pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?`);
             try {
               const rows = statement.all([name, maxColumns + 1]);
               if (!rows.length || rows.length > maxColumns) throw new Error('Queries support 1 to 128 result columns.');
@@ -2202,16 +2561,13 @@ async function handleRequest(request) {
         if (typeof db.allAsync !== 'function') {
           throw new Error('Native SQLite requires primary-connection allAsync support');
         }
-        if (!queryPlanDatabases.has(db)) {
-          db.loadExtension(library, 'sqlite3_sqliteexplorer_init');
-          queryPlanDatabases.add(db);
-        }
+        if (!queryPlanDatabases.has(db)) loadRuntimeLibrary(db, library);
         // Use the primary connection so TEMP objects and pending DDL are
         // included. Threaded execution keeps cancel RPCs deliverable while the
         // bundled C reader bounds compilation and extraction on that handle.
         result = await runWithQueryDeadline(db, timeoutMs, () => (
           executeInterruptibleAsyncOperation(id, timeoutMs, async signal => {
-            const rows = await db.allAsync(sql, params ?? [], { signal });
+            const rows = await db.allAsync(sql, bindableParams(params ?? []), { signal });
             return rows[0].plan;
           })
         ));
@@ -2225,13 +2581,24 @@ async function handleRequest(request) {
         if (typeof db.allAsync !== 'function') {
           throw new Error('Native SQLite requires primary-connection allAsync support');
         }
-        // Keep TEMP objects, pending changes and the host's metadata snapshot
-        // on this handle without blocking delivery of the cancellation RPC.
-        const rows = await runWithQueryDeadline(db, timeoutMs, () => (
-          executeInterruptibleAsyncOperation(id, timeoutMs, signal => (
-            db.allAsync(sql, params ?? [], { signal })
-          ))
-        ));
+        // query_only makes SQLite refuse every write on this handle, nested
+        // statements included. Requests run one at a time and allAsync
+        // settles only after its job ends, so the flag covers exactly this
+        // statement; the restore runs after the deadline is cleared.
+        const queryOnly = Number(executeQuery(db, 'PRAGMA query_only', []).values[0]?.[0]) === 1;
+        if (!queryOnly) db.exec('PRAGMA query_only = ON');
+        let rows;
+        try {
+          // Keep TEMP objects, pending changes and the host's metadata snapshot
+          // on this handle without blocking delivery of the cancellation RPC.
+          rows = await runWithQueryDeadline(db, timeoutMs, () => (
+            executeInterruptibleAsyncOperation(id, timeoutMs, signal => (
+              db.allAsync(sql, bindableParams(params ?? []), { signal })
+            ))
+          ));
+        } finally {
+          if (!queryOnly) db.exec('PRAGMA query_only = OFF');
+        }
         const names = columns;
         result = { columns: names, values: rows.map(row => names.map(name => row[name])) };
         break;
@@ -2293,13 +2660,76 @@ async function handleRequest(request) {
 
       case "queryBatch": {
         // Execute a batch of queries and return results for each
-        // args: [queries: { sql: string, params?: any[] }[]]
+        // args: [queries: { sql: string, params?: any[] }[], onlyReads?: boolean]
         const [queries] = args;
         if (!db) throw new Error("Database not open");
 
         const results = [];
         for (const query of queries) {
             results.push(executeQuery(db, query.sql, query.params));
+        }
+        result = { results };
+        break;
+      }
+
+      case "queryHistoryBatch": {
+        // Generated row-history statements in units of `stride` queries (a
+        // write and the reads that check it). Each unit gets its own deadline,
+        // as separate requests did. After the unit that crosses the time or
+        // response budget the completed prefix is returned and the host sends
+        // the rest again, so one request is bounded by a budget plus a unit.
+        // Callers read values positionally; column names are not returned.
+        // A query whose sql is a number names one of `texts`: rows repeat a
+        // few long texts, which would otherwise cross the pipe once per row.
+        const [queries, stride, unitTimeoutMs, budgetMs, budgetBytes, texts = []] = args;
+        if (!db) throw new Error("Database not open");
+        if (
+          !Array.isArray(queries) || !Number.isSafeInteger(stride) || stride < 1 ||
+          queries.length % stride !== 0 || !(budgetMs >= 0) || !(budgetBytes >= 0) ||
+          !Array.isArray(texts) || !texts.every(text => typeof text === 'string')
+        ) {
+          throw new Error("Invalid row-history batch");
+        }
+        const startedAt = Date.now();
+        const results = [];
+        let responseBytes = 0;
+        const statements = new Map();
+        let completed = false;
+        try {
+          // One wrapper reports a timeout and clears the deadline; setting it
+          // again at each unit replaces the previous one.
+          runWithQueryDeadline(db, unitTimeoutMs, () => {
+            for (let start = 0; start < queries.length; start += stride) {
+              db.setQueryDeadline(unitTimeoutMs);
+              for (let index = start; index < start + stride; index++) {
+                const { sql, params } = queries[index];
+                const text = typeof sql === 'number' ? texts[sql] : sql;
+                if (typeof sql === 'number' && typeof text !== 'string') {
+                  throw new Error("Invalid row-history batch");
+                }
+                const { values, rowCount } = runCachedHistoryQuery(db, statements, sql, text, params);
+                responseBytes += approximateValuesBytes(values);
+                results.push({ columns: [], values, rowCount });
+              }
+              if (Date.now() - startedAt >= budgetMs || responseBytes >= budgetBytes) break;
+            }
+          });
+          completed = true;
+        } finally {
+          for (const statement of statements.values()) {
+            try {
+              statement.finalize();
+            } catch (error) {
+              // After a failed request finalize repeats the error the host
+              // already gets; after a completed one nothing else reports it.
+              if (completed) {
+                console.error(
+                  '[native-worker] Failed to finalize a row-history statement:',
+                  describeNativeError(error, 'Unknown finalize error')
+                );
+              }
+            }
+          }
         }
         result = { results };
         break;
@@ -2316,6 +2746,7 @@ async function handleRequest(request) {
           );
         }
         const errors = [];
+        let locked = false;
         for (const sql of queries) {
           if (typeof sql !== 'string' || !/^\s*EXPLAIN\s/i.test(sql)) {
             throw new Error('Schema dependency probes must be EXPLAIN statements');
@@ -2326,10 +2757,17 @@ async function handleRequest(request) {
             errors.push(null);
           } catch (error) {
             errors.push(describeNativeError(error, 'Unknown compile error'));
+            // A locked file refuses every statement that reads the schema,
+            // each after its own wait: the rest get this answer unasked.
+            locked = (Number(error?.errno) & 0xff) === 5;
           } finally {
             if (statement && typeof statement.finalize === 'function') {
               try { statement.finalize(); } catch { /* preparation result is already known */ }
             }
+          }
+          if (locked) {
+            while (errors.length < queries.length) errors.push(errors[errors.length - 1]);
+            break;
           }
         }
         result = { errors };
@@ -2395,6 +2833,25 @@ async function handleRequest(request) {
         }
         const savepointName = ownsSavepoint
           ? `"sqlite_explorer_exec_batch_${++savepointCounter}"` : historySavepoint;
+        // A guarded replay reads changes() after every row. One prepared
+        // reader serves the batch; preparing one per row was most of its cost.
+        let changesReader;
+        const readBatchChanges = () => {
+          if (db.changes !== undefined) return readRunFallbackResult(db).changes;
+          changesReader ??= db.prepare('SELECT changes() AS c');
+          const row = changesReader.all()[0];
+          if (!row) throw new Error('Native SQLite did not return mutation metadata');
+          const changes = typeof row.c === 'bigint' ? Number(row.c) : row.c;
+          if (!Number.isSafeInteger(changes) || changes < 0) {
+            throw new Error('Native SQLite returned an invalid changes() count');
+          }
+          return changes;
+        };
+        const finalizeChangesReader = () => {
+          const reader = changesReader;
+          changesReader = undefined;
+          if (typeof reader?.finalize === 'function') reader.finalize();
+        };
         if (ownsSavepoint) db.exec(`SAVEPOINT ${savepointName}`);
         try {
           for (const item of items) {
@@ -2404,7 +2861,7 @@ async function handleRequest(request) {
              }
              const assertChanges = () => {
                  if (item.expectedChanges !== undefined
-                   && readRunFallbackResult(db).changes !== item.expectedChanges) {
+                   && readBatchChanges() !== item.expectedChanges) {
                      throw new Error(`Guarded batch expected ${item.expectedChanges} changed row(s); cell history was not applied`);
                  }
              };
@@ -2412,7 +2869,7 @@ async function handleRequest(request) {
                  const stmt = db.prepare(item.sql);
                  try {
                      for (const params of item.paramsList) {
-                         stmt.run(params ?? []);
+                         stmt.run(bindableParams(params ?? []));
                          assertChanges();
                      }
                  } finally {
@@ -2424,10 +2881,12 @@ async function handleRequest(request) {
                  assertChanges();
              }
           }
+          finalizeChangesReader();
           if (ownsSavepoint) db.exec(`RELEASE SAVEPOINT ${savepointName}`);
           result = { success: true };
         } catch (err) {
           try {
+            finalizeChangesReader();
             db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
             if (ownsSavepoint) db.exec(`RELEASE SAVEPOINT ${savepointName}`);
           } catch (rollbackErr) {
@@ -2461,7 +2920,7 @@ async function handleRequest(request) {
         }
         // The bundled Statement run/all methods reset and bind on each call;
         // there is no separate reset/bind API on this runtime.
-        stmt.run(params ?? []);
+        stmt.run(bindableParams(params ?? []));
         result = readRunFallbackResult(db);
         break;
       }
@@ -2473,7 +2932,7 @@ async function handleRequest(request) {
         if (params !== undefined && params !== null && !Array.isArray(params)) {
           throw new Error('SQL query parameters must be an array');
         }
-        const rows = stmt.all(params ?? []);
+        const rows = stmt.all(bindableParams(params ?? []));
         let columns = [];
         if (rows.length > 0) {
           columns = Object.keys(rows[0]);
@@ -2560,20 +3019,34 @@ async function handleRequest(request) {
     return result;
     };
 
-    const result = deadlineDatabase && ![
-      'open',
-      'openMemory',
-      'close',
-      'cancel',
-      'ping',
-      // These methods can execute on a dedicated snapshot connection. Each
-      // case arms that actual handle rather than the unrelated main database.
-      'openCellReadSession',
-      'readCellChunk',
-      'closeCellReadSession'
-    ].includes(method)
-      ? await runWithQueryDeadline(deadlineDatabase, timeoutMs, executeRequest)
-      : await executeRequest();
+    // A read runs with SQLite refusing every write on this handle. The flag
+    // brackets the deadline: its restore never runs under an expired one.
+    // Requests run one at a time and a cancel request runs no SQL, so no
+    // other statement sees the flag.
+    const refuseWrites = Boolean(deadlineDatabase) && requestOnlyReads(method, args)
+      && !isQueryOnly(deadlineDatabase);
+    if (refuseWrites) deadlineDatabase.exec('PRAGMA query_only = ON');
+    let result;
+    try {
+      result = deadlineDatabase && ![
+        'open',
+        'openMemory',
+        'close',
+        'cancel',
+        'ping',
+        // Arms one deadline per unit of generated statements.
+        'queryHistoryBatch',
+        // These methods can execute on a dedicated snapshot connection. Each
+        // case arms that actual handle rather than the unrelated main database.
+        'openCellReadSession',
+        'readCellChunk',
+        'closeCellReadSession'
+      ].includes(method)
+        ? await runWithQueryDeadline(deadlineDatabase, timeoutMs, executeRequest)
+        : await executeRequest();
+    } finally {
+      if (refuseWrites) deadlineDatabase.exec('PRAGMA query_only = OFF');
+    }
 
     return { id, result };
 

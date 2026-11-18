@@ -4,6 +4,7 @@ import assert from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
+    assertOneRowPerIdentity,
     buildTableIdentityMap,
     buildRecordIdentityPredicate,
     buildRecordIdentitiesPredicate,
@@ -102,7 +103,7 @@ describe('bulk primary-key predicates', () => {
             identities[1],
             { kind: 'primaryKey', columns }
         );
-        assert.strictEqual(single.sql, '"key" = CAST(? AS INTEGER)');
+        assert.strictEqual(single.sql, `"key" = +CAST(? AS INTEGER) AND typeof("key") = 'integer'`);
         assert.deepStrictEqual(single.params, ['9007199254740993']);
 
         const bulk = buildRecordIdentitiesPredicate(
@@ -111,7 +112,7 @@ describe('bulk primary-key predicates', () => {
         );
         assert.strictEqual(
             bulk.sql,
-            '"key" IN (CAST(? AS INTEGER), CAST(? AS INTEGER))'
+            `"key" IN (+CAST(? AS INTEGER), +CAST(? AS INTEGER)) AND typeof("key") = 'integer'`
         );
         assert.deepStrictEqual(
             bulk.params,
@@ -128,7 +129,7 @@ describe('bulk primary-key predicates', () => {
             { kind: 'primaryKey', columns }
         );
 
-        assert.strictEqual(predicate.sql, '"key" IN (?, ?, ?)');
+        assert.strictEqual(predicate.sql, `"key" IN (?, ?, ?) AND typeof("key") = 'text'`);
         assert.deepStrictEqual(predicate.params, ['alpha', 'beta', 'gamma']);
     });
 
@@ -147,8 +148,71 @@ describe('bulk primary-key predicates', () => {
 
         assert.strictEqual(
             predicate.sql,
-            '("tenant", "sequence") IN (VALUES (?, CAST(? AS INTEGER)), (?, CAST(? AS INTEGER)))'
+            '("tenant", "sequence") IN (VALUES (?, +CAST(? AS INTEGER)), (?, +CAST(? AS INTEGER))) ' +
+            `AND typeof("tenant") = 'text' AND typeof("sequence") = 'integer'`
         );
         assert.deepStrictEqual(predicate.params, ['north', 1, 'south', 2]);
+    });
+
+    it('groups identities by the storage-class guards their members need', () => {
+        // Each identity keeps the guards of its single-row predicate. A list
+        // that mixes classes becomes one IN per set of guards, joined by OR.
+        const single: PrimaryKeyColumn[] = [
+            { identifier: 'key', declaredType: '', position: 1 }
+        ];
+        const mixed = buildRecordIdentitiesPredicate(
+            [1n, 'one', 2n].map(value => encodePrimaryKeyRecordId(single, [value])),
+            { kind: 'primaryKey', columns: single }
+        );
+        assert.strictEqual(
+            mixed.sql,
+            `(("key" IN (+CAST(? AS INTEGER), +CAST(? AS INTEGER)) AND typeof("key") = 'integer') ` +
+            `OR ("key" IN (?) AND typeof("key") = 'text'))`
+        );
+        assert.deepStrictEqual(mixed.params, [1, 2, 'one']);
+
+        const composite: PrimaryKeyColumn[] = [
+            { identifier: 'a', declaredType: '', position: 1 },
+            { identifier: 'b', declaredType: '', position: 2 }
+        ];
+        const pairs = buildRecordIdentitiesPredicate(
+            [[1n, 'x'], ['1', 'x'], [1n, 2n], [3n, 'y']].map(values => (
+                encodePrimaryKeyRecordId(composite, values)
+            )),
+            { kind: 'primaryKey', columns: composite }
+        );
+        assert.strictEqual(
+            pairs.sql,
+            '(((("a", "b") IN (VALUES (+CAST(? AS INTEGER), ?), (+CAST(? AS INTEGER), ?)) ' +
+            `AND typeof("a") = 'integer' AND typeof("b") = 'text') ` +
+            `OR (("a", "b") IN (VALUES (?, ?)) AND typeof("a") = 'text' AND typeof("b") = 'text')) ` +
+            'OR (("a", "b") IN (VALUES (+CAST(? AS INTEGER), +CAST(? AS INTEGER))) ' +
+            `AND typeof("a") = 'integer' AND typeof("b") = 'integer'))`
+        );
+        assert.deepStrictEqual(pairs.params, [1, 'x', 3, 'y', '1', 'x', 1, 2]);
+
+        // A rowid is INTEGER storage by definition and needs no guard.
+        assert.deepStrictEqual(
+            buildRecordIdentitiesPredicate([1, '9007199254740993'], { kind: 'rowid' }),
+            { sql: 'rowid IN (?, ?)', params: [1, '9007199254740993'] }
+        );
+    });
+});
+
+describe('one row per deleted identity', () => {
+    it('requires each requested identity to match exactly one row, comparing numbers by value', () => {
+        const key: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: '', position: 1 }];
+        const id = (value: string | number | bigint) => encodePrimaryKeyRecordId(key, [value]);
+
+        assertOneRowPerIdentity('t', [id('a'), id('b')], [id('b'), id('a')]);
+        // The native engine reports an INTEGER key up to 2^53 as a number.
+        assertOneRowPerIdentity('t', [id(1), id(2.5)], [id(1n), id(2.5)]);
+
+        // One identity matched twice beside one that matched nothing.
+        assert.throws(() => assertOneRowPerIdentity('t', [id('a'), id(5n)], [id('A'), id('a')]), /no longer exist/);
+        assert.throws(() => assertOneRowPerIdentity('t', [id('a')], [id('a'), id('a')]), /more than one row/);
+        assert.throws(() => assertOneRowPerIdentity('t', [id('a')], [id('A')]), /no longer exist/);
+        assert.throws(() => assertOneRowPerIdentity('t', [id('1')], [id(1n)]), /no longer exist/);
+        assert.throws(() => assertOneRowPerIdentity('t', [id('a')], [id('a'), id('b')]), /does not name/);
     });
 });

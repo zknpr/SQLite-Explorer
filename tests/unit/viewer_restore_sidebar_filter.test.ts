@@ -87,6 +87,7 @@ it('restores and renders a saved sidebar filter without a selected table', async
                         './modules/grid.js': `
                             export function loadTableColumns() {}
                             export function loadTableData() {}
+                            export function recordCountStatus() { return ''; }
                             export function initGridInteraction() {}
                             export function initGridControls() {}
                         `,

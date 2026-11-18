@@ -1,0 +1,11 @@
+{
+  "name": "web-lane-helper",
+  "displayName": "SQLite Explorer web lane helper",
+  "description": "Lets tests/gui/web-save.mjs reach VS Code's API in the browser's extension host. Never packaged.",
+  "publisher": "local",
+  "version": "0.0.1",
+  "private": true,
+  "engines": { "vscode": "^1.90.0" },
+  "browser": "./extension.js",
+  "activationEvents": ["*"]
+}

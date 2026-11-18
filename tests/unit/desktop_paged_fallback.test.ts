@@ -672,17 +672,23 @@ describe('desktop paged fallback routing (engine layer)', () => {
       if (before !== undefined) {
         assert.strictEqual(openFdCount(), before, 'overlay extraction must release its base handle');
       }
+      const injected = Object.assign(new Error('injected replacement failure'), { code: 'EPERM' });
       const refusingFs = new Proxy(fs, {
         get(target, property) {
-          if (property === 'renameSync') return () => {
-            throw Object.assign(new Error('injected replacement failure'), { code: 'EPERM' });
-          };
+          if (property === 'renameSync') return () => { throw injected; };
           return Reflect.get(target, property);
         }
       });
       await assert.rejects(
         writePagedWritableOverlayToFile(refusingFs, basePath, basePath, snapshot),
-        /injected replacement failure/
+        (error: unknown) => {
+          // On Windows the save rewords this code, so look for the failure
+          // itself among the causes and not for its text in the message.
+          for (let cause: unknown = error; cause; cause = (cause as Error).cause) {
+            if (cause === injected) return true;
+          }
+          return false;
+        }
       );
       assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from(dbBytes));
       const rows = await engine.executeQuery(

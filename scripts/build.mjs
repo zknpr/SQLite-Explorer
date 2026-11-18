@@ -18,6 +18,7 @@ import path from 'path';
 import fs from 'fs';
 import { createHash } from 'node:crypto';
 import { verifyQueryPlanArtifacts } from './build-query-plan.mjs';
+import { buildCodiconSubset, collectCodiconClasses, readCodiconSources } from './lib/codicon-subset.mjs';
 
 verifyQueryPlanArtifacts(undefined, { includeBuildAssets: false });
 
@@ -181,37 +182,6 @@ const compileNodeWorker = () =>
   });
 
 /**
- * Compile browser worker bundle.
- * This runs SQLite operations in a web worker.
- */
-const compileBrowserWorker = () =>
-  esbuild.build({
-    ...baseWorkerConfig,
-    outfile: resolve(outDir, 'worker-browser.js'),
-    platform: 'browser',
-    // IIFE (not ESM): this bundle is loaded as a CLASSIC Web Worker via
-    // `new Worker(blobUrl)` in workerFactory.ts. An ESM bundle emits a top-level
-    // `export{...}` which a classic worker cannot parse ("SyntaxError: Unexpected
-    // token 'export'"), so the worker never boots and VS Code Web hangs on load.
-    // IIFE also keeps the classic-worker environment sql.js/emscripten expects.
-    format: 'iife',
-    mainFields: ['browser', 'module', 'main'],
-    external: ['fs/promises', 'path'],
-    define: {
-      ...baseWorkerConfig.define,
-      ...envToDefine({
-        DEV,
-        VSCODE_BROWSER_EXT: true,
-      })
-    },
-    plugins: [
-      polyfillNode({
-        polyfills: {}
-      })
-    ]
-  });
-
-/**
  * Bundle the standalone website worker from its authored source. The source
  * imports the canonical TypeScript view helpers, preventing parser drift.
  */
@@ -265,14 +235,23 @@ const copyAssets = async () => {
   // Ship only the two codicon runtime files (css + the ttf it @font-face's)
   // under assets/, so the .vsix never carries the 4.6MB @vscode/codicons
   // package (2.3MB src/ SVGs, a 1.2MB preview HTML, ...). The extension serves
-  // codicons from assets/codicons/ (editorController + hostBridge).
-  const codiconsSrc = resolve('node_modules', '@vscode', 'codicons', 'dist');
+  // codicons from assets/codicons/ (editorController). Both are subset to the
+  // classes the UI sources name, which the scan derives on every build so a
+  // new icon cannot ship without its glyph.
+  const codiconsPackage = resolve('node_modules', '@vscode', 'codicons');
+  const codiconsSrc = resolve(codiconsPackage, 'dist');
   const codiconsDst = resolve(assetsDir, 'codicons');
   fs.mkdirSync(codiconsDst, { recursive: true });
-  for (const file of ['codicon.css', 'codicon.ttf']) {
-    fs.copyFileSync(resolve(codiconsSrc, file), resolve(codiconsDst, file));
-  }
-  console.log('Copied codicon.css + codicon.ttf to assets/codicons/');
+  const usedCodicons = collectCodiconClasses(readCodiconSources(resolve()));
+  const codicons = buildCodiconSubset({
+    css: fs.readFileSync(resolve(codiconsSrc, 'codicon.css'), 'utf8'),
+    font: fs.readFileSync(resolve(codiconsSrc, 'codicon.ttf')),
+    usedClasses: usedCodicons,
+    sourceLabel: `@vscode/codicons ${JSON.parse(fs.readFileSync(resolve(codiconsPackage, 'package.json'), 'utf8')).version}`
+  });
+  fs.writeFileSync(resolve(codiconsDst, 'codicon.css'), codicons.css);
+  fs.writeFileSync(resolve(codiconsDst, 'codicon.ttf'), codicons.font);
+  console.log(`Subset codicons to ${usedCodicons.length} classes (${codicons.codePoints.length} code points) in assets/codicons/`);
 
   const demoAssetsDir = resolve('website', 'public', 'sqlite-viewer');
   fs.mkdirSync(demoAssetsDir, { recursive: true });
@@ -282,6 +261,11 @@ const copyAssets = async () => {
   );
   fs.copyFileSync(wasmSrc, resolve(demoAssetsDir, 'sql-wasm.wasm'));
   console.log('Copied vendored sql.js runtime to website/public/sqlite-viewer/');
+  // The demo viewer runs the same UI, so it serves the same subset itself
+  // instead of fetching the full font and stylesheet from a CDN.
+  fs.writeFileSync(resolve(demoAssetsDir, 'codicon.css'), codicons.css);
+  fs.writeFileSync(resolve(demoAssetsDir, 'codicon.ttf'), codicons.font);
+  console.log('Wrote the codicon subset to website/public/sqlite-viewer/');
 };
 
 /**
@@ -412,8 +396,9 @@ const bundleWebDemoViewer = async () => {
     });
     finalJs = jsResult.outputFiles[0].text;
   } catch (err) {
-    console.error('Web demo JS bundling failed:', err);
-    return;
+    // Fail the build: returning here left the tracked demo viewer stale while
+    // the build reported success.
+    throw new Error('Web demo JS bundling failed', { cause: err });
   }
 
   // Minify CSS in production mode
@@ -431,8 +416,9 @@ const bundleWebDemoViewer = async () => {
   }
 
   // Bundle: replace placeholders with actual content
-  // Inject Codicon font for web demo (VS Code extension handles this via local resources or CSP-friendly URI)
-  const codiconLink = '<link rel="stylesheet" href="https://unpkg.com/@vscode/codicons@0.0.44/dist/codicon.css" integrity="sha384-sVpT0iPTciRIsuV1JVtIodkJ0guQ/8vFWf8PaazFqcSmJfWptKd00bCziqfui3Ir" crossorigin="anonymous">';
+  // The web demo serves the codicon subset beside this page (copyAssets);
+  // the VS Code extension injects its local copy through the webview URI.
+  const codiconLink = '<link rel="stylesheet" href="codicon.css">';
 
   const bundled = template
     .replace('<!--HEAD-->', () => codiconLink)
@@ -454,7 +440,6 @@ const validateBuildOutputs = () => {
     'out/extension.js',
     'out/extension-browser.js',
     'out/worker.cjs',
-    'out/worker-browser.js',
     'assets/sqlite3.wasm',
     'core/ui/viewer.html',
     'website/public/sqlite-viewer/worker.js',
@@ -471,7 +456,7 @@ const validateBuildOutputs = () => {
   // grow. These are shipped byte sizes; readable development builds are exempt.
   if (!DEV) {
     const entryBudgets = {
-      'out/extension.js': 450_000,
+      'out/extension.js': 500_000,
       'out/extension-browser.js': 550_000,
     };
     for (const [file, budget] of Object.entries(entryBudgets)) {
@@ -493,7 +478,6 @@ const compileExt = async (target) => {
     { name: 'compileNodeMain', fn: compileNodeMain },
     { name: 'compileBrowserMain', fn: compileBrowserMain },
     { name: 'compileNodeWorker', fn: compileNodeWorker },
-    { name: 'compileBrowserWorker', fn: compileBrowserWorker },
     { name: 'bundleWebDemoWorker', fn: bundleWebDemoWorker },
     { name: 'copyAssets', fn: copyAssets },
     { name: 'bundleWebview', fn: bundleWebview },
@@ -516,6 +500,11 @@ const compileExt = async (target) => {
     }
     throw new Error(`Build failed: ${failures.length} task(s) failed: ${failures.map(f => f.task.name).join(', ')}`);
   }
+
+  // VS Code Web runs sql.js in the extension host (Trusted Types blocks blob
+  // workers, #418), so no browser worker bundle is built. Remove one left by an
+  // older build so local packaging cannot ship it.
+  fs.rmSync(resolve(outDir, 'worker-browser.js'), { force: true });
 
   // Validate all required outputs exist
   validateBuildOutputs();

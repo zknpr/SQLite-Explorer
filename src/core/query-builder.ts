@@ -5,7 +5,14 @@
  */
 import { escapeIdentifier, escapeLikePattern, escapeMainIdentifier } from './sql-utils';
 import { getActiveFilterValue } from './filter-utils';
-import { assembleKeysetSelect, type ResolvedKeysetPlan } from './keyset-pagination';
+import {
+  assembleKeysetSelect,
+  buildRowIdLookupSelect,
+  keyColumnOrderSql,
+  ROW_ID_LOOKUP_ROW,
+  rowIdLookupApplies,
+  type ResolvedKeysetPlan
+} from './keyset-pagination';
 import type { CellValue, TableQueryOptions, TableCountOptions } from './types';
 import {
   normalizeTablePageLimit,
@@ -24,7 +31,15 @@ export { MAX_TABLE_PAGE_ROWS } from './table-pagination';
 export function buildSelectQuery(
   table: string,
   options: TableQueryOptions,
-  keysetPlan?: ResolvedKeysetPlan
+  keysetPlan?: ResolvedKeysetPlan,
+  /**
+   * Replaces the select list with expressions over the requested columns,
+   * one per column in order. WHERE, ORDER BY and LIMIT are unchanged, so a
+   * row-packed grid page reads the base table with no co-routine. A reversed
+   * keyset page re-sorts its inner SELECT by name and cannot take one.
+   */
+  selectList?: (columnExpressions: string[]) => string,
+  engine: EngineQueryOptions = {}
 ): { sql: string; params: CellValue[] } {
   const {
     columns = ['*'],
@@ -39,11 +54,19 @@ export function buildSelectQuery(
   } = options;
 
   const escapedTable = escapeMainIdentifier(table);
-  const escapedColumns = columns.map(col => {
-    if (col === '*') return '*';
-    if (col === 'rowid') return '"rowid" AS "rowid"';
-    return escapeIdentifier(col);
-  }).join(', ');
+  if (selectList && (columns.includes('*')
+    || keysetPlan?.mode === 'before' || keysetPlan?.mode === 'last')) {
+    throw new Error('A replaced select list needs named columns and a forward page');
+  }
+  const selectListSql = (qualifier: string) => selectList
+    ? selectList(columns.map(col => qualifier + escapeIdentifier(col)))
+    : columns.map(col => {
+        if (col === '*') return `${qualifier}*`;
+        if (col === 'rowid') return `${qualifier}"rowid" AS "rowid"`;
+        return qualifier + escapeIdentifier(col);
+      }).join(', ');
+  const escapedColumns = selectListSql('');
+  const rowIdLookupSelectListSql = engine.rowIdLookup ? selectListSql(`${ROW_ID_LOOKUP_ROW}.`) : undefined;
 
   let sql = `SELECT ${escapedColumns} FROM ${escapedTable}`;
   const whereClauses: string[] = [];
@@ -52,7 +75,8 @@ export function buildSelectQuery(
   const { conditions, params: filterParams } = buildFilterConditions(
     filters,
     globalFilter,
-    globalFilterColumns
+    globalFilterColumns,
+    engine
   );
   whereClauses.push(...conditions);
   params.push(...filterParams);
@@ -66,39 +90,54 @@ export function buildSelectQuery(
       plan: {
         ...keysetPlan,
         limit: normalizeTablePageLimit(keysetPlan.limit)
-      }
+      },
+      rowIdLookupSelectListSql
     });
   }
 
-  if (whereClauses.length > 0) {
-    sql += ` WHERE ${whereClauses.join(' AND ')}`;
-  }
-
+  const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
   const orderedColumns = orderByColumns?.length
     ? orderByColumns
     : (orderBy ? [orderBy] : []);
-  if (orderedColumns.length > 0) {
-    const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
-    sql += ` ORDER BY ${orderedColumns
-      .map(column => `${escapeIdentifier(column)} ${direction}`)
-      .join(', ')}`;
-  }
-
+  const direction = orderDir === 'DESC' ? 'DESC' : 'ASC';
+  const orderSql = orderedColumns.length > 0
+    ? ` ORDER BY ${orderedColumns.map(column => (
+        `${keyColumnOrderSql(column, engine.keyCollations?.get(column))} ${direction}`
+      )).join(', ')}`
+    : '';
+  let pageSql = '';
   if (limit !== undefined) {
-    sql += ` LIMIT ${normalizeTablePageLimit(limit)}`;
+    pageSql += ` LIMIT ${normalizeTablePageLimit(limit)}`;
   }
-
   if (offset !== undefined) {
-    sql += ` OFFSET ${normalizeTablePageOffset(offset)}`;
+    pageSql += ` OFFSET ${normalizeTablePageOffset(offset)}`;
   }
 
-  return { sql, params };
+  if (rowIdLookupSelectListSql !== undefined && limit !== undefined && rowIdLookupApplies(orderedColumns)) {
+    return {
+      sql: buildRowIdLookupSelect({
+        selectListSql: rowIdLookupSelectListSql,
+        escapedTable,
+        whereSql,
+        keyColumns: orderedColumns,
+        innerDirection: direction,
+        outerDirection: direction,
+        pageSql
+      }),
+      params
+    };
+  }
+  return { sql: sql + whereSql + orderSql + pageSql, params };
 }
 
 /**
  * Build a COUNT query from options.
  */
-export function buildCountQuery(table: string, options: TableCountOptions): { sql: string; params: CellValue[] } {
+export function buildCountQuery(
+  table: string,
+  options: TableCountOptions,
+  engine: EngineQueryOptions = {}
+): { sql: string; params: CellValue[] } {
   const {
     columns = [],
     globalFilterColumns = columns,
@@ -114,7 +153,8 @@ export function buildCountQuery(table: string, options: TableCountOptions): { sq
   const { conditions, params: filterParams } = buildFilterConditions(
     filters,
     globalFilter,
-    globalFilterColumns
+    globalFilterColumns,
+    engine
   );
   whereClauses.push(...conditions);
   params.push(...filterParams);
@@ -126,13 +166,37 @@ export function buildCountQuery(table: string, options: TableCountOptions): { sq
   return { sql, params };
 }
 
+/** What the engine knows about the connection and table, which page options cannot say. */
+export interface EngineQueryOptions {
+  /** The runtime's sqlite_explorer_like_any is registered, on a UTF-8 database (query-plan.c). */
+  likeAny?: boolean;
+  /**
+   * The table is an authority-confirmed ordinary rowid table, so a sorted page
+   * can take buildRowIdLookupSelect (keyset-pagination.ts). Without an index
+   * on the sort, SQLite otherwise builds a sorter record of every column for
+   * every row.
+   */
+  rowIdLookup?: boolean;
+  /**
+   * The table's WITHOUT ROWID key collations (primaryKeyCollations), which
+   * ORDER BY applies to those columns so a page follows the order its keyset
+   * anchors seek.
+   */
+  keyCollations?: ReadonlyMap<string, string>;
+}
+
+/** Values per sqlite_explorer_like_any call, as for the cell pack. */
+const LIKE_ANY_CHUNK = 100;
+
 /**
  * Helper to build WHERE conditions for column filters and global search.
+ * The web demo's worker builds its pages and counts with it too.
  */
-function buildFilterConditions(
+export function buildFilterConditions(
   filters: { column: string; value: string }[] = [],
   globalFilter: string | undefined,
-  searchColumns: string[]
+  searchColumns: string[],
+  engine: EngineQueryOptions = {}
 ): { conditions: string[]; params: CellValue[] } {
   const conditions: string[] = [];
   const params: CellValue[] = [];
@@ -149,13 +213,25 @@ function buildFilterConditions(
   // Global filter
   const activeGlobalFilter = getActiveFilterValue(globalFilter);
   if (activeGlobalFilter !== undefined && searchColumns.length > 0) {
-    const globalConditions = searchColumns
-      .map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`)
-      .join(' OR ');
-
-    conditions.push(`(${globalConditions})`);
-    for (let i = 0; i < searchColumns.length; i++) {
-      params.push(`%${escapeLikePattern(activeGlobalFilter)}%`);
+    const pattern = `%${escapeLikePattern(activeGlobalFilter)}%`;
+    const likeChain = (columns: string[]) => {
+      for (let i = 0; i < columns.length; i++) params.push(pattern);
+      return `(${columns.map(col => `${escapeIdentifier(col)} LIKE ? ESCAPE '\\'`).join(' OR ')})`;
+    };
+    if (engine.likeAny) {
+      // One call per row and chunk instead of one LIKE per column. The LIKE
+      // chain decides only rows the function leaves NULL, and the constant
+      // test keeps PRAGMA case_sensitive_like on SQLite's own LIKE.
+      const chunks: string[] = [];
+      for (let start = 0; start < searchColumns.length; start += LIKE_ANY_CHUNK) {
+        const columns = searchColumns.slice(start, start + LIKE_ANY_CHUNK);
+        params.push(activeGlobalFilter);
+        const call = `sqlite_explorer_like_any(?, ${columns.map(escapeIdentifier).join(', ')})`;
+        chunks.push(`COALESCE(CASE WHEN 'a' LIKE 'A' THEN ${call} END, ${likeChain(columns)})`);
+      }
+      conditions.push(`(${chunks.join(' OR ')})`);
+    } else {
+      conditions.push(likeChain(searchColumns));
     }
   }
 

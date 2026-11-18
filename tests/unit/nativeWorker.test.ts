@@ -58,6 +58,13 @@ function loadNativeWorkerFunction(
             { MAX_NATIVE_ERROR_MESSAGE_LENGTH: 8192 }
         );
     }
+    if (
+        functionName !== 'bindableParams'
+        && functionSource.includes('bindableParams(')
+        && !Object.prototype.hasOwnProperty.call(resolvedDependencies, 'bindableParams')
+    ) {
+        resolvedDependencies.bindableParams = loadNativeWorkerFunction('bindableParams', ['params']);
+    }
     const dependencyNames = Object.keys(resolvedDependencies);
     return Function(
         ...dependencyNames,
@@ -77,7 +84,7 @@ function loadNativeBoundaryFunction(
     if (functionName === 'executeBoundedQuery') {
         dependencies.compactExactNumericResult = loadNativeWorkerFunction(
             'compactExactNumericResult',
-            ['result', 'transportColumns', 'valueColumnCount']
+            ['result', 'transportColumns', 'valueColumnCount', 'realTextColumnCount = valueColumnCount', 'packedRealTextColumnCount']
         );
     }
     return loadNativeWorkerFunction(functionName, parameters, dependencies);
@@ -253,6 +260,8 @@ function createRecordingNativeProcess(recordedCalls: RecordedNativeCall[], respo
                         ? { result: { columns: ['1'], values: [[1]] } }
                         : call.method === 'query' && call.args[0] === 'PRAGMA encoding'
                             ? { result: { columns: ['encoding'], values: [['UTF-8']] } }
+                        : call.method === 'prepareGridPage'
+                            ? { result: { encoding: 'UTF-8', cellHelpers: false } }
                         : await respondToCall?.(call);
                     const response: RecordedNativeResponse = call.method === 'compileBatch'
                         && suppliedResponse?.error === undefined
@@ -493,6 +502,29 @@ describe('native statement fallback integrity', () => {
             /query parameters must be an array/i
         );
         assert.strictEqual(prepares, 0);
+    });
+
+    it('runs a bound query through the one statement that checked it', () => {
+        const executeQuery = loadNativeWorkerFunction(
+            'executeQuery',
+            ['db', 'sql', 'params'],
+            { MAX_QUERY_STATEMENTS: 32 }
+        );
+        const prepared: string[] = [];
+        let runs = 0;
+        const db = {
+            prepare(sql: string) {
+                prepared.push(sql);
+                // txiki's toString() returns the first statement's SQL.
+                const first = sql.includes(';') ? sql.slice(0, sql.indexOf(';') + 1) : sql;
+                return { toString: () => first, all: () => { runs++; return [{ v: 1 }]; }, finalize() {} };
+            }
+        };
+
+        assert.deepStrictEqual(executeQuery(db, 'SELECT ? AS v', [1]), { columns: ['v'], values: [[1]], rowCount: 1 });
+        assert.deepStrictEqual(prepared, ['SELECT ? AS v\n/*sqlite_explorer_parameterized_query_boundary*/']);
+        assert.throws(() => executeQuery(db, 'SELECT ?; SELECT 2', [1]), /exactly one SQL statement/);
+        assert.strictEqual(runs, 1);
     });
 });
 
@@ -782,7 +814,8 @@ describe('createNativeDatabaseConnection', () => {
                             },
                             { columns: ['name'], values: [] },
                             { columns: ['name', 'tbl_name'], values: [] },
-                            ...(queries.length > 3 ? [identityMetadata] : [])
+                            ...(queries.length > 3 ? [identityMetadata] : []),
+                            ...(queries.length > 4 ? [{ columns: ['has_triggers'], values: [[0]] }] : [])
                         ]
                     }
                 };
@@ -812,8 +845,9 @@ describe('createNativeDatabaseConnection', () => {
                     }]
                 ]
             );
+            assert.strictEqual(schema.hasTriggers, false);
             assert.deepStrictEqual(connection.calls.map(call => call.method), ['queryBatch']);
-            assert.strictEqual((connection.calls[0].args[0] as unknown[]).length, 4);
+            assert.strictEqual((connection.calls[0].args[0] as unknown[]).length, 5);
         } finally {
             connection.dispose();
         }
@@ -902,6 +936,84 @@ describe('createNativeDatabaseConnection', () => {
         }
     });
 
+    it('gives native reads the configured statement deadline and leaves writes at the fixed one', async () => {
+        // The worker arms each request's frame deadline when it starts it. The
+        // count reply arrives after that deadline but inside the transport
+        // margin, as a worker's own timeout error would.
+        const queryTimeout = 20;
+        const connection = await createRecordingConnection(async call => {
+            if (isRowIdAliasMetadataCall(call)) return noRowIdAliasResponse();
+            if (isPostUpdateRowIdCall(call)) return updatedRowIdResponse(1);
+            const sql = String(call.args[0]);
+            if (call.method === 'query' && sql.startsWith('SELECT "type", "wr" FROM pragma.pragma_table_list')) {
+                return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
+            }
+            if (call.method === 'queryNumeric') {
+                // Two values, one empty containment token each, raw-text slots.
+                const transportColumns = call.args[2] as string[];
+                return {
+                    result: {
+                        columns: transportColumns,
+                        values: [[1, 2, '|', ...transportColumns.slice(3).map(() => null)]]
+                    }
+                };
+            }
+            if (call.method === 'query' && sql.startsWith('SELECT COUNT(*) as count FROM')) {
+                await new Promise(resolve => setTimeout(resolve, 600));
+                return { result: { columns: ['count'], values: [[1]] } };
+            }
+            return { result: { changes: 1, lastInsertRowId: 1 } };
+        }, undefined, queryTimeout);
+
+        try {
+            connection.calls.length = 0;
+            await connection.databaseOps.fetchTableData('items', { columns: ['rowid', 'name'], limit: 1, offset: 0 });
+            assert.deepStrictEqual(
+                await connection.databaseOps.fetchTableCount('items', {}),
+                { count: 1, isExact: true }
+            );
+            await connection.databaseOps.executeQuery('SELECT name FROM items');
+            const reads = connection.calls.filter(call => (
+                call.method === 'queryNumeric'
+                || (call.method === 'query' && (
+                    call.args[0] === ROWID_TABLE_AUTHORITY_SQL
+                    || String(call.args[0]).startsWith('SELECT COUNT(*) as count FROM')
+                    || call.args[0] === 'SELECT name FROM items'
+                ))
+            ));
+            assert.deepStrictEqual(
+                reads.map(call => [call.method, call.timeoutMs]),
+                [
+                    ['query', queryTimeout],
+                    ['queryNumeric', queryTimeout],
+                    ['query', queryTimeout],
+                    ['query', queryTimeout]
+                ]
+            );
+
+            // A read snapshot's SAVEPOINT and RELEASE also go through
+            // executeQuery, and that RELEASE commits an import run inside it.
+            connection.calls.length = 0;
+            await connection.databaseOps.runReadSnapshot!(async () => {});
+            assert.deepStrictEqual(
+                connection.calls.map(call => [String(call.args[0]).split(' ')[0], call.timeoutMs]),
+                [['SAVEPOINT', 30000], ['RELEASE', 30000]]
+            );
+
+            // Edits keep the fixed limit, including the reads inside them: an
+            // interrupted write rolls back the whole transaction.
+            connection.calls.length = 0;
+            await connection.databaseOps.updateCell('items', 1, 'name', 'two');
+            assert.ok(connection.calls.some(call => call.method === 'run' && /^UPDATE /.test(String(call.args[0]))));
+            assert.deepStrictEqual(
+                connection.calls.filter(call => call.timeoutMs !== 30000).map(call => call.method),
+                []
+            );
+        } finally {
+            connection.dispose();
+        }
+    });
+
     it('preserves typeless INTEGER cast flags in native primary-key cell locators', async () => {
         const metadata = { storageClass: 'blob', byteLength: 4 };
         const connection = await createRecordingConnection(call => {
@@ -979,9 +1091,31 @@ describe('createNativeDatabaseConnection', () => {
                 { escapeCellIdentifier, isCellBinding }
             );
             assert.deepStrictEqual(buildCellLocator(expectedLocator), {
-                sql: '"id" = CAST(? AS INTEGER) AND "shard" = ?',
+                sql: `"id" = +CAST(? AS INTEGER) AND typeof("id") = 'integer' AND "shard" = ? AND typeof("shard") = 'text'`,
                 params: ['9007199254740993', 'a']
             });
+            // A REAL identity arrives as a number and names numeric storage.
+            assert.deepStrictEqual(buildCellLocator({
+                ...expectedLocator,
+                values: [1, 'a'],
+                integerCasts: [false, false]
+            }), {
+                sql: `"id" = ? AND typeof("id") IN ('integer', 'real') AND "shard" = ? AND typeof("shard") = 'text'`,
+                params: [1, 'a']
+            });
+            // Members compare under their key's collation, quoted as identifiers.
+            assert.deepStrictEqual(buildCellLocator({
+                ...expectedLocator,
+                collations: ['BINARY', 'x"y']
+            }), {
+                sql: `"id" COLLATE "BINARY" = +CAST(? AS INTEGER) AND typeof("id") = 'integer' ` +
+                    `AND "shard" COLLATE "x""y" = ? AND typeof("shard") = 'text'`,
+                params: ['9007199254740993', 'a']
+            });
+            assert.throws(
+                () => buildCellLocator({ ...expectedLocator, collations: ['BINARY'] }),
+                /invalid collation/
+            );
             assert.throws(
                 () => buildCellLocator({ ...expectedLocator, integerCasts: [true, '?'] }),
                 /invalid INTEGER cast flag/
@@ -1776,7 +1910,7 @@ describe('createNativeDatabaseConnection', () => {
                 .filter(call => call.method === 'run')
                 .map(call => String(call.args[0]));
             assert.match(runSql[0], /^SAVEPOINT "sp_update_rowid_cell_/);
-            assert.strictEqual(runSql[1], 'UPDATE main."native_large" SET "payload" = ? WHERE rowid = ? AND NOT (typeof("payload") IN (\'text\', \'blob\') AND length(CAST("payload" AS BLOB)) > ?)');
+            assert.strictEqual(runSql[1], 'UPDATE OR ABORT main."native_large" SET "payload" = ? WHERE rowid = ? AND NOT (typeof("payload") IN (\'text\', \'blob\') AND length(CAST("payload" AS BLOB)) > ?)');
             assert.deepStrictEqual(runSql.slice(2), ['ROLLBACK']);
         } finally {
             connection.dispose();
@@ -1907,7 +2041,7 @@ describe('createNativeDatabaseConnection', () => {
 
             const update = operationCalls[4];
             const [sql, params] = update.args as [string, unknown[]];
-            assert.match(sql, /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\) WHERE rowid = \?/);
+            assert.match(sql, /^UPDATE OR ABORT main\."docs" SET "payload" = CAST\(\? AS TEXT\) WHERE rowid = \?/);
             assert.match(sql, /typeof\("payload"\) = 'text'/);
             assert.deepStrictEqual(JSON.parse(params[0] as string), {
                 status: 'draft',
@@ -2014,7 +2148,7 @@ describe('createNativeDatabaseConnection', () => {
             const [sql, params] = update.args as [string, unknown[]];
             assert.strictEqual(
                 sql,
-                `UPDATE main."docs" SET "value" = CAST(? AS TEXT) WHERE rowid = ? AND ` +
+                `UPDATE OR ABORT main."docs" SET "value" = CAST(? AS TEXT) WHERE rowid = ? AND ` +
                 `(typeof("value") = 'text' AND CAST("value" AS BLOB) = CAST(? AS BLOB))`
             );
             assert.deepStrictEqual(params, ['before', 7, 'after']);
@@ -2222,10 +2356,10 @@ describe('createNativeDatabaseConnection', () => {
             const runCalls = connection.calls.filter(call => call.method === 'run');
             const runSql = runCalls.map(call => String(call.args[0]));
             assert.match(runSql[0], /^SAVEPOINT "sp_replay_cell_history_/);
-            assert.match(runSql[1], /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
+            assert.match(runSql[1], /^UPDATE OR ABORT main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
             assert.match(runSql[2], /^RELEASE "sp_replay_cell_history_/);
             assert.match(runSql[3], /^SAVEPOINT "sp_update_rowid_cell_/);
-            assert.strictEqual(runSql[4], 'UPDATE main."docs" SET "payload" = ? WHERE rowid = ?');
+            assert.strictEqual(runSql[4], 'UPDATE OR ABORT main."docs" SET "payload" = ? WHERE rowid = ?');
             assert.match(runSql[5], /^RELEASE "sp_update_rowid_cell_/);
             const undoRun = runCalls[1];
             const updateRun = runCalls[4];
@@ -2303,7 +2437,7 @@ describe('createNativeDatabaseConnection', () => {
             assert.strictEqual(call.method, 'run');
 
             const [sql, params] = call.args as [string, unknown[]];
-            assert.match(sql, /^UPDATE main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
+            assert.match(sql, /^UPDATE OR ABORT main\."docs" SET "payload" = CAST\(\? AS TEXT\)/);
             assert.match(sql, /typeof\("payload"\) = 'text'/);
             assert.deepStrictEqual(JSON.parse(params[0] as string), JSON.parse(replayed));
             assert.strictEqual(params[1], 7);
@@ -2974,11 +3108,8 @@ describe('createNativeDatabaseConnection', () => {
             ) {
                 return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
             }
-            if (
-                call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
-            ) {
-                return { result: { columns: ['1'], values: [[1]] } };
+            if (call.method === 'query' && call.args[0] === ROWID_TABLE_AUTHORITY_SQL) {
+                return { result: { columns: ['type'], values: [['table']] } };
             }
             if (call.method === 'query' && call.args[0] === 'PRAGMA encoding') {
                 return { result: { columns: ['encoding'], values: [['UTF-8']] } };
@@ -3033,8 +3164,7 @@ describe('createNativeDatabaseConnection', () => {
             ));
             const mainReadIndex = connection.calls.findIndex(call => call.method === 'queryNumeric');
             const authorityReadIndex = connection.calls.findIndex(call => (
-                call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
+                call.method === 'query' && call.args[0] === ROWID_TABLE_AUTHORITY_SQL
             ));
             const companionBatchIndices = connection.calls
                 .map((call, index) => ({ call, index }))
@@ -3077,11 +3207,8 @@ describe('createNativeDatabaseConnection', () => {
             ) {
                 return { result: { columns: ['type', 'wr'], values: [['table', 0]] } };
             }
-            if (
-                call.method === 'query'
-                && String(call.args[0]).startsWith('SELECT 1 FROM pragma.pragma_table_list')
-            ) {
-                return { result: { columns: ['1'], values: [[1]] } };
+            if (call.method === 'query' && call.args[0] === ROWID_TABLE_AUTHORITY_SQL) {
+                return { result: { columns: ['type'], values: [['table']] } };
             }
             if (call.method === 'queryBatch') {
                 throw new Error('companion read failed');
@@ -3705,6 +3832,141 @@ describe('NativeWorkerProcess', () => {
         assert.strictEqual(errorLogged, true, 'Should log error on bad deserialization');
     });
 
+    function createStartupChild() {
+        const child = new EventEmitter() as any;
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.stdin = new EventEmitter();
+        child.stdin.write = () => true;
+        // A real kill ends the process, which then reports its exit.
+        child.kill = () => { setImmediate(() => child.emit('exit', null, 'SIGTERM')); };
+        mock.method(require('node:child_process'), 'spawn', () => child);
+        mock.method(console, 'warn', () => {});
+        mock.method(console, 'error', () => {});
+        return child;
+    }
+
+    async function settledWithin<T>(promise: Promise<T>, ms: number): Promise<{ value?: T; error?: unknown } | 'pending'> {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+            return await Promise.race([
+                promise.then(value => ({ value }), error => ({ error })),
+                new Promise<'pending'>(resolve => { timer = setTimeout(() => resolve('pending'), ms); })
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    it('names what the worker wrote to stderr when it exits before ready', async () => {
+        const child = createStartupChild();
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        const starting = worker.start();
+
+        child.stderr.emit('data', Buffer.from(
+            "tjs: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by tjs)\r\n" +
+            '\u001b[31mred\u0007\tend\n'
+        ));
+        // Node can report the exit before it has read the rest of stderr.
+        child.emit('exit', 127, null);
+        child.stderr.emit('data', Buffer.from(`${'x'.repeat(3000)}\n`));
+        child.emit('close', 127, null);
+
+        const outcome = await settledWithin(starting, 2000);
+        assert.notStrictEqual(outcome, 'pending');
+        const message = String((outcome as { error?: Error }).error?.message);
+        assert.match(
+            message,
+            /^Native worker process exited with code 127; stderr: tjs: \/lib\/x86_64-linux-gnu\/libc\.so\.6: version `GLIBC_2\.38' not found \(required by tjs\)\n\uFFFD\[31mred\uFFFD\tend\nx+…$/
+        );
+        assert.ok(message.length < 2100, `excerpt is bounded: ${message.length}`);
+        assert.doesNotMatch(message, /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/);
+    });
+
+    it('stops keeping stderr once the worker is ready', async () => {
+        const child = createStartupChild();
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        const starting = worker.start();
+        child.stderr.emit('data', Buffer.from('startup warning\n'));
+        child.stdout.emit('data', encodeNativeMessage({ ready: true }));
+        await starting;
+        const pending = worker.call('query', [], 5_000);
+
+        child.stderr.emit('data', Buffer.from('later noise\n'));
+        child.emit('exit', 1, null);
+
+        await assert.rejects(pending, error => (error as Error).message === 'Native worker process exited with code 1');
+    });
+
+    it('names the startup failure of a stub that exits like a loader missing GLIBC', async (testContext) => {
+        if (process.platform === 'win32') {
+            testContext.skip('POSIX shell stub');
+            return;
+        }
+        fs.mkdirSync(path.join(process.cwd(), '.tmp'), { recursive: true });
+        const directory = fs.mkdtempSync(path.join(process.cwd(), '.tmp', 'native-startup-stderr-'));
+        try {
+            const stub = path.join(directory, 'tjs');
+            fs.writeFileSync(stub, [
+                '#!/bin/sh',
+                "echo \"tjs: /lib/x86_64-linux-gnu/libc.so.6: version \\`GLIBC_2.38' not found (required by tjs)\" >&2",
+                'exit 127',
+                ''
+            ].join('\n'), { mode: 0o755 });
+            mock.method(console, 'warn', () => {});
+            mock.method(console, 'error', () => {});
+            const worker = new NativeWorkerProcess(stub, path.join(directory, 'native-worker.js'));
+
+            await assert.rejects(
+                worker.start(),
+                /^Error: Native worker process exited with code 127; stderr: tjs: \/lib\/x86_64-linux-gnu\/libc\.so\.6: version `GLIBC_2\.38' not found \(required by tjs\)$/
+            );
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    for (const [name, frame, cause] of [
+        ['oversized', Buffer.from([0xff, 0xff, 0xff, 0xff]), /response frame 4294967295 bytes exceeds/],
+        ['undecodable', Buffer.from([0, 0, 0, 3, 0xff, 0x0f, 0x6f]), /response frame could not be deserialized/]
+    ] as const) {
+        it(`rejects start at once when the first frame is ${name}`, async () => {
+            const child = createStartupChild();
+            const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+            const starting = worker.start();
+
+            child.stdout.emit('data', frame);
+
+            const outcome = await settledWithin(starting, 2000);
+            assert.notStrictEqual(outcome, 'pending', 'start() must not wait for the initialization timeout');
+            assert.match(String((outcome as { error?: Error }).error?.message), cause);
+        });
+    }
+
+    it('rejects pending requests at once when a response frame cannot be deserialized', async () => {
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        let killCount = 0;
+        (worker as any).process = {
+            stdin: { write: () => true },
+            kill: () => { killCount++; }
+        };
+        mock.method(console, 'error', () => {});
+        const pending = worker.call('query', [], 5_000);
+        const started = performance.now();
+        // A well-formed length prefix around a truncated V8 object.
+        const body = Buffer.from([0xff, 0x0f, 0x6f]);
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(body.length, 0);
+
+        (worker as any).handleData(Buffer.concat([header, body]));
+
+        await assert.rejects(pending, /response frame could not be deserialized/);
+        assert.ok(performance.now() - started < 1_000, 'the request must fail with the frame, not at its timeout');
+        assert.strictEqual(killCount, 1);
+        assert.strictEqual((worker as any).process, null);
+        assert.strictEqual((worker as any).pendingRequests.size, 0);
+    });
+
     it('terminates the worker when a response frame advertises an unsafe allocation', async () => {
         const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
         let killCount = 0;
@@ -3723,6 +3985,34 @@ describe('NativeWorkerProcess', () => {
         assert.strictEqual((worker as any).process, null);
         assert.strictEqual((worker as any).chunksTotalLength, 0);
         assert.strictEqual((worker as any).pendingRequests.size, 0);
+    });
+
+    it('ignores stdout that a retired child still delivers', async () => {
+        const childProcess = require('node:child_process');
+        const fakeChild = new EventEmitter() as any;
+        fakeChild.stdout = new EventEmitter();
+        fakeChild.stderr = new EventEmitter();
+        fakeChild.stdin = new EventEmitter();
+        fakeChild.stdin.write = () => true;
+        fakeChild.kill = () => {};
+        mock.method(childProcess, 'spawn', () => fakeChild);
+        const errors: string[] = [];
+        mock.method(console, 'error', (message: unknown) => { errors.push(String(message)); });
+        const worker = new NativeWorkerProcess('/fake/bin', '/fake/script');
+        const starting = worker.start();
+        fakeChild.stdout.emit('data', encodeNativeMessage({ ready: true }));
+        await starting;
+        const pending = worker.call('query', [], 1000);
+        const hostileHeader = Buffer.alloc(4);
+        hostileHeader.writeUInt32BE(0xffff_ffff, 0);
+
+        fakeChild.stdout.emit('data', hostileHeader);
+        await assert.rejects(pending, /native worker response frame.*limit/i);
+        // The rest of the oversized frame arrives after the worker retired it.
+        fakeChild.stdout.emit('data', Buffer.from([0xff, 0x00, 0x00, 0x7f, 0x01, 0x02]));
+
+        assert.strictEqual(errors.filter(message => /response frame/.test(message)).length, 1, errors.join('\n'));
+        assert.strictEqual((worker as any).chunksTotalLength, 0);
     });
 
     it('retires the worker and clears request state when an IPC write fails', async () => {

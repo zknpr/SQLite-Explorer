@@ -112,11 +112,12 @@ export function getGridReloadOwner() {
  * OFFSET query. `nav` is the page's relationship to the committed grid
  * ('first'/'next'/'prev'/'last' from the nav buttons, 'refetch' otherwise).
  * Anchors are only usable when they describe the exact page the intent
- * expects for this table — a clamped index after a shrunken count, a table
- * switch, or a rapid double-click whose first load never committed all fail
- * these checks and fall back to OFFSET. The engine independently re-validates
- * the anchor's embedded query tag, so sort/filter/page-size staleness needs no
- * tracking here.
+ * expects for this table at this page size — a clamped index after a shrunken
+ * count, a table switch, a column change that lowered the page size, or a
+ * rapid double-click whose first load never committed all fail these checks
+ * and fall back to OFFSET. The engine independently re-validates the anchor's
+ * embedded query tag, which also names the page size, so sort/filter
+ * staleness needs no tracking here.
  *
  * `recordCount`/`pageCount` are undefined for the speculative data query a
  * cache miss fires in parallel with its count; anchor-based modes never need
@@ -128,7 +129,8 @@ function buildKeysetRequest(nav, pageIndex, pageCount, recordCount, countIsExact
     // any refetch at 0, and single-page tables.
     if (pageIndex === 0) return { mode: 'first' };
     const anchors = state.keysetAnchors;
-    const usable = anchors && anchors.table === table;
+    // A page index means different rows under another page size.
+    const usable = anchors && anchors.table === table && anchors.pageSize === pageSize;
     if (nav === 'next' && usable && anchors.pageIndex === pageIndex - 1 && anchors.last) {
         return { mode: 'after', anchor: anchors.last };
     }
@@ -180,6 +182,49 @@ function keysetModeCanProveInexactCount(keyset) {
     );
 }
 
+// The host fits a page into 16 MiB by clipping each value to an equal share of
+// it, so a page of many values clips short ones: at 5,000 rows, values over
+// 16 bytes became previews at 200 columns, and 400 columns did not fit at all.
+// 250,000 values leaves about 67 bytes each, enough for a UUID or most email
+// addresses, and keeps the chosen size up to 49 columns and the rowid at the
+// default 5,000 rows.
+const MAX_GRID_PAGE_CELLS = 250_000;
+
+/**
+ * Rows per page for a query of columnCount values a row: the chosen size, or
+ * fewer for a wide one, rounded down to a multiple of 100 from 100 rows up.
+ */
+export function pageSizeForColumns(rowsPerPage, columnCount) {
+    if (!(columnCount > 0) || rowsPerPage * columnCount <= MAX_GRID_PAGE_CELLS) return rowsPerPage;
+    const rows = Math.max(1, Math.floor(MAX_GRID_PAGE_CELLS / columnCount));
+    return rows >= 100 ? rows - (rows % 100) : rows;
+}
+
+/**
+ * Show a lowered page size beside the Rows selector, which keeps the chosen
+ * size. Status messages replace the record-count note, so it cannot carry
+ * this alone. pageShown is false once an error replaced the page.
+ */
+function syncPageSizeNote(pageShown = true) {
+    const note = document.getElementById('pageSizeNote');
+    if (!note) return;
+    const lowered = pageShown && state.pageSize < state.rowsPerPage;
+    note.hidden = !lowered;
+    note.textContent = lowered ? `(${state.pageSize} for ${state.tableColumns.length} columns)` : '';
+    note.title = lowered
+        ? `Pages hold at most ${MAX_GRID_PAGE_CELLS.toLocaleString('en-US')} values, so this table shows `
+            + `${state.pageSize} rows per page instead of ${state.rowsPerPage}.`
+        : '';
+}
+
+/** Status bar text for the committed page's count, naming a lowered page size. */
+export function recordCountStatus() {
+    const count = `${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`;
+    return state.pageSize < state.rowsPerPage
+        ? `${count}; ${state.pageSize} rows per page for ${state.tableColumns.length} columns`
+        : count;
+}
+
 /**
  * Bound the engine query to the rows that can actually exist on an exact page.
  * The containment layer divides its fixed transport budget across `limit`
@@ -195,6 +240,33 @@ function getPageQueryLimit(recordCount, countIsExact, pageIndex, pageSize) {
 
 function hasClippedCells(result) {
     return Object.keys(result?.oversizedCells || {}).length > 0;
+}
+
+/**
+ * Reload the grid after this webview's own mutation. The VS Code host posts
+ * its refreshContent broadcast before the mutation reply, and that refresh
+ * reloads schema, columns and rows after the write, so the page is not fetched
+ * a second time. Without a broadcast (the web demo), or when the newest one
+ * did not finish its reload, the page is loaded here.
+ *
+ * @param {number} contentGenerationBeforeMutation contentGeneration read
+ *   before the mutation request was sent
+ * @param {() => boolean} isTargetCurrent whether the mutated grid is still shown
+ */
+export async function reloadAfterOwnMutation(contentGenerationBeforeMutation, isTargetCurrent) {
+    if (state.contentGeneration !== contentGenerationBeforeMutation) {
+        while (state.contentRefreshPromise) {
+            try {
+                await state.contentRefreshPromise;
+            } catch {
+                // refreshContent shows its failure; load below as before.
+                break;
+            }
+        }
+        if (state.refreshedContentGeneration === state.contentGeneration) return true;
+        if (!isTargetCurrent()) return false;
+    }
+    return loadTableData();
 }
 
 export async function loadTableData(showSpinner = true, saveScrollPosition = true, navIntent) {
@@ -221,8 +293,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
     let earlyDataResult;
 
     // Both the early page and a count-aware retry use the same atomic row commit.
-    const commitRows = (dataResult, currentPageIndex, container) => {
+    const commitRows = (dataResult, currentPageIndex, container, pageSize) => {
         state.gridData = dataResult.rows || [];
+        state.pageSize = pageSize;
+        syncPageSizeNote();
         state.gridExactIntegerTexts = dataResult.exactIntegerTexts || {};
         state.gridOversizedCells = dataResult.oversizedCells || {};
         state.gridReadOnlyRowReasons = dataResult.readOnlyRowReasons || {};
@@ -242,6 +316,7 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         state.keysetAnchors = {
             table: requestedTable,
             pageIndex: currentPageIndex,
+            pageSize,
             first: dataResult.keysetAnchors?.first ?? null,
             last: dataResult.keysetAnchors?.last ?? null
         };
@@ -366,18 +441,20 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             requestedTable, filters, globalFilter, columnNames
         );
 
-        // Snapshot the page size once so the clamp, OFFSET, keyset remainder,
-        // and committed page math all derive from the same value across the
-        // awaits below. (A mid-load page-size change also supersedes this
-        // load; the snapshot makes the consistency structural, not reasoned.)
-        const requestedPageSize = state.rowsPerPage;
-
         const isTable = requestedTableType === 'table';
 
         // For tables, we need to explicitly request the 'rowid' column to handle row identification.
         // The frontend expects rowid at index 0 for tables (see `getRowId` and `getRowDataOffset`).
         // Query builder handles the construction: SELECT "rowid", "col1", ...
         const queryColumns = isTable ? ['rowid', ...columnNames] : columnNames;
+
+        // Snapshot the page size once so the clamp, OFFSET, keyset remainder,
+        // and committed page math all derive from the same value across the
+        // awaits below. (A mid-load page-size change also supersedes this
+        // load; the snapshot makes the consistency structural, not reasoned.)
+        // The host shares the page budget among every value it returns,
+        // including the rowid.
+        const requestedPageSize = pageSizeForColumns(state.rowsPerPage, queryColumns.length);
 
         // One builder for every data request this load can issue (speculative,
         // clamped, retry), so they can never disagree on anything but the page
@@ -406,6 +483,9 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                       )
                     : requestedPageSize,
                 offset: pageIndex * requestedPageSize,
+                // The engine tags anchors with the page size, not the limit,
+                // which a final page bounds to its remainder.
+                pageSize: requestedPageSize,
                 filters,
                 globalFilter
             };
@@ -448,7 +528,11 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         let totalPageCount;
         let totalRecordCount;
         let totalRecordCountIsExact;
-        let currentPageIndex = state.currentPageIndex;
+        // A column change can change the page size under a kept page index;
+        // stay on the page that holds the first row the index pointed at.
+        let currentPageIndex = state.pageSize > 0 && state.pageSize !== requestedPageSize
+            ? Math.floor(state.currentPageIndex * state.pageSize / requestedPageSize)
+            : state.currentPageIndex;
         let dataResult;
         let queryOptions;
         let exactBoundStore;
@@ -490,27 +574,38 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
                 // rows ahead of counting, then let the webview paint them first.
                 const firstPage = await backendApi.fetchTableData(requestedTable, speculativeOptions);
                 if (isSuperseded()) return;
-                state.totalRecordCount = 0;
-                state.totalRecordCountIsExact = false;
-                state.totalPageCount = 1;
-                state.currentPageIndex = 0;
-                state.countStatus = 'pending';
-                commitRows(firstPage, 0, container);
-                earlyDataResult = firstPage;
-                state.isLoadingData = false;
-                // Keep the existing reload guard until metadata settles so
-                // queued filters and edits retain their ordering contract.
-                updatePagination();
-                updateToolbarButtons();
-                updateStatus(`${state.gridData.length} records loaded; counting…`);
-                if (typeof requestAnimationFrame === 'function' && document.visibilityState !== 'hidden') {
-                    await new Promise(resolve => {
-                        requestAnimationFrame(() => setTimeout(resolve, 0));
-                    });
-                }
-                if (isSuperseded()) return;
-                countOutcome = { status: 'fulfilled', value: await backendApi.fetchTableCount(requestedTable, countOptions) };
                 dataOutcome = { status: 'fulfilled', value: firstPage };
+                const firstPageRowCount = (firstPage.rows || []).length;
+                if (firstPageRowCount < speculativeOptions.limit) {
+                    // Page 0 starts at the identity's first row, and engines
+                    // clip cells rather than drop rows at the page budget, so
+                    // a short first page holds every matching row. Its length
+                    // is the exact count a COUNT(*) scan would return. Page
+                    // sizes stop at the host's 100,000-row limit, so the
+                    // engine applied this request's limit.
+                    countOutcome = { status: 'fulfilled', value: { count: firstPageRowCount, isExact: true } };
+                } else {
+                    state.totalRecordCount = 0;
+                    state.totalRecordCountIsExact = false;
+                    state.totalPageCount = 1;
+                    state.currentPageIndex = 0;
+                    state.countStatus = 'pending';
+                    commitRows(firstPage, 0, container, requestedPageSize);
+                    earlyDataResult = firstPage;
+                    state.isLoadingData = false;
+                    // Keep the existing reload guard until metadata settles so
+                    // queued filters and edits retain their ordering contract.
+                    updatePagination();
+                    updateToolbarButtons();
+                    updateStatus(`${state.gridData.length} records loaded; counting…`);
+                    if (typeof requestAnimationFrame === 'function' && document.visibilityState !== 'hidden') {
+                        await new Promise(resolve => {
+                            requestAnimationFrame(() => setTimeout(resolve, 0));
+                        });
+                    }
+                    if (isSuperseded()) return;
+                    countOutcome = { status: 'fulfilled', value: await backendApi.fetchTableCount(requestedTable, countOptions) };
+                }
             } else {
                 // Observe both outcomes even if one fails while the other is pending.
                 [countOutcome, dataOutcome] = await Promise.allSettled([
@@ -622,6 +717,19 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             }
         }
         if (queryOptions.limit > countAwareOptions.limit && hasClippedCells(dataResult)) {
+            // A seek bounded to the rows the count leaves returns exactly that
+            // many even from an anchor that moved, so the length check below
+            // cannot catch it. Judge the anchor on the full page in hand.
+            if (queryOptions.keyset && keysetResultNeedsOffsetRetry(
+                queryOptions.keyset,
+                dataResult,
+                totalRecordCount,
+                totalRecordCountIsExact,
+                currentPageIndex,
+                requestedPageSize
+            )) {
+                delete countAwareOptions.keyset;
+            }
             queryOptions = countAwareOptions;
             dataResult = await backendApi.fetchTableData(requestedTable, queryOptions);
             if (isSuperseded()) return;
@@ -719,10 +827,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
         state.totalRecordCountIsExact = totalRecordCountIsExact;
         state.totalPageCount = totalPageCount;
         state.currentPageIndex = currentPageIndex;
-        if (dataResult !== earlyDataResult) commitRows(dataResult, currentPageIndex, container);
+        if (dataResult !== earlyDataResult) commitRows(dataResult, currentPageIndex, container, requestedPageSize);
 
         updatePagination();
-        updateStatus(`${state.totalRecordCountIsExact ? '' : '≤'}${state.totalRecordCount} records`);
+        updateStatus(recordCountStatus());
         return true; // signals callers (e.g. filter submit) that the load applied
 
     } catch (err) {
@@ -742,7 +850,10 @@ export async function loadTableData(showSpinner = true, saveScrollPosition = tru
             updateStatus(`Error: ${message}`);
             // Background filters retain the last successful grid so the UI can
             // roll back atomically instead of replacing it with an error panel.
-            if (!keepExistingGridOnError) showErrorState(message);
+            if (!keepExistingGridOnError) {
+                showErrorState(message);
+                syncPageSizeNote(false);
+            }
             return false; // the current load genuinely failed (lets callers retry)
         }
         // Superseded failure: a newer load owns the outcome — return undefined.

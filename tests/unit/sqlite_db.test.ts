@@ -441,7 +441,7 @@ describe('WasmDatabaseEngine', () => {
             const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
             const insertPrepares: string[] = [];
             wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
-                if (sql.startsWith('INSERT INTO main."batch_target"')) insertPrepares.push(sql);
+                if (sql.startsWith('INSERT OR ABORT INTO main."batch_target"')) insertPrepares.push(sql);
                 return originalPrepare(sql, params);
             };
             try {
@@ -462,8 +462,8 @@ describe('WasmDatabaseEngine', () => {
                 ['first', 'second', 'third']
             );
             assert.deepStrictEqual(insertPrepares, [
-                'INSERT INTO main."batch_target" ("a") VALUES (?)',
-                'INSERT INTO main."batch_target" ("b") VALUES (?)'
+                'INSERT OR ABORT INTO main."batch_target" ("a") VALUES (?)',
+                'INSERT OR ABORT INTO main."batch_target" ("b") VALUES (?)'
             ]);
         })
     ));
@@ -588,7 +588,7 @@ describe('WasmDatabaseEngine', () => {
             await batchEngine.executeQuery('CREATE TABLE prepare_failure_batch (a TEXT, b TEXT)');
             const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
             wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
-                if (sql === 'INSERT INTO main."prepare_failure_batch" ("b") VALUES (?)') {
+                if (sql === 'INSERT OR ABORT INTO main."prepare_failure_batch" ("b") VALUES (?)') {
                     throw new Error('simulated second-shape prepare failure');
                 }
                 return originalPrepare(sql, params);
@@ -684,7 +684,7 @@ describe('WasmDatabaseEngine', () => {
             let preparedInsertCount = 0;
             wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
                 const statement = originalPrepare(sql, params);
-                if (!sql.startsWith('INSERT INTO main."cleanup_failure_batch"')) return statement;
+                if (!sql.startsWith('INSERT OR ABORT INTO main."cleanup_failure_batch"')) return statement;
                 const cleanupIndex = ++preparedInsertCount;
                 const originalFree = statement.free.bind(statement);
                 statement.free = () => {
@@ -728,7 +728,7 @@ describe('WasmDatabaseEngine', () => {
             const originalPrepare = wasmEngine.instance.prepare.bind(wasmEngine.instance);
             wasmEngine.instance.prepare = (sql: string, params?: unknown[]) => {
                 const statement = originalPrepare(sql, params);
-                if (!sql.startsWith('INSERT INTO main."finalize_failure_batch"')) return statement;
+                if (!sql.startsWith('INSERT OR ABORT INTO main."finalize_failure_batch"')) return statement;
                 const originalFree = statement.free.bind(statement);
                 statement.free = () => {
                     originalFree();

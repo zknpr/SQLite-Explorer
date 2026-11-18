@@ -54,6 +54,7 @@ interface DesktopTestApi {
   readonly version: 1;
   setBackend(backend: Backend): void;
   setPagedOpenThresholdBytes(thresholdBytes: number | undefined): void;
+  nativeRequestsLeftToV8(): number;
   inspectDocument(uri: string): Promise<DesktopDocumentState | null>;
   inspectLifecycle(documentId: string): DesktopDocumentState | null;
   openCustomDocument(
@@ -70,6 +71,7 @@ interface DesktopTestApi {
     column: string,
     value: CellValue
   ): Promise<string | number | void>;
+  setPragma(target: string, pragma: string, value: CellValue): Promise<void>;
   save(target: string): Promise<void>;
   revert(target: string): Promise<void>;
   backup(target: string, destination: string): Promise<string>;
@@ -241,6 +243,31 @@ function cellUri(state: DesktopDocumentState, column: string): vscode.Uri {
   return vscode.Uri.from({ scheme: 'sqlite-explorer', path: `/${uriPath}` });
 }
 
+/**
+ * Run VS Code's own Undo command. A refused Undo awaits its warning, and a
+ * notification without actions settles only when it closes, so close
+ * notifications until the command returns.
+ */
+async function undoThroughVsCode(): Promise<void> {
+  let settled = false;
+  const undo = Promise.resolve(vscode.commands.executeCommand('undo')).finally(() => { settled = true; });
+  await waitFor('VS Code Undo to return', async () => {
+    if (!settled) await vscode.commands.executeCommand('notifications.clearAll');
+    return settled;
+  });
+  await undo;
+}
+
+/** Record every dirty value VS Code reports for one custom-editor tab. */
+function recordTabDirtyStates(uri: vscode.Uri, viewType: string): { states: boolean[]; dispose(): void } {
+  const states: boolean[] = [];
+  const subscription = vscode.window.tabGroups.onDidChangeTabs(() => {
+    const tab = findCustomTab(uri, viewType);
+    if (tab && states.at(-1) !== tab.isDirty) states.push(tab.isDirty);
+  });
+  return { states, dispose: () => subscription.dispose() };
+}
+
 function assertFileBytes(filePath: string, expected: string): void {
   assert.deepEqual(fs.readFileSync(filePath), Buffer.from(expected, 'utf8'));
 }
@@ -271,6 +298,9 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
   });
 
   suiteTeardown(async () => {
+    // Every request to the native engine is written by the extension itself, in the format the
+    // engine reads, so that this editor's own runtime cannot change it (`nativeRequestFormat.ts`).
+    assert.strictEqual(api.nativeRequestsLeftToV8(), 0, 'no request to the native engine was left to the editor to write');
     for (const handle of [...directHandles]) {
       await disposeDirect(handle);
     }
@@ -278,6 +308,24 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
     api.setPagedOpenThresholdBytes(undefined);
     await setMaxFileSize(DEFAULT_MAX_FILE_SIZE_MIB);
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+
+  // Where the system has no path through a descriptor for a save's file, a helper process makes
+  // it (`makeFileInside` in src/insideDirectory.ts). That
+  // process is the editor's own runtime told to run as Node, which only the real extension host shows.
+  test('the editor\'s runtime runs as Node for a child that is told to, with its arguments', () => {
+    const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
+    assert.ok(process.versions.electron, 'this suite runs in the editor\'s extension host');
+    const env: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' };
+    delete env.NODE_OPTIONS;
+    const answer = spawnSync(
+      process.execPath,
+      ['-e', "process.stdout.write([typeof process.chdir, String(Boolean(process.versions.electron)), ...process.argv.slice(-2)].join(' '))", '--', 'one', 'two words'],
+      { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000 }
+    );
+    assert.equal(answer.error, undefined);
+    assert.equal(answer.status, 0, answer.stderr);
+    assert.equal(answer.stdout, 'function true one two words');
   });
 
   for (const backend of ['native', 'wasm'] as const) {
@@ -549,7 +597,10 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           // stream its runs to the host-side adjacent-temp writer, rename
           // atomically, and reconnect the document to the replacement inode.
           const originalStat = fs.statSync(fixture.filePath, { bigint: true });
-          const frozenDescriptor = fs.openSync(fixture.filePath, 'r');
+          // Windows refuses a rename onto a file this process holds open, so
+          // the descriptor check below is POSIX-only. The file identity checks
+          // show the replacement on every platform.
+          const frozenDescriptor = process.platform === 'win32' ? undefined : fs.openSync(fixture.filePath, 'r');
           try {
             await api.updateCell(handle, 'items', 1, 'value', 'wasm-paged-saved');
             assert.deepEqual(fs.readFileSync(fixture.filePath), fixture.originalBytes);
@@ -601,10 +652,12 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
 
             // An in-place overwrite would change reads through this already-open
             // descriptor. Atomic rename leaves it on the byte-identical old inode.
-            const frozenBytes = Buffer.alloc(fixture.originalBytes.length);
-            const bytesRead = fs.readSync(frozenDescriptor, frozenBytes, 0, frozenBytes.length, 0);
-            assert.equal(bytesRead, fixture.originalBytes.length);
-            assert.deepEqual(frozenBytes, fixture.originalBytes);
+            if (frozenDescriptor !== undefined) {
+              const frozenBytes = Buffer.alloc(fixture.originalBytes.length);
+              const bytesRead = fs.readSync(frozenDescriptor, frozenBytes, 0, frozenBytes.length, 0);
+              assert.equal(bytesRead, fixture.originalBytes.length);
+              assert.deepEqual(frozenBytes, fixture.originalBytes);
+            }
 
             assert.equal(
               fs.readdirSync(fixtureRoot).some(name => name.includes('.sqlite-explorer-') && name.endsWith('.tmp')),
@@ -615,7 +668,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
             assert.equal(savedState?.dirty, false);
             assert.equal(savedState?.storage, 'paged');
           } finally {
-            fs.closeSync(frozenDescriptor);
+            if (frozenDescriptor !== undefined) fs.closeSync(frozenDescriptor);
           }
           await disposeDirect(handle);
         });
@@ -634,6 +687,37 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
           );
           assert.deepEqual(fs.readFileSync(fixture.filePath), fixture.originalBytes);
           await disposeDirect(handle);
+        });
+
+        test('[row 11][WASM-only] Undo refused at an unsaved history barrier leaves the tab dirty', async () => {
+          const fixture = createFixture('barrier-undo-wasm');
+          await vscode.commands.executeCommand('vscode.openWith', fixture.uri, viewTypes[0], vscode.ViewColumn.One);
+          await waitFor('the barrier editor', () => findCustomTab(fixture.uri, viewTypes[0]));
+          await waitFor('the barrier document', () => api.inspectDocument(fixture.uri.toString()));
+
+          // On WebAssembly a persistent PRAGMA is a forward-only history barrier,
+          // and the only edit since the file was opened.
+          await api.setPragma(fixture.uri.toString(), 'journal_mode', 'off');
+          await waitFor('the dirty barrier tab', () => findCustomTab(fixture.uri, viewTypes[0])?.isDirty === true);
+
+          const recorded = recordTabDirtyStates(fixture.uri, viewTypes[0]);
+          try {
+            await undoThroughVsCode();
+            // Tab state reaches the extension host asynchronously.
+            await sleep(1000);
+          } finally {
+            recorded.dispose();
+          }
+          console.log(`[row 11] tab isDirty after the refused Undo: ${JSON.stringify(recorded.states)}`);
+          assert.equal((await api.inspectDocument(fixture.uri.toString()))?.dirty, true, 'the barrier edit is still unsaved');
+          assert.equal(
+            findCustomTab(fixture.uri, viewTypes[0])?.isDirty,
+            true,
+            'a clean tab closes without asking to save, which discards the unsaved WebAssembly edit'
+          );
+
+          assert.ok(await vscode.workspace.save(fixture.uri));
+          await waitFor('the saved tab', () => findCustomTab(fixture.uri, viewTypes[0])?.isDirty === false);
         });
 
         test('[row 7][WASM-only] observable storage selects memory below and paged above the dedicated threshold', async () => {
@@ -720,6 +804,27 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
         await closeAllCustomTabs();
       });
 
+      test('[row 11] an ordinary Undo back to the saved state leaves the tab clean', async () => {
+        const fixture = createFixture(`clean-undo-${backend}`);
+        await vscode.commands.executeCommand('vscode.openWith', fixture.uri, viewTypes[0], vscode.ViewColumn.One);
+        await waitFor('the editor', () => findCustomTab(fixture.uri, viewTypes[0]));
+        await waitFor('the document', () => api.inspectDocument(fixture.uri.toString()));
+        await api.updateCell(fixture.uri.toString(), 'items', 1, 'value', 'unsaved');
+        await waitFor('the dirty tab', () => findCustomTab(fixture.uri, viewTypes[0])?.isDirty === true);
+
+        const recorded = recordTabDirtyStates(fixture.uri, viewTypes[0]);
+        try {
+          await undoThroughVsCode();
+          await sleep(1000);
+        } finally {
+          recorded.dispose();
+        }
+        console.log(`[row 11] tab isDirty after an ordinary Undo (${backend}): ${JSON.stringify(recorded.states)}`);
+        assertSingleValue(await api.query(fixture.uri.toString(), 'SELECT value FROM items'), 'original');
+        assert.equal((await api.inspectDocument(fixture.uri.toString()))?.dirty, false);
+        assert.equal(findCustomTab(fixture.uri, viewTypes[0])?.isDirty, false);
+      });
+
       test('[row 5] backup reopens through openCustomDocument(backupId) with unsaved mutations present', async () => {
         const fixture = createFixture(`hot-exit-${backend}`);
         const first = await openDirect(fixture);
@@ -787,7 +892,7 @@ suite('SQLite Explorer desktop extension-host matrix', () => {
         assertFileBytes(
           sqlPath,
           'INSERT INTO "export_cases" ("id", "payload", "nul_text") VALUES ' +
-          '(1, X\'000102fdfeff\', CAST(X\'6265666f7265006166746572\' AS TEXT));'
+          '(1, X\'000102fdfeff\', (\'before\' || char(0) || \'after\'));'
         );
         assert.equal(
           fs.readdirSync(fixtureRoot).some(name => /^\.export-.*\.tmp$/.test(name)),

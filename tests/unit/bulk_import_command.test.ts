@@ -13,6 +13,7 @@ import type { DatabaseOperations, LabeledModification } from '../../src/core/typ
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { createNativeDatabaseConnection } from '../../src/nativeWorker';
 import { serializeOperations } from '../../src/core/operation-serializer';
+import { NO_FILE_SYMLINKS } from './helpers/symlinks';
 
 interface Scenario {
     source?: string | Uint8Array;
@@ -65,7 +66,7 @@ async function runWizard(backend: 'wasm' | 'native', scenario: Scenario) {
                         return (action: (snapshot: DatabaseOperations) => Promise<unknown>) => value.call(target,
                             (snapshot: DatabaseOperations) => action(intercept(snapshot)));
                     }
-                    if (property === 'insertRowWithHistory') {
+                    if (property === 'insertRowsWithHistory') {
                         return async (...args: unknown[]) => {
                             if (!inserted) { inserted = true; await scenario.beforeFirstInsert!(); }
                             return value.apply(target, args);
@@ -275,9 +276,18 @@ for (const change of ['truncated', 'overwritten with restored mtime'] as const) 
                 if (change === 'truncated') fs.truncateSync(file, 5);
                 else {
                     const before = fs.statSync(file, { bigint: true });
-                    fs.writeFileSync(file, 'id\n3\n4');
-                    fs.utimesSync(file, new Date(0), new Date(0));
-                    const after = fs.statSync(file, { bigint: true });
+                    let after = before;
+                    // A file's change time moves with the system clock's tick,
+                    // up to 15.6 ms on Windows: a rewrite within the tick of the
+                    // file's last change leaves it where it was. Rewrite until
+                    // the clock has moved on.
+                    const pause = new Int32Array(new SharedArrayBuffer(4));
+                    for (let attempt = 0; attempt < 50 && after.ctimeNs === before.ctimeNs; attempt++) {
+                        if (attempt > 0) Atomics.wait(pause, 0, 0, 5);
+                        fs.writeFileSync(file, 'id\n3\n4');
+                        fs.utimesSync(file, new Date(0), new Date(0));
+                        after = fs.statSync(file, { bigint: true });
+                    }
                     assert.equal(after.size, before.size);
                     assert.equal(after.mtimeNs, before.mtimeNs);
                     assert.notEqual(after.ctimeNs, before.ctimeNs);
@@ -294,7 +304,7 @@ for (const change of ['truncated', 'overwritten with restored mtime'] as const) 
     });
 }
 
-it('import command keeps the held descriptor when the selected source symlink is retargeted', async () => {
+it('import command keeps the held descriptor when the selected source symlink is retargeted', { skip: NO_FILE_SYMLINKS }, async () => {
     let selected = '';
     await runWizard('wasm', {
         source: 'id\n1\n2',

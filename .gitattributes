@@ -1,0 +1,9 @@
+# Text files are checked out with LF on every platform, whatever
+# core.autocrlf says. The build compares hashes of source files with
+# vendor/query-plan-manifest.json, and tests read source text, so the bytes
+# must not depend on the checkout.
+* text=auto eol=lf
+
+# Windows batch files keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

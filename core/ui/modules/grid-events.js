@@ -24,7 +24,13 @@ import {
 } from './grid-actions.js';
 import { openCellPreview } from './edit.js';
 import { clearSelection } from './grid-selection.js';
-import { ensureGridRowMaterialized, scheduleVirtualGridUpdate } from './grid-render.js';
+import {
+    ensureGridCellMaterialized,
+    focusGridTabStop,
+    noteGridKeyboardTarget,
+    scheduleVirtualGridUpdate,
+    takeParkedGridFocus
+} from './grid-render.js';
 import { revealGridCell } from './grid-reveal.js';
 import { validateRowId } from './utils.js';
 import { getOrderedColumnIndices, getOrderedRowIndices } from './data-utils.js';
@@ -134,7 +140,13 @@ function handleKeydown(event) {
     );
     if (interactiveControl) return;
 
-    const cell = event.target?.closest?.('.data-cell');
+    // A key the cell branch handles, pressed while focus is on the container,
+    // acts on the cell a window move parked focus from, else on the tab stop.
+    const cell = event.target?.closest?.('.data-cell')
+        ?? (event.key.startsWith('Arrow') || event.key === ' ' || event.key === 'Enter'
+            ? takeParkedGridFocus(event.target)
+                ?? (event.target === event.currentTarget ? focusGridTabStop() : null)
+            : null);
     if (cell && !cell.classList.contains('row-number')) {
         if (state.isGridReloading && (event.key === ' ' || event.key === 'Enter')) {
             event.preventDefault();
@@ -169,6 +181,17 @@ function handleKeydown(event) {
 }
 
 function handleFocusin(event) {
+    const container = event.currentTarget;
+    if (event.target === container) {
+        // The container holds the tab stop only while its cell is out of the
+        // windows. Keyboard focus from outside the grid goes on to that cell;
+        // parking (focus from inside) and a click on empty grid area stay put.
+        if (!container.contains(event.relatedTarget) && container.matches?.(':focus-visible')) {
+            const cell = focusGridTabStop();
+            if (cell) revealGridCell(cell);
+        }
+        return;
+    }
     if (event.target?.classList?.contains('data-cell')
         && !event.target.classList.contains('row-number')) {
         setGridTabstop(event.target, false);
@@ -184,6 +207,7 @@ function setGridTabstop(cell, focus = true) {
     }
     cell.tabIndex = 0;
     cell.dataset.gridTabstop = 'true';
+    noteGridKeyboardTarget(Number(cell.dataset.rowidx), Number(cell.dataset.colidx));
     if (focus) cell.focus?.({ preventScroll: true });
 }
 
@@ -207,7 +231,7 @@ function moveGridCellFocus(event, rowIdx, colIdx) {
     event.stopPropagation();
     const targetRowIdx = rows[rowPosition];
     const targetColIdx = columns[columnPosition];
-    ensureGridRowMaterialized(targetRowIdx);
+    ensureGridCellMaterialized(targetRowIdx, targetColIdx);
     const target = document.getElementById(`cell-${targetRowIdx}-${targetColIdx}`);
     if (!target) return false;
     setGridTabstop(target);

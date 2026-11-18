@@ -606,7 +606,7 @@ async function exportLocalAtomic(
 ): Promise<number> {
   return writeLocalAtomic(fs, uri, sink => streamTableExport(
     document.databaseOperations, tableName, columns, options, sink, cancellation
-  ), cancellation, undefined, confirmReplacement);
+  ), cancellation, exportDestinationValidator(uri, fs), confirmReplacement);
 }
 
 async function writeLocalAtomic(
@@ -818,7 +818,7 @@ async function exportWorkspaceAtomic(
 ): Promise<number> {
   return writeWorkspaceAtomic(uri, sink => streamTableExport(
     document.databaseOperations, tableName, columns, options, sink, cancellation
-  ), cancellation, undefined, confirmReplacement);
+  ), cancellation, exportDestinationValidator(uri, undefined), confirmReplacement);
 }
 
 async function writeWorkspaceAtomic(
@@ -1103,13 +1103,15 @@ export function exportToCsv(columns: string[], rows: CellValue[][], includeHeade
     return typeof value === 'string' ? encodeCsvExportText(value) : String(value);
   };
 
+  // A record of one empty field is written as "", as streamed exports write
+  // it; a blank line would be read as no record at all.
   const lines = [];
   if (includeHeader) {
-    lines.push(columns.map(encodeCsvExportText).join(','));
+    lines.push(columns.map(encodeCsvExportText).join(',') || '""');
   }
 
   rows.forEach(row => {
-    lines.push(row.map(escapeCsvValue).join(','));
+    lines.push(row.map(escapeCsvValue).join(',') || '""');
   });
 
   return lines.join('\n');

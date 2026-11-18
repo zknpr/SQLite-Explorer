@@ -187,7 +187,9 @@ async function prepareState(columns: Array<{ name: string; type: string }>) {
     state.tableColumns = columns;
     state.gridData = [];
     state.currentPageIndex = 0;
-    state.rowsPerPage = 500;
+    // The mocks return one row, which fills a one-row first page, so each load
+    // still requests its count and holds the reload guard while counting.
+    state.rowsPerPage = 1;
     state.totalPageCount = 1;
     state.columnFilters = {};
     state.filterQuery = '';
@@ -347,6 +349,49 @@ describe('filter controls', () => {
             );
             assert.strictEqual(state.isGridReloading, false);
             assert.strictEqual(globalInput.value, '');
+        } finally {
+            backendApi.fetchTableCount = originalFetchCount;
+            backendApi.fetchTableData = originalFetchData;
+            timers.restore();
+        }
+    });
+
+    it('gives focus back after a debounced load only when the filter still has it or the reload dropped it', async () => {
+        const timers = installTimerHarness();
+        const { globalInput } = installFilterDocument();
+        const state = await prepareState([{ name: 'value', type: 'TEXT' }]);
+        const { backendApi } = await import(apiModulePath);
+        const originalFetchCount = backendApi.fetchTableCount;
+        const originalFetchData = backendApi.fetchTableData;
+        backendApi.fetchTableCount = async () => 1;
+        backendApi.fetchTableData = async () => ({ rows: [['hit']] });
+        const doc = (globalThis as any).document;
+        const body = { tagName: 'BODY' };
+        doc.body = body;
+        // An inline cell editor opened during the debounce.
+        const editor = { tagName: 'TEXTAREA', classList: createClassList(['cell-input']) };
+        const { onFilterInput } = await import(gridActionsModulePath);
+
+        const typeAndLoad = async (value: string, activeElement: any) => {
+            globalInput.value = value;
+            doc.activeElement = globalInput;
+            onFilterInput({ target: globalInput, isComposing: false });
+            doc.activeElement = activeElement;
+            await timers.run(300);
+            assert.strictEqual(state.filterPendingAction, null);
+        };
+
+        try {
+            await typeAndLoad('a', editor);
+            assert.strictEqual(globalInput.focusCount, 0, 'the editor keeps focus');
+            assert.strictEqual(doc.activeElement, editor);
+
+            await typeAndLoad('ab', body);
+            assert.strictEqual(globalInput.focusCount, 1, 'focus the reload dropped returns to the filter');
+            assert.strictEqual(doc.activeElement, globalInput);
+
+            await typeAndLoad('abc', globalInput);
+            assert.strictEqual(globalInput.focusCount, 2, 'a filter that kept focus keeps it');
         } finally {
             backendApi.fetchTableCount = originalFetchCount;
             backendApi.fetchTableData = originalFetchData;

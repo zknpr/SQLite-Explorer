@@ -182,7 +182,23 @@ export function encodeJsonExportCell(cell: ExportEncodingCell): string {
 export function encodeSqlExportCell(cell: ExportEncodingCell): string {
   const unrepresentableText = encodeUnrepresentableText(cell, 'sql');
   if (unrepresentableText !== undefined) return unrepresentableText;
-  return cell.storageClass === 'integer'
-    ? canonicalIntegerText(cell.value)
-    : cellValueToSql(cell.value);
+  if (cell.storageClass === 'integer') return canonicalIntegerText(cell.value);
+  if (cell.storageClass === 'real') return realSqlLiteral(cell.value);
+  return cellValueToSql(cell.value);
+}
+
+/**
+ * A literal SQLite reads back as the same REAL. A whole value keeps a decimal
+ * point, or `5` would come back INTEGER in a column without REAL affinity,
+ * and infinities are written as SQLite's .dump writes them.
+ */
+function realSqlLiteral(value: CellValue): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    throw new Error('A REAL export cell must hold a number');
+  }
+  if (value === Number.POSITIVE_INFINITY) return '1e999';
+  if (value === Number.NEGATIVE_INFINITY) return '-1e999';
+  if (Object.is(value, -0)) return '-0.0';
+  const text = String(value);
+  return /[.eE]/.test(text) ? text : `${text}.0`;
 }

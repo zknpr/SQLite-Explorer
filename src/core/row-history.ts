@@ -10,6 +10,7 @@ import {
   type StoredCellSqlFragment
 } from './cell-history';
 import { foldSqliteIdentifier } from './integer-utils';
+import { joinExpressionTerms } from './sql-utils';
 
 export const ROW_HISTORY_CONFLICT_MESSAGE =
   'Row changed outside SQLite Explorer history; undo/redo was not applied.';
@@ -33,6 +34,23 @@ export class LegacyRowHistoryError extends Error {
     super(LEGACY_ROW_HISTORY_MESSAGE);
     this.name = 'LegacyRowHistoryError';
   }
+}
+
+/**
+ * Columns one row-history SELECT reads. SQLite caps a result set at 2,000
+ * columns in both engines' builds, and buildStoredCellStateProjection returns
+ * two per column beside an optional rowid.
+ */
+const ROW_HISTORY_COLUMNS_PER_SELECT = 999;
+
+/** A row's columns in SELECT-sized chunks: the whole list up to one SELECT. */
+export function chunkRowHistoryColumns(columns: readonly string[]): string[][] {
+  if (columns.length <= ROW_HISTORY_COLUMNS_PER_SELECT) return [[...columns]];
+  const chunks: string[][] = [];
+  for (let start = 0; start < columns.length; start += ROW_HISTORY_COLUMNS_PER_SELECT) {
+    chunks.push(columns.slice(start, start + ROW_HISTORY_COLUMNS_PER_SELECT));
+  }
+  return chunks;
 }
 
 export interface RowHistoryState {
@@ -74,16 +92,18 @@ export function rowHistoryStates(snapshot: DeletedRow): RowHistoryState[] {
   });
 }
 
+/** `states` is rowHistoryStates(snapshot), when the caller already has it. */
 export function buildRowHistoryPredicate(
   snapshot: DeletedRow,
-  bindPlaceholder: (value: CellValue) => string = () => '?'
+  bindPlaceholder: (value: CellValue) => string = () => '?',
+  states: readonly RowHistoryState[] = rowHistoryStates(snapshot)
 ): StoredCellSqlFragment {
-  const predicates = rowHistoryStates(snapshot).map(({ column, state }) => (
+  const predicates = states.map(({ column, state }) => (
     buildStoredCellPredicate(column, state, bindPlaceholder)
   ));
   return {
     sql: predicates.length > 0
-      ? predicates.map(predicate => `(${predicate.sql})`).join(' AND ')
+      ? joinExpressionTerms(predicates.map(predicate => `(${predicate.sql})`), 'AND')
       : '1',
     params: predicates.flatMap(predicate => predicate.params)
   };
@@ -91,9 +111,10 @@ export function buildRowHistoryPredicate(
 
 export function buildRowHistoryWrites(
   snapshot: DeletedRow,
-  bindPlaceholder: (value: CellValue) => string = () => '?'
+  bindPlaceholder: (value: CellValue) => string = () => '?',
+  states: readonly RowHistoryState[] = rowHistoryStates(snapshot)
 ): Array<{ column: string; write: StoredCellSqlFragment }> {
-  return rowHistoryStates(snapshot).map(({ column, state }) => ({
+  return states.map(({ column, state }) => ({
     column,
     write: buildStoredCellWrite(state, bindPlaceholder)
   }));

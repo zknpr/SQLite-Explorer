@@ -58,7 +58,12 @@ import type {
 import type { PagedWritableOverlaySnapshot } from './core/paged-writable-overlay';
 
 import { Worker } from './platform/threadPool';
-import type { DatabaseConnectionBundle } from './connectionTypes';
+import type { DatabaseConnectionBundle, EstablishedDatabaseConnection } from './connectionTypes';
+import {
+  WASM_ONLY_VIRTUAL_TABLE_MODULES,
+  type ModuleCheckResult,
+  type ModuleTable
+} from './core/virtual-table-modules';
 import { getMaximumFileSizeBytes, getQueryTimeout } from './config';
 import { createWorkerEndpoint } from './core/sqlite-db';
 import { getNodeFs } from './core/platform/fs';
@@ -68,11 +73,13 @@ import { writePagedWritableOverlayToFile } from './pagedWritableSave';
 import { canPersistLocalDatabase } from './fileWritability';
 import { DatabaseFileSizeLimitError } from './databaseFileSizeLimit';
 import { plainNotificationText } from './notificationText';
+import { isReadStatement } from './core/read-statement';
 
 // Native worker support (only in Node.js environment)
 let nativeSupport: {
   isNativeAvailable: (path: string) => Promise<boolean>;
   createNativeDatabaseConnection: typeof import('./nativeWorker').createNativeDatabaseConnection;
+  nativeRequestsWrittenByV8: typeof import('./nativeWorker').nativeRequestsWrittenByV8;
 } | null = null;
 
 type DesktopTestBackend = 'native' | 'wasm';
@@ -85,6 +92,11 @@ export function setDesktopTestDatabaseBackend(backend: DesktopTestBackend | unde
     throw new Error(`Unsupported desktop test backend: ${String(backend)}`);
   }
   desktopTestBackend = backend;
+}
+
+/** For the integration API: how many requests to the native engine the editor's V8 wrote, where the extension writes them itself. */
+export function nativeRequestsLeftToV8(): number {
+  return nativeSupport?.nativeRequestsWrittenByV8.count ?? 0;
 }
 
 /** Set only by the non-production integration API; normal paging policy is unchanged. */
@@ -141,7 +153,7 @@ interface WorkerMethods {
   ): Promise<CellReadChunk>;
   closeCellReadSession(sessionId: string): Promise<void>;
   openQueryReadSession(sql: string): Promise<QueryReadSession>;
-  readQueryRows(sessionId: string, maxRows: number): Promise<QueryReadChunk>;
+  readQueryRows(sessionId: string, maxRows: number, maxBytes?: number): Promise<QueryReadChunk>;
   closeQueryReadSession(sessionId: string): Promise<void>;
   exportDatabase(): Promise<Uint8Array>;
   exportPagedWritableOverlay(): Promise<PagedWritableOverlaySnapshot>;
@@ -177,6 +189,12 @@ interface WorkerMethods {
     maxEditValueBytes?: number,
     maxUndoSnapshotBytes?: number
   ): Promise<DeletedRow>;
+  insertRowsWithHistory(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
   insertRowBatch(
     table: string,
     rows: Record<string, CellValue>[],
@@ -236,6 +254,7 @@ interface WorkerMethods {
   ): Promise<ColumnDropTableState>;
   fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
   fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult>;
+  prepareCellHelpers(): Promise<boolean>;
   fetchSchema(): Promise<SchemaSnapshot>;
   getTableInfo(table: string): Promise<ColumnMetadata[]>;
   getPragmas(): Promise<Record<string, CellValue>>;
@@ -268,6 +287,7 @@ const WORKER_METHOD_NAMES = [
   'replaceOversizedCell',
   'insertRow',
   'insertRowWithHistory',
+  'insertRowsWithHistory',
   'insertRowBatch',
   'deleteRows',
   'deleteColumns',
@@ -284,6 +304,7 @@ const WORKER_METHOD_NAMES = [
   'addColumn',
   'fetchTableData',
   'fetchTableCount',
+  'prepareCellHelpers',
   'fetchSchema',
   'getTableInfo',
   'getPragmas',
@@ -368,14 +389,43 @@ function getModificationWorkUnits(modification: ModificationEntry | undefined): 
   return Math.max(1, workUnits);
 }
 
+/**
+ * Reads that the worker runs under its queryTimeout deadline (the engine's
+ * progress handler). Their host deadline must outlast it, or the transport
+ * fails a read the setting allows while the worker keeps running it.
+ */
+const WORKER_READ_METHODS = new Set([
+  'executeReadQuery',
+  'previewViewDefinition',
+  'fetchTableData',
+  'fetchTableCount',
+  'fetchSchema',
+  'getTableInfo',
+  'getPragmas',
+  'readQueryRows'
+]);
+const WORKER_READ_TIMEOUT_MARGIN_MS = 2000;
+
 function getWorkerInvocationTimeout(
   methodName: string,
-  parameters: readonly unknown[]
+  parameters: readonly unknown[],
+  queryTimeout = 0
 ): number {
+  // Only a SELECT sent through runQuery counts as a read, as on native:
+  // writes and savepoint control keep the fixed limit. Reads never drop below
+  // it, because one call can run several statements under their own deadlines.
+  if (WORKER_READ_METHODS.has(methodName)
+    || (methodName === 'runQuery' && typeof parameters[0] === 'string' && isReadStatement(parameters[0]))) {
+    return Math.max(DEFAULT_INVOCATION_TIMEOUT_MS, queryTimeout + WORKER_READ_TIMEOUT_MARGIN_MS);
+  }
   let workUnits: number;
   if (methodName === 'applyModifications' || methodName === 'discardModifications') {
     const modifications = parameters[0];
     workUnits = Array.isArray(modifications) ? Math.max(1, modifications.length) : 1;
+  } else if (methodName === 'insertRowsWithHistory') {
+    // One import batch replaces one guarded insert call per row.
+    const rows = parameters[1];
+    workUnits = Array.isArray(rows) ? Math.max(1, rows.length) : 1;
   } else if (methodName === 'undoModification' || methodName === 'redoModification') {
     const modification = parameters[0] as ModificationEntry | undefined;
     workUnits = getModificationWorkUnits(modification);
@@ -393,11 +443,118 @@ function getWorkerInvocationTimeout(
 // Worker Factory
 // ============================================================================
 
+const MAX_LOGGED_TABLES = 5;
+const MAX_LOGGED_TABLE_NAME_CHARS = 64;
+
+/** Name a few tables for one output line; the names come from the file. */
+function describeTables(tables: readonly ModuleTable[]): string {
+  const names = tables.slice(0, MAX_LOGGED_TABLES).map(({ table }) => JSON.stringify(
+    table.length > MAX_LOGGED_TABLE_NAME_CHARS ? `${table.slice(0, MAX_LOGGED_TABLE_NAME_CHARS)}...` : table
+  ).replace(/[\u007f-\u009f\u2028\u2029]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`));
+  const more = tables.length - names.length;
+  return `${tables.length === 1 ? 'table' : 'tables'} ${names.join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
+}
+
+function moduleNames(tables: readonly ModuleTable[]): string {
+  return [...new Set(tables.map(({ module }) => module))].join(', ');
+}
+
+/**
+ * Open a file with the WebAssembly engine when its schema uses a virtual-table
+ * module that only that engine has (FTS3/FTS4), so those tables can be read and
+ * edited. The native build leaves the modules out because they would parse
+ * index data from the file unsandboxed. The file
+ * stays native, with one output line naming the tables, when it is over the
+ * WebAssembly size limit, when its -wal holds frames the WebAssembly engine
+ * cannot read (it would open a stale read-only copy), or when the WebAssembly
+ * engine cannot open it or load its schema: the native connection is kept
+ * open until both succeed.
+ * A check that cannot finish also keeps native: the native connection then
+ * behaves as it did before this check existed, and its next query reports
+ * the same error.
+ *
+ * @returns The WebAssembly connection, or undefined to keep the native one
+ */
+async function openWithModulesNativeLacks(
+  nativeConnection: EstablishedDatabaseConnection,
+  fileUri: vsc.Uri,
+  displayName: string,
+  openWasm: () => Promise<EstablishedDatabaseConnection>,
+  discardWasm: () => void
+): Promise<EstablishedDatabaseConnection | undefined> {
+  if (!nativeConnection.findTablesWithMissingModules) return undefined;
+  const log = (line: string): undefined => {
+    GlobalOutputChannel?.appendLine(`[SQLite Explorer] ${displayName}: ${line}`);
+    return undefined;
+  };
+  const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+  let result: ModuleCheckResult;
+  try {
+    result = await nativeConnection.findTablesWithMissingModules(WASM_ONLY_VIRTUAL_TABLE_MODULES);
+  } catch (error) {
+    return log(`could not check the schema for virtual-table modules the native SQLite engine lacks (${describeError(error)}); using the native engine.`);
+  }
+  if (!result.checked) {
+    return log(`did not check which virtual tables use ${WASM_ONLY_VIRTUAL_TABLE_MODULES.join(', ')}: ${result.reason}. Using the native engine, which does not include them.`);
+  }
+  if (result.tables.length === 0) return undefined;
+
+  const subject = `${describeTables(result.tables)} ${result.tables.length === 1 ? 'uses' : 'use'} `
+    + `${moduleNames(result.tables)}, which the native SQLite engine does not include`;
+  const stayNative = (reason: string): undefined => log(
+    `${subject}. ${reason}, so the file stays on the native engine and those tables will not open.`
+  );
+  const maxSize = getMaximumFileSizeBytes();
+  let size: number;
+  try {
+    size = (await vsc.workspace.fs.stat(fileUri)).size;
+  } catch (error) {
+    return stayNative(`Its size could not be read (${describeError(error)})`);
+  }
+  // The same gate the WebAssembly open enforces (0 is unlimited).
+  if (maxSize !== 0 && size > maxSize) {
+    return stayNative(
+      `The file (${(size / (2 ** 20)).toFixed(2)} MB) is larger than sqliteExplorer.maxFileSize `
+      + `(${(maxSize / (2 ** 20)).toFixed(2)} MB), which bounds the WebAssembly engine`
+    );
+  }
+  if (await statWalSize(fileUri) > WAL_HEADER_SIZE_BYTES) {
+    return stayNative('Its -wal file holds changes the WebAssembly engine cannot read');
+  }
+  let wasmConnection: EstablishedDatabaseConnection;
+  try {
+    wasmConnection = await openWasm();
+  } catch (error) {
+    return stayNative(`The WebAssembly engine could not open it (${describeError(error)})`);
+  }
+  try {
+    // SQLite reads the schema for the first statement that needs it, not at
+    // the open, and the WebAssembly build refuses some schemas the native
+    // build accepts (a libm math function in an index). Every statement
+    // would then fail, where native still reads the file's ordinary tables.
+    await wasmConnection.databaseOps.executeQuery('SELECT 1 FROM sqlite_schema LIMIT 0');
+  } catch (error) {
+    try {
+      discardWasm();
+    } catch (releaseError) {
+      log(`could not release the WebAssembly worker (${describeError(releaseError)}).`);
+    }
+    return stayNative(`The WebAssembly engine could not load its schema (${describeError(error)})`);
+  }
+
+  // The WebAssembly build has every module the native build has, so the move
+  // loses no table (native_module_fallback.test.ts compares the two builds).
+  log(`${subject}; opening it with the WebAssembly engine.`);
+  return wasmConnection;
+}
+
 /**
  * Create a database connection bundle.
  *
  * Attempts to use native SQLite (txiki-js) for better performance.
- * Falls back to sql.js (WebAssembly) when native is unavailable or fails.
+ * Falls back to sql.js (WebAssembly) when native is unavailable or fails, and
+ * moves a file whose schema uses FTS3/FTS4 to it (openWithModulesNativeLacks).
  *
  * IMPORTANT: The fallback to WASM happens at bundle creation time. If native
  * backend creation succeeds but file open fails later (e.g., due to macOS
@@ -438,6 +595,10 @@ export async function createDatabaseConnection(
         let nativeDisposed = false;
         let wasmDisposed = false;
         let wrapperDisposed = false;
+        // Set once an open moved to WebAssembly by choice rather than failure,
+        // so a later open through this bundle (a failed hot-exit replay reopens
+        // read-only) lands on the same engine.
+        let movedToWasm = false;
 
         const disposeNative = (): void => {
           if (nativeDisposed) return;
@@ -448,6 +609,17 @@ export async function createDatabaseConnection(
           if (!wasmBundle || wasmDisposed) return;
           wasmDisposed = true;
           wasmBundle.workerMethods[Symbol.dispose]();
+        };
+        // Release a WebAssembly worker that will not be used, with its copy of
+        // the file. A later open through this bundle starts a new one.
+        const discardWasm = (): void => {
+          try {
+            disposeWasm();
+          } finally {
+            wasmBundlePromise = undefined;
+            wasmBundle = null;
+            wasmDisposed = false;
+          }
         };
         const getWasmBundle = async (): Promise<DatabaseConnectionBundle> => {
           if (wrapperDisposed) throw new Error('Database connection bundle has been disposed');
@@ -501,12 +673,22 @@ export async function createDatabaseConnection(
 
         return {
           workerMethods,
-          async establishConnection(fileUri, displayName, forceReadOnly, autoCommit) {
+          async establishConnection(fileUri, displayName, forceReadOnly, autoCommit, backupEngine) {
             if (wrapperDisposed) throw new Error('Database connection bundle has been disposed');
+            if (desktopTestBackend !== 'native' && (movedToWasm || backupEngine === 'wasm')) {
+              // A WebAssembly backup's unsaved edits exist only in it, so its
+              // restore must not land on native, which would drop them.
+              const connection = await (await getWasmBundle())
+                .establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
+              movedToWasm = true;
+              disposeNative();
+              return connection;
+            }
+            let nativeConnection: EstablishedDatabaseConnection;
             try {
               // Native opens do not buffer the database. WASM fallback keeps
               // its own configured size checks if the native open fails.
-              return await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
+              nativeConnection = await nativeBundle.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             } catch (nativeErr) {
               disposeNative();
               if (desktopTestBackend === 'native') {
@@ -517,6 +699,32 @@ export async function createDatabaseConnection(
               const fallback = await getWasmBundle();
               return fallback.establishConnection(fileUri, displayName, forceReadOnly, autoCommit);
             }
+            // A native backup's edits are in the file already; replaying them
+            // on WebAssembly would apply them twice.
+            if (desktopTestBackend === 'native' || backupEngine === 'native') return nativeConnection;
+            const wasmConnection = await openWithModulesNativeLacks(
+              nativeConnection,
+              fileUri,
+              displayName,
+              async () => (await getWasmBundle()).establishConnection(fileUri, displayName, forceReadOnly, autoCommit),
+              discardWasm
+            );
+            if (!wasmConnection) return nativeConnection;
+            movedToWasm = true;
+            // Stopping the worker kills its process, which keeps its lock on
+            // a WAL database until it has exited: a save made at once then
+            // found the file locked. Closing the database releases the lock
+            // first and removes the -wal and -shm the open created.
+            try {
+              await nativeConnection.closeDatabase?.();
+            } catch (error) {
+              GlobalOutputChannel?.appendLine(
+                `[SQLite Explorer] ${displayName}: the native engine could not close the database before stopping `
+                + `(${error instanceof Error ? error.message : String(error)}).`
+              );
+            }
+            disposeNative();
+            return wasmConnection;
           }
         };
       } catch (err) {
@@ -643,8 +851,8 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.closeCellReadSession(sessionId),
         openQueryReadSession: (sql: string) =>
           endpoint.openQueryReadSession(sql),
-        readQueryRows: (sessionId: string, maxRows: number) =>
-          endpoint.readQueryRows(sessionId, maxRows),
+        readQueryRows: (sessionId: string, maxRows: number, maxBytes?: number) =>
+          endpoint.readQueryRows(sessionId, maxRows, maxBytes),
         closeQueryReadSession: (sessionId: string) =>
           endpoint.closeQueryReadSession(sessionId),
         // In-process facade plumbing; persistence policy belongs to the caller.
@@ -704,6 +912,17 @@ async function createInProcessWasmDatabaseConnection(
         ) => endpoint.insertRowWithHistory(
           table,
           data,
+          maxEditValueBytes,
+          maxUndoSnapshotBytes
+        ),
+        insertRowsWithHistory: (
+          table: string,
+          rows: Record<string, CellValue>[],
+          maxEditValueBytes?: number,
+          maxUndoSnapshotBytes?: number
+        ) => endpoint.insertRowsWithHistory(
+          table,
+          rows,
           maxEditValueBytes,
           maxUndoSnapshotBytes
         ),
@@ -781,6 +1000,7 @@ async function createInProcessWasmDatabaseConnection(
           endpoint.fetchTableData(table, options),
         fetchTableCount: (table: string, options: TableCountOptions) =>
           endpoint.fetchTableCount(table, options),
+        prepareCellHelpers: () => endpoint.prepareCellHelpers(),
         fetchSchema: () =>
           endpoint.fetchSchema(),
         getTableInfo: (table: string) =>
@@ -817,6 +1037,9 @@ async function createWorkerBackedWasmDatabaseConnection(
   const workerScriptPath = path.resolve(__dirname, './worker.cjs');
   const workerThread: InstanceType<typeof Worker> = new Worker(workerScriptPath);
   let terminationError: Error | undefined;
+  // The engine's read deadline is the queryTimeout it was opened with, not
+  // the current setting.
+  let workerQueryTimeout = 0;
 
   // Create IPC proxy for Node.js worker communication
   // Route worker log messages to the VS Code output channel for visibility.
@@ -842,7 +1065,7 @@ async function createWorkerBackedWasmDatabaseConnection(
     },
     COMPLETE_WORKER_METHOD_NAMES,
     forwardWorkerLog,
-    getWorkerInvocationTimeout
+    (methodName, parameters) => getWorkerInvocationTimeout(methodName, parameters, workerQueryTimeout)
   );
 
   // Termination handler
@@ -978,6 +1201,7 @@ async function createWorkerBackedWasmDatabaseConnection(
             transferables.push(initConfig.wasmBinary.buffer);
         }
 
+        workerQueryTimeout = initConfig.queryTimeout ?? 0;
         const result = await workerProxy.initializeDatabase(
             displayName,
             new Transfer(initConfig, transferables) as unknown as DatabaseInitConfig
@@ -1077,8 +1301,8 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.closeCellReadSession(sessionId),
           openQueryReadSession: (sql: string) =>
             workerProxy.openQueryReadSession(sql),
-          readQueryRows: (sessionId: string, maxRows: number) =>
-            workerProxy.readQueryRows(sessionId, maxRows),
+          readQueryRows: (sessionId: string, maxRows: number, maxBytes?: number) =>
+            workerProxy.readQueryRows(sessionId, maxRows, maxBytes),
           closeQueryReadSession: (sessionId: string) =>
             workerProxy.closeQueryReadSession(sessionId),
           // Worker facade plumbing; persistence policy belongs to the caller.
@@ -1150,6 +1374,26 @@ async function createWorkerBackedWasmDatabaseConnection(
             return workerProxy.insertRowWithHistory(
               table,
               wrappedData,
+              maxEditValueBytes,
+              maxUndoSnapshotBytes
+            );
+          },
+          insertRowsWithHistory: (
+            table: string,
+            rows: Record<string, CellValue>[],
+            maxEditValueBytes?: number,
+            maxUndoSnapshotBytes?: number
+          ) => {
+            const wrappedRows = rows.map(data => {
+              const wrappedData = Object.create(null) as Record<string, CellValue>;
+              for (const key of Object.keys(data)) {
+                wrappedData[key] = wrapForTransfer(data[key]);
+              }
+              return wrappedData;
+            });
+            return workerProxy.insertRowsWithHistory(
+              table,
+              wrappedRows,
               maxEditValueBytes,
               maxUndoSnapshotBytes
             );
@@ -1250,6 +1494,7 @@ async function createWorkerBackedWasmDatabaseConnection(
             workerProxy.fetchTableData(table, options),
           fetchTableCount: (table: string, options: TableCountOptions) =>
             workerProxy.fetchTableCount(table, options),
+          prepareCellHelpers: () => workerProxy.prepareCellHelpers(),
           fetchSchema: () =>
             workerProxy.fetchSchema(),
           getTableInfo: (table: string) =>

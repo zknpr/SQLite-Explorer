@@ -24,6 +24,8 @@ import {
     inspectCsvTextChunk
 } from '../../src/core/export-encoding';
 import { serializeOperations } from '../../src/core/operation-serializer';
+import { parseImport } from '../../src/core/bulk-import';
+import { NO_FILE_SYMLINKS } from './helpers/symlinks';
 
 async function collectStreamingExport(
     operations: DatabaseOperations,
@@ -501,7 +503,7 @@ describe('streamTableExport golden parity', () => {
                 sql.content,
                 'INSERT INTO "stage_e_golden" ("id", "name", "note", "payload", "nul", "nullable") ' +
                 'VALUES (1, \'Alice\', \'comma, "quote"\nline\', X\'000102fdfeff\', ' +
-                'CAST(X\'6265666f7265006166746572\' AS TEXT), NULL);\n' +
+                '(\'before\' || char(0) || \'after\'), NULL);\n' +
                 'INSERT INTO "stage_e_golden" ("id", "name", "note", "payload", "nul", "nullable") ' +
                 'VALUES (2, \'O\'\'Reilly 😀\', \'plain\', X\'\', \'ok\', 3.5);'
             );
@@ -655,7 +657,73 @@ describe('streamTableExport golden parity', () => {
     });
 });
 
+describe('CSV exports import back with every row', () => {
+    it('writes a record of one empty field as "" instead of a blank line', async () => {
+        const database = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+        const operations = database.operations!;
+        try {
+            await operations.executeQuery(
+                'CREATE TABLE single (a); CREATE TABLE lone (a); CREATE TABLE pair (a, b); CREATE TABLE unnamed (""); ' +
+                "INSERT INTO single VALUES (NULL), ('x'), (''), ('y'), (NULL); INSERT INTO lone VALUES (NULL); " +
+                "INSERT INTO pair VALUES ('x', 'y'), (NULL, ''); INSERT INTO unnamed VALUES ('x')"
+            );
+            const csv = async (table: string, columns: string[], options: ExportOptions) => (
+                await collectStreamingExport(operations, table, columns, options)
+            ).content;
+
+            const single = await csv('single', ['a'], { format: 'csv', header: true });
+            assert.deepStrictEqual(
+                parseImport(single, 'csv').rows,
+                [{ a: '' }, { a: 'x' }, { a: '' }, { a: 'y' }, { a: '' }]
+            );
+            assert.strictEqual(single, 'a\n""\nx\n""\ny\n""');
+            assert.strictEqual(single, exportToCsv(['a'], [[null], ['x'], [''], ['y'], [null]], true));
+            assert.strictEqual(await csv('single', ['a'], { format: 'csv', header: false }), '""\nx\n""\ny\n""');
+            assert.strictEqual(await csv('single', ['a'], { format: 'excel', header: true }), `﻿${single}`);
+            assert.deepStrictEqual(
+                parseImport(await csv('lone', ['a'], { format: 'csv', header: true }), 'csv').rows,
+                [{ a: '' }]
+            );
+
+            // Two empty fields are already a comma, and stay unquoted.
+            const pair = await csv('pair', ['a', 'b'], { format: 'csv', header: true });
+            assert.strictEqual(pair, 'a,b\nx,y\n,');
+            assert.strictEqual(parseImport(pair, 'csv').rows.length, 2);
+
+            // A header of one empty column name follows the same rule.
+            const unnamed = await csv('unnamed', [''], { format: 'csv', header: true });
+            assert.strictEqual(unnamed, '""\nx');
+            assert.strictEqual(unnamed, exportToCsv([''], [['x']], true));
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+});
+
 describe('streamTableExport wide and selected-row batching', () => {
+    it('keeps cell order when a streamed cell sits between inline cells', async () => {
+        const database = await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false });
+        const operations = database.operations!;
+        const big = 'L'.repeat(70 * 1024);
+        await operations.executeQuery('CREATE TABLE mixed_cells (a TEXT, big TEXT, b INTEGER, payload BLOB)');
+        await operations.executeQuery(
+            "INSERT INTO mixed_cells VALUES ('x,y', ?, 5, x'0102'), ('plain', 'short', 6, zeroblob(70000))",
+            [big]
+        );
+        const columns = ['a', 'big', 'b', 'payload'];
+        const zeros = 'A'.repeat(Math.floor(70000 / 3) * 4) + 'AA==';
+        const csv = await collectStreamingExport(operations, 'mixed_cells', columns, { format: 'csv', header: true } as ExportOptions);
+        assert.strictEqual(csv.content, `a,big,b,payload\n"x,y",${big},5,[BLOB]\nplain,short,6,[BLOB]`);
+        const json = await collectStreamingExport(operations, 'mixed_cells', columns, { format: 'json' } as ExportOptions);
+        assert.strictEqual(json.content,
+            `[\n  {\n    "a": "x,y",\n    "big": "${big}",\n    "b": 5,\n    "payload": "AQI="\n  },` +
+            `\n  {\n    "a": "plain",\n    "big": "short",\n    "b": 6,\n    "payload": "${zeros}"\n  }\n]`);
+        const sql = await collectStreamingExport(operations, 'mixed_cells', columns, { format: 'sql', includeTableName: true } as ExportOptions);
+        assert.strictEqual(sql.content,
+            `INSERT INTO "mixed_cells" ("a", "big", "b", "payload") VALUES ('x,y', '${big}', 5, X'0102');\n` +
+            `INSERT INTO "mixed_cells" ("a", "big", "b", "payload") VALUES ('plain', 'short', 6, X'${'00'.repeat(70000)}');`);
+    });
+
     it('bounds packed inline bytes before a stable export query reaches the host', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -1340,6 +1408,54 @@ describe('streamTableExport cell boundaries', () => {
         }
     });
 
+    it('exports small BLOBs of rowid and primary-key tables without a read session per cell', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE blob_rows (id INTEGER PRIMARY KEY, digest BLOB, body BLOB)');
+        await operations.executeQuery('CREATE TABLE blob_keys (k TEXT PRIMARY KEY, digest BLOB) WITHOUT ROWID');
+        await operations.executeQuery("INSERT INTO blob_rows VALUES (1, X'00FF10', zeroblob(200000)), (2, X'', NULL), (3, X'CAFE', X'01')");
+        await operations.executeQuery("INSERT INTO blob_keys VALUES ('a', X'00FF10'), ('b', X'')");
+        const sessions: string[] = [];
+        const counting = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (property === 'openCellReadSession') {
+                    return async (cellTarget: Parameters<DatabaseOperations['openCellReadSession']>[0]) => {
+                        sessions.push(`${cellTarget.table}.${cellTarget.column}`);
+                        return target.openCellReadSession(cellTarget);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const sql = await collectStreamingExport(counting, 'blob_rows', ['id', 'digest', 'body'], { format: 'sql' });
+            assert.ok(sql.content.includes("VALUES (1, X'00ff10', X'0000"), sql.content.slice(0, 200));
+            assert.ok(sql.content.includes("VALUES (2, X'', NULL);"));
+            assert.ok(sql.content.includes("VALUES (3, X'cafe', X'01');"));
+            // Only the 200,000-byte value is past a batch's per-cell share.
+            assert.deepStrictEqual(sessions, ['blob_rows.body']);
+
+            sessions.length = 0;
+            const json = await collectStreamingExport(counting, 'blob_rows', ['id', 'digest'], { format: 'json' });
+            assert.deepStrictEqual(
+                JSON.parse(json.content).map((row: { digest: string }) => row.digest),
+                ['AP8Q', '', 'yv4=']
+            );
+            const keyed = await collectStreamingExport(counting, 'blob_keys', ['k', 'digest'], { format: 'sql' });
+            assert.ok(keyed.content.includes("VALUES ('a', X'00ff10');"));
+            assert.ok(keyed.content.includes("VALUES ('b', X'');"));
+            assert.deepStrictEqual(sessions, []);
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
     it('awaits each sink emission before producing the next chunk', async () => {
         const database = await createDatabaseEngine({
             content: null,
@@ -1402,6 +1518,7 @@ describe('streamTableExport cell boundaries', () => {
         let openedQuerySessions = 0;
         let closedQuerySessions = 0;
         const queryReadLimits: number[] = [];
+        const queryReadByteLimits: Array<number | undefined> = [];
         const recordingOperations = new Proxy(operations, {
             get(target, property, receiver) {
                 if (property === 'openQueryReadSession') {
@@ -1411,9 +1528,10 @@ describe('streamTableExport cell boundaries', () => {
                     };
                 }
                 if (property === 'readQueryRows') {
-                    return async (sessionId: string, maxRows: number) => {
+                    return async (sessionId: string, maxRows: number, maxBytes?: number) => {
                         queryReadLimits.push(maxRows);
-                        return target.readQueryRows!(sessionId, maxRows);
+                        queryReadByteLimits.push(maxBytes);
+                        return target.readQueryRows!(sessionId, maxRows, maxBytes);
                     };
                 }
                 if (property === 'closeQueryReadSession') {
@@ -1439,8 +1557,11 @@ describe('streamTableExport cell boundaries', () => {
             assert.strictEqual(invocations, 3, 'the view must have one SQLite evaluation pass');
             assert.strictEqual(openedQuerySessions, 1);
             assert.strictEqual(closedQuerySessions, 1);
-            assert.ok(queryReadLimits.length >= 3);
-            assert.ok(queryReadLimits.every(limit => limit === 1));
+            // Rows are read in batches; a byte limit bounds each one because a
+            // view's row can hold a megabyte per column.
+            assert.ok(queryReadLimits.length >= 1);
+            assert.ok(queryReadLimits.every(limit => limit === 128));
+            assert.ok(queryReadByteLimits.every(limit => limit === 16 * 1024 * 1024));
 
             invocations = 0;
             const spoolFallbackOperations = new Proxy(operations, {
@@ -1465,6 +1586,65 @@ describe('streamTableExport cell boundaries', () => {
             assert.strictEqual(fallbackExport.content, 'id\n3\n1\n2');
             assert.strictEqual(fallbackExport.rowCount, 3);
             assert.strictEqual(invocations, 3, 'the spool fallback must also evaluate the view once');
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('reads a view export spool in batches bounded by bytes, not one row per query', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery('CREATE TABLE spool_rows (id INTEGER PRIMARY KEY, label TEXT, body TEXT, digest BLOB)');
+        await operations.executeQuery(
+            'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) ' +
+            "INSERT INTO spool_rows SELECT i, 'row ' || i, NULL, randomblob(i % 9) FROM n"
+        );
+        // Twenty rows of 900,000 bytes each pack to 1.8 MB apiece: more than
+        // one 16 MiB batch, so the size query has to split them.
+        await operations.executeQuery(
+            "UPDATE spool_rows SET body = hex(zeroblob(450000)) WHERE id BETWEEN 140 AND 159"
+        );
+        await operations.executeQuery('CREATE VIEW spool_view AS SELECT * FROM spool_rows');
+        const spoolReads: string[] = [];
+        const spoolOperations = new Proxy(operations, {
+            get(target, property, receiver) {
+                if (
+                    property === 'openQueryReadSession'
+                    || property === 'readQueryRows'
+                    || property === 'closeQueryReadSession'
+                ) {
+                    return undefined;
+                }
+                if (property === 'executeQuery') {
+                    return async (...args: Parameters<DatabaseOperations['executeQuery']>) => {
+                        if (/^SELECT CAST\(rowid AS TEXT\)/.test(args[0])) spoolReads.push(args[0]);
+                        return target.executeQuery(...args);
+                    };
+                }
+                const value = Reflect.get(target, property, receiver);
+                return typeof value === 'function' ? value.bind(target) : value;
+            }
+        });
+
+        try {
+            const columns = ['id', 'label', 'body', 'digest'];
+            for (const format of ['json', 'sql', 'csv'] as const) {
+                spoolReads.length = 0;
+                const viaSessions = await collectStreamingExport(operations, 'spool_view', columns, { format });
+                const viaSpool = await collectStreamingExport(spoolOperations, 'spool_view', columns, { format });
+                assert.strictEqual(viaSpool.rowCount, 300);
+                assert.strictEqual(viaSpool.content, viaSessions.content, format);
+                const sizeQueries = spoolReads.filter(sql => sql.includes('"__export_row_bytes" FROM'));
+                const rowQueries = spoolReads.filter(sql => sql.includes('AND rowid <= ?'));
+                assert.strictEqual(sizeQueries.length + rowQueries.length, spoolReads.length, 'no single-row reads');
+                // 300 rows in runs of at most 128, with the large rows split further.
+                assert.ok(rowQueries.length >= 5 && rowQueries.length <= 12, `row queries: ${rowQueries.length}`);
+                assert.strictEqual(sizeQueries.length, rowQueries.length + 1);
+            }
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
         }
@@ -1763,6 +1943,46 @@ describe('streamTableExport cell boundaries', () => {
                 'id,value\n9007199254740993,selected'
             );
             assert.strictEqual(exported.rowCount, 1);
+        } finally {
+            (operations as WasmDatabaseEngine).shutdown();
+        }
+    });
+
+    it('exports only the selected INTEGER key beside its numeric-looking TEXT twin', async () => {
+        const database = await createDatabaseEngine({
+            content: null,
+            maxSize: 0,
+            readOnlyMode: false
+        });
+        const operations = database.operations!;
+        await operations.executeQuery(
+            'CREATE TABLE stage_e_typeless_twins (' +
+            'id PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO stage_e_typeless_twins VALUES (1, 'integer'), ('1', 'text'), (2, 'other')"
+        );
+        const page = await operations.fetchTableData('stage_e_typeless_twins', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        const identityOf = (label: string) => page.rows.find(row => row[2] === label)![0] as string;
+
+        try {
+            for (const [rowIds, expected] of [
+                [[identityOf('integer')], 'id,value\n1,integer'],
+                [[identityOf('text')], 'id,value\n1,text'],
+                [[identityOf('other'), identityOf('integer')], 'id,value\n2,other\n1,integer'],
+                [[identityOf('text'), identityOf('integer')], 'id,value\n1,text\n1,integer']
+            ] as const) {
+                const exported = await collectStreamingExport(
+                    operations,
+                    'stage_e_typeless_twins',
+                    ['id', 'value'],
+                    { format: 'csv', rowIds: [...rowIds] }
+                );
+                assert.strictEqual(exported.content, expected);
+            }
         } finally {
             (operations as WasmDatabaseEngine).shutdown();
         }
@@ -2355,7 +2575,7 @@ describe('exportTableCommand atomic streaming', () => {
         }
     });
 
-    it('writes through an existing destination symlink without replacing the link or target mode', async () => {
+    it('writes through an existing destination symlink without replacing the link or target mode', { skip: NO_FILE_SYMLINKS }, async () => {
         const database = await createDatabaseEngine({
             content: null,
             maxSize: 0,
@@ -2855,7 +3075,7 @@ describe('exportToCsv', () => {
             ['-9223372036854775808', "'-text"],
             ['normal,"quoted"\r\nnext', allIgnorable]
         ]);
-        assert.strictEqual(exportToCsv([], [['']], false), '');
+        assert.strictEqual(exportToCsv([], [['']], false), '""');
         assert.strictEqual(exportToCsv([], [['\r']], false), '"\r"');
         assert.strictEqual(exportToCsv([], [["'=1"]], false), "'=1");
     });

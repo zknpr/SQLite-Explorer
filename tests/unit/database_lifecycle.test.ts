@@ -10,6 +10,7 @@ import type { DatabaseOperations } from '../../src/core/types';
 import { ModificationTracker } from '../../src/core/undo-history';
 import { mockVscode } from './mocks/vscode';
 import { createDeferred } from './helpers/deferred';
+import { NO_FILE_SYMLINKS } from './helpers/symlinks';
 
 type Document = import('../../src/databaseModel').DatabaseDocument;
 type Edit = vscode.CustomDocumentEditEvent<Document>;
@@ -159,7 +160,7 @@ describe('database custom-editor lifecycle', () => {
   });
 
   for (const aliasSide of ['destination', 'open document'] as const) {
-    it(`Save As refreshes a destination reached through a symlink on the ${aliasSide}`, async () => {
+    it(`Save As refreshes a destination reached through a symlink on the ${aliasSide}`, { skip: NO_FILE_SYMLINKS }, async () => {
       const sourceUri = await fixture('source.db', 'copied value');
       const targetUri = await fixture('target.db', 'original target');
       const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
@@ -179,7 +180,7 @@ describe('database custom-editor lifecycle', () => {
     });
   }
 
-  it('Save As refuses a dirty alias even when the literal destination document is clean', async () => {
+  it('Save As refuses a dirty alias even when the literal destination document is clean', { skip: NO_FILE_SYMLINKS }, async () => {
     const sourceUri = await fixture('source.db', 'copied value');
     const targetUri = await fixture('target.db', 'original target');
     const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
@@ -198,7 +199,7 @@ describe('database custom-editor lifecycle', () => {
     assert.equal(fs.lstatSync(aliasUri.fsPath).isSymbolicLink(), true);
   });
 
-  it('Save As pins the writer to the canonical destination whose handles were retired', async () => {
+  it('Save As pins the writer to the canonical destination whose handles were retired', { skip: NO_FILE_SYMLINKS }, async () => {
     const sourceUri = await fixture('source.db', 'copied value');
     const targetUri = await fixture('target.db', 'original target');
     const otherUri = await fixture('other.db', 'unrelated database');
@@ -222,7 +223,7 @@ describe('database custom-editor lifecycle', () => {
     assert.equal((await onDisk.executeQuery(query))[0].rows[0][0], 'unrelated database');
   });
 
-  it('Save As refreshes every clean document for the same canonical destination', async () => {
+  it('Save As refreshes every clean document for the same canonical destination', { skip: NO_FILE_SYMLINKS }, async () => {
     const sourceUri = await fixture('source.db', 'copied value');
     const targetUri = await fixture('target.db', 'original target');
     const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
@@ -245,7 +246,7 @@ describe('database custom-editor lifecycle', () => {
     assert.equal(await value(alias), 'copied value');
   });
 
-  it('Save As waits for an alias that is still opening before replacing its bytes', async () => {
+  it('Save As waits for an alias that is still opening before replacing its bytes', { skip: NO_FILE_SYMLINKS }, async () => {
     const sourceUri = await fixture('source.db', 'copied value');
     const targetUri = await fixture('target.db', 'original target');
     const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
@@ -268,7 +269,7 @@ describe('database custom-editor lifecycle', () => {
     assert.equal(await value(target), 'copied value');
   });
 
-  it('a failed alias reopen does not preserve another destination document\'s obsolete Undo', async () => {
+  it('a failed alias reopen does not preserve another destination document\'s obsolete Undo', { skip: NO_FILE_SYMLINKS }, async () => {
     const sourceUri = await fixture('source.db', 'copied value');
     const targetUri = await fixture('target.db', 'original target');
     const aliasUri = vscode.Uri.file(path.join(directory, 'alias.db'));
@@ -465,5 +466,220 @@ describe('database custom-editor lifecycle', () => {
     const independent = await engineFor(fs.readFileSync(uri.fsPath));
     assert.equal((await independent.executeQuery(query))[0].rows[0][0], 'before');
     assert.deepEqual(fs.readFileSync(otherUri.fsPath), otherBytes);
+  });
+
+  /**
+   * The dirty bookkeeping of VS Code 1.145.0's custom-editor model
+   * (workbench.desktop.main.js): Undo moves the cursor before it calls the
+   * extension, whatever the callback does; an event without undo/redo is a
+   * content change that only Save or Revert clears.
+   */
+  class HostDirtyModel {
+    #edits: Edit[] = [];
+    #index = -1;
+    #savePoint = -1;
+    #dirtyFromContentChange = false;
+    constructor(source: Provider) {
+      source.onDidChangeCustomDocument(event => {
+        const edit = event as Partial<Edit>;
+        if (typeof edit.undo === 'function' && typeof edit.redo === 'function') {
+          this.#edits.splice(this.#index + 1, this.#edits.length, event as Edit);
+          this.#index = this.#edits.length - 1;
+        } else {
+          this.#dirtyFromContentChange = true;
+        }
+      });
+    }
+    get dirty() {
+      if (this.#dirtyFromContentChange) return true;
+      return this.#edits.length > 0 ? this.#savePoint !== this.#index : false;
+    }
+    async undo() {
+      if (this.#index < 0) return;
+      const edit = this.#edits[this.#index];
+      this.#index--;
+      await edit.undo();
+    }
+    save() {
+      this.#dirtyFromContentChange = false;
+      this.#savePoint = this.#index;
+    }
+  }
+
+  it('keeps the tab dirty when Undo is refused at an unsaved history barrier', async () => {
+    const uri = await fixture('barrier.db', 'saved');
+    const document = await open(uri);
+    const host = new HostDirtyModel(provider);
+    await document.hostBridge.setPragma('journal_mode', 'off');
+    assert.equal(events.length, 1, 'the persistent PRAGMA is recorded as a barrier edit');
+    assert.equal(host.dirty, true);
+
+    await host.undo();
+    assert.match(warnings()[0] ?? '', /cannot be undone/i);
+    assert.equal((await document.getDesktopTestState()).dirty, true, 'the barrier edit is still unsaved');
+    assert.equal(host.dirty, true, 'VS Code would close the tab without asking to save');
+
+    await provider.saveCustomDocument(document, token);
+    host.save();
+    assert.equal(host.dirty, false);
+  });
+
+  it('lets an ordinary Undo back to the saved state leave the tab clean', async () => {
+    const uri = await fixture('clean-undo.db', 'saved');
+    const document = await open(uri);
+    const host = new HostDirtyModel(provider);
+    await document.hostBridge.updateCell('items', 1, 'name', 'unsaved');
+    assert.equal(host.dirty, true);
+
+    await host.undo();
+    assert.equal(await value(document), 'saved');
+    assert.equal(host.dirty, false);
+    assert.equal(events.length, 1, 'a successful Undo sends VS Code nothing more');
+  });
+
+  function bundledNativeBinary(): boolean {
+    const platformDir = process.platform === 'darwin'
+      ? (process.arch === 'arm64' ? 'aarch64-macos' : 'x86_64-macos')
+      : process.platform === 'linux'
+        ? (process.arch === 'arm64' ? 'aarch64-linux-gnu' : 'x86_64-linux-gnu')
+        : process.platform === 'win32' && process.arch === 'x64' ? 'x86_64-windows' : undefined;
+    return !!platformDir && fs.existsSync(
+      path.join('natives', platformDir, process.platform === 'win32' ? 'tjs.exe' : 'tjs')
+    );
+  }
+
+  function warnings(): string[] {
+    return (mockVscode.window.showWarningMessage as unknown as {
+      mock: { calls: Array<{ arguments: unknown[] }> }
+    }).mock.calls.map(call => String(call.arguments[0]));
+  }
+
+  // The tracker keeps 100 entries; the native engine has written every edit.
+  async function nativeEdits(count: number) {
+    nativeConnections = true;
+    const uri = await fixture('native-history.db', 'saved');
+    const document = await open(uri);
+    for (let edit = 1; edit <= count; edit++) {
+      await document.hostBridge.updateCell('items', 1, 'name', `edit ${edit}`);
+    }
+    return { uri, document };
+  }
+
+  it('native File Revert restores the saved value when history holds every unsaved edit', async t => {
+    if (!bundledNativeBinary()) return t.skip('no bundled txiki binary for this platform');
+    const { document } = await nativeEdits(100);
+    await provider.revertCustomDocument(document, token);
+    assert.equal(await value(document), 'saved');
+    assert.deepEqual(warnings(), []);
+  });
+
+  it('native File Revert says it cannot restore the saved value once history dropped an unsaved edit', async t => {
+    if (!bundledNativeBinary()) return t.skip('no bundled txiki binary for this platform');
+    const { document } = await nativeEdits(101);
+    await assert.rejects(async () => provider.revertCustomDocument(document, token), /cannot restore the saved database/i);
+    assert.equal(await value(document), 'edit 101', 'a refused revert must change nothing');
+    assert.equal(warnings().length, 1);
+    assert.match(warnings()[0], /cannot restore the saved database.*nothing was reverted/i);
+  });
+
+  it('native File Revert after a hot-exit restore still knows history dropped an unsaved edit', async t => {
+    if (!bundledNativeBinary()) return t.skip('no bundled txiki binary for this platform');
+    const { uri, document } = await nativeEdits(101);
+    const restored = await open(uri, await backupAndDispose(document));
+    await assert.rejects(async () => provider.revertCustomDocument(restored, token), /cannot restore the saved database/i);
+    assert.equal(await value(restored), 'edit 101');
+    assert.equal(warnings().length, 1);
+  });
+
+  it('native Undo tells the user when an edit is no longer in history', async t => {
+    if (!bundledNativeBinary()) return t.skip('no bundled txiki binary for this platform');
+    const { document } = await nativeEdits(101);
+    assert.equal(events.length, 101);
+    for (const edit of [...events].reverse()) await edit.undo();
+    assert.equal(await value(document), 'edit 1', 'the dropped edit stays in the file');
+    assert.equal(warnings().length, 1);
+    assert.match(warnings()[0], /no longer in the undo history.*not undone/i);
+  });
+
+  function setInstantCommit(value: string) {
+    (vscode.workspace.getConfiguration as unknown as {
+      mock: { mockImplementation(fn: () => vscode.WorkspaceConfiguration): void }
+    }).mock.mockImplementation(() => ({
+      get: (name: string, fallback: unknown) => name === 'instantCommit' ? value : fallback
+    }) as vscode.WorkspaceConfiguration);
+  }
+
+  it('restores unsaved WebAssembly edits after instantCommit is switched on before the reload', async () => {
+    const uri = await fixture('instant-commit.db', 'saved');
+    const original = await open(uri);
+    await original.hostBridge.updateCell('items', 1, 'name', 'unsaved');
+    const openContext = await backupAndDispose(original);
+    setInstantCommit('always');
+    events = [];
+
+    const restored = await open(uri, openContext);
+    assert.equal(await value(restored), 'unsaved');
+    await provider.resolveCustomEditor(restored, {} as vscode.WebviewPanel, token);
+    assert.equal(events.length, 1, 'the restored edit must stay unsaved and undoable');
+  });
+
+  it('restores unsaved WebAssembly edits whose instant commit failed before the reload', async () => {
+    setInstantCommit('always');
+    mock.method(vscode.workspace, 'save', async () => undefined);
+    const uri = await fixture('failed-instant-commit.db', 'saved');
+    const original = await open(uri);
+    assert.equal(original.autoCommitEnabled, true);
+    await original.hostBridge.updateCell('items', 1, 'name', 'unsaved');
+    assert.equal((await original.getDesktopTestState()).dirty, true);
+    const openContext = await backupAndDispose(original);
+
+    const restored = await open(uri, openContext);
+    assert.equal(await value(restored), 'unsaved');
+  });
+
+  // A column without affinity stores REAL -0.0 as written; a REAL column keeps
+  // only +0.0. JSON writes -0 as 0.
+  async function negativeZeroFixture() {
+    const file = path.join(directory, 'negative-zero.db');
+    const engine = await engineFor(null);
+    await engine.executeQuery('CREATE TABLE items(id INTEGER PRIMARY KEY, amount DEFAULT -0.0)');
+    await engine.executeQuery('INSERT INTO items VALUES(1, -0.0)');
+    fs.writeFileSync(file, await engine.serializeDatabase());
+    return vscode.Uri.file(file);
+  }
+
+  async function amounts(document: Document) {
+    const result = await document.databaseOperations.executeQuery(
+      'SELECT id, typeof(amount), amount FROM items ORDER BY id'
+    );
+    return result[0].rows.map(([id, storageClass, amount]) => [
+      id, storageClass, Object.is(amount, -0) ? '-0' : amount
+    ]);
+  }
+
+  it('restores an edit of a REAL -0.0 cell from a hot-exit backup and undoes it to -0.0', async () => {
+    const uri = await negativeZeroFixture();
+    const original = await open(uri);
+    await original.hostBridge.updateCell('items', 1, 'amount', 2.5);
+    const openContext = await backupAndDispose(original);
+    events = [];
+
+    const restored = await open(uri, openContext);
+    assert.equal(restored.isReadOnlyMode, false, 'the restore must replay the edit, not refuse it');
+    assert.deepEqual(await amounts(restored), [[1, 'real', 2.5]]);
+    await provider.resolveCustomEditor(restored, {} as vscode.WebviewPanel, token);
+    await events[0].undo();
+    assert.deepEqual(await amounts(restored), [[1, 'real', '-0']]);
+  });
+
+  it('restores an inserted row holding REAL -0.0 from a hot-exit backup', async () => {
+    const uri = await negativeZeroFixture();
+    const original = await open(uri);
+    await original.hostBridge.insertRow('items', { id: 2 });
+    assert.deepEqual(await amounts(original), [[1, 'real', '-0'], [2, 'real', '-0']]);
+    const openContext = await backupAndDispose(original);
+
+    const restored = await open(uri, openContext);
+    assert.deepEqual(await amounts(restored), [[1, 'real', '-0'], [2, 'real', '-0']]);
   });
 });

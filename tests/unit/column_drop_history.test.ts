@@ -37,13 +37,13 @@ describe('column-drop undo history preflight', () => {
       droppedColumnCount: 2,
       preflight,
       resultRows: [[1, 10], [1, 8]],
-      maxSnapshotBytes: 82
+      maxSnapshotBytes: 86
     };
 
     assert.doesNotThrow(() => assertColumnDropHistoryFitsUndoBudget(input));
     assert.throws(
-      () => assertColumnDropHistoryFitsUndoBudget({ ...input, maxSnapshotBytes: 81 }),
-      /Column-drop undo snapshot exceeds the 81-byte memory budget/i
+      () => assertColumnDropHistoryFitsUndoBudget({ ...input, maxSnapshotBytes: 85 }),
+      /Column-drop undo snapshot exceeds the 85-byte memory budget/i
     );
   });
 
@@ -59,7 +59,7 @@ describe('column-drop undo history preflight', () => {
         ]
       }
     );
-    const exactBound = preflight.primaryKeyStaticIdentityBytes + 4 + 28;
+    const exactBound = preflight.primaryKeyStaticIdentityBytes + 4 + 30;
 
     assert.ok(preflight.primaryKeyStaticIdentityBytes > 0);
     assert.match(

@@ -64,9 +64,9 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
                 this.log('Opening incremental query read');
                 return openQueryReadSession.call(wrapped, sql);
             };
-            this.readQueryRows = async (sessionId: string, maxRows: number) => {
+            this.readQueryRows = async (sessionId: string, maxRows: number, maxBytes?: number) => {
                 this.log(`Reading up to ${maxRows} incremental query rows`);
-                return readQueryRows.call(wrapped, sessionId, maxRows);
+                return readQueryRows.call(wrapped, sessionId, maxRows, maxBytes);
             };
             this.closeQueryReadSession = async (sessionId: string) => {
                 this.log('Closing incremental query read');
@@ -312,6 +312,24 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         );
     }
 
+    async insertRowsWithHistory(
+        table: string,
+        rows: Record<string, CellValue>[],
+        maxEditValueBytes?: number,
+        maxUndoSnapshotBytes?: number
+    ): Promise<DeletedRow[]> {
+        this.log(`INSERT batch: ${rows.length} rows into ${escapeIdentifier(table)}`, true);
+        if (typeof this.wrapped.insertRowsWithHistory !== 'function') {
+            throw new Error('Backend does not support guarded row insertion history');
+        }
+        return this.wrapped.insertRowsWithHistory(
+            table,
+            rows,
+            maxEditValueBytes,
+            maxUndoSnapshotBytes
+        );
+    }
+
     async insertRowBatch(
         table: string,
         rows: Record<string, CellValue>[],
@@ -502,6 +520,10 @@ export class LoggingDatabaseOperations implements DatabaseOperations {
         const paramStr = params && params.length > 0 ? ` -- params: [${params.map(p => this.sanitizeValue(p)).join(', ')}]` : '';
         this.log(`${sql}${paramStr}`, false);
         return this.wrapped.fetchTableCount(table, options);
+    }
+
+    async prepareCellHelpers(): Promise<boolean> {
+        return await this.wrapped.prepareCellHelpers?.() ?? false;
     }
 
     async fetchSchema(): Promise<SchemaSnapshot> {

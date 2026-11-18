@@ -1,6 +1,6 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert';
-import { spawnSync } from 'node:child_process';
+import childProcess, { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
@@ -19,9 +19,22 @@ import {
   type PagedWritableOverlaySnapshot,
   type RawPagedWritableOverlay
 } from '../../src/core/paged-writable-overlay';
+import { NO_FILE_SYMLINKS } from './helpers/symlinks';
+import { entriesForOther, NO_REAL_ENTRIES, shareWithOther } from './helpers/access-entries';
+import { othersCanRenameIn } from '../../src/folderAccess';
+import { stagedSnapshotAccess } from '../../src/insideDirectory';
+import { accessEntryTools, macStoredListTools } from '../../src/posixAccessEntries';
 
+// These tests are not about access-control entries, except the one that says so: no program is
+// started for the others, so that what a save logs does not depend on which programs a machine has.
+accessEntryTools.use = null;
+// Where a test here turns the system's programs on, macOS uses `ls` and `chmod`, as where there is
+// no Ruby: what they leave out is what these tests hold. One test below asks for the stored list.
+accessEntryTools.storedLists = false;
+
+// The tracked runtime; assets/sqlite3.wasm is a build output the native CI lane lacks.
 const wasmBinary = new Uint8Array(
-  fs.readFileSync(path.resolve(process.cwd(), 'assets/sqlite3.wasm'))
+  fs.readFileSync(path.resolve(process.cwd(), 'vendor/sql.js/sql-wasm.wasm'))
 ).buffer;
 
 let SqlJsModule: WasmEngineModule;
@@ -100,6 +113,42 @@ function capabilityWithOpen(
   });
 }
 
+/**
+ * The file system with the top bit set in every file ID. An NTFS file ID has
+ * it once the file's record has been reused 32,768 times, and Node reports
+ * the ID as a signed 64-bit integer, so such a file's `ino` is negative.
+ */
+function capabilityWithHighFileIds(): typeof fs {
+  const high = <T>(stats: T): T => {
+    if (typeof (stats as { ino?: unknown } | undefined)?.ino !== 'bigint') return stats;
+    return new Proxy(stats as object, {
+      get(target, property) {
+        if (property === 'ino') return BigInt.asIntN(64, (target as { ino: bigint }).ino | (1n << 63n));
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    }) as T;
+  };
+  const open = async (...args: Parameters<typeof fs.promises.open>) => {
+    const handle = await fs.promises.open(...args);
+    return new Proxy(handle, {
+      get(target, property) {
+        if (property === 'stat') return async (...statArgs: any[]) => high(await (target.stat as any)(...statArgs));
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+  };
+  return capabilityWithOpen(open as typeof fs.promises.open, {
+    stat: (async (...args: any[]) => high(await (fs.promises.stat as any)(...args))) as typeof fs.promises.stat,
+    lstat: (async (...args: any[]) => high(await (fs.promises.lstat as any)(...args))) as typeof fs.promises.lstat
+  }, {
+    statSync: ((...args: any[]) => high((fs.statSync as any)(...args))) as typeof fs.statSync,
+    lstatSync: ((...args: any[]) => high((fs.lstatSync as any)(...args))) as typeof fs.lstatSync,
+    fstatSync: ((...args: any[]) => high((fs.fstatSync as any)(...args))) as typeof fs.fstatSync
+  });
+}
+
 function proxyHandleRead(
   handle: Awaited<ReturnType<typeof fs.promises.open>>,
   read: (...args: any[]) => Promise<any>
@@ -134,6 +183,10 @@ function bundledNativeBinary(): string | undefined {
 
 /** File-mechanics fixtures below are intentionally not valid SQLite images. */
 const acquireFixtureWriteLock = () => ({ release() {} });
+
+// Measured on Windows: chmod to 0o640 and to 0o600 both leave 0o666, and only
+// a mode without the owner write bit changes anything (0o444).
+const NO_POSIX_MODES = 'Windows has no owner, group and other modes: chmod there only sets or clears read-only';
 
 describe('paged writable host save', () => {
   it('refuses insufficient adjacent-temp space before creating the temp file', async () => {
@@ -215,7 +268,9 @@ describe('paged writable host save', () => {
       assert.deepStrictEqual(result, { requiresReopen: false });
       assert.deepStrictEqual(fs.readFileSync(targetPath), Buffer.from(expected));
       assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from(original));
-      assert.strictEqual(fs.statSync(targetPath).mode & 0o777, 0o640);
+      if (process.platform !== 'win32') {
+        assert.strictEqual(fs.statSync(targetPath).mode & 0o777, 0o640);
+      }
     } finally {
       engine.shutdown();
     }
@@ -410,6 +465,28 @@ describe('paged writable host save', () => {
     )));
   });
 
+  it('saves a database whose file ID has its top bit set', async () => {
+    const basePath = path.join(fixtureDir, 'high-file-id.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    const capability = capabilityWithHighFileIds();
+    const stats = capability.statSync(basePath, { bigint: true });
+    assert.ok(stats.ino < 0n);
+
+    const result = await writePagedWritableOverlayToFile(
+      capability,
+      basePath,
+      basePath,
+      snapshotFor(basePath, {
+        baseIdentity: { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeNs: stats.mtimeNs, mode: stats.mode }
+      }),
+      undefined,
+      acquireFixtureWriteLock
+    );
+
+    assert.deepStrictEqual(result, { requiresReopen: true });
+    assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
+  });
+
   it('replaces the active base atomically and requires reopen', async () => {
     const basePath = path.join(fixtureDir, 'active-base.db');
     fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
@@ -429,7 +506,7 @@ describe('paged writable host save', () => {
     assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
   });
 
-  it('follows a target symlink to the active base and leaves the symlink in place', async () => {
+  it('follows a target symlink to the active base and leaves the symlink in place', { skip: NO_FILE_SYMLINKS }, async () => {
     const basePath = path.join(fixtureDir, 'symlink-base.db');
     const targetPath = path.join(fixtureDir, 'symlink-target.db');
     fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
@@ -472,7 +549,421 @@ describe('paged writable host save', () => {
     );
   });
 
-  it('preserves an existing distinct target mode for Save As', async () => {
+  /**
+   * `fs` whose copy reports when it is given its owner and its mode: `step` runs before and after
+   * each of the two, with the copy's path and descriptor.
+   */
+  const watchingCopy = (step: (name: string, copyPath: string, fd: number) => void): typeof fs => new Proxy(fs, {
+    get(real, key) {
+      if (key !== 'promises') return Reflect.get(real, key);
+      return new Proxy(real.promises, {
+        get(promises, name) {
+          if (name !== 'open') return Reflect.get(promises, name);
+          return async (file: fs.PathLike, ...rest: unknown[]) => {
+            const handle = await (promises.open as (...given: unknown[]) => Promise<fs.promises.FileHandle>)(file, ...rest);
+            if (!/\.sqlite-explorer-[^/\\]*\.tmp$/.test(String(file))) return handle;
+            return new Proxy(handle, {
+              get(given, property) {
+                const value = Reflect.get(given, property);
+                if (typeof value !== 'function') return value;
+                if (property !== 'chown' && property !== 'chmod') return value.bind(given);
+                return async (...args: unknown[]) => {
+                  step(`before ${property}`, String(file), given.fd);
+                  const answer = await (value as (...all: unknown[]) => Promise<void>).apply(given, args);
+                  step(`after ${property}`, String(file), given.fd);
+                  return answer;
+                };
+              }
+            });
+          };
+        }
+      });
+    }
+  });
+
+  it('gives its copy the old file\'s owner first, then its entries, then its mode', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip('a copy is given no owner on Windows');
+      return;
+    }
+    // The copy is in the destination's own folder: the order of its owner, its entries and its mode.
+    const basePath = path.join(fixtureDir, 'order-base.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), { mode: 0o640 });
+    const events: string[] = [];
+    const before = accessEntryTools.use;
+    t.after(() => { accessEntryTools.use = before; });
+    accessEntryTools.use = {
+      readsByDescriptor: true,
+      read: (files) => {
+        events.push('entries');
+        return files.map(() => ['user::rw-', 'group::r--', 'other::---']);
+      },
+      write: () => true
+    };
+
+    await writePagedWritableOverlayToFile(
+      watchingCopy((name) => { if (name.startsWith('after')) events.push(name.slice('after '.length)); }),
+      basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock
+    );
+
+    assert.deepStrictEqual(events, ['chown', 'entries', 'chmod']);
+    assert.strictEqual(fs.statSync(basePath).mode & 0o777, 0o640);
+  });
+
+  it('keeps its copy within the permissions of the file it replaces at every step (Linux)', { skip: process.platform !== 'linux' ? 'a listing carries the mode on Linux only' : NO_REAL_ENTRIES }, async (t) => {
+    const before = accessEntryTools.use;
+    accessEntryTools.use = undefined;
+    t.after(() => { accessEntryTools.use = before; });
+    const uid = process.getuid!();
+    const ownGroup = process.getgid!();
+    // A folder that hands its group down makes the copy with a group the old file does not have.
+    const secondGroup = process.getgroups!().find((group) => group !== ownGroup);
+    if (secondGroup === undefined) t.diagnostic('this account has one group: the cases with a copy made for another group were not run');
+    type Listed = { gid: number; entries: Map<string, number> };
+    const rights = (text: string): number => (text[0] === 'r' ? 4 : 0) | (text[1] === 'w' ? 2 : 0) | (text[2] === 'x' ? 1 : 0);
+    const listed = (file: string, gid: number): Listed => {
+      // A path through this process's descriptors is another process's own under `self`.
+      const reached = file.replace(/^\/proc\/self\//, `/proc/${process.pid}/`);
+      const printed = spawnSync('/usr/bin/getfacl', ['-c', '-p', '-n', '-E', '--', reached], { encoding: 'utf8' });
+      assert.strictEqual(printed.status, 0, printed.stderr);
+      const entries = new Map<string, number>();
+      for (const line of printed.stdout.split('\n')) {
+        const [kind, who, granted] = line.split(':');
+        if (granted !== undefined) entries.set(`${kind}:${who}`, rights(granted));
+      }
+      return { gid, entries };
+    };
+    /** What an account that is not the owner may do: one an entry names, a member of one group, or anyone else. */
+    const allowed = (file: Listed, account: { user?: number; group?: number }): number => {
+      const mask = file.entries.get('mask:') ?? 7;
+      const named = account.user === undefined ? undefined : file.entries.get(`user:${account.user}`);
+      if (named !== undefined) return named & mask;
+      if (account.group !== undefined) {
+        const classes = [file.gid === account.group ? file.entries.get('group:') : undefined, file.entries.get(`group:${account.group}`)]
+          .filter((granted): granted is number => granted !== undefined);
+        if (classes.length > 0) return classes.reduce((all, granted) => all | granted, 0) & mask;
+      }
+      return file.entries.get('other:') ?? 0;
+    };
+    const accounts = [{ user: 65534 }, { group: ownGroup }, ...(secondGroup === undefined ? [] : [{ group: secondGroup }]), {}];
+
+    for (const own of [false, true]) {
+      for (const handsDown of [false, true]) {
+        for (const otherGroup of secondGroup === undefined ? [false] : [false, true]) {
+          const about = `the old file ${own ? 'has an entry of its own' : 'has its mode only'}, the folder ${handsDown ? 'hands an entry down' : 'hands nothing down'}, the copy is made with ${otherGroup ? 'another group' : "the old file's group"}`;
+          const folder = fs.mkdtempSync(path.join(fixtureDir, 'steps-'));
+          const basePath = path.join(folder, 'base.db');
+          fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+          if (otherGroup) {
+            fs.chownSync(folder, uid, secondGroup!);
+            fs.chmodSync(folder, 0o2770);
+          }
+          fs.chownSync(basePath, uid, ownGroup);
+          fs.chmodSync(basePath, 0o640);
+          // Checked: on a filesystem that keeps no entries these would be cases of a mode only.
+          if (own) assert.strictEqual(spawnSync('/usr/bin/setfacl', ['-m', 'u:65534:r--', basePath]).status, 0, about);
+          if (handsDown) assert.strictEqual(spawnSync('/usr/bin/setfacl', ['-d', '-m', 'u:65534:r-x', folder]).status, 0, about);
+          const old = listed(basePath, ownGroup);
+          assert.strictEqual(old.entries.has('user:65534'), own, about);
+          const wider: string[] = [];
+          const steps: string[] = [];
+
+          await writePagedWritableOverlayToFile(watchingCopy((name, copyPath, fd) => {
+            steps.push(name);
+            const now = listed(copyPath, fs.fstatSync(fd).gid);
+            for (const account of accounts) {
+              const more = allowed(now, account) & ~allowed(old, account);
+              if (more !== 0) wider.push(`${name}: ${JSON.stringify(account)} is allowed ${more} more than by the old file`);
+            }
+          }), basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock);
+
+          assert.deepStrictEqual(steps, ['before chown', 'after chown', 'before chmod', 'after chmod'], about);
+          assert.deepStrictEqual(wider, [], about);
+          const now = listed(basePath, fs.statSync(basePath).gid);
+          assert.deepStrictEqual([now.gid, [...now.entries]], [old.gid, [...old.entries]], about);
+          assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]), about);
+        }
+      }
+    }
+  });
+
+  it('replaces a file in a folder that hands down an entry refusing every account a file\'s removal (macOS)', { skip: process.platform !== 'darwin' && 'entries that refuse are a macOS kind' }, async (t) => {
+    const before = accessEntryTools.use;
+    accessEntryTools.use = undefined;
+    t.after(() => { accessEntryTools.use = before; });
+    // The file was there before the folder handed the entry down, so it has none. The copy is made
+    // in that folder and has the entry: kept, it would stop the rename, for the copy's owner too.
+    // That happened in the folder every account can write, where entries are not copied; in the
+    // other one the old file's list, which is empty, always replaced the copy's.
+    for (const [name, mode] of [['refusing-open', 0o777], ['refusing-mine', 0o755]] as const) {
+      const folder = fs.mkdtempSync(path.join(fixtureDir, `${name}-`));
+      t.after(() => { spawnSync('/bin/chmod', ['-R', '-N', folder]); });
+      fs.chmodSync(folder, mode);
+      const basePath = path.join(folder, 'base.db');
+      fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), { mode: 0o644 });
+      assert.strictEqual(spawnSync('/bin/chmod', ['+a', 'group:everyone deny delete,file_inherit', folder]).status, 0);
+      const log: string[] = [];
+
+      await writePagedWritableOverlayToFile(fs, basePath, basePath, snapshotFor(basePath), (_level, message) => { log.push(message); }, acquireFixtureWriteLock);
+
+      assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]), name);
+      assert.deepStrictEqual(fs.readdirSync(folder), ['base.db'], name);
+      assert.deepStrictEqual(spawnSync('/bin/ls', ['-lde', basePath], { encoding: 'utf8' }).stdout.split('\n').slice(1).filter((line) => line !== ''), [], name);
+      assert.deepStrictEqual(log.filter((message) => /access-control/i.test(message)), [], name);
+    }
+  });
+
+  it('gives its copy the stored list of the file it replaces, in a folder every account can write (macOS)', { skip: process.platform !== 'darwin' && 'the stored list is read through descriptors on macOS only' }, async (t) => {
+    const before = accessEntryTools.use;
+    accessEntryTools.use = undefined;
+    accessEntryTools.storedLists = undefined;
+    t.after(() => { accessEntryTools.use = before; accessEntryTools.storedLists = false; });
+    const folder = fs.mkdtempSync(path.join(fixtureDir, 'stored-list-'));
+    t.after(() => { spawnSync('/bin/chmod', ['-R', '-N', folder]); });
+    fs.chmodSync(folder, 0o777);
+    const basePath = path.join(folder, 'base.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), { mode: 0o644 });
+    // An entry that is only to be handed down and a right without a word: `ls` shows neither on a file.
+    assert.strictEqual(spawnSync('/bin/chmod', ['+a', 'user:daemon allow read,write,file_inherit,directory_inherit,only_inherit', basePath]).status, 0);
+    assert.strictEqual(spawnSync('/bin/chmod', ['+a', 'user:nobody deny delete_child', basePath]).status, 0);
+    const stored = (file: string): string[] => {
+      const fd = fs.openSync(file, 'r');
+      try {
+        const read = macStoredListTools!.read([{ fd, path: file }]);
+        assert.ok(read, 'the stored list is read');
+        return read[0];
+      } finally {
+        fs.closeSync(fd);
+      }
+    };
+    const was = stored(basePath);
+    assert.strictEqual(was.length, 2);
+    const log: string[] = [];
+
+    await writePagedWritableOverlayToFile(fs, basePath, basePath, snapshotFor(basePath), (_level, message) => { log.push(message); }, acquireFixtureWriteLock);
+
+    assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
+    assert.deepStrictEqual(fs.readdirSync(folder), ['base.db']);
+    assert.deepStrictEqual(stored(basePath), was);
+    assert.deepStrictEqual(log.filter((message) => /access-control/i.test(message)), []);
+  });
+
+  it('removes an entry its folder hands its copy whose rights are not printed (macOS)', { skip: process.platform !== 'darwin' && 'rights that are not printed are a macOS kind' }, async (t) => {
+    const before = accessEntryTools.use;
+    accessEntryTools.use = undefined;
+    t.after(() => { accessEntryTools.use = before; });
+    // The file was there before its folder handed anything down, so it has no entry. The copy is
+    // made in that folder and is handed a right `ls` has no word for on a file. Such rights can be
+    // ones the system goes by, so the copy must not keep an entry the old file did not have.
+    for (const kind of ['allow', 'deny']) {
+      const folder = fs.mkdtempSync(path.join(fixtureDir, `unprinted-${kind}-`));
+      t.after(() => { spawnSync('/bin/chmod', ['-R', '-N', folder]); });
+      const basePath = path.join(folder, 'base.db');
+      fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), { mode: 0o600 });
+      assert.strictEqual(spawnSync('/bin/chmod', ['+a', `user:nobody ${kind} delete_child,file_inherit`, folder]).status, 0);
+      const listed = (file: string): string[] => spawnSync('/bin/ls', ['-lde', file], { encoding: 'utf8' }).stdout.split('\n').slice(1).filter((line) => line !== '')
+        .map((line) => line.replace(/^ \d+: /, '').trimEnd());
+      // What a file made there now is handed.
+      const probe = path.join(folder, 'probe');
+      fs.writeFileSync(probe, '');
+      assert.deepStrictEqual(listed(probe), [`user:nobody inherited ${kind}`], kind);
+      fs.rmSync(probe);
+      const log: string[] = [];
+
+      await writePagedWritableOverlayToFile(fs, basePath, basePath, snapshotFor(basePath), (_level, message) => { log.push(message); }, acquireFixtureWriteLock);
+
+      assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]), kind);
+      assert.deepStrictEqual(listed(basePath), [], kind);
+      assert.deepStrictEqual(log.filter((message) => /access-control/i.test(message)), [], kind);
+    }
+  });
+
+  // macOS reads the old file's entries by its name, so there it matters who else can rename on the
+  // way to it: in a folder every account can write, entries that allow are not copied.
+  for (const open of process.platform === 'darwin' ? [false, true] : [false]) {
+    it(`keeps the access-control entries of the file it replaces${open ? ', and none that allow in a folder every account can write (macOS)' : ''}`, { skip: NO_REAL_ENTRIES }, async (t) => {
+      const before = accessEntryTools.use;
+      accessEntryTools.use = undefined;
+      t.after(() => { accessEntryTools.use = before; });
+      const folder = open ? fs.mkdtempSync(path.join(fixtureDir, 'open-entries-')) : fixtureDir;
+      if (open) fs.chmodSync(folder, 0o777);
+      const basePath = path.join(folder, 'shared-base.db');
+      fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), { mode: 0o640 });
+      shareWithOther(basePath);
+      const own = entriesForOther(basePath);
+      assert.strictEqual(own.length, 1);
+      const beforeIno = fs.statSync(basePath, { bigint: true }).ino;
+      const forgeable = process.platform === 'darwin' && othersCanRenameIn(fs, fs.realpathSync(folder)) !== undefined;
+      if (open) assert.strictEqual(forgeable, true);
+      const log: string[] = [];
+
+      await writePagedWritableOverlayToFile(fs, basePath, basePath, snapshotFor(basePath), (_level, message) => { log.push(message); }, acquireFixtureWriteLock);
+
+      assert.notStrictEqual(fs.statSync(basePath, { bigint: true }).ino, beforeIno, 'the file is replaced, as before');
+      assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
+      assert.deepStrictEqual(entriesForOther(basePath), forgeable ? [] : own);
+      assert.deepStrictEqual(log.filter((message) => /access-control/i.test(message)), forgeable ? ["Access-control entries that let accounts in were not kept on the database's new file."] : []);
+
+      // The control: the step turned off.
+      if (entriesForOther(basePath).length === 0) shareWithOther(basePath);
+      accessEntryTools.use = null;
+      await writePagedWritableOverlayToFile(fs, basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock);
+      assert.deepStrictEqual(entriesForOther(basePath), []);
+    });
+  }
+
+  // The copy is made in the folder the save holds open: through that folder's descriptor on
+  // Linux, and elsewhere by a helper process from inside it. Linux runs both.
+  for (const throughDescriptor of process.platform === 'linux' ? [true, false] : process.platform === 'win32' ? [] : [false]) {
+    const route = process.platform !== 'linux' ? '' : throughDescriptor ? ' (through a descriptor)' : ' (by a helper process)';
+    /** A database in a folder of this account's own, inside one every account can write. */
+    const inOpenFolder = (name: string): { open: string; inner: string; basePath: string } => {
+      const open = fs.mkdtempSync(path.join(fixtureDir, `${name}-`));
+      fs.chmodSync(open, 0o777);
+      const inner = path.join(open, 'inner');
+      fs.mkdirSync(inner, { mode: 0o755 });
+      const basePath = path.join(inner, 'base.db');
+      fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+      return { open, inner, basePath };
+    };
+    const madeByHelper = fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0);
+    /** The save's file calls, with `seen` told of each open that makes or takes the copy. */
+    const watching = (seen: (file: string, flags: unknown) => void, afterFolderOpened?: () => void): typeof fs => new Proxy(fs, {
+      get(real, key) {
+        if (key !== 'promises') return Reflect.get(real, key);
+        return new Proxy(real.promises, {
+          get(promises, name) {
+            if (name !== 'open') return Reflect.get(promises, name);
+            return async (file: fs.PathLike, flags: unknown, ...rest: unknown[]) => {
+              if (flags === 'wx' || flags === madeByHelper) seen(String(file), flags);
+              const handle = await (promises.open as (...given: unknown[]) => Promise<fs.promises.FileHandle>)(file, flags, ...rest);
+              if (flags === 'r' && path.basename(String(file)) === 'inner') afterFolderOpened?.();
+              return handle;
+            };
+          }
+        });
+      }
+    });
+
+    it(`makes its copy in the folder it holds open, where another account can rename on the way to it${route}`, async (t) => {
+      stagedSnapshotAccess.throughDescriptor = throughDescriptor;
+      t.after(() => { stagedSnapshotAccess.throughDescriptor = true; });
+      const { inner, basePath } = inOpenFolder('paged-open');
+      const opened: Array<[string, unknown]> = [];
+      let helpers = 0;
+      const start = childProcess.spawnSync;
+      t.mock.method(childProcess, 'spawnSync', ((...args: unknown[]) => {
+        if (args[0] === process.execPath) helpers++;
+        return (start as (...given: unknown[]) => unknown)(...args);
+      }) as typeof childProcess.spawnSync);
+
+      const result = await writePagedWritableOverlayToFile(watching((file, flags) => { opened.push([file, flags]); }), basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock);
+
+      assert.deepStrictEqual(result, { requiresReopen: true });
+      assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
+      assert.deepStrictEqual(fs.readdirSync(inner), ['base.db']);
+      assert.strictEqual(opened.length, 1);
+      if (throughDescriptor) {
+        assert.match(opened[0][0], /^\/proc\/self\/fd\/\d+\/\.base\.db\.sqlite-explorer-[-0-9a-f]+\.tmp$/);
+        assert.strictEqual(opened[0][1], 'wx');
+        assert.strictEqual(helpers, 0);
+      } else {
+        assert.strictEqual(fs.realpathSync(path.dirname(opened[0][0])), fs.realpathSync(inner));
+        assert.strictEqual(opened[0][1], madeByHelper);
+        assert.strictEqual(helpers, 1);
+      }
+
+      // In a folder no other account can rename on the way to, it is made by name, as before.
+      const own = path.join(fixtureDir, `own-${throughDescriptor}.db`);
+      fs.writeFileSync(own, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+      opened.length = 0;
+      helpers = 0;
+      if (othersCanRenameIn(fs, fs.realpathSync(fixtureDir), process.platform, process.platform === 'darwin' ? undefined : false) === undefined) {
+        await writePagedWritableOverlayToFile(watching((file, flags) => { opened.push([file, flags]); }), own, own, snapshotFor(own), undefined, acquireFixtureWriteLock);
+        assert.deepStrictEqual(opened.map(([file, flags]) => [path.dirname(file) === fs.realpathSync(fixtureDir), flags]), [[true, 'wx']]);
+        assert.strictEqual(helpers, 0);
+      }
+    });
+
+    it(`makes its copy only in the folder it took hold of${route}`, async (t) => {
+      stagedSnapshotAccess.throughDescriptor = throughDescriptor;
+      t.after(() => { stagedSnapshotAccess.throughDescriptor = true; });
+      const { open, inner, basePath } = inOpenFolder('paged-swapped');
+      const away = path.join(open, 'inner-away');
+      // Once the save has opened the database's folder: that folder moved away, and another under its name.
+      const files = watching(() => undefined, () => {
+        if (fs.existsSync(away)) return;
+        fs.renameSync(inner, away);
+        fs.mkdirSync(inner, { mode: 0o777 });
+      });
+
+      await assert.rejects(
+        writePagedWritableOverlayToFile(files, basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock),
+        // Whichever look meets the other folder first: the one for the copy, or the one at the database itself.
+        /Save target changed on disk; retry the save\.|Database file changed on disk; reload the document\./
+      );
+
+      assert.deepStrictEqual(fs.readdirSync(inner), [], 'nothing of the save is in the folder put there');
+      assert.deepStrictEqual(fs.readdirSync(away), ['base.db'], 'and nothing is left beside the database');
+      assert.deepStrictEqual(fs.readFileSync(path.join(away, 'base.db')), Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]));
+    });
+
+    it(`writes into no other file than the one the helper process made${route}`, { skip: throughDescriptor && 'only where no path through a descriptor is to be had' }, async (t) => {
+      stagedSnapshotAccess.throughDescriptor = throughDescriptor;
+      t.after(() => { stagedSnapshotAccess.throughDescriptor = true; });
+      const { open, inner, basePath } = inOpenFolder('paged-other-file');
+      const away = path.join(open, 'inner-away');
+      // Once the helper process has made the copy: the database's folder moved away, and another
+      // under its name that holds a file of the copy's name, which this account may write.
+      const start = childProcess.spawnSync;
+      t.mock.method(childProcess, 'spawnSync', ((...args: unknown[]) => {
+        const answer = (start as (...given: unknown[]) => unknown)(...args);
+        if (args[0] === process.execPath) {
+          const copy = fs.readdirSync(inner).find((name) => name.endsWith('.tmp'))!;
+          fs.renameSync(inner, away);
+          fs.mkdirSync(inner, { mode: 0o777 });
+          fs.writeFileSync(path.join(inner, copy), 'theirs', { mode: 0o666 });
+        }
+        return answer;
+      }) as typeof childProcess.spawnSync);
+
+      await assert.rejects(
+        writePagedWritableOverlayToFile(fs, basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock),
+        /Save target changed on disk; retry the save\./
+      );
+
+      const theirs = fs.readdirSync(inner);
+      assert.strictEqual(theirs.length, 1);
+      assert.strictEqual(fs.readFileSync(path.join(inner, theirs[0]), 'utf8'), 'theirs', 'the other file is as it was');
+      assert.deepStrictEqual(fs.readFileSync(path.join(away, 'base.db')), Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]));
+    });
+
+    it(`fails when the helper process cannot be run${route}`, { skip: throughDescriptor && 'only where no path through a descriptor is to be had' }, async (t) => {
+      stagedSnapshotAccess.throughDescriptor = throughDescriptor;
+      t.after(() => { stagedSnapshotAccess.throughDescriptor = true; });
+      const { inner, basePath } = inOpenFolder('paged-no-helper');
+      const start = childProcess.spawnSync;
+      t.mock.method(childProcess, 'spawnSync', ((...args: unknown[]) => (args[0] === process.execPath
+        ? { error: Object.assign(new Error('spawnSync ENOENT'), { code: 'ENOENT' }), status: null, stdout: '', stderr: '' }
+        : (start as (...given: unknown[]) => unknown)(...args))) as typeof childProcess.spawnSync);
+      const opened: string[] = [];
+
+      await assert.rejects(
+        writePagedWritableOverlayToFile(watching((file) => { opened.push(file); }), basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock),
+        /The save could not make its file beside the destination: the helper process failed/
+      );
+
+      assert.deepStrictEqual(opened, []);
+      assert.deepStrictEqual(fs.readdirSync(inner), ['base.db']);
+      assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]));
+    });
+  }
+
+  it('preserves an existing distinct target mode for Save As', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip(NO_POSIX_MODES);
+      return;
+    }
     const basePath = path.join(fixtureDir, 'mode-base.db');
     const targetPath = path.join(fixtureDir, 'mode-target.db');
     fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
@@ -587,7 +1078,11 @@ describe('paged writable host save', () => {
     assert.match(String(warnings[0].error), /synthetic foreign-owner EPERM/i);
   });
 
-  it('preserves the active base mode observed when the save starts', async () => {
+  it('preserves the active base mode observed when the save starts', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip(NO_POSIX_MODES);
+      return;
+    }
     const basePath = path.join(fixtureDir, 'active-mode-before-save.db');
     fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
     fs.chmodSync(basePath, 0o644);
@@ -609,7 +1104,11 @@ describe('paged writable host save', () => {
     assert.strictEqual(fs.statSync(basePath).mode & 0o777, 0o600);
   });
 
-  it('aborts if the active base mode changes during assembly', async () => {
+  it('aborts if the active base mode changes during assembly', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip(NO_POSIX_MODES);
+      return;
+    }
     const basePath = path.join(fixtureDir, 'active-mode-during-save.db');
     fs.writeFileSync(basePath, Buffer.alloc(64, 3));
     fs.chmodSync(basePath, 0o640);
@@ -654,6 +1153,113 @@ describe('paged writable host save', () => {
     assert.deepStrictEqual(fs.readFileSync(basePath), original);
     assert.strictEqual(fs.statSync(basePath).mode & 0o777, 0o600);
     assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('active-mode-during-save.db.sqlite-explorer')));
+  });
+
+  it('replaces a database without a warning', async () => {
+    const basePath = path.join(fixtureDir, 'quiet-save-base.db');
+    const targetPath = path.join(fixtureDir, 'quiet-save-target.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    const warnings: string[] = [];
+
+    await writePagedWritableOverlayToFile(
+      fs,
+      basePath,
+      targetPath,
+      snapshotFor(basePath),
+      (_level, message) => { warnings.push(message); }
+    );
+
+    assert.deepStrictEqual(warnings, []);
+  });
+
+  it('says what to do when the target cannot be replaced, and leaves it as it was', async () => {
+    const basePath = path.join(fixtureDir, 'refused-save-base.db');
+    const original = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    fs.writeFileSync(basePath, original);
+    const refusal = Object.assign(new Error("EPERM: operation not permitted, rename 'copy' -> 'refused-save-base.db'"), { code: 'EPERM' });
+    const refusing = capabilityWithOpen(fs.promises.open, {}, {
+      renameSync: (() => { throw refusal; }) as typeof fs.renameSync
+    });
+
+    await assert.rejects(
+      writePagedWritableOverlayToFile(refusing, basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock),
+      (error: unknown) => {
+        // Only Windows refuses to replace a file another program has open.
+        const reported = (error as Error).cause as NodeJS.ErrnoException;
+        if (process.platform === 'win32') {
+          assert.match((error as Error).message, /another program has the file open/);
+          assert.strictEqual(reported.cause, refusal);
+          assert.strictEqual(reported.code, 'EPERM');
+        } else {
+          assert.strictEqual(reported, refusal);
+        }
+        return true;
+      }
+    );
+
+    assert.deepStrictEqual(new Uint8Array(fs.readFileSync(basePath)), original);
+    assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('refused-save-base.db.sqlite-explorer')));
+  });
+
+  it('waits for a lock that is held for a moment, then replaces the database', async () => {
+    const basePath = path.join(fixtureDir, 'momentary-lock-base.db');
+    fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    let attempts = 0;
+    const busyOnce = () => {
+      if (++attempts === 1) throw Object.assign(new Error('another connection holds a lock'), { momentary: true });
+      return acquireFixtureWriteLock();
+    };
+
+    const result = await writePagedWritableOverlayToFile(fs, basePath, basePath, snapshotFor(basePath), undefined, busyOnce);
+
+    assert.strictEqual(attempts, 2);
+    assert.deepStrictEqual(result, { requiresReopen: true });
+    assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
+  });
+
+  it('does not wait for a lock that fails for another reason', async () => {
+    const basePath = path.join(fixtureDir, 'failed-lock-base.db');
+    const original = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    fs.writeFileSync(basePath, original);
+    let attempts = 0;
+    const failing = () => {
+      attempts++;
+      throw new Error('this host has no SQLite write locking');
+    };
+
+    await assert.rejects(
+      writePagedWritableOverlayToFile(fs, basePath, basePath, snapshotFor(basePath), undefined, failing)
+    );
+
+    assert.strictEqual(attempts, 1);
+    assert.deepStrictEqual(new Uint8Array(fs.readFileSync(basePath)), original);
+  });
+
+  it('replaces the database once Windows stops refusing it', async () => {
+    const basePath = path.join(fixtureDir, 'refused-twice-base.db');
+    const original = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    fs.writeFileSync(basePath, original);
+    const refusal = Object.assign(new Error("EPERM: operation not permitted, rename 'copy' -> 'refused-twice-base.db'"), { code: 'EPERM' });
+    let attempts = 0;
+    const refusingTwice = capabilityWithOpen(fs.promises.open, {}, {
+      renameSync: ((from: fs.PathLike, to: fs.PathLike) => {
+        if (++attempts <= 2) throw refusal;
+        fs.renameSync(from, to);
+      }) as typeof fs.renameSync
+    });
+    const save = writePagedWritableOverlayToFile(refusingTwice, basePath, basePath, snapshotFor(basePath), undefined, acquireFixtureWriteLock);
+
+    if (process.platform === 'win32') {
+      assert.deepStrictEqual(await save, { requiresReopen: true });
+      assert.strictEqual(attempts, 3);
+      assert.deepStrictEqual(fs.readFileSync(basePath), Buffer.from([9, 8, 7, 6, 5, 6, 7, 8]));
+    } else {
+      // Nothing but Windows refuses a rename for a moment, so nothing is tried again.
+      await assert.rejects(save);
+      assert.strictEqual(attempts, 1);
+      assert.deepStrictEqual(new Uint8Array(fs.readFileSync(basePath)), original);
+    }
+    assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('refused-twice-base.db.sqlite-explorer')));
   });
 
   it('fsyncs the replacement directory after the atomic rename', async () => {
@@ -1150,10 +1756,14 @@ describe('paged writable host save', () => {
         if (!temporaryMutated && candidatePath.includes('temp-swap-target.db.sqlite-explorer')) {
           temporaryMutated = true;
           const before = fs.lstatSync(candidatePath, { bigint: true });
-          fs.chmodSync(candidatePath, 0o644);
+          // A mode the file does not have yet. A chmod to its present mode
+          // changes nothing some file systems record: a folder shared into a
+          // container from macOS keeps the same ctime.
+          fs.chmodSync(candidatePath, Number(before.mode & 0o777n) ^ 0o040);
           const after = fs.lstatSync(candidatePath, { bigint: true });
           assert.strictEqual(after.ino, before.ino);
           assert.strictEqual(after.size, before.size);
+          assert.notStrictEqual(after.mode, before.mode);
         }
         return (fs.lstatSync as any)(...args);
       }) as typeof fs.lstatSync,
@@ -1179,7 +1789,11 @@ describe('paged writable host save', () => {
     assert.ok(!fs.readdirSync(fixtureDir).some(name => name.includes('temp-swap-target.db.sqlite-explorer')));
   });
 
-  it('refuses an existing Save As target chmod after initial resolution', async () => {
+  it('refuses an existing Save As target chmod after initial resolution', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip(NO_POSIX_MODES);
+      return;
+    }
     const basePath = path.join(fixtureDir, 'target-chmod-base.db');
     const targetPath = path.join(fixtureDir, 'target-chmod-target.db');
     fs.writeFileSync(basePath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));

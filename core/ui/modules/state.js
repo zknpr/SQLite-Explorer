@@ -70,6 +70,9 @@ export const state = {
     // edits. Row identities can be deleted and reused without changing the
     // connection generation, so delayed destructive intents bind to both.
     contentGeneration: 0,
+    // The contentGeneration whose broadcast refresh finished reloading the
+    // grid while still the newest broadcast (see reloadAfterOwnMutation).
+    refreshedContentGeneration: 0,
     selectedTable: null,
     selectedTableType: 'table',
     selectedTableIdentity: null,
@@ -79,6 +82,9 @@ export const state = {
     renderedTable: null,
     currentPageIndex: 0,
     rowsPerPage: DEFAULT_ROWS_PER_PAGE,
+    // Rows per page of the committed grid page. rowsPerPage is the chosen
+    // size; a wide table loads fewer (pageSizeForColumns in grid-data.js).
+    pageSize: undefined,
     totalRecordCount: 0,
     totalRecordCountIsExact: true,
     // Unknown totals are distinct from the existing numeric upper-bound mode.

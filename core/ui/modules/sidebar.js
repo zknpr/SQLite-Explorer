@@ -205,6 +205,7 @@ export async function refreshSchema() {
         }));
         state.schemaCache.views = (schema.views || []).map(v => ({ name: v.identifier }));
         state.schemaCache.indexes = (schema.indexes || []).map(i => ({ name: i.identifier, table: i.parentTable }));
+        state.schemaCache.hasTriggers = typeof schema.hasTriggers === 'boolean' ? schema.hasTriggers : undefined;
         syncSelectedTableIdentity();
 
         renderSidebar();

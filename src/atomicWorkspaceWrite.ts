@@ -124,19 +124,34 @@ function siblingTemporaryUri(target: vsc.Uri): vsc.Uri {
 }
 
 /**
- * Replace a workspace-provider resource only after a complete sibling write.
- * workspace.fs has no conditional rename primitive, so compare both provider
- * metadata and content immediately before rename to catch coarse-timestamp races.
+ * Replace a workspace-provider resource only after a complete sibling copy
+ * exists. workspace.fs has no atomic replace: VS Code's file service runs
+ * rename(..., { overwrite: true }) as "delete the destination, then rename".
+ * That removes the open document's file for a moment, leaves no copy at all
+ * when the rename then fails and the sibling is cleaned up, and leaves VS
+ * Code showing the editor as unsaved after a save that succeeded. So an
+ * existing destination is written in place, and the sibling copy is removed
+ * only after that write succeeded: when the write fails, the sibling holds
+ * the complete image and the error names it. A destination that does not
+ * exist yet is created by a rename that cannot overwrite.
+ *
+ * workspace.fs has no conditional write either, so compare both provider
+ * metadata and content immediately before the write to catch
+ * coarse-timestamp races.
+ *
+ * @param warn - Told when the save succeeded but its sibling copy remains
  */
-export async function writeWorkspaceFileAtomically(
+export async function replaceWorkspaceFile(
   target: vsc.Uri,
   bytes: Uint8Array,
   expectedGeneration: WorkspaceFileGeneration,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  warn?: (message: string, error: unknown) => void
 ): Promise<void> {
   signal?.throwIfAborted();
   const temporary = siblingTemporaryUri(target);
   let temporaryMayExist = false;
+  let destinationMayBeIncomplete = false;
   try {
     // A provider may create or truncate the resource before rejecting writeFile.
     temporaryMayExist = true;
@@ -144,9 +159,22 @@ export async function writeWorkspaceFileAtomically(
     signal?.throwIfAborted();
     await assertWorkspaceFileGenerationUnchanged(target, expectedGeneration);
     signal?.throwIfAborted();
-    await vsc.workspace.fs.rename(temporary, target, { overwrite: true });
-    temporaryMayExist = false;
+    if (!expectedGeneration.exists) {
+      await vsc.workspace.fs.rename(temporary, target, { overwrite: false });
+      temporaryMayExist = false;
+      return;
+    }
+    destinationMayBeIncomplete = true;
+    await vsc.workspace.fs.writeFile(target, bytes);
+    destinationMayBeIncomplete = false;
   } catch (error) {
+    if (destinationMayBeIncomplete) {
+      throw new Error(
+        `The database could not be written to its destination, which may now be incomplete. `
+        + `A complete copy was kept as ${temporary.toString()}`,
+        { cause: error }
+      );
+    }
     if (temporaryMayExist) {
       try {
         await vsc.workspace.fs.delete(temporary, { recursive: false, useTrash: false });
@@ -160,5 +188,12 @@ export async function writeWorkspaceFileAtomically(
       }
     }
     throw error;
+  }
+  try {
+    await vsc.workspace.fs.delete(temporary, { recursive: false, useTrash: false });
+  } catch (cleanupError) {
+    if (!isMissingWorkspaceFile(cleanupError)) {
+      warn?.(`Database saved, but its temporary copy remains: ${temporary.toString()}`, cleanupError);
+    }
   }
 }

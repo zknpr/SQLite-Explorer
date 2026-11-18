@@ -46,6 +46,9 @@ export const DEFAULT_QUERY_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_FILE_SIZE_MB = 200;
 const MAX_FILE_SIZE_MB = 4000;
 const MIN_QUERY_TIMEOUT_MS = 1000;
+// The setting's schema maximum. A hand-edited value past 2^31 - 1 ms would make
+// every timer built on it fire after 1 ms.
+const MAX_QUERY_TIMEOUT_MS = 600000;
 const MIN_INLINE_CELL_BYTES = 1024;
 const MAX_INLINE_CELL_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_MAX_UNDO_MEMORY_BYTES = 50 * 1024 * 1024;
@@ -89,7 +92,7 @@ export function getQueryTimeout(): number {
   if (typeof configuredValue !== 'number' || !Number.isFinite(configuredValue)) {
     return DEFAULT_QUERY_TIMEOUT_MS;
   }
-  return Math.max(MIN_QUERY_TIMEOUT_MS, configuredValue);
+  return Math.min(MAX_QUERY_TIMEOUT_MS, Math.max(MIN_QUERY_TIMEOUT_MS, configuredValue));
 }
 
 /** Retrieve the hard server-side ceiling for inline TEXT/BLOB grid values. */

@@ -26,6 +26,11 @@
  *   trigger/cascade side effects. The demo has no echo, so it also drops the
  *   unfiltered identity: an uploaded database can already contain an UPDATE
  *   trigger that inserts or deletes rows.
+ * - A refreshContent echo for a cell edit or its undo (keepTableRowCounts)
+ *   keeps every table's unfiltered identity when the last schema load found
+ *   no main or TEMP trigger. An UPDATE alone, its OR ABORT conflict handling
+ *   and its foreign-key actions change no table's row count. It can move
+ *   rows into or out of a filter or a view, so those identities are dropped.
  * - Anything that reloads because of external/unknown changes — table switch,
  *   refreshContent broadcasts (VS Code also echoes one after every local
  *   edit), reload-from-disk, view redefinition — invalidates wholesale.
@@ -199,6 +204,24 @@ export function noteCellValuesChanged(table) {
     const unfiltered = tableCounts.get(UNFILTERED_SUB_KEY);
     tableCounts.clear();
     if (!demoMode && unfiltered !== undefined) {
+        tableCounts.set(UNFILTERED_SUB_KEY, unfiltered);
+    }
+}
+
+/**
+ * A cell edit or its undo in a database without triggers: keep the unfiltered
+ * identity of each table in `tables` and drop everything else, views included.
+ */
+export function keepTableRowCounts(tables) {
+    cacheEpoch++;
+    const kept = new Set(tables);
+    for (const [name, tableCounts] of countsByTable) {
+        const unfiltered = tableCounts.get(UNFILTERED_SUB_KEY);
+        if (demoMode || !kept.has(name) || unfiltered === undefined) {
+            countsByTable.delete(name);
+            continue;
+        }
+        tableCounts.clear();
         tableCounts.set(UNFILTERED_SUB_KEY, unfiltered);
     }
 }

@@ -115,29 +115,33 @@ function resolveLimits(options: WebviewTransportLimits) {
   };
 }
 
-function utf8ByteLength(value: string): number {
-  let bytes = 0;
+/**
+ * UTF-8 bytes of JSON.stringify(value), counted without building that string:
+ * quotes, two-byte escapes for " \\ \b \t \n \f \r, \u00XX for other
+ * control characters and \uXXXX for unpaired surrogates.
+ */
+function escapedJsonStringByteLength(value: string): number {
+  let bytes = 2;
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
-    if (code < 0x80) bytes += 1;
-    else if (code < 0x800) bytes += 2;
-    else if (code >= 0xD800 && code <= 0xDBFF && index + 1 < value.length) {
-      const next = value.charCodeAt(index + 1);
+    if (code < 0x80) {
+      if (code >= 0x20) bytes += code === 0x22 || code === 0x5c ? 2 : 1;
+      else bytes += code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d ? 2 : 6;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = index + 1 < value.length ? value.charCodeAt(index + 1) : 0;
       if (next >= 0xDC00 && next <= 0xDFFF) {
         bytes += 4;
         index++;
       } else {
-        bytes += 3;
+        bytes += 6;
       }
     } else {
-      bytes += 3;
+      bytes += code >= 0xDC00 && code <= 0xDFFF ? 6 : 3;
     }
   }
   return bytes;
-}
-
-function escapedJsonStringByteLength(value: string): number {
-  return utf8ByteLength(JSON.stringify(value));
 }
 
 function decodedBase64Bytes(base64: string): number {
@@ -156,6 +160,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
     && Object.prototype.toString.call(value) === '[object Object]';
 }
 
+// Read once at load. Pages without cross-origin isolation do not define this
+// global, and a lookup that misses goes through the window's named-property
+// check each time; done per visited value, that took about 13 of the 17 ms
+// spent measuring a 5,000-row, 51-column page in Chrome.
+const SharedArrayBufferConstructor = typeof SharedArrayBuffer === 'function'
+  ? SharedArrayBuffer
+  : undefined;
+
 /**
  * Estimate the serialized/base64 wire footprint without allocating encoded
  * strings. Shared aliases are deliberately visited for every property because
@@ -165,9 +177,25 @@ export function assertWebviewTransportPayload(
   value: unknown,
   options: WebviewTransportLimits
 ): number {
+  return measureWebviewTransportPayload(value, options).bytes;
+}
+
+/**
+ * assertWebviewTransportPayload, also saying whether the host's serializeValue
+ * or the webview's deserializeValue could rewrite anything in `value`. When
+ * neither would, the receiver can use the value itself instead of walking it
+ * again to copy it unchanged.
+ */
+export function measureWebviewTransportPayload(
+  value: unknown,
+  options: WebviewTransportLimits
+): { bytes: number; needsRewrite: boolean } {
   const limits = resolveLimits(options);
   const ancestors = new WeakSet<object>();
   let aggregateBytes = 0;
+  // Set at every value either side rewrites: binary values and markers,
+  // non-finite numbers, '~' strings, and objects this walk does not enter.
+  let needsRewrite = false;
 
   const rejectBinary = (actualBytes: number): never => {
     throw new WebviewPayloadLimitError({
@@ -202,30 +230,41 @@ export function assertWebviewTransportPayload(
       );
     }
     if (candidate instanceof Uint8Array) {
+      needsRewrite = true;
       addBinary(candidate.byteLength, encodedBase64Bytes(candidate.byteLength));
       return;
     }
     if (ArrayBuffer.isView(candidate)) {
+      needsRewrite = true;
       addBinary(candidate.byteLength, encodedBase64Bytes(candidate.byteLength));
       return;
     }
     if (candidate instanceof ArrayBuffer) {
+      needsRewrite = true;
       addBinary(candidate.byteLength, candidate.byteLength);
       return;
     }
-    if (typeof SharedArrayBuffer === 'function' && candidate instanceof SharedArrayBuffer) {
+    if (
+      SharedArrayBufferConstructor !== undefined
+      && candidate instanceof SharedArrayBufferConstructor
+    ) {
+      needsRewrite = true;
       addBinary(candidate.byteLength, candidate.byteLength);
       return;
     }
     if (typeof candidate === 'string') {
-      add(
-        escapedJsonStringByteLength(candidate)
-        + jsonSafeNumberStringExpansionBytes(candidate)
-      );
+      const expansion = jsonSafeNumberStringExpansionBytes(candidate);
+      if (expansion) needsRewrite = true;
+      add(escapedJsonStringByteLength(candidate) + expansion);
       return;
     }
     if (typeof candidate === 'number') {
-      add(Number.isFinite(candidate) ? 8 : JSON_SAFE_NON_FINITE_NUMBER_MAX_WIRE_BYTES);
+      if (Number.isFinite(candidate)) {
+        add(8);
+      } else {
+        needsRewrite = true;
+        add(JSON_SAFE_NON_FINITE_NUMBER_MAX_WIRE_BYTES);
+      }
       return;
     }
     if (
@@ -253,6 +292,7 @@ export function assertWebviewTransportPayload(
         return;
       }
       if (!isPlainObject(candidate)) {
+        needsRewrite = true;
         add(16);
         return;
       }
@@ -265,6 +305,7 @@ export function assertWebviewTransportPayload(
         && keys.includes('base64')
         && typeof candidate.base64 === 'string'
       ) {
+        needsRewrite = true;
         addBinary(decodedBase64Bytes(candidate.base64), candidate.base64.length);
         return;
       }
@@ -275,6 +316,7 @@ export function assertWebviewTransportPayload(
         && keys.includes('data')
         && Array.isArray(candidate.data)
       ) {
+        needsRewrite = true;
         if (candidate.data.length > limits.maxBinaryBytes) rejectBinary(candidate.data.length);
       }
 
@@ -289,7 +331,7 @@ export function assertWebviewTransportPayload(
   };
 
   visit(value);
-  return aggregateBytes;
+  return { bytes: aggregateBytes, needsRewrite };
 }
 
 export function isWebviewPayloadLimitError(error: unknown): error is WebviewPayloadLimitError {
