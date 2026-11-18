@@ -146,6 +146,11 @@ for (const backend of ['wasm', 'native'] as const) {
     it(`${backend} history replay gives every row its own deadline`, async () => {
         // Each guarded DELETE scans the unindexed child table: a few ms per row,
         // well inside a 250 ms timeout, far beyond it for 256 rows together.
+        // The WebAssembly engine reads this process's clock, so the test paces
+        // it: every reading moves it on a tenth of a millisecond, which makes a
+        // row about 60 ms on any machine. On a real clock a busy machine can
+        // take longer than the timeout over one row. The native worker has its
+        // own clock and a fixed limit for history.
         const setup =
             'CREATE TABLE parent (id INTEGER PRIMARY KEY, v TEXT);' +
             'CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));' +
@@ -156,7 +161,18 @@ for (const backend of ['wasm', 'native'] as const) {
             const rows = Array.from({ length: 300 }, (_, index) => ({ v: `row${index}` }));
             const modification = await importRowsAtomically(ops, 'parent', rows, 50 * 1024 * 1024);
             const count = async () => (await ops.executeQuery('SELECT count(*) FROM parent'))[0].rows[0][0];
-            await ops.undoModification(modification);
+            const realNow = Date.now;
+            const start = realNow();
+            let clock = start;
+            const paced = backend === 'wasm';
+            if (paced) Date.now = () => (clock += 0.1);
+            try {
+                await ops.undoModification(modification);
+            } finally {
+                Date.now = realNow;
+            }
+            // One deadline for the rows together would have passed many times over.
+            if (paced) assert.ok(clock - start > 10 * 250, `the undo took ${clock - start} ms on the paced clock`);
             assert.equal(await count(), 0);
             await ops.redoModification(modification);
             assert.equal(await count(), 300);

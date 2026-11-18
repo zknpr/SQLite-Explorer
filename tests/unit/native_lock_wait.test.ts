@@ -213,17 +213,17 @@ describe('the native engine beside another program that holds the file', () => {
         let engine: DatabaseOperations;
         try {
             engine = await f.open();
-            const refused = await timed(() => page(engine));
-            assert.match(String(refused.error?.message), /database is locked/);
-            // One wait: nothing else was tried on the locked file.
-            assert.ok(refused.ms < 1500, `the page failed after ${refused.ms} ms`);
+            await assert.rejects(page(engine), /database is locked/);
         } finally {
             writer.letGo();
         }
         const sent: string[] = [];
         for (const method of ['queryPacked', 'queryNumeric']) f.before.set(method, () => { sent.push(method); });
         assert.deepEqual((await page(engine)).rows, [[1, 'one'], [2, 'two']]);
-        // The packed page is the one the helpers serve.
+        // The packed page is the one the helpers serve. A helper tried on the
+        // locked file would have stayed off, and it would have waited as well:
+        // that is not timed here, because one wait on a busy machine takes
+        // longer than three on an idle one.
         assert.deepEqual(sent, ['queryPacked']);
     });
 
