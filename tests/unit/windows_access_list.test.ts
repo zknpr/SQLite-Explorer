@@ -738,8 +738,14 @@ function icacls(...args: string[]): void {
 
 /** The account that owns a file, which `icacls /save` does not write. */
 function ownerOf(file: string): string {
+    // Windows PowerShell finds its own modules when it inherits no module path. One inherited from
+    // PowerShell 7, the shell of a CI step, lists that version's modules first, which it cannot load.
+    const env: NodeJS.ProcessEnv = { ...process.env, ACL_TEST_FILE: file };
+    for (const name of Object.keys(env)) {
+        if (name.toLowerCase() === 'psmodulepath') delete env[name];
+    }
     const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', '(Get-Acl -LiteralPath $env:ACL_TEST_FILE).Owner'], {
-        env: { ...process.env, ACL_TEST_FILE: file }, encoding: 'utf8'
+        env, encoding: 'utf8'
     });
     assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
     return result.stdout.trim();
