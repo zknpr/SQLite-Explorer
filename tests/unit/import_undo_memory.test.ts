@@ -71,6 +71,65 @@ it('the tracker shares the equal storage-class lists of an entry it records, and
     assert.equal((restored as unknown as { currentSize: number }).currentSize, live);
 });
 
+it('a backup names each list once, also for an entry kept to revert a save, and restores the lists', () => {
+    const list = () => [{ column: 'a', storageClass: 'integer' }, { column: 'b', storageClass: 'text' }];
+    const deletedRows = Array.from({ length: 100 }, (_, i) => ({ rowId: i + 1, row: { a: BigInt(i), b: 'x' + i }, storageClasses: list() }));
+    deletedRows.push({ rowId: 101, row: { a: 100n, b: 'y' }, storageClasses: [{ column: 'a', storageClass: 'integer', note: 1 } as never, list()[1]] });
+    const removed = { label: 'Delete 101 rows', modificationType: 'row_delete', targetTable: 't', deletedRows } as unknown as LabeledModification;
+    const text = (value: unknown) => JSON.stringify(value, (_key, item) => typeof item === 'bigint' ? String(item) : item);
+    const before = text(removed);
+    const tracker = new ModificationTracker<LabeledModification>(100, 1 << 30);
+    tracker.record(removed);
+    tracker.createCheckpointAt(tracker.getCurrentPosition());
+    tracker.stepBack();
+    // Recording after undoing past the save keeps the entry to revert it.
+    tracker.record({ label: 'Edit', modificationType: 'cell_update', targetTable: 't' } as LabeledModification);
+    assert.equal(tracker.getCheckpointRevertSequence().length, 1);
+    const backup = tracker.serialize();
+    // One shared list, and the list of another shape inline.
+    assert.equal(new TextDecoder().decode(backup).split('"storageClass"').length - 1, 2 + 2);
+    assert.equal(text(removed), before, 'the backup changed the live entry');
+    const restored = ModificationTracker.deserialize<LabeledModification>(backup, 100, 1 << 30);
+    const [kept] = restored.getCheckpointRevertSequence();
+    assert.equal(text(kept), before);
+    assert.equal(new Set(kept.deletedRows!.map(row => row.storageClasses)).size, 2);
+    assert.equal((restored as unknown as { currentSize: number }).currentSize, (tracker as unknown as { currentSize: number }).currentSize);
+});
+
+it('a backup written with a list in every row, as 1.9.0 wrote them, restores with the lists shared', () => {
+    const backup = new TextEncoder().encode(JSON.stringify({
+        timeline: [{
+            label: 'Import 3 rows', description: 'Import 3 rows into t', modificationType: 'row_insert', targetTable: 't',
+            insertedRows: [1, 2, 3].map(i => ({
+                rowId: i, row: { a: { __type: 'BigInt', text: String(i) }, b: 'x' + i },
+                storageClasses: [{ column: 'a', storageClass: 'integer' }, { column: 'b', storageClass: 'text' }]
+            }))
+        }],
+        checkpointIndex: 0, futureStack: [], revertOnRestore: [], uncommittedEntriesEvicted: false, engineKind: 'wasm'
+    }));
+    const restored = ModificationTracker.deserialize<LabeledModification>(backup, 100, 1 << 20);
+    const [entry] = restored.getUncommittedEntries();
+    assert.deepEqual(entry.insertedRows!.map(row => row.row.a), [1n, 2n, 3n]);
+    assert.deepEqual(entry.insertedRows![2].storageClasses, [{ column: 'a', storageClass: 'integer' }, { column: 'b', storageClass: 'text' }]);
+    assert.equal(new Set(entry.insertedRows!.map(row => row.storageClasses)).size, 1);
+    assert.equal((restored as unknown as { currentSize: number }).currentSize, estimateUndoMemoryBytes(entry));
+});
+
+it('a backup that names a list it does not hold, or holds a malformed list, does not restore', () => {
+    const tracker = new ModificationTracker<LabeledModification>(100, 1 << 20);
+    tracker.record({
+        label: 'Delete 2 rows', modificationType: 'row_delete', targetTable: 't',
+        deletedRows: [1, 2].map(i => ({ rowId: i, row: { a: 'x' }, storageClasses: [{ column: 'a', storageClass: 'text' }] }))
+    } as unknown as LabeledModification);
+    const payload = JSON.parse(new TextDecoder().decode(tracker.serialize()));
+    assert.equal(payload.timeline[0].deletedRows[1].storageClasses, 0);
+    const restore = (value: unknown) => ModificationTracker.deserialize<LabeledModification>(new TextEncoder().encode(JSON.stringify(value)), 100, 1 << 20);
+    assert.throws(() => restore({ ...payload, timeline: [{ ...payload.timeline[0], deletedRows: [{ ...payload.timeline[0].deletedRows[0], storageClasses: 1 }] }] }), /does not hold/);
+    assert.throws(() => restore({ ...payload, timeline: [{ ...payload.timeline[0], deletedRows: [{ ...payload.timeline[0].deletedRows[0], storageClasses: 0.5 }] }] }), /does not hold/);
+    assert.throws(() => restore({ ...payload, storageClassLists: [[{ column: 'a' }]] }), /malformed/);
+    assert.throws(() => restore({ ...payload, storageClassLists: undefined }), /does not hold/);
+});
+
 for (const backend of ['wasm', 'native'] as const) {
     it(`${backend}: an import that fits the undo memory limit is admitted, undone, redone and restored at the size it was admitted at`, async () => {
         await withBackend(backend, async ops => {
@@ -92,8 +151,18 @@ for (const backend of ['wasm', 'native'] as const) {
             tracker.record(modification);
             const live = (tracker as unknown as { currentSize: number }).currentSize;
             assert.equal(live, admitted);
-            const restored = ModificationTracker.deserialize<LabeledModification>(tracker.serialize(), 100, BUDGET);
+            const backup = tracker.serialize();
+            // The backup holds each of the import's two lists once.
+            assert.equal(new TextDecoder().decode(backup).split('"storageClass"').length - 1, 2 * 5);
+            const restored = ModificationTracker.deserialize<LabeledModification>(backup, 100, BUDGET);
             assert.equal((restored as unknown as { currentSize: number }).currentSize, live);
+            // The restored entry replays, from the undo stack and, after another
+            // backup, from the redo stack.
+            await ops.undoModification(restored.stepBack()!);
+            assert.deepEqual(await tableRows(ops), []);
+            const redoTracker = ModificationTracker.deserialize<LabeledModification>(restored.serialize(), 100, BUDGET);
+            await ops.redoModification(redoTracker.stepForward()!);
+            assert.deepEqual(await tableRows(ops), imported);
 
             // Admission and the tracker count the same bytes: one byte less
             // than the entry is refused, a few kilobytes more is not.
