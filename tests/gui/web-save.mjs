@@ -158,7 +158,8 @@ async function edit(row, value) {
   await input.press('Enter');
   await waitForValue(async () => (await cell(row).textContent()).includes(value), true, `row ${row} shows ${value}`);
 }
-const save = () => page.keyboard.press('Control+S');
+// VS Code for the Web takes the platform's own modifier: Cmd on macOS.
+const save = () => page.keyboard.press('ControlOrMeta+S');
 const autoSave = mode => host.evaluate(value => {
   const vscode = globalThis.__webLane;
   return vscode.workspace.getConfiguration('files').update('autoSave', value, vscode.ConfigurationTarget.Global);
@@ -228,7 +229,7 @@ try {
 
   await step('W07 Save As makes a new file, and later saves go to it', async () => {
     await cell(1).click();
-    await page.keyboard.press('Control+Shift+S');
+    await page.keyboard.press('ControlOrMeta+Shift+S');
     const input = page.locator('.quick-input-widget input');
     await input.waitFor();
     await input.fill('/copy.db');
@@ -248,7 +249,7 @@ try {
 
   await step('W08 Save As over an existing database replaces its content after both confirmations', async () => {
     await cell(1).click();
-    await page.keyboard.press('Control+Shift+S');
+    await page.keyboard.press('ControlOrMeta+Shift+S');
     const input = page.locator('.quick-input-widget input');
     await input.waitFor();
     await input.fill('/qa.db');
