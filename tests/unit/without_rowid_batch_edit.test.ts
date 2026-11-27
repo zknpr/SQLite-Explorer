@@ -112,6 +112,19 @@ const cases: Case[] = [
         ]
     },
     {
+        name: 'a long text key beside cells near the response bound',
+        // A key is read as text and as bytes. Beside 50 MB of edited cells,
+        // which one response may carry, a 9 MiB key must not share it.
+        setup: "CREATE TABLE t (k TEXT PRIMARY KEY, a, b, c, d, e) WITHOUT ROWID;" +
+            "INSERT INTO t VALUES ('r', zeroblob(1048576), NULL, NULL, NULL, NULL);" +
+            "INSERT INTO t VALUES (printf('%.9437184c', 'k'), zeroblob(10000000), zeroblob(10000000), zeroblob(10000000), zeroblob(10000000), zeroblob(10000000))",
+        updates: [
+            { rowId: key(['k'], ['r']), column: 'a', value: 'v' },
+            ...['a', 'b', 'c', 'd', 'e'].map(column => ({ rowId: key(['k'], ['k'.repeat(9437184)]), column, value: 'v' }))
+        ],
+        budget: 256 << 20
+    },
+    {
         name: 'megabyte cells across several requests',
         setup: "CREATE TABLE t (k INTEGER PRIMARY KEY, big, n) WITHOUT ROWID;" +
             `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 12) INSERT INTO t SELECT x, '${big}', x FROM c`,
@@ -146,7 +159,7 @@ async function runCase(testCase: Case, together: boolean) {
             let results: unknown;
             let error: string | undefined;
             try {
-                results = await ops.updateCellBatch('t', testCase.updates, 4 << 20, testCase.budget);
+                results = await ops.updateCellBatch('t', testCase.updates, 16 << 20, testCase.budget);
             } catch (caught) {
                 // Native errors name the worker request that failed ([run],
                 // [execBatch], [queryHistoryBatch]); SQLite's text follows.

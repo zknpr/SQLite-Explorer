@@ -2490,9 +2490,9 @@ export async function createNativeDatabaseConnection(
         // Each row's cells as [typeof, value] pairs: one statement per row
         // when they fit one response, as readNativeRowCellStates decides, and
         // cell by cell otherwise.
-        const readCells = async (reads: NativeQueryResult[], stride: number, offset: number) => {
+        const readCells = async (reads: NativeQueryResult[]) => {
           const found = rows.map((_, index) => {
-            const values = reads[index * stride + offset].values;
+            const values = reads[index].values;
             return values?.length === 1 ? values[0] : undefined;
           });
           const unread = rows.filter((_, index) => !found[index]);
@@ -2510,17 +2510,19 @@ export async function createNativeDatabaseConnection(
           params: row.predicate.params
         });
 
-        const before = await runUnits(rows.map(row => [{
+        // Keys get their own pass: a cell read may fill a response on its own,
+        // and a key crosses as text and as bytes.
+        const keys = await runUnits(rows.map(row => [{
           sql: `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} FROM ${escapedTable} WHERE ${row.predicate.sql} LIMIT 2`,
           params: row.predicate.params
-        }, cellRead(row)]));
+        }]));
         const storedIds = rows.map((_, index) => {
-          const keys = before[index * 2].values ?? [];
-          if (keys.length !== 1) throw new Error(`Cannot update ${table}: row identity no longer exists`);
-          return encodeByteFaithfulPrimaryKeyRecordId(identity, keys[0], textEncoding, `Cannot resolve updated identity in ${table}`);
+          const values = keys[index].values ?? [];
+          if (values.length !== 1) throw new Error(`Cannot update ${table}: row identity no longer exists`);
+          return encodeByteFaithfulPrimaryKeyRecordId(identity, values[0], textEncoding, `Cannot resolve updated identity in ${table}`);
         });
         if (new Set(storedIds).size !== rows.length) return undefined;
-        const priors = await readCells(before, 2, 1);
+        const priors = await readCells(await runUnits(rows.map(row => [cellRead(row)])));
 
         const prepared: Array<Array<{
           update: CellUpdate;
@@ -2563,7 +2565,7 @@ export async function createNativeDatabaseConnection(
           }
         });
 
-        const posts = await readCells(await runUnits(rows.map(row => [cellRead(row)])), 1, 0);
+        const posts = await readCells(await runUnits(rows.map(row => [cellRead(row)])));
         return rows.flatMap((row, rowIndex) => {
           const post = posts[rowIndex];
           if (!post) throw unresolvableTriggeredPrimaryKeyUpdateError(table);
