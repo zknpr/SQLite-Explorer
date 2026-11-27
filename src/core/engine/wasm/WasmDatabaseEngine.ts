@@ -3490,8 +3490,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private async assertBatchPriorsWithinEditLimit(
     table: string,
     updates: readonly CellUpdate[],
-    editLimitBytes: number
+    editLimitBytes: number,
+    identity: TableIdentity
   ): Promise<void> {
+    // One metadata query per column and identity chunk. Only a refusal checks
+    // cell by cell, so the error names the first oversized cell in request order.
+    const queries = buildBatchPriorLimitQueries(table, updates, editLimitBytes, identity);
+    const refused: Array<{ query: (typeof queries)[number]; rows: unknown[][] }> = [];
+    for (const query of queries) {
+      const rows = (await this.executeQuery(query.sql, query.params))[0]?.rows ?? [];
+      if (rows.length > 0) refused.push({ query, rows });
+    }
+    if (refused.length === 0) return;
     const seen = new Set<string>();
     for (const update of updates) {
       const key = `${String(update.rowId)}\0${update.column}`;
@@ -3504,6 +3514,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         editLimitBytes
       );
     }
+    assertBatchPriorLimitResult(table, refused[0].query, refused[0].rows, editLimitBytes);
   }
 
   private async assertRowIdBatchPriorsWithinEditLimit(
@@ -3927,7 +3938,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       // Metadata-only preflight must run before the established full prior-value
       // SELECT below. Normal bounded edits retain the same SAVEPOINT and update path.
       if (!isHistoryReplay && maxEditValueBytes !== undefined) {
-        await this.assertBatchPriorsWithinEditLimit(table, updates, editLimitBytes);
+        await this.assertBatchPriorsWithinEditLimit(table, updates, editLimitBytes, identity);
       }
       const updatesByRow = new Map<RecordId, CellUpdate[]>();
       for (const update of updates) {
@@ -3938,7 +3949,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       const results: CellUpdateResult[] = [];
       const textEncoding = this.getCellTextEncoding();
-      for (const [rowId, rowUpdates] of updatesByRow) {
+      // The call compiles each statement once, and each row restarts the
+      // deadline, as when its UPDATE was its own call.
+      this.withHistoryStatements(() => this.mapInDeadlineChunks([...updatesByRow], ([rowId, rowUpdates]) => {
         const oldPredicate = buildRecordIdentityPredicate(rowId, identity);
         const columns = [...new Set(rowUpdates.map(update => update.column))];
         if (columns.length !== rowUpdates.length) {
@@ -3980,7 +3993,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const setClause = preparedUpdates.map(({ update, storedValue }) => (
           `${escapeIdentifier(update.column)} = ${wasmBindPlaceholder(storedValue)}`
         )).join(', ');
-        await this.executeQuery(
+        this.runHistoryStatement(
           `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
           [
             ...preparedUpdates.map(update => update.storedValue),
@@ -4016,7 +4029,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             identity,
             primaryKeyReplacements.map(replacement => replacement.column)
           ),
-          unresolvableTriggeredPrimaryKeyUpdateError(table)
+          unresolvableTriggeredPrimaryKeyUpdateError(table),
+          textEncoding
         );
         const newPredicate = buildRecordIdentityPredicate(newRowId, identity);
         const post = this.queryRaw(
@@ -4044,7 +4058,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             operation: preparedUpdate.prepared.operation
           });
         }
-      }
+      }));
 
       await this.executeQuery(`RELEASE ${savepointName}`);
       return results;

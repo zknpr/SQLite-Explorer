@@ -377,6 +377,8 @@ The native engine reads and writes the file itself, beside whatever else has it 
 
 `queryBatch` in `nativeWorker.ts` sends multiple SQL queries in a single IPC round-trip. Used for schema fetching (3 queries → 1 call) and pragma reads.
 
+A WITHOUT ROWID batch cell edit on native runs its rows together (`updateNativePrimaryKeyRowsTogether`: every row's key and prior cells, then every UPDATE with `changes()`, then every row's cells, each phase in `queryHistoryBatch` requests) only when no edited column is a key column and the UPDATE probe compiled no ON UPDATE CASCADE (`assertNoApplicableUpdateTriggerTargetWrites` returns that): then each UPDATE changes only its own row. Two requested identities that name one stored row (a NOCASE key) fall back to the per-row sequence before anything is written. `without_rowid_batch_edit.test.ts` runs each case both ways (`nativePrimaryKeyBatch.enabled`) and pins the request count; on WebAssembly the same edit caches its statements per call.
+
 ### Native Memory-Mapped Reads
 
 At each open, `nativeMemoryMapBytes()` in `nativeWorker.ts` decides whether the worker sets `PRAGMA main.mmap_size` (256 MiB). SQLite cannot catch a fault on a mapped page. An I/O error, or another program truncating the file during a statement, kills the tjs process, where `read()` fails only that statement with "database disk image is malformed". So only files on Linux local filesystems are mapped, picked by statfs magic number:

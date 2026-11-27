@@ -6,7 +6,7 @@ import { escapeIdentifier, escapeMainIdentifier, validateRowId } from './sql-uti
 import {
   buildRecordIdentityPredicateChunks
 } from './row-identity';
-import type { CellUpdate, CellValue, TableIdentity } from './types';
+import type { CellUpdate, CellValue, RecordId, TableIdentity } from './types';
 
 export interface BatchPriorLimitQuery {
   column: string;
@@ -25,18 +25,21 @@ export const BATCH_PRIOR_ROWID_CHUNK_SIZE = SQLITE_MAX_VARIABLE_NUMBER - 1;
 const RAW_TEXT_HISTORY_SIDECAR_KEY_BYTES = 'rawTextBytes'.length * 2;
 
 /**
- * Build metadata-only guards for rowid batches without one query per cell.
- * Distinct row identities are checked once per column and no prior value is
+ * Build metadata-only guards for a batch without one query per cell. Distinct
+ * row identities are checked once per column and no prior value is
  * materialized before the caller has confirmed that every value is bounded.
+ * Rowid batches by default; a primary-key identity chunks its predicates.
  */
 export function buildBatchPriorLimitQueries(
   table: string,
   updates: readonly CellUpdate[],
-  editLimitBytes: number
+  editLimitBytes: number,
+  identity?: TableIdentity
 ): BatchPriorLimitQuery[] {
+  const byPrimaryKey = identity?.kind === 'primaryKey';
   const rowIdsByColumn = new Map<string, Map<string, CellValue>>();
   for (const update of updates) {
-    const rowId = validateRowId(update.rowId);
+    const rowId = byPrimaryKey ? update.rowId : validateRowId(update.rowId);
     let rowIds = rowIdsByColumn.get(update.column);
     if (!rowIds) {
       rowIds = new Map();
@@ -49,17 +52,25 @@ export function buildBatchPriorLimitQueries(
   for (const [column, rowIdMap] of rowIdsByColumn) {
     const rowIds = [...rowIdMap.values()];
     const escapedColumn = escapeIdentifier(column);
+    const select =
+      `SELECT typeof(${escapedColumn}) AS "storage_class", ` +
+      `length(CAST(${escapedColumn} AS BLOB)) AS "byte_length" ` +
+      `FROM ${escapeMainIdentifier(table)} WHERE `;
+    const oversized =
+      `AND typeof(${escapedColumn}) IN ('text', 'blob') ` +
+      `AND length(CAST(${escapedColumn} AS BLOB)) > ? LIMIT 1`;
+    if (byPrimaryKey) {
+      // The chunks leave one bind free for the limit.
+      for (const predicate of buildRecordIdentityPredicateChunks(rowIds as RecordId[], identity)) {
+        queries.push({ column, sql: `${select}(${predicate.sql}) ${oversized}`, params: [...predicate.params, editLimitBytes] });
+      }
+      continue;
+    }
     for (let offset = 0; offset < rowIds.length; offset += BATCH_PRIOR_ROWID_CHUNK_SIZE) {
       const chunk = rowIds.slice(offset, offset + BATCH_PRIOR_ROWID_CHUNK_SIZE);
       queries.push({
         column,
-        sql:
-          `SELECT typeof(${escapedColumn}) AS "storage_class", ` +
-          `length(CAST(${escapedColumn} AS BLOB)) AS "byte_length" ` +
-          `FROM ${escapeMainIdentifier(table)} ` +
-          `WHERE rowid IN (${chunk.map(() => '?').join(', ')}) ` +
-          `AND typeof(${escapedColumn}) IN ('text', 'blob') ` +
-          `AND length(CAST(${escapedColumn} AS BLOB)) > ? LIMIT 1`,
+        sql: `${select}rowid IN (${chunk.map(() => '?').join(', ')}) ${oversized}`,
         params: [...chunk, editLimitBytes]
       });
     }
