@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "eslint .",
     "test:demo-cache": "node --test tests/demo-cache.test.mjs",
-    "test:demo-sql": "node --test tests/demo-sql.test.mjs"
+    "test:demo-sql": "node --test tests/demo-sql.test.mjs",
+    "test:landing": "node --test tests/landing.test.mjs",
+    "test:desktop-release": "node --test tests/desktop-release.test.mjs"
   },
   "dependencies": {
     "@vercel/analytics": "^2.0.1",
