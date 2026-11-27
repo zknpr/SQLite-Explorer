@@ -355,7 +355,7 @@ The webview provides a UI to configure SQLite PRAGMAs (e.g., WAL mode, Foreign K
   - The tests that use the system's own programs need macOS, or Linux with `getfacl` and `setfacl`. Test files that assert what a save logs turn those programs off for themselves (`accessEntryTools.use = null`), so that they do not depend on which programs a machine has.
   - Run `windows_access_list.test.ts` and `save_in_place_engines.test.ts` on Windows as a standard user as well. `save_lock_page.test.ts` runs only with `SQLITE_EXPLORER_BIG_TESTS=1`.
   - `tests/desktop` checks in the editor's own runtime that a child process told to run as Node does.
-- `scripts/build.mjs` holds `out/extension.js` to 500,000 bytes and `out/extension-browser.js` to 550,000.
+- `scripts/build.mjs` holds `out/extension.js` to 500,000 bytes and `out/extension-browser.js` to 575,000.
 
 ### Reads and Edits Beside Another Program (native)
 
