@@ -139,6 +139,7 @@ import {
 import {
   assertDeleteSnapshotFitsUndoBudget,
   buildDeleteSnapshotSizeQuery,
+  deleteSnapshotCharger,
   deleteSnapshotValueColumns,
   parseDeleteSnapshotSizeRow,
   projectDeleteSnapshotBytes,
@@ -1871,7 +1872,8 @@ export async function createNativeDatabaseConnection(
         rowIds: readonly RecordId[],
         includeSyntheticRowId: boolean,
         maxSnapshotBytes: number,
-        operation: 'Delete' | 'Insert' = 'Delete'
+        operation: 'Delete' | 'Insert' = 'Delete',
+        oneStorageClassList = false
       ): Promise<Array<{ rowCount: number; valueBytes: number }>> => {
         const sizes = await readNativeDeleteSnapshotSizes(
           table,
@@ -1887,7 +1889,8 @@ export async function createNativeDatabaseConnection(
           rowCount: sizes.reduce((total, size) => total + size.rowCount, 0),
           valueBytes: sizes.reduce((total, size) => total + size.valueBytes, 0),
           maxSnapshotBytes,
-          operation
+          operation,
+          oneStorageClassList
         });
         return sizes;
       };
@@ -4652,10 +4655,13 @@ export async function createNativeDatabaseConnection(
                   predicates,
                   rowIds,
                   false,
-                  maxUndoSnapshotBytes
+                  maxUndoSnapshotBytes,
+                  'Delete',
+                  true
                 )
                 : await readNativeDeleteSnapshotSizes(table, insertableColumns, predicates, false);
               const textEncoding = await readNativeCellTextEncoding();
+              const chargeSnapshot = deleteSnapshotCharger(maxUndoSnapshotBytes);
               const deletedRows: DeletedRow[] = [];
               const columnChunks = chunkRowHistoryColumns(insertableColumns);
               const currentRows: CellValue[][][] = [];
@@ -4699,14 +4705,14 @@ export async function createNativeDatabaseConnection(
                       states[index].rawTextBytes ?? states[index].value
                     ]
                   ));
-                  return {
+                  return chargeSnapshot({
                     rowId: deletedRowId,
                     row: rowData,
                     storageClasses: insertableColumns.map((column, index) => ({
                       column,
                       storageClass: states[index].storageClass
                     }))
-                  };
+                  });
                 }));
               }
               assertOneRowPerIdentity(table, rowIds, deletedRows.map(row => row.rowId));
@@ -4743,10 +4749,13 @@ export async function createNativeDatabaseConnection(
                 predicates,
                 rowIds,
                 true,
-                maxUndoSnapshotBytes
+                maxUndoSnapshotBytes,
+                'Delete',
+                true
               )
               : await readNativeDeleteSnapshotSizes(table, insertableColumns, predicates, true);
             const textEncoding = await readNativeCellTextEncoding();
+            const chargeSnapshot = deleteSnapshotCharger(maxUndoSnapshotBytes);
             const deletedRows: DeletedRow[] = [];
             const columnChunks = chunkRowHistoryColumns(insertableColumns);
             const currentRows: CellValue[][][] = [];
@@ -4780,14 +4789,14 @@ export async function createNativeDatabaseConnection(
                     states[index].rawTextBytes ?? states[index].value
                   ])
                 );
-                return {
+                return chargeSnapshot({
                   rowId: deletedRowId,
                   row: rowData,
                   storageClasses: insertableColumns.map((column, index) => ({
                     column,
                     storageClass: states[index].storageClass
                   }))
-                };
+                });
               }));
             }
             if (deletedRows.length !== rowIds.length) {

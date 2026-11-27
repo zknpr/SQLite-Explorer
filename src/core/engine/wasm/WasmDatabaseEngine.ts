@@ -174,6 +174,7 @@ import {
   assertDeleteSnapshotFitsUndoBudget,
   buildDeleteSnapshotSizeQuery,
   deleteSnapshotValueColumns,
+  deleteSnapshotCharger,
   parseDeleteSnapshotSizeRow,
   undoSnapshotBudgetError
 } from '../../delete-history';
@@ -3106,9 +3107,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             predicates,
             rowIds,
             false,
-            maxUndoSnapshotBytes
+            maxUndoSnapshotBytes,
+            'Delete',
+            true
           );
         }
+        const chargeSnapshot = deleteSnapshotCharger(maxUndoSnapshotBytes);
         const deletedRows: DeletedRow[] = [];
         const textEncoding = this.getCellTextEncoding();
         const columnChunks = chunkRowHistoryColumns(insertableColumns);
@@ -3144,14 +3148,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                 states[index].rawTextBytes ?? states[index].value
               ]
             ));
-            return {
+            return chargeSnapshot({
               rowId: deletedRowId,
               row: rowData,
               storageClasses: insertableColumns.map((column, index) => ({
                 column,
                 storageClass: states[index].storageClass
               }))
-            };
+            });
           }));
         }
         assertOneRowPerIdentity(table, rowIds, deletedRows.map(row => row.rowId));
@@ -3187,9 +3191,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           predicates,
           rowIds,
           true,
-          maxUndoSnapshotBytes
+          maxUndoSnapshotBytes,
+          'Delete',
+          true
         );
       }
+      const chargeSnapshot = deleteSnapshotCharger(maxUndoSnapshotBytes);
       const deletedRows: DeletedRow[] = [];
       const textEncoding = this.getCellTextEncoding();
       const columnChunks = chunkRowHistoryColumns(insertableColumns);
@@ -3218,14 +3225,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               states[index].rawTextBytes ?? states[index].value
             ]
           ));
-          return {
+          return chargeSnapshot({
             rowId,
             row: rowData,
             storageClasses: insertableColumns.map((column, index) => ({
               column,
               storageClass: states[index].storageClass
             }))
-          };
+          });
         }));
       }
       if (deletedRows.length !== rowIds.length) {
@@ -3588,7 +3595,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     rowIds: readonly RecordId[],
     includeSyntheticRowId: boolean,
     maxSnapshotBytes: number,
-    operation: 'Delete' | 'Insert' = 'Delete'
+    operation: 'Delete' | 'Insert' = 'Delete',
+    oneStorageClassList = false
   ): void {
     const valueColumns = deleteSnapshotValueColumns(
       insertableColumns,
@@ -3611,7 +3619,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       rowCount,
       valueBytes,
       maxSnapshotBytes,
-      operation
+      operation,
+      oneStorageClassList
     });
   }
 

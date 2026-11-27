@@ -1,6 +1,7 @@
 import type { CellValue, RecordId } from './types';
 import type { RecordIdentityPredicate } from './row-identity';
-import { estimateUndoMemoryBytes } from './undo-history';
+import type { DeletedRow } from './types';
+import { estimateUndoMemoryBytes, SharedStorageClassLists } from './undo-history';
 import { escapeIdentifier, escapeMainIdentifier, joinExpressionTerms } from './sql-utils';
 
 const DELETED_ROW_STRUCTURAL_BYTES = 32;
@@ -72,6 +73,7 @@ export function assertDeleteSnapshotFitsUndoBudget(input: {
   valueBytes: number;
   maxSnapshotBytes: number;
   operation?: 'Delete' | 'Insert';
+  oneStorageClassList?: boolean;
 }): void {
   if (!Number.isSafeInteger(input.maxSnapshotBytes) || input.maxSnapshotBytes < 0) {
     throw new Error('Delete undo snapshot budget must be a non-negative safe integer');
@@ -92,6 +94,13 @@ export function projectDeleteSnapshotBytes(input: {
   rowIds: readonly RecordId[];
   rowCount: number;
   valueBytes: number;
+  /**
+   * Count one storage-class list for all the rows, as an entry whose
+   * snapshots share their lists may hold. Only for a caller that then charges
+   * every snapshot exactly (deleteSnapshotCharger): this projection is then an
+   * early refusal, and the charge is what holds the entry to the budget.
+   */
+  oneStorageClassList?: boolean;
 }): number {
   const rowKeys = new Set(input.insertableColumns);
   const rowKeyBytes = [...rowKeys].reduce((total, key) => total + key.length * 2, 0);
@@ -99,7 +108,8 @@ export function projectDeleteSnapshotBytes(input: {
     (total, rowId) => total + estimateUndoMemoryBytes(rowId),
     0
   );
-  const storageClassBytes = input.rowCount * input.insertableColumns.reduce(
+  const listCount = input.oneStorageClassList ? Math.min(input.rowCount, 1) : input.rowCount;
+  const storageClassBytes = listCount * input.insertableColumns.reduce(
     (total, column) => total + column.length * 2 + STORAGE_CLASS_ENTRY_STRUCTURAL_BYTES,
     0
   );
@@ -117,6 +127,25 @@ export function undoSnapshotBudgetError(operation: 'Delete' | 'Insert', maxSnaps
     `${operation.toLowerCase()} fewer rows or increase ` +
     'sqliteExplorer.maxUndoMemory.'
   );
+}
+
+/**
+ * Charge each snapshot of a delete as its entry will count it, with equal
+ * storage-class lists shared, and refuse once the snapshots pass the budget.
+ * The engine reads every snapshot before it deletes a row, so a refusal
+ * leaves the table as it was.
+ */
+export function deleteSnapshotCharger(maxSnapshotBytes: number | undefined): (snapshot: DeletedRow) => DeletedRow {
+  const lists = new SharedStorageClassLists();
+  let remaining = maxSnapshotBytes;
+  return snapshot => {
+    const bytes = lists.charge(snapshot);
+    if (remaining !== undefined) {
+      remaining -= bytes;
+      if (remaining < 0) throw undoSnapshotBudgetError('Delete', maxSnapshotBytes!);
+    }
+    return snapshot;
+  };
 }
 
 /** Whether an error is undoSnapshotBudgetError's, also after a worker passed on its message. */

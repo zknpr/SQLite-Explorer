@@ -10,6 +10,7 @@
 
 - Undoing an import or an added row, and redoing a row deletion, no longer removes a row whose REAL zero changed sign outside SQLite Explorer. SQL compares 0.0 and -0.0 as equal, so in a column without a declared type, which keeps the sign, such a row was removed as if it had not changed. These now fail with "Row changed outside SQLite Explorer history", as an undo or redo of a cell edit already did.
 - An import of 100,000 rows now fits the default undo memory limit (`sqliteExplorer.maxUndoMemory`, 50 MiB) unless its rows are wide. Every row's undo record held its own copy of the table's column list with each value's storage class, so a five-column import counted 53.6 MB and was refused. The rows now share one copy: the same import counts 21.4 MB and holds about 30 MB of memory instead of 72 MB or more. An import that still does not fit says how many of its rows did and names the setting.
+- Deleting rows shares the same lists, and each row is now counted against the undo memory limit as it is read, where an estimate made before reading decided alone: 100,000 rows of ten columns can be deleted at the default limit instead of being refused, and a delete can no longer take a little more than the limit. Rows with much text outside ASCII can still be refused before they reach it, because that estimate counts such text at more than its size.
 
 ## 1.9.0
 
