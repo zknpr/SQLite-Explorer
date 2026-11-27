@@ -38,17 +38,24 @@ const themeScript = `
   })();
 `;
 
+const title = 'SQLite Explorer: a SQLite viewer and editor';
+const description =
+  'Open SQLite databases in VS Code, in a desktop app for macOS, Windows and Linux, or in your browser. Browse, edit, query, import and export. Open source.';
+
+
 export const metadata: Metadata = {
-  title: "SQLite Explorer - VS Code Extension",
-  description:
-    "A powerful, open-source SQLite database viewer and editor for Visual Studio Code. View, edit, and manage SQLite databases directly in your editor.",
+  title: {
+    default: title,
+    template: '%s | SQLite Explorer',
+  },
+  description,
   keywords: [
     "SQLite",
+    "SQLite viewer",
+    "SQLite editor",
     "VS Code",
-    "extension",
+    "desktop app",
     "database",
-    "viewer",
-    "editor",
     "SQL",
     "WebAssembly",
   ],
@@ -75,24 +82,13 @@ export const metadata: Metadata = {
     locale: "en_US",
     url: "https://sqlite-explorer.zknpr.xyz/",
     siteName: "SQLite Explorer",
-    title: "SQLite Explorer - VS Code Extension",
-    description:
-      "A powerful, open-source SQLite database viewer and editor for Visual Studio Code.",
-    images: [
-      {
-        url: "/og-image.png",
-        width: 1200,
-        height: 630,
-        alt: "SQLite Explorer - VS Code Extension",
-      },
-    ],
+    title,
+    description,
   },
   twitter: {
     card: "summary_large_image",
-    title: "SQLite Explorer - VS Code Extension",
-    description:
-      "A powerful, open-source SQLite database viewer and editor for Visual Studio Code.",
-    images: ["/og-image.png"],
+    title,
+    description,
   },
   robots: {
     index: true,
