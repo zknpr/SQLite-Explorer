@@ -13,6 +13,10 @@
 - Deleting rows shares the same lists, and each row is now counted against the undo memory limit as it is read, where an estimate made before reading decided alone: 100,000 rows of ten columns can be deleted at the default limit instead of being refused, and a delete can no longer take a little more than the limit. Rows with much text outside ASCII can still be refused before they reach it, because that estimate counts such text at more than its size.
 - Hot-exit backups write each of those lists once: the backup of an unsaved 100,000-row import of ten columns is 26 MB instead of 68 MB. A backup written by this version cannot be restored by 1.9.0 or earlier, so do not downgrade with unsaved changes in a window you mean to restore.
 
+### Runtime
+
+- Update the native runtime to the txiki.js fork's commit `b9415b58`, which checks more of the SQL it is asked to run.
+
 ## 1.9.0
 
 ### Security

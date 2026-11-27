@@ -529,6 +529,26 @@ it('passes the native view smoke lane through the bundled txiki worker', async (
             assert.deepStrictEqual((await engine.executeQuery('SELECT 1 AS ok'))[0].rows, [[1]]);
         });
 
+        await testContext.test('refuses the PRAGMAs that set a file path, in both forms, before they reach the file system', async () => {
+            // The runtime's authorizer refuses them at compile time; the worker
+            // reports that with its coded refusal. Nothing the extension sends
+            // uses them, so even the internal path must not run them.
+            const pathDirectory = fs.mkdtempSync(path.join(testDir, 'path-pragmas-'));
+            const target = path.join(pathDirectory, 'chosen');
+            const quoted = `'${target.replaceAll("'", "''")}'`;
+            for (const pragma of ['temp_store_directory', 'data_store_directory', 'lock_proxy_file']) {
+                for (const sql of [`PRAGMA ${pragma} = ${quoted}`, `PRAGMA ${pragma}`, `PRAGMA main.${pragma}`, `EXPLAIN PRAGMA ${pragma} = ${quoted}`]) {
+                    await assert.rejects(engine.executeQuery(sql), /set a file path through a PRAGMA\. \(ERR_NATIVE_SQL_ATTACH_BLOCKED\)/, sql);
+                }
+            }
+            // A write takes the lock a proxy file would have moved.
+            await engine.executeQuery('CREATE TEMP TABLE path_pragma_probe (a)');
+            await engine.executeQuery('INSERT INTO path_pragma_probe VALUES (1)');
+            assert.deepStrictEqual(fs.readdirSync(pathDirectory), []);
+            assert.ok(!fs.readdirSync(testDir).some(name => name.endsWith('-conch')), 'a lock proxy file appeared');
+            assert.deepStrictEqual((await engine.executeQuery('SELECT 1 AS ok'))[0].rows, [[1]]);
+        });
+
         await testContext.test('serializes through an isolated native snapshot', async () => {
             const snapshot = await engine.serializeDatabase();
             assert.strictEqual(

@@ -199,9 +199,9 @@ function forEachWrappedError(error, visit, depth = 0, seen = new Set()) {
 }
 
 /**
- * The runtime's authorizer denies only ATTACH, DETACH and the ATTACH inside
- * VACUUM INTO, so SQLITE_AUTH on these connections is exactly that refusal,
- * wherever a wrapper put it.
+ * The runtime's authorizer denies only ATTACH, DETACH, the ATTACH inside
+ * VACUUM INTO and the PRAGMAs that set a file path, so SQLITE_AUTH on these
+ * connections is exactly one of those refusals, wherever a wrapper put it.
  */
 function isPathAuthorityRefusal(error) {
   let found = false;
@@ -225,7 +225,8 @@ function describeWorkerError(error) {
     if (!others.includes(message)) others.push(message);
   });
   const text = 'The native SQLite engine refused a statement that would ATTACH, DETACH or ' +
-    'VACUUM INTO a database other than the one this editor opened. ' +
+    'VACUUM INTO a database other than the one this editor opened, or set a file path ' +
+    'through a PRAGMA. ' +
     `(${NATIVE_SQL_ATTACH_BLOCKED})` + others.map(message => `; ${message}`).join('');
   // The same IPC bound as every other worker error.
   return describeNativeError({ message: text }, 'Unknown native worker error');
