@@ -146,3 +146,68 @@ describe('JSON import of integers past int32', () => {
         }
     });
 });
+
+/**
+ * SQL compares REAL 0.0 and -0.0 as equal, and a typeless column keeps either.
+ * History that finds the other zero than it recorded refuses to replay: cell
+ * history, and row history (the redo of a delete, the undo of an import).
+ */
+async function assertZeroSignChangesRefuse(ops: DatabaseOperations) {
+    const read = async () => (await ops.executeQuery('SELECT id, a FROM s ORDER BY id'))[0].rows;
+    for (const [recorded, outside] of [['0.0', '-0.0'], ['-0.0', '0.0']]) {
+        const context = `recorded ${recorded}, found ${outside}`;
+        await ops.executeQuery(`DROP TABLE IF EXISTS s; CREATE TABLE s (id INTEGER PRIMARY KEY, a); INSERT INTO s VALUES (1, ${recorded}), (2, ${recorded})`);
+        const affectedCells = await ops.updateCellBatch('s', [1, 2].map(rowId => ({ rowId, column: 'a', value: 'x' })));
+        const edit = { modificationType: 'cell_update' as const, targetTable: 's', description: 'Edit', affectedCells };
+        await ops.undoModification(edit);
+        await ops.executeQuery(`UPDATE s SET a = ${outside} WHERE id = 1`);
+        await assert.rejects(() => ops.redoModification(edit), /Cell changed outside SQLite Explorer history/, `cell redo, ${context}`);
+        assert.ok(Object.is((await read())[0][1], Number(outside)), `cell kept, ${context}`);
+
+        await ops.executeQuery(`DELETE FROM s; INSERT INTO s VALUES (1, ${recorded}), (2, ${recorded})`);
+        const deletedRows = await ops.deleteRows('s', [1, 2]);
+        const deletion = { modificationType: 'row_delete' as const, targetTable: 's', description: 'Delete', deletedRows };
+        await ops.undoModification(deletion);
+        await ops.executeQuery(`UPDATE s SET a = ${outside} WHERE id = 1`);
+        await assert.rejects(() => ops.redoModification(deletion), /Row changed outside SQLite Explorer history/, `delete redo, ${context}`);
+        assert.equal((await read()).length, 2, `rows kept after the delete redo, ${context}`);
+        const insertion = { modificationType: 'row_insert' as const, targetTable: 's', description: 'Import', insertedRows: deletedRows };
+        await assert.rejects(() => ops.undoModification(insertion), /Row changed outside SQLite Explorer history/, `import undo, ${context}`);
+        assert.equal((await read()).length, 2, `rows kept after the import undo, ${context}`);
+
+        // With the recorded zero back, the same redo applies.
+        await ops.executeQuery(`UPDATE s SET a = ${recorded} WHERE id = 1`);
+        await ops.redoModification(deletion);
+        assert.deepEqual(await read(), [], `delete redo applies, ${context}`);
+    }
+}
+
+describe('REAL zero whose sign changed outside history', () => {
+    it('refuses to replay on WebAssembly', async () => {
+        const engine = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+        try {
+            await assertZeroSignChangesRefuse(engine);
+        } finally {
+            engine.shutdown();
+        }
+    });
+
+    it('refuses to replay on the native engine', async (context) => {
+        if (!await isNativeAvailable(process.cwd())) {
+            if (process.env.FUZZ_EXPECT_TARGET) throw new Error(`Missing native runtime for ${process.env.FUZZ_EXPECT_TARGET}`);
+            return context.skip('Bundled native runtime unavailable');
+        }
+        fs.mkdirSync('.tmp', { recursive: true });
+        const directory = fs.mkdtempSync(path.resolve('.tmp/history-zero-sign-'));
+        const file = path.join(directory, 'zeros.db');
+        fs.closeSync(fs.openSync(file, 'w'));
+        const native = await createNativeDatabaseConnection(vscode.Uri.file(process.cwd()));
+        try {
+            const { databaseOps } = await native.establishConnection(vscode.Uri.file(file), 'history-zero-sign', false);
+            await assertZeroSignChangesRefuse(databaseOps);
+        } finally {
+            native.workerMethods[Symbol.dispose]();
+            fs.rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        }
+    });
+});

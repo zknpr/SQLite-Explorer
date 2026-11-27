@@ -90,10 +90,12 @@ import {
   type StoredCellSqlFragment
 } from '../../cell-history';
 import {
+  buildRealZeroCheck,
   buildRowHistoryPredicate,
   buildRowHistoryWrites,
   chunkRowHistoryColumns,
   LegacyRowHistoryError,
+  realZerosMatch,
   RowHistoryConflictError,
   rowHistoryStates
 } from '../../row-history';
@@ -1779,6 +1781,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       await this.assertDeleteHasNoUntrackedPrograms(table);
       this.withHistoryStatements(() => this.mapInDeadlineChunks(rows, ({ snapshot, states }) => {
         const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
+        const zeroCheck = buildRealZeroCheck(states);
+        if (zeroCheck) {
+          const current = this.queryRaw(
+            `SELECT ${zeroCheck.projection} FROM ${escapeMainIdentifier(table)} WHERE ${rowIdentity.sql} LIMIT 2`,
+            rowIdentity.params
+          ).rows;
+          if (!realZerosMatch(zeroCheck, current.length === 1 ? current[0] : undefined)) {
+            throw new RowHistoryConflictError(table);
+          }
+        }
         const rowState = buildRowHistoryPredicate(snapshot, wasmBindPlaceholder, states);
         this.runHistoryStatement(
           `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +

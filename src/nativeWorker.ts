@@ -103,10 +103,12 @@ import {
   storedCellStatesEqual
 } from './core/cell-history';
 import {
+  buildRealZeroCheck,
   buildRowHistoryPredicate,
   buildRowHistoryWrites,
   chunkRowHistoryColumns,
   LegacyRowHistoryError,
+  realZerosMatch,
   RowHistoryConflictError,
   rowHistoryStates
 } from './core/row-history';
@@ -3559,6 +3561,30 @@ export async function createNativeDatabaseConnection(
         await beginNativeSavepoint(savepointName);
         try {
           await assertNativeMutationHasNoUntrackedPrograms('DELETE', table);
+          // Rows whose snapshot holds a REAL zero are read before any delete:
+          // the check above refuses triggers and mutating foreign-key actions,
+          // so no delete here changes another row.
+          const zeroReads = snapshots.flatMap((snapshot, index) => {
+            const check = buildRealZeroCheck(states[index]);
+            if (!check) return [];
+            const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
+            return [{
+              check,
+              query: {
+                sql: `SELECT ${check.projection} FROM ${escapeMainIdentifier(table)} WHERE ${rowIdentity.sql} LIMIT 2`,
+                params: rowIdentity.params
+              }
+            }];
+          });
+          for (const group of groupConsecutive(zeroReads, read => approximateQueryBytes(read.query))) {
+            const results = await queryNativeBatch(group.map(read => read.query));
+            group.forEach((read, index) => {
+              const values = results[index].values;
+              if (!realZerosMatch(read.check, values?.length === 1 ? values[0] : undefined)) {
+                throw new RowHistoryConflictError(table);
+              }
+            });
+          }
           const deletes = snapshots.map((snapshot, index) => {
             const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
             const rowState = buildRowHistoryPredicate(snapshot, undefined, states[index]);

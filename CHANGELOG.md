@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Undoing an import or an added row, and redoing a row deletion, no longer removes a row whose REAL zero changed sign outside SQLite Explorer. SQL compares 0.0 and -0.0 as equal, so in a column without a declared type, which keeps the sign, such a row was removed as if it had not changed. These now fail with "Row changed outside SQLite Explorer history", as an undo or redo of a cell edit already did.
+
 ## 1.9.0
 
 ### Security
