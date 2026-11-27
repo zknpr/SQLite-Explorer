@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "sqlJsCommit": "53f08bc0011b622f7462894dafd486990a32b63c",
+  "sqlJsCommit": "d3a01b8c633ae98ab594c50c0f3a8840add18212",
   "emcc": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 5.0.0 (a7c5deabd7c88ba1c38ebe988112256775f944c6)",
   "zig": "0.16.0",
   "zigClang": "clang version 21.1.0",
   "inputs": {
     "src/runtime/query-plan.c": "cf2c76d0aaf2b7d0d943485386ec7956e64b91622f2b8e9153f3a4b5ae7d5605",
-    "scripts/build-query-plan.mjs": "3fc1e935a59c1559b16f8b083e365b0aef09ea34d24019d84e652afc42494391",
+    "scripts/build-query-plan.mjs": "317fdb17b5cf65cda160d93a4126f440eacdee1662c0071e05aca5b1614c6524",
     "scripts/lib/sqlite-math-patch.mjs": "3ccde13595cc830f3641fa1a85c8ea4dca76348fd4b047417cb269cf7a0d504a"
   },
   "outputs": {
@@ -15,10 +15,10 @@
     "natives/x86_64-linux-gnu/query-plan.so": "a2d419bea944046b2c8483cc04a3a54df9a981b55723e5ca48db4301e430ab38",
     "natives/aarch64-linux-gnu/query-plan.so": "7d5c4b3c38db2f16b5d5cc555330fa8c08d6c42186f0d5c8510f1d3996024e89",
     "natives/x86_64-windows/query-plan.dll": "e46c647b4417044eaab05916682880c90e898c2dae4d93737bb5c1b1910cee26",
-    "vendor/sql.js/sql-wasm.js": "19d909678ee429f9e564d0c601bf4b21dab82d1be4f28bcb24cbd0c30fa07241",
-    "website/public/sqlite-viewer/sql-wasm.js": "19d909678ee429f9e564d0c601bf4b21dab82d1be4f28bcb24cbd0c30fa07241",
-    "vendor/sql.js/sql-wasm.wasm": "0c7f5bb1fe9556b2f8042dc16477f542d10a01eb85b2e24b7fb949b03c3dc283",
-    "assets/sqlite3.wasm": "0c7f5bb1fe9556b2f8042dc16477f542d10a01eb85b2e24b7fb949b03c3dc283",
-    "website/public/sqlite-viewer/sql-wasm.wasm": "0c7f5bb1fe9556b2f8042dc16477f542d10a01eb85b2e24b7fb949b03c3dc283"
+    "vendor/sql.js/sql-wasm.js": "440604ffbf14ca824fbdfca7a3e8d6196a4d10764ec74bf88377595a2926c643",
+    "website/public/sqlite-viewer/sql-wasm.js": "440604ffbf14ca824fbdfca7a3e8d6196a4d10764ec74bf88377595a2926c643",
+    "vendor/sql.js/sql-wasm.wasm": "9bd70b3f192ee1b129ffce061b45f9f93b1e5f7448698e40e092369641011025",
+    "assets/sqlite3.wasm": "9bd70b3f192ee1b129ffce061b45f9f93b1e5f7448698e40e092369641011025",
+    "website/public/sqlite-viewer/sql-wasm.wasm": "9bd70b3f192ee1b129ffce061b45f9f93b1e5f7448698e40e092369641011025"
   }
 }

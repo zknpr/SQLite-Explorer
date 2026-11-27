@@ -16,6 +16,7 @@
 ### Runtime
 
 - Update the native runtime to the txiki.js fork's commit `b9415b58`, which checks more of the SQL it is asked to run.
+- Build the WebAssembly runtime from sql.js 1.17.0 (fork commit `d3a01b8`). The engine passes every integer to it in a form it already bound exactly, so stored values do not change. The browser extension is 16 KB larger, for the table of SQLite's constants that sql.js now carries.
 
 ## 1.9.0
 

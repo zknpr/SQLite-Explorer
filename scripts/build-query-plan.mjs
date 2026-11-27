@@ -8,7 +8,7 @@ import { createPinnedArtifactPolicy } from './lib/pinned-artifacts.mjs';
 import { patchSqliteMath } from './lib/sqlite-math-patch.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const sourceCommit = '53f08bc0011b622f7462894dafd486990a32b63c';
+const sourceCommit = 'd3a01b8c633ae98ab594c50c0f3a8840add18212';
 const manifestPath = 'vendor/query-plan-manifest.json';
 const sourceFiles = ['src/runtime/query-plan.c', 'scripts/build-query-plan.mjs', 'scripts/lib/sqlite-math-patch.mjs'];
 const nativeTargets = [
@@ -164,8 +164,12 @@ export async function buildQueryPlanRuntime(args = process.argv.slice(2)) {
     // Its own extension-functions.o would compile src/legacy-functions.c with
     // a deprecation warning on every call of those functions; this build
     // compiles it with SQLJS_SILENT_LEGACY_FUNCTIONS, so nothing warns.
+    // out/constants.js (sql.js 1.17) is made by the Makefile's own rule from
+    // the header of the amalgamation verified above; marking that directory
+    // old keeps make from downloading and checking it a second time.
     run('make', ['dist/sql-wasm.js', `EMCC=${options.emcc}`, 'BITCODE_FILES=out/sqlite3.o out/extension-functions.o out/vfs.o out/query-plan.o',
-      '-o', 'out/sqlite3.o', '-o', 'out/extension-functions.o', '-o', 'out/vfs.o'], { cwd: source });
+      '-o', 'out/sqlite3.o', '-o', 'out/extension-functions.o', '-o', 'out/vfs.o',
+      '-o', path.relative(source, headers)], { cwd: source });
     for (const [file, copies] of Object.entries(wasmCopies)) {
       const contents = readFileSync(path.join(dist, file));
       for (const copy of copies) outputs.set(copy, contents);
