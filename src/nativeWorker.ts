@@ -144,7 +144,7 @@ import {
   projectDeleteSnapshotBytes,
   undoSnapshotBudgetError
 } from './core/delete-history';
-import { estimateUndoMemoryBytes } from './core/undo-history';
+import { SharedStorageClassLists } from './core/undo-history';
 import {
   buildExactNumericTextQuery,
   buildRowIdExactRealTextQueries,
@@ -3683,6 +3683,7 @@ export async function createNativeDatabaseConnection(
             });
           };
           const snapshots: DeletedRow[] = [];
+          const storageClassLists = new SharedStorageClassLists();
           const reads = predicates.map(predicate => ({
             sql: `SELECT ${projections} FROM ${escapedTable} WHERE ${predicate.sql} LIMIT 2`,
             params: predicate.params
@@ -3710,8 +3711,10 @@ export async function createNativeDatabaseConnection(
                 results[position],
                 textEncoding
               );
+              // Charged as the import's entry counts it: one list per distinct list.
+              const snapshotBytes = storageClassLists.charge(snapshot);
               if (remainingSnapshotBytes !== undefined) {
-                remainingSnapshotBytes -= estimateUndoMemoryBytes(snapshot);
+                remainingSnapshotBytes -= snapshotBytes;
                 if (remainingSnapshotBytes < 0) throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes!);
               }
               snapshots.push(snapshot);

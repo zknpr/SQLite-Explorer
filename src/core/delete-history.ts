@@ -118,3 +118,9 @@ export function undoSnapshotBudgetError(operation: 'Delete' | 'Insert', maxSnaps
     'sqliteExplorer.maxUndoMemory.'
   );
 }
+
+/** Whether an error is undoSnapshotBudgetError's, also after a worker passed on its message. */
+export function isUndoSnapshotBudgetError(error: unknown, operation: 'Delete' | 'Insert'): boolean {
+  return error instanceof Error
+    && new RegExp(`${operation} undo snapshot exceeds the \\d+-byte memory budget`).test(error.message);
+}

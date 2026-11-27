@@ -7,7 +7,8 @@ import * as vscode from 'vscode';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
 import { createNativeDatabaseConnection } from '../../src/nativeWorker';
 import { serializeOperations, runReadSnapshot } from '../../src/core/operation-serializer';
-import { estimateUndoMemoryBytes } from '../../src/core/undo-history';
+import { estimateUndoMemoryBytes, SharedStorageClassLists } from '../../src/core/undo-history';
+import { projectDeleteSnapshotBytes } from '../../src/core/delete-history';
 import { importRowsAtomically } from '../../src/core/bulk-import';
 import type { CellValue, DatabaseOperations, DeletedRow } from '../../src/core/types';
 
@@ -64,6 +65,37 @@ async function insertOneByOne(
     return snapshots;
 }
 
+/** What each snapshot adds to the import's entry, whose snapshots share equal storage-class lists. */
+function chargesAsOneEntry(snapshots: readonly DeletedRow[]): number[] {
+    const lists = new SharedStorageClassLists();
+    return snapshots.map(snapshot => lists.charge(structuredClone(snapshot)));
+}
+
+/**
+ * The rule a batch applies to each row in order: its preflight projection
+ * (TEXT at twice its UTF-8 bytes, as the size query counts it) must fit what
+ * the earlier rows left, and then its charge to the entry must.
+ */
+function admittedRowByRow(snapshots: readonly DeletedRow[], budget: number): boolean {
+    const lists = new SharedStorageClassLists();
+    let remaining = budget;
+    for (const snapshot of snapshots) {
+        const valueBytes = snapshot.storageClasses!.reduce((sum, { column, storageClass }) => {
+            const value = snapshot.row[column];
+            if (storageClass === 'text') return sum + 2 * Buffer.byteLength(value as string, 'utf8');
+            if (storageClass === 'blob') return sum + (value as Uint8Array).byteLength;
+            return sum + (storageClass === 'integer' || storageClass === 'real' ? 8 : 0);
+        }, 0);
+        const projected = projectDeleteSnapshotBytes({
+            insertableColumns: Object.keys(snapshot.row), rowIds: [snapshot.rowId], rowCount: 1, valueBytes
+        });
+        if (projected > remaining) return false;
+        remaining -= lists.charge(structuredClone(snapshot));
+        if (remaining < 0) return false;
+    }
+    return true;
+}
+
 async function attempt(ops: DatabaseOperations, insert: (ops: DatabaseOperations) => Promise<DeletedRow[]>) {
     // Roll back every attempt so each budget starts from the same empty table.
     let outcome: { snapshots?: DeletedRow[]; error?: unknown } = {};
@@ -81,30 +113,43 @@ const SCHEMAS = {
 
 for (const backend of ['wasm', 'native'] as const) {
     for (const [kind, schema] of Object.entries(SCHEMAS)) {
-        it(`${backend} ${kind} batch history matches successive single-row inserts at every budget near the cutoff`, async () => {
+        it(`${backend} ${kind} batch history is admitted row by row at every budget near the cutoff`, async () => {
             // Non-ASCII TEXT makes the projected preflight size differ from the
             // exact tracker size, which is where a batched check could diverge.
             const rows = Array.from({ length: 30 }, (_, index) => ({ id: index + 1, value: 'é'.repeat(index * 7) + 'x'.repeat(index % 5) }));
             await withBackend(backend, schema, async ops => {
                 const reference = await attempt(ops, transaction => insertOneByOne(transaction, 'items', rows, 1 << 30));
                 assert.ok(reference.snapshots, String(reference.error));
-                const total = reference.snapshots.reduce((sum, snapshot) => sum + estimateUndoMemoryBytes(snapshot), 0);
-                const firstRows = reference.snapshots.slice(0, 3).reduce((sum, snapshot) => sum + estimateUndoMemoryBytes(snapshot), 0);
-                const budgets = [0, 1, firstRows - 1, firstRows, firstRows + 1];
-                for (let budget = total - 400; budget <= total + 40; budget += 9) budgets.push(budget);
-                budgets.push(total - 1, total, total + 1);
+                const charges = chargesAsOneEntry(reference.snapshots);
+                const total = charges.reduce((sum, bytes) => sum + bytes, 0);
+                const firstRows = charges.slice(0, 3).reduce((sum, bytes) => sum + bytes, 0);
+                // The least budget the rule admits. The last row's preflight
+                // counts TEXT at twice its UTF-8 bytes and a list of its own, so
+                // the cutoff sits above the entry's total.
+                let low = 0, high = 4 * total;
+                while (low < high) {
+                    const middle = Math.floor((low + high) / 2);
+                    if (admittedRowByRow(reference.snapshots, middle)) high = middle; else low = middle + 1;
+                }
+                const cutoff = low;
+                const budgets = [0, 1, firstRows - 1, firstRows, firstRows + 1, total - 1, total, total + 1];
+                for (let budget = cutoff - 400; budget <= cutoff + 40; budget += 9) budgets.push(budget);
+                budgets.push(cutoff - 1, cutoff, cutoff + 1);
+                let accepted = 0;
                 for (const budget of budgets) {
-                    const single = await attempt(ops, transaction => insertOneByOne(transaction, 'items', rows, budget));
+                    const expected = admittedRowByRow(reference.snapshots, budget);
                     const batch = await attempt(ops, async transaction => {
                         const snapshots = await transaction.insertRowsWithHistory!('items', rows, undefined, budget);
-                        const used = snapshots.reduce((sum, snapshot) => sum + estimateUndoMemoryBytes(snapshot), 0);
+                        const used = chargesAsOneEntry(snapshots).reduce((sum, bytes) => sum + bytes, 0);
                         if (used > budget) throw new Error('batch returned history beyond its budget');
                         return snapshots;
                     });
-                    assert.equal(batch.error === undefined, single.error === undefined,
-                        `budget ${budget}: single ${single.error ?? 'accepted'}, batch ${batch.error ?? 'accepted'}`);
-                    if (batch.snapshots) assert.deepEqual(batch.snapshots, single.snapshots);
+                    assert.equal(batch.error === undefined, expected,
+                        `budget ${budget}: expected ${expected ? 'accepted' : 'refused'}, batch ${batch.error ?? 'accepted'}`);
+                    if (batch.snapshots) { accepted++; assert.deepEqual(batch.snapshots, reference.snapshots); }
                 }
+                // The sweep reaches both sides of the cutoff.
+                assert.ok(accepted > 0 && accepted < budgets.length);
             });
         });
     }

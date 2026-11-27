@@ -177,7 +177,7 @@ import {
   parseDeleteSnapshotSizeRow,
   undoSnapshotBudgetError
 } from '../../delete-history';
-import { estimateUndoMemoryBytes } from '../../undo-history';
+import { SharedStorageClassLists } from '../../undo-history';
 import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
@@ -2732,6 +2732,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       const textEncoding = this.getCellTextEncoding();
       let remainingSnapshotBytes = maxUndoSnapshotBytes;
+      const storageClassLists = new SharedStorageClassLists();
       const snapshots = this.withHistoryStatements(() => this.mapInDeadlineChunks(rows, row => {
         const rowId = this.insertRowForHistory(table, identity, row, textEncoding);
         if (remainingSnapshotBytes !== undefined) {
@@ -2746,8 +2747,10 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           );
         }
         const snapshot = this.readRowHistorySnapshot(table, identity, rowId, insertableColumns, textEncoding);
+        // Charged as the import's entry counts it: one list per distinct list.
+        const snapshotBytes = storageClassLists.charge(snapshot);
         if (remainingSnapshotBytes !== undefined) {
-          remainingSnapshotBytes -= estimateUndoMemoryBytes(snapshot);
+          remainingSnapshotBytes -= snapshotBytes;
           if (remainingSnapshotBytes < 0) throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes!);
         }
         return snapshot;

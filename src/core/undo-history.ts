@@ -5,7 +5,7 @@
  * Supports serialization for VS Code hot exit backup.
  */
 
-import type { LabeledModification } from './types';
+import type { DeletedRow, LabeledModification } from './types';
 import {
   decodeJsonSafeNumberString,
   encodeJsonSafeNonFiniteNumber,
@@ -146,6 +146,76 @@ export function estimateUndoMemoryBytes(value: unknown): number {
     }
   }
   return size;
+}
+
+type StorageClassList = NonNullable<DeletedRow['storageClasses']>;
+
+/**
+ * One frozen copy of each distinct storage-class list, shared by the row
+ * snapshots that carry it. A snapshot lists every column with its storage
+ * class, nearly always the same list for every row of an import or deletion,
+ * and the copies were most of its history: a 100,000-row import of five
+ * columns was estimated at 53.6 MB, 32.2 MB of it these lists, and took
+ * 162 MB of heap once it had crossed from a worker (30 MB shared).
+ *
+ * estimateUndoMemoryBytes counts an object once per call, so an entry whose
+ * snapshots share a list is charged for it once. charge() returns what one
+ * snapshot adds to that estimate of its entry: an admission that sums it
+ * admits exactly what the tracker then counts. The lists are only read
+ * afterwards (rowHistoryStates maps them); freezing them makes a write fail
+ * instead of changing every row that shares the list.
+ */
+export class SharedStorageClassLists {
+  private readonly lists = new Map<string, { list: StorageClassList; bytes: number }>();
+
+  /** Point the snapshot at the shared list equal to its own; return its share of the entry estimate. */
+  charge(snapshot: DeletedRow): number {
+    const key = storageClassListKey(snapshot.storageClasses);
+    if (key === undefined) return estimateUndoMemoryBytes(snapshot);
+    const known = this.lists.get(key);
+    if (known) {
+      snapshot.storageClasses = known.list;
+      return estimateUndoMemoryBytes(snapshot) - known.bytes;
+    }
+    const list = Object.freeze(snapshot.storageClasses!.map(
+      ({ column, storageClass }) => Object.freeze({ column, storageClass })
+    )) as StorageClassList;
+    snapshot.storageClasses = list;
+    this.lists.set(key, { list, bytes: estimateUndoMemoryBytes(list) });
+    return estimateUndoMemoryBytes(snapshot);
+  }
+}
+
+/** A key for a list of plain {column, storageClass} pairs; any other shape is left as it is. */
+function storageClassListKey(list: unknown): string | undefined {
+  if (!Array.isArray(list)) return undefined;
+  const parts: string[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object' || Object.getPrototypeOf(entry) !== Object.prototype) return undefined;
+    const { column, storageClass } = entry as Record<string, unknown>;
+    if (Object.keys(entry).length !== 2 || typeof column !== 'string' || typeof storageClass !== 'string') {
+      return undefined;
+    }
+    parts.push(column, storageClass);
+  }
+  return JSON.stringify(parts);
+}
+
+/**
+ * Share the lists of an entry's row snapshots before it is counted, live and
+ * on restore alike: a hot-exit backup writes every copy out, and an entry
+ * counted unshared after a restore could no longer fit the limit it was
+ * admitted under.
+ */
+function shareRowStorageClasses(entry: unknown): void {
+  if (!entry || typeof entry !== 'object') return;
+  const lists = new SharedStorageClassLists();
+  for (const snapshots of [(entry as LabeledModification).insertedRows, (entry as LabeledModification).deletedRows]) {
+    if (!Array.isArray(snapshots)) continue;
+    for (const snapshot of snapshots) {
+      if (snapshot && typeof snapshot === 'object') lists.charge(snapshot);
+    }
+  }
 }
 
 // ============================================================================
@@ -336,6 +406,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.advanceMutationRevision();
 
     // Calculate size of new entry
+    shareRowStorageClasses(entry);
     const entrySize = estimateUndoMemoryBytes(entry);
 
     const savedUndoneCount = this.checkpointIndex - this.timeline.length;
@@ -720,6 +791,9 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     // Recalculate sizes for active timeline entries, redo entries, and captured
     // branch-revert entries so restored trackers enforce the same memory
     // accounting as live trackers.
+    for (const entry of [...tracker.timeline, ...tracker.futureStack, ...tracker.revertOnRestore]) {
+      shareRowStorageClasses(entry);
+    }
     tracker.timelineSizes = tracker.timeline.map(estimateUndoMemoryBytes);
     tracker.futureStackSizes = tracker.futureStack.map(estimateUndoMemoryBytes);
     tracker.revertOnRestoreSizes = tracker.revertOnRestore.map(estimateUndoMemoryBytes);

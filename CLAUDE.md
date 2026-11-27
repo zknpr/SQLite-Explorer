@@ -294,6 +294,8 @@ The build uses esbuild with these targets:
 
 Hot exit backs up only the `ModificationTracker`. On WebAssembly, restore replays its unsaved entries onto the saved file, so the document pins them (`pinUncommittedEntries`): the entry and memory limits evict saved entries only, and once unsaved entries fill `maxUndoMemory` further edits wait for a save. The native engine has written every edit already and keeps the plain limits.
 
+The row snapshots of one history entry share their storage-class lists (`SharedStorageClassLists` in `undo-history.ts`): an import's admission sums `charge()`, which is what the tracker's estimate of the entry counts, and the tracker shares the lists of every entry it records or restores. The shared lists are frozen, and a write to one is silently ignored outside strict mode, so never write to a snapshot's `storageClasses`; replace the array instead.
+
 ### Inline Cell Editing
 
 The webview handles inline editing:
