@@ -14,10 +14,10 @@ const INT64_MIN = -9223372036854775808n, INT64_MAX = 9223372036854775807n;
 const INT64_RANGE_ERROR = 'Integer parameters must fit in a 64-bit signed integer, from -9223372036854775808 to 9223372036854775807.';
 
 /**
- * sql.js binds a whole number in int32 as INTEGER, any other number as REAL and
- * a BigInt as TEXT; the native worker binds numbers the same way
- * (bindableParams). So no JS value binds as an INTEGER past int32 on every
- * engine, or as a REAL with a whole value. Such a parameter is bound as text or
+ * sql.js binds a whole number in int32 as INTEGER and any other number as REAL,
+ * and the native worker binds numbers the same way (bindableParams); a BigInt
+ * binds as INTEGER on sql.js 1.17 but not on every engine. So no JS value binds
+ * as an INTEGER past int32 on every engine, or as a REAL with a whole value. Such a parameter is bound as text or
  * as its number and converted in SQL. The unary plus drops the CAST's
  * affinity, so the value compares as a plain ? would.
  */
