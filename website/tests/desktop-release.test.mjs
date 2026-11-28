@@ -3,9 +3,11 @@ import { afterEach, describe, test } from 'node:test';
 import {
   fetchDesktopRelease,
   formatMegabytes,
-  parseReleaseManifest
+  linuxInstallCommand,
+  parseReleaseManifest,
+  windowsChecksumCommand
 } from '../lib/desktop-release.ts';
-import { platformFromUserAgent } from '../lib/platform.ts';
+import { guessPlatform, platformFromUserAgent } from '../lib/platform.ts';
 
 // The shape of the app's real 0.4.0 release-manifest.json.
 const manifest = () => ({
@@ -133,3 +135,47 @@ describe('platformFromUserAgent', () => {
   }
 });
 
+
+describe('install and checksum commands', () => {
+  test('name the release file when the manifest was read', () => {
+    const release = parseReleaseManifest(manifest());
+    assert.equal(linuxInstallCommand(release), 'sudo apt install ./SQLite-Explorer-0.4.0-linux-amd64.deb');
+    assert.equal(
+      windowsChecksumCommand(release),
+      "(Get-FileHash .\\SQLite-Explorer-0.4.0-windows-x64-setup.exe).Hash -eq ((Select-String -Path SHA256SUMS -SimpleMatch 'SQLite-Explorer-0.4.0-windows-x64-setup.exe').Line -split ' ')[0]"
+    );
+  });
+
+  test('without a manifest, find the downloaded file by a wildcard the shell expands', () => {
+    // Angle brackets would be redirections in both shells.
+    for (const command of [linuxInstallCommand(null), windowsChecksumCommand(null)]) assert.doesNotMatch(command, /[<>]/);
+    assert.equal(linuxInstallCommand(null), 'sudo apt install ./SQLite-Explorer-*-linux-amd64.deb');
+    assert.equal(
+      windowsChecksumCommand(null),
+      "$file = Get-Item .\\SQLite-Explorer-*-windows-x64-setup.exe; (Get-FileHash $file).Hash -eq ((Select-String -Path SHA256SUMS -SimpleMatch $file.Name).Line -split ' ')[0]"
+    );
+  });
+});
+
+describe('guessPlatform', () => {
+  const WINDOWS = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36';
+  const LINUX = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36';
+  // A browser answers only the hints it is asked for.
+  const navigatorWith = (userAgent, hints) => ({
+    userAgent,
+    maxTouchPoints: 0,
+    userAgentData: {
+      mobile: false,
+      getHighEntropyValues: async requested => Object.fromEntries(Object.entries(hints).filter(([hint]) => requested.includes(hint)))
+    }
+  });
+
+  test('a 32-bit Windows or Linux machine cannot run the x86-64 package', async () => {
+    for (const [userAgent, platform] of [[WINDOWS, 'windows'], [LINUX, 'linux']]) {
+      assert.deepEqual(await guessPlatform(navigatorWith(userAgent, { architecture: 'x86', bitness: '32' })), { platform, unsupported: true });
+      assert.deepEqual(await guessPlatform(navigatorWith(userAgent, { architecture: 'x86', bitness: '64' })), { platform, unsupported: false });
+      // Without the hint the guess rests on the platform alone.
+      assert.deepEqual(await guessPlatform(navigatorWith(userAgent, { architecture: 'x86' })), { platform, unsupported: false });
+    }
+  });
+});

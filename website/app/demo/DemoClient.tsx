@@ -78,7 +78,7 @@ export default function DemoClient() {
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       <SiteHeader>
         {status === 'ready' && (
-          <div className="flex min-w-0 items-center gap-1 border-l border-edge pl-4">
+          <div className="order-last flex min-w-0 basis-full items-center gap-1 border-t border-edge py-2 md:order-none md:basis-auto md:border-l md:border-t-0 md:py-0 md:pl-4">
             <span className="mr-1 hidden truncate text-[0.9375rem] font-semibold sm:inline">{databaseName}</span>
             <button onClick={handleReload} className={iconButton} title="Reload database">
               <RefreshCw className="h-4 w-4" aria-hidden="true" />

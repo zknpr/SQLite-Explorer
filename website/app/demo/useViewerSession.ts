@@ -194,6 +194,15 @@ export function useViewerSession() {
 
   const activePreviewController = useRef<AbortController | null>(null);
 
+  /**
+   * Set when the session unmounts. A load still reading its bytes must not
+   * create a worker then: no cleanup would retire it.
+   */
+  const sessionClosed = useRef(false);
+
+  /** The sample download in flight, aborted when the session closes or another sample loads. */
+  const sampleDownload = useRef<AbortController | null>(null);
+
   /** Latest source-bound reload callback used by iframe RPCs. */
   const reloadDatabaseRef = useRef<(() => Promise<unknown>) | null>(null);
 
@@ -520,10 +529,14 @@ export function useViewerSession() {
    * Initialize the Web Worker when component mounts.
    */
   useEffect(() => {
+    sessionClosed.current = false;
     // Listen for messages from iframe
     window.addEventListener('message', handleIframeMessage);
 
     return () => {
+      sessionClosed.current = true;
+      sampleDownload.current?.abort();
+      sampleDownload.current = null;
       window.removeEventListener('message', handleIframeMessage);
 
       // Cleanup worker on unmount
@@ -553,6 +566,9 @@ export function useViewerSession() {
    * File — the guard rejects larger inline Uint8Arrays.
    */
   const initializeWorker = useCallback(async (source: Uint8Array | File, filename: string) => {
+    if (sessionClosed.current) {
+      throw new DemoWorkerRetiredError('The demo closed before its database loaded');
+    }
     setQueryEditorOpen(false);
     setQuerySession(session => session + 1);
     // Terminate existing worker
@@ -718,8 +734,11 @@ export function useViewerSession() {
     setStatus('loading');
     setErrorMessage(null);
 
+    sampleDownload.current?.abort();
+    const download = new AbortController();
+    sampleDownload.current = download;
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: download.signal });
       if (!response.ok) {
         throw new Error(`Failed to fetch: ${response.statusText}`);
       }
@@ -734,10 +753,12 @@ export function useViewerSession() {
         : new File([binary], name, { type: 'application/x-sqlite3' });
       await initializeWorker(source, name);
     } catch (error) {
-      if (error instanceof DemoWorkerRetiredError) return;
+      if (error instanceof DemoWorkerRetiredError || download.signal.aborted) return;
       console.error('[Demo] Failed to load sample:', error);
       setStatus('error');
       setErrorMessage(error instanceof Error ? error.message : 'Failed to load sample database');
+    } finally {
+      if (sampleDownload.current === download) sampleDownload.current = null;
     }
   }, [initializeWorker]);
 

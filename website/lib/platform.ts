@@ -17,7 +17,7 @@ export interface PlatformGuess {
 interface UADataLike {
   platform?: string;
   mobile?: boolean;
-  getHighEntropyValues?: (hints: string[]) => Promise<{ architecture?: string }>;
+  getHighEntropyValues?: (hints: string[]) => Promise<{ architecture?: string; bitness?: string }>;
 }
 
 export function platformFromUserAgent(userAgent: string, maxTouchPoints = 0): DesktopPlatform | null {
@@ -34,14 +34,16 @@ export async function guessPlatform(nav: Navigator): Promise<PlatformGuess> {
   const platform = platformFromUserAgent(nav.userAgent, nav.maxTouchPoints);
   if (!platform || uaData?.mobile) return { platform: null, unsupported: false };
 
-  let architecture: string | undefined;
+  let hints: { architecture?: string; bitness?: string } | undefined;
   try {
-    architecture = (await uaData?.getHighEntropyValues?.(['architecture']))?.architecture;
+    hints = await uaData?.getHighEntropyValues?.(['architecture', 'bitness']);
   } catch {
-    // The hint is optional; without it the guess rests on the platform alone.
+    // The hints are optional; without them the guess rests on the platform alone.
   }
   const unsupported =
-    (platform === 'macos' && architecture === 'x86') ||
-    (platform === 'linux' && architecture === 'arm');
+    (platform === 'macos' && hints?.architecture === 'x86') ||
+    (platform === 'linux' && hints?.architecture === 'arm') ||
+    // The Windows and Linux packages are x86-64 builds.
+    ((platform === 'windows' || platform === 'linux') && hints?.bitness === '32');
   return { platform, unsupported };
 }

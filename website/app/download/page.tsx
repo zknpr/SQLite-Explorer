@@ -19,7 +19,9 @@ import {
   DESKTOP_PLATFORMS,
   PACKAGE_INFO,
   fetchDesktopRelease,
-  formatMegabytes
+  formatMegabytes,
+  linuxInstallCommand,
+  windowsChecksumCommand
 } from '@/lib/desktop-release';
 
 export const revalidate = 3600;
@@ -35,8 +37,6 @@ const link = 'font-semibold text-accent underline-offset-2 hover:underline';
 
 export default async function DownloadPage() {
   const release = await fetchDesktopRelease();
-  const fileName = (platform: (typeof DESKTOP_PLATFORMS)[number]) =>
-    release?.assets[platform].name ?? `SQLite-Explorer-<version>-${PACKAGE_INFO[platform].suffix}`;
 
   return (
     <>
@@ -168,7 +168,7 @@ export default async function DownloadPage() {
                 x86-64 Debian package. It needs glibc 2.39 or newer: Ubuntu 24.04, Debian 13 or later.
               </p>
               <p className="mt-4">Install it from the folder you downloaded it to:</p>
-              <CopyCommand command={`sudo apt install ./${fileName('linux')}`} className="mt-2" />
+              <CopyCommand command={linuxInstallCommand(release)} className="mt-2" />
               <p className="mt-4 text-[0.9375rem] text-subtle-foreground">
                 Remove it with <code>sudo apt remove sqlite-explorer</code>. AppImage packages are not provided.
               </p>
@@ -200,7 +200,7 @@ export default async function DownloadPage() {
             <div>
               <p className="mb-2 text-[0.9375rem] font-semibold">Windows (PowerShell, prints True for a match)</p>
               <CopyCommand
-                command={`(Get-FileHash .\\${fileName('windows')}).Hash -eq ((Select-String -Path SHA256SUMS -SimpleMatch '${fileName('windows')}').Line -split ' ')[0]`}
+                command={windowsChecksumCommand(release)}
               />
             </div>
             <div>

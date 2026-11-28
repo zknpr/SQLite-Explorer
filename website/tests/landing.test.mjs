@@ -327,3 +327,75 @@ test('the footer links to every way of supporting the project', { timeout: 30_00
     await context.close();
   }
 });
+
+test('leaving the landing page while its preview downloads starts no worker afterwards', { timeout: 60_000 }, async () => {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  await page.route('**/samples/chinook.db', async route => {
+    await held;
+    // The page may have aborted the request by now.
+    await route.continue().catch(() => undefined);
+  });
+  try {
+    const requested = page.waitForRequest('**/samples/chinook.db');
+    await page.goto(`${origin}/`);
+    await requested;
+    await page.getByRole('link', { name: 'Open your own file' }).click();
+    await page.waitForURL('**/demo');
+    release();
+    await page.waitForTimeout(2_000);
+    assert.equal(page.workers().length, 0, 'the finished download started a worker for the page that had left');
+  } finally {
+    release();
+    await context.close();
+  }
+});
+
+/** Header controls that overlap, or reach past the window, and how wide the page is. */
+async function headerLayout(page) {
+  return page.evaluate(() => {
+    const header = document.querySelector('header.sticky');
+    const boxes = [...header.querySelectorAll('a, button')].filter(element => element.offsetParent !== null).map(element => {
+      const box = element.getBoundingClientRect();
+      return { name: (element.textContent || element.title || '').trim(), left: box.left, right: box.right, top: box.top, bottom: box.bottom };
+    });
+    const overlaps = [];
+    for (const [index, a] of boxes.entries()) {
+      for (const b of boxes.slice(index + 1)) {
+        if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) overlaps.push(`${a.name} / ${b.name}`);
+      }
+    }
+    return {
+      overlaps,
+      outside: boxes.filter(box => box.left < 0 || box.right > window.innerWidth).map(box => box.name),
+      pageWidth: document.documentElement.scrollWidth,
+      headerHeight: Math.round(header.getBoundingClientRect().height)
+    };
+  });
+}
+
+test('on a narrow screen the header keeps every control apart and inside the window', { timeout: 120_000 }, async () => {
+  for (const width of [320, 360, 375, 414, 640, 700, 768, 1440]) {
+    const context = await browser.newContext({ viewport: { width, height: 800 } });
+    const page = await context.newPage();
+    try {
+      await page.goto(`${origin}/download`);
+      const idle = await headerLayout(page);
+      await page.goto(`${origin}/demo`);
+      await page.getByRole('button', { name: /chinook/i }).first().click();
+      await page.getByRole('button', { name: 'Close', exact: true }).waitFor({ timeout: 30_000 });
+      const ready = await headerLayout(page);
+      for (const [state, layout] of [['without a database', idle], ['with a database open', ready]]) {
+        assert.deepEqual(layout.overlaps, [], `${width} px ${state}: controls overlap`);
+        assert.deepEqual(layout.outside, [], `${width} px ${state}: controls past the window`);
+        assert.ok(layout.pageWidth <= width, `${width} px ${state}: the page is ${layout.pageWidth} px wide`);
+      }
+      // From the md breakpoint up the demo's controls stay in the one row.
+      if (width >= 768) assert.equal(ready.headerHeight, 65);
+    } finally {
+      await context.close();
+    }
+  }
+});

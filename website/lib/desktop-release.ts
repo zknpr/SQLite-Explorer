@@ -114,3 +114,28 @@ export async function fetchDesktopRelease(): Promise<DesktopRelease | null> {
 export function formatMegabytes(bytes: number): string {
   return `${(bytes / 1_000_000).toFixed(1)} MB`;
 }
+
+/**
+ * The package's file name. Without a manifest the version is not known, so
+ * the name has a wildcard the shell expands to the downloaded file: a
+ * placeholder in angle brackets would be a redirection in both shells.
+ */
+export function packageFileName(release: DesktopRelease | null, platform: DesktopPlatform): string {
+  return release?.assets[platform].name ?? `SQLite-Explorer-*-${PACKAGE_INFO[platform].suffix}`;
+}
+
+/** The command that installs the Linux package from the folder it was downloaded to. */
+export function linuxInstallCommand(release: DesktopRelease | null): string {
+  return `sudo apt install ./${packageFileName(release, 'linux')}`;
+}
+
+/** The PowerShell line that compares the Windows installer with SHA256SUMS. */
+export function windowsChecksumCommand(release: DesktopRelease | null): string {
+  if (release) {
+    const name = release.assets.windows.name;
+    return `(Get-FileHash .\\${name}).Hash -eq ((Select-String -Path SHA256SUMS -SimpleMatch '${name}').Line -split ' ')[0]`;
+  }
+  // -SimpleMatch would take the wildcard literally, so the line looks up the
+  // name of the file the wildcard found.
+  return `$file = Get-Item .\\${packageFileName(null, 'windows')}; (Get-FileHash $file).Hash -eq ((Select-String -Path SHA256SUMS -SimpleMatch $file.Name).Line -split ' ')[0]`;
+}
