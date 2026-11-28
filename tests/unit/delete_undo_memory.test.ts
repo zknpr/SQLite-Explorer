@@ -131,7 +131,7 @@ async function sqlSent(action: () => Promise<unknown>): Promise<string[]> {
         return call.apply(this, args);
     } as typeof call;
     try {
-        await action().catch(() => undefined);
+        await action();
     } finally {
         engine.queryRaw = queryRaw;
         NativeWorkerProcess.prototype.call = call;
