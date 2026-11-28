@@ -191,7 +191,10 @@ describe('bounded cell viewer in Chromium', {
             await page.waitForFunction(() => (document.getElementById('page') as HTMLInputElement)?.value === '2');
             assert.ok(!(await page.locator('#content').textContent())!.includes('\uFFFD'));
             await page.locator('#last').click();
-            await page.waitForFunction(() => document.querySelector<HTMLButtonElement>('#last')?.disabled);
+            // Every button is disabled while a page loads; on the last page
+            // Previous is enabled again.
+            await page.waitForFunction(() => document.querySelector<HTMLButtonElement>('#last')?.disabled
+                && !document.querySelector<HTMLButtonElement>('#previous')?.disabled);
             assert.ok((await page.locator('#content').textContent())!.endsWith('😀é𝄞'));
             await page.locator('#previous').click();
             await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('#last')?.disabled);

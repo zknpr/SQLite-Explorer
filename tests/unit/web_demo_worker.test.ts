@@ -3703,6 +3703,43 @@ describe('web demo view worker', () => {
         );
     });
 
+    it('refuses demo row replay over a REAL zero whose sign changed outside history', async () => {
+        // SQL compares REAL 0.0 and -0.0 as equal, and a typeless column keeps either.
+        const worker = await createWorkerHarness();
+        const read = async () => ((await worker.invoke('runQuery', 'SELECT id, a FROM demo_zero_sign ORDER BY id'))[0]?.rows ?? [])
+            .map((values: unknown[]) => Array.from(values));
+        for (const [recorded, outside] of [['0.0', '-0.0'], ['-0.0', '0.0']]) {
+            const context = `recorded ${recorded}, found ${outside}`;
+            await worker.invoke(
+                'runQuery',
+                'DROP TABLE IF EXISTS demo_zero_sign; ' +
+                `CREATE TABLE demo_zero_sign (id INTEGER PRIMARY KEY, a DEFAULT (${recorded})); ` +
+                `INSERT INTO demo_zero_sign VALUES (1, ${recorded}), (2, ${recorded})`
+            );
+            const deletedRows = await worker.invoke('deleteRows', 'demo_zero_sign', [1, 2]);
+            const deletion = { modificationType: 'row_delete', targetTable: 'demo_zero_sign', description: 'Delete', deletedRows };
+            await worker.invoke('undoModification', deletion);
+            await worker.invoke('runQuery', `UPDATE demo_zero_sign SET a = ${outside} WHERE id = 1`);
+            await assert.rejects(worker.invoke('redoModification', deletion), /Row changed outside SQLite Explorer history/, `delete redo, ${context}`);
+            assert.strictEqual((await read()).length, 2, `rows kept after the delete redo, ${context}`);
+            await worker.invoke('runQuery', `UPDATE demo_zero_sign SET a = ${recorded} WHERE id = 1`);
+            await worker.invoke('redoModification', deletion);
+            assert.deepStrictEqual(await read(), [], `delete redo applies, ${context}`);
+
+            const insertedRow = await worker.invoke('insertRowWithHistory', 'demo_zero_sign', { id: 3 });
+            const insertion = {
+                modificationType: 'row_insert', targetTable: 'demo_zero_sign', targetRowId: insertedRow.rowId,
+                description: 'Insert', rowData: insertedRow.row, insertedRow
+            };
+            await worker.invoke('runQuery', `UPDATE demo_zero_sign SET a = ${outside} WHERE id = 3`);
+            await assert.rejects(worker.invoke('undoModification', insertion), /Row changed outside SQLite Explorer history/, `insert undo, ${context}`);
+            assert.strictEqual((await read()).length, 1, `row kept after the insert undo, ${context}`);
+            await worker.invoke('runQuery', `UPDATE demo_zero_sign SET a = ${recorded} WHERE id = 3`);
+            await worker.invoke('undoModification', insertion);
+            assert.deepStrictEqual(await read(), [], `insert undo applies, ${context}`);
+        }
+    });
+
     it('replays demo row history on FTS5 and language-id FTS4 tables', async () => {
         const worker = await createWorkerHarness();
         for (const [ddl, table, row, columns] of [

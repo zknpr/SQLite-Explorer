@@ -185,13 +185,15 @@ function readExplainInteger(value: unknown): number | undefined {
  * because its side effects are outside history. For foreign-key UPDATE programs,
  * only CASCADE is reversible through the existing parent-row history; SET
  * NULL/DEFAULT sever the reference and must be rejected before mutation.
+ * Returns whether such a CASCADE compiled: it can change rows other than the
+ * one updated.
  */
 export function assertNoApplicableUpdateTriggerTargetWrites(
   table: string,
   targetRootPage: number,
   rows: readonly (readonly unknown[])[],
   identityKind: 'rowid' | 'primary-key' = 'rowid'
-): void {
+): boolean {
   if (!Number.isSafeInteger(targetRootPage) || targetRootPage < 0) {
     throw new Error(`SQLite returned invalid table root-page metadata for ${table}`);
   }
@@ -322,6 +324,8 @@ export function assertNoApplicableUpdateTriggerTargetWrites(
       'the operation was rolled back because affected child rows are not represented in undo history.'
     );
   }
+  // What is left is an allowed ON UPDATE CASCADE, which can change other rows.
+  return programCount > 1;
 }
 
 /**

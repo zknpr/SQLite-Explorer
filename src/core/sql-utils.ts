@@ -38,7 +38,7 @@ const EXPRESSION_TERM_GROUP = 200;
  * columns reaches near that many terms, so a longer list is joined in
  * parenthesized groups. Up to one group the text is the flat chain.
  */
-export function joinExpressionTerms(terms: readonly string[], operator: 'AND' | '+'): string {
+export function joinExpressionTerms(terms: readonly string[], operator: 'AND' | '+' | '||'): string {
   const separator = ` ${operator} `;
   if (terms.length <= EXPRESSION_TERM_GROUP) return terms.join(separator);
   const groups: string[] = [];

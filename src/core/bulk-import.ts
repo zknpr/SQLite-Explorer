@@ -1,7 +1,8 @@
 import { bindableIntegerValue } from './integer-utils';
 import type { CellValue, DatabaseOperations, LabeledModification } from './types';
 import { runReadSnapshot } from './operation-serializer';
-import { estimateUndoMemoryBytes } from './undo-history';
+import { estimateUndoMemoryBytes, SharedStorageClassLists } from './undo-history';
+import { isUndoSnapshotBudgetError, undoSnapshotBudgetAdmittedRows } from './delete-history';
 import { DEFAULT_MAX_CELL_EDIT_BYTES } from './cell-edit-policy';
 
 export const IMPORT_MAX_BYTES = 64 * 1024 * 1024;
@@ -197,7 +198,16 @@ export async function importRowsAtomically(
         modificationType: 'row_insert', targetTable: table, insertedRows: []
     };
     let historyBytes = estimateUndoMemoryBytes(modification);
-    if (!Number.isFinite(maxUndoBytes) || historyBytes >= maxUndoBytes) throw new Error('Import exceeds the undo memory limit.');
+    // The rows whose history fit tell how far the limit is from this import.
+    const overLimit = (fitted: number) => new Error(
+        `Import needs more undo memory than sqliteExplorer.maxUndoMemory allows (${maxUndoBytes.toLocaleString('en-US')} bytes): ` +
+        `the history of ${fitted.toLocaleString('en-US')} of its ${rows.length.toLocaleString('en-US')} rows fit. ` +
+        'Nothing was imported. Import fewer rows or raise the limit.'
+    );
+    if (!Number.isFinite(maxUndoBytes)) throw new Error('Import exceeds the undo memory limit.');
+    if (historyBytes >= maxUndoBytes) throw overLimit(0);
+    // Batches arrive with lists of their own, so the entry shares them here.
+    const storageClassLists = new SharedStorageClassLists();
     return runReadSnapshot(operations, async transaction => {
         if (!transaction.insertRowsWithHistory) throw new Error('Backend does not support guarded import history.');
         let completed = 0;
@@ -211,11 +221,22 @@ export async function importRowsAtomically(
                 end++;
             }
             const batch = rows.slice(completed, end).map(bindIntegersExactly);
-            const snapshots = await transaction.insertRowsWithHistory(table, batch, DEFAULT_MAX_CELL_EDIT_BYTES, maxUndoBytes - historyBytes);
+            let snapshots: Awaited<ReturnType<typeof transaction.insertRowsWithHistory>>;
+            try {
+                snapshots = await transaction.insertRowsWithHistory(table, batch, DEFAULT_MAX_CELL_EDIT_BYTES, maxUndoBytes - historyBytes);
+            } catch (error) {
+                // The engine refused the batch against the budget this import had
+                // left, after the rows it names fit.
+                if (isUndoSnapshotBudgetError(error, 'Insert')) {
+                    const admitted = undoSnapshotBudgetAdmittedRows(error) ?? 0;
+                    throw overLimit(completed + Math.min(admitted, batch.length));
+                }
+                throw error;
+            }
             if (snapshots.length !== batch.length) throw new Error('Backend returned incomplete import history.');
             for (const snapshot of snapshots) {
-                historyBytes += estimateUndoMemoryBytes(snapshot);
-                if (historyBytes > maxUndoBytes) throw new Error('Import exceeds the undo memory limit. Split the file into smaller imports.');
+                historyBytes += storageClassLists.charge(snapshot);
+                if (historyBytes > maxUndoBytes) throw overLimit(completed);
                 modification.insertedRows!.push(snapshot);
                 completed++;
                 // Rows are reported once their batch is applied; a cancellation

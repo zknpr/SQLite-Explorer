@@ -90,10 +90,12 @@ import {
   type StoredCellSqlFragment
 } from '../../cell-history';
 import {
+  buildRealZeroCheck,
   buildRowHistoryPredicate,
   buildRowHistoryWrites,
   chunkRowHistoryColumns,
   LegacyRowHistoryError,
+  realZerosMatch,
   RowHistoryConflictError,
   rowHistoryStates
 } from '../../row-history';
@@ -172,10 +174,12 @@ import {
   assertDeleteSnapshotFitsUndoBudget,
   buildDeleteSnapshotSizeQuery,
   deleteSnapshotValueColumns,
+  deleteSnapshotCharger,
+  isUndoSnapshotBudgetError,
   parseDeleteSnapshotSizeRow,
   undoSnapshotBudgetError
 } from '../../delete-history';
-import { estimateUndoMemoryBytes } from '../../undo-history';
+import { SharedStorageClassLists } from '../../undo-history';
 import {
   assertViewDefinitionSnapshotCurrent,
   assertViewDefinitionStateCurrent,
@@ -1779,6 +1783,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       await this.assertDeleteHasNoUntrackedPrograms(table);
       this.withHistoryStatements(() => this.mapInDeadlineChunks(rows, ({ snapshot, states }) => {
         const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
+        const zeroCheck = buildRealZeroCheck(states);
+        if (zeroCheck) {
+          const current = this.queryRaw(
+            `SELECT ${zeroCheck.projection} FROM ${escapeMainIdentifier(table)} WHERE ${rowIdentity.sql} LIMIT 2`,
+            rowIdentity.params
+          ).rows;
+          if (!realZerosMatch(zeroCheck, current.length === 1 ? current[0] : undefined)) {
+            throw new RowHistoryConflictError(table);
+          }
+        }
         const rowState = buildRowHistoryPredicate(snapshot, wasmBindPlaceholder, states);
         this.runHistoryStatement(
           `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
@@ -2708,6 +2722,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const identity = await this.resolveTableIdentity(table);
     const insertableColumns = await this.getInsertableColumnNames(table);
     const savepointName = this.createSavepointName('sp_insert_rows_history');
+    let admitted = 0;
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const probedShapes = new Set<string>();
@@ -2720,6 +2735,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       }
       const textEncoding = this.getCellTextEncoding();
       let remainingSnapshotBytes = maxUndoSnapshotBytes;
+      const storageClassLists = new SharedStorageClassLists();
       const snapshots = this.withHistoryStatements(() => this.mapInDeadlineChunks(rows, row => {
         const rowId = this.insertRowForHistory(table, identity, row, textEncoding);
         if (remainingSnapshotBytes !== undefined) {
@@ -2734,16 +2750,23 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           );
         }
         const snapshot = this.readRowHistorySnapshot(table, identity, rowId, insertableColumns, textEncoding);
+        // Charged as the import's entry counts it: one list per distinct list.
+        const snapshotBytes = storageClassLists.charge(snapshot);
         if (remainingSnapshotBytes !== undefined) {
-          remainingSnapshotBytes -= estimateUndoMemoryBytes(snapshot);
+          remainingSnapshotBytes -= snapshotBytes;
           if (remainingSnapshotBytes < 0) throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes!);
         }
+        admitted++;
         return snapshot;
       }));
       await this.executeQuery(`RELEASE ${savepointName}`);
       return snapshots;
     } catch (error) {
       await this.safeRollbackSavepoint(savepointName, 'insertRowsWithHistory');
+      // The rows before the refused one fit; an import reports how many.
+      if (maxUndoSnapshotBytes !== undefined && isUndoSnapshotBudgetError(error, 'Insert')) {
+        throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes, admitted);
+      }
       throw error;
     }
   }
@@ -3091,9 +3114,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             predicates,
             rowIds,
             false,
-            maxUndoSnapshotBytes
+            maxUndoSnapshotBytes,
+            'Delete',
+            true
           );
         }
+        const chargeSnapshot = deleteSnapshotCharger(maxUndoSnapshotBytes);
         const deletedRows: DeletedRow[] = [];
         const textEncoding = this.getCellTextEncoding();
         const columnChunks = chunkRowHistoryColumns(insertableColumns);
@@ -3129,14 +3155,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
                 states[index].rawTextBytes ?? states[index].value
               ]
             ));
-            return {
+            return chargeSnapshot({
               rowId: deletedRowId,
               row: rowData,
               storageClasses: insertableColumns.map((column, index) => ({
                 column,
                 storageClass: states[index].storageClass
               }))
-            };
+            });
           }));
         }
         assertOneRowPerIdentity(table, rowIds, deletedRows.map(row => row.rowId));
@@ -3172,9 +3198,12 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           predicates,
           rowIds,
           true,
-          maxUndoSnapshotBytes
+          maxUndoSnapshotBytes,
+          'Delete',
+          true
         );
       }
+      const chargeSnapshot = deleteSnapshotCharger(maxUndoSnapshotBytes);
       const deletedRows: DeletedRow[] = [];
       const textEncoding = this.getCellTextEncoding();
       const columnChunks = chunkRowHistoryColumns(insertableColumns);
@@ -3203,14 +3232,14 @@ export class WasmDatabaseEngine implements DatabaseOperations {
               states[index].rawTextBytes ?? states[index].value
             ]
           ));
-          return {
+          return chargeSnapshot({
             rowId,
             row: rowData,
             storageClasses: insertableColumns.map((column, index) => ({
               column,
               storageClass: states[index].storageClass
             }))
-          };
+          });
         }));
       }
       if (deletedRows.length !== rowIds.length) {
@@ -3478,8 +3507,18 @@ export class WasmDatabaseEngine implements DatabaseOperations {
   private async assertBatchPriorsWithinEditLimit(
     table: string,
     updates: readonly CellUpdate[],
-    editLimitBytes: number
+    editLimitBytes: number,
+    identity: TableIdentity
   ): Promise<void> {
+    // One metadata query per column and identity chunk. Only a refusal checks
+    // cell by cell, so the error names the first oversized cell in request order.
+    const queries = buildBatchPriorLimitQueries(table, updates, editLimitBytes, identity);
+    const refused: Array<{ query: (typeof queries)[number]; rows: unknown[][] }> = [];
+    for (const query of queries) {
+      const rows = (await this.executeQuery(query.sql, query.params))[0]?.rows ?? [];
+      if (rows.length > 0) refused.push({ query, rows });
+    }
+    if (refused.length === 0) return;
     const seen = new Set<string>();
     for (const update of updates) {
       const key = `${String(update.rowId)}\0${update.column}`;
@@ -3492,6 +3531,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         editLimitBytes
       );
     }
+    assertBatchPriorLimitResult(table, refused[0].query, refused[0].rows, editLimitBytes);
   }
 
   private async assertRowIdBatchPriorsWithinEditLimit(
@@ -3562,7 +3602,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     rowIds: readonly RecordId[],
     includeSyntheticRowId: boolean,
     maxSnapshotBytes: number,
-    operation: 'Delete' | 'Insert' = 'Delete'
+    operation: 'Delete' | 'Insert' = 'Delete',
+    sharedStorageClassLists = false
   ): void {
     const valueColumns = deleteSnapshotValueColumns(
       insertableColumns,
@@ -3570,12 +3611,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     );
     let rowCount = 0;
     let valueBytes = 0;
+    // The distinct lists of each chunk, added: at least the entry's, so a
+    // delete whose lists alone pass the budget is refused before its rows
+    // are read. A list in several chunks counts once per chunk.
+    let storageClassLists = 0;
     for (const predicate of predicates) {
       const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
       const result = this.queryRaw(query.sql, query.params);
       const chunk = parseDeleteSnapshotSizeRow(result.rows[0]);
       rowCount += chunk.rowCount;
       valueBytes += chunk.valueBytes;
+      storageClassLists += chunk.storageClassLists;
     }
     assertDeleteSnapshotFitsUndoBudget({
       table,
@@ -3585,7 +3631,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       rowCount,
       valueBytes,
       maxSnapshotBytes,
-      operation
+      operation,
+      storageClassListCount: sharedStorageClassLists ? storageClassLists : undefined
     });
   }
 
@@ -3915,7 +3962,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       // Metadata-only preflight must run before the established full prior-value
       // SELECT below. Normal bounded edits retain the same SAVEPOINT and update path.
       if (!isHistoryReplay && maxEditValueBytes !== undefined) {
-        await this.assertBatchPriorsWithinEditLimit(table, updates, editLimitBytes);
+        await this.assertBatchPriorsWithinEditLimit(table, updates, editLimitBytes, identity);
       }
       const updatesByRow = new Map<RecordId, CellUpdate[]>();
       for (const update of updates) {
@@ -3926,7 +3973,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
 
       const results: CellUpdateResult[] = [];
       const textEncoding = this.getCellTextEncoding();
-      for (const [rowId, rowUpdates] of updatesByRow) {
+      // The call compiles each statement once, and each row restarts the
+      // deadline, as when its UPDATE was its own call.
+      this.withHistoryStatements(() => this.mapInDeadlineChunks([...updatesByRow], ([rowId, rowUpdates]) => {
         const oldPredicate = buildRecordIdentityPredicate(rowId, identity);
         const columns = [...new Set(rowUpdates.map(update => update.column))];
         if (columns.length !== rowUpdates.length) {
@@ -3968,7 +4017,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
         const setClause = preparedUpdates.map(({ update, storedValue }) => (
           `${escapeIdentifier(update.column)} = ${wasmBindPlaceholder(storedValue)}`
         )).join(', ');
-        await this.executeQuery(
+        this.runHistoryStatement(
           `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
           [
             ...preparedUpdates.map(update => update.storedValue),
@@ -4004,7 +4053,8 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             identity,
             primaryKeyReplacements.map(replacement => replacement.column)
           ),
-          unresolvableTriggeredPrimaryKeyUpdateError(table)
+          unresolvableTriggeredPrimaryKeyUpdateError(table),
+          textEncoding
         );
         const newPredicate = buildRecordIdentityPredicate(newRowId, identity);
         const post = this.queryRaw(
@@ -4032,7 +4082,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
             operation: preparedUpdate.prepared.operation
           });
         }
-      }
+      }));
 
       await this.executeQuery(`RELEASE ${savepointName}`);
       return results;

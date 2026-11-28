@@ -10,7 +10,7 @@ import {
   type StoredCellSqlFragment
 } from './cell-history';
 import { foldSqliteIdentifier } from './integer-utils';
-import { joinExpressionTerms } from './sql-utils';
+import { escapeIdentifier, joinExpressionTerms } from './sql-utils';
 
 export const ROW_HISTORY_CONFLICT_MESSAGE =
   'Row changed outside SQLite Explorer history; undo/redo was not applied.';
@@ -107,6 +107,34 @@ export function buildRowHistoryPredicate(
       : '1',
     params: predicates.flatMap(predicate => predicate.params)
   };
+}
+
+/**
+ * SQL compares REAL 0.0 and -0.0 as equal, so buildRowHistoryPredicate cannot
+ * tell which zero a typeless column holds. A snapshot with a REAL zero is
+ * checked in JavaScript as well: `projection` reads each such column as its
+ * REAL value or NULL, and realZerosMatch compares the row with Object.is.
+ */
+export interface RealZeroCheck {
+  projection: string;
+  expected: readonly number[];
+}
+
+export function buildRealZeroCheck(states: readonly RowHistoryState[]): RealZeroCheck | undefined {
+  const zeros = states.filter(({ state }) => state.storageClass === 'real' && state.value === 0);
+  if (zeros.length === 0) return undefined;
+  return {
+    projection: zeros.map(({ column }) => {
+      const escaped = escapeIdentifier(column);
+      return `CASE WHEN typeof(${escaped}) = 'real' THEN ${escaped} END`;
+    }).join(', '),
+    expected: zeros.map(({ state }) => state.value as number)
+  };
+}
+
+/** `row`: the projection read by the row's identity, undefined unless exactly one row matched. */
+export function realZerosMatch(check: RealZeroCheck, row: readonly unknown[] | undefined): boolean {
+  return row !== undefined && check.expected.every((value, index) => Object.is(row[index], value));
 }
 
 export function buildRowHistoryWrites(

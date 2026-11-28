@@ -1674,7 +1674,7 @@ describe('createNativeDatabaseConnection', () => {
                     result: {
                         results: queries.map(query => (
                             /SELECT COUNT\(\*\), COALESCE\(SUM/i.test(query.sql)
-                                ? { columns: ['COUNT(*)', 'value_bytes'], values: [[4, 2 * 1024 * 1024]] }
+                                ? { columns: ['COUNT(*)', 'value_bytes', 'storage_class_lists'], values: [[4, 2 * 1024 * 1024, 1]] }
                                 : { columns: ['storage_class', 'byte_length'], values: [] }
                         ))
                     }
@@ -1753,8 +1753,8 @@ describe('createNativeDatabaseConnection', () => {
                 if (/SELECT COUNT\(\*\), COALESCE\(SUM/i.test(sql)) {
                     return {
                         result: {
-                            columns: ['COUNT(*)', 'value_bytes'],
-                            values: [[1, 2 * 1024 * 1024]]
+                            columns: ['COUNT(*)', 'value_bytes', 'storage_class_lists'],
+                            values: [[1, 2 * 1024 * 1024, 1]]
                         }
                     };
                 }

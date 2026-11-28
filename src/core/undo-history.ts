@@ -5,7 +5,7 @@
  * Supports serialization for VS Code hot exit backup.
  */
 
-import type { LabeledModification } from './types';
+import type { DeletedRow, LabeledModification } from './types';
 import {
   decodeJsonSafeNumberString,
   encodeJsonSafeNonFiniteNumber,
@@ -146,6 +146,149 @@ export function estimateUndoMemoryBytes(value: unknown): number {
     }
   }
   return size;
+}
+
+type StorageClassList = NonNullable<DeletedRow['storageClasses']>;
+
+/**
+ * One frozen copy of each distinct storage-class list, shared by the row
+ * snapshots that carry it. A snapshot lists every column with its storage
+ * class, nearly always the same list for every row of an import or deletion,
+ * and the copies were most of its history: a 100,000-row import of five
+ * columns was estimated at 53.6 MB, 32.2 MB of it these lists, and took
+ * 162 MB of heap once it had crossed from a worker (30 MB shared).
+ *
+ * estimateUndoMemoryBytes counts an object once per call, so an entry whose
+ * snapshots share a list is charged for it once. charge() returns what one
+ * snapshot adds to that estimate of its entry: an admission that sums it
+ * admits exactly what the tracker then counts. The lists are only read
+ * afterwards (rowHistoryStates maps them); freezing them makes a write fail
+ * instead of changing every row that shares the list.
+ */
+export class SharedStorageClassLists {
+  private readonly lists = new Map<string, { list: StorageClassList; bytes: number }>();
+
+  /** Point the snapshot at the shared list equal to its own; return its share of the entry estimate. */
+  charge(snapshot: DeletedRow): number {
+    const key = storageClassListKey(snapshot.storageClasses);
+    if (key === undefined) return estimateUndoMemoryBytes(snapshot);
+    const known = this.lists.get(key);
+    if (known) {
+      snapshot.storageClasses = known.list;
+      return estimateUndoMemoryBytes(snapshot) - known.bytes;
+    }
+    const list = Object.freeze(snapshot.storageClasses!.map(
+      ({ column, storageClass }) => Object.freeze({ column, storageClass })
+    )) as StorageClassList;
+    snapshot.storageClasses = list;
+    this.lists.set(key, { list, bytes: estimateUndoMemoryBytes(list) });
+    return estimateUndoMemoryBytes(snapshot);
+  }
+}
+
+/** A key for a list of plain {column, storageClass} pairs; any other shape is left as it is. */
+function storageClassListKey(list: unknown): string | undefined {
+  if (!Array.isArray(list)) return undefined;
+  const parts: string[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object' || Object.getPrototypeOf(entry) !== Object.prototype) return undefined;
+    const { column, storageClass } = entry as Record<string, unknown>;
+    if (Object.keys(entry).length !== 2 || typeof column !== 'string' || typeof storageClass !== 'string') {
+      return undefined;
+    }
+    parts.push(column, storageClass);
+  }
+  return JSON.stringify(parts);
+}
+
+/**
+ * Share the lists of an entry's row snapshots before it is counted, live and
+ * on restore alike: a hot-exit backup writes every copy out, and an entry
+ * counted unshared after a restore could no longer fit the limit it was
+ * admitted under.
+ */
+function shareRowStorageClasses(entry: unknown): void {
+  if (!entry || typeof entry !== 'object') return;
+  const lists = new SharedStorageClassLists();
+  for (const snapshots of [(entry as LabeledModification).insertedRows, (entry as LabeledModification).deletedRows]) {
+    if (!Array.isArray(snapshots)) continue;
+    for (const snapshot of snapshots) {
+      if (snapshot && typeof snapshot === 'object') lists.charge(snapshot);
+    }
+  }
+}
+
+/**
+ * The distinct storage-class lists of a hot-exit backup, numbered in the
+ * order first met. A backup that wrote a list per row held every copy the
+ * tracker shares: 68 MB for an import counted at 32 MB.
+ */
+class StorageClassListTable {
+  readonly lists: StorageClassList[] = [];
+  private readonly byList = new Map<unknown, number>();
+  private readonly byKey = new Map<string, number>();
+
+  /** The list's number, or undefined for a list of any other shape, which stays inline. */
+  indexOf(list: unknown): number | undefined {
+    const known = this.byList.get(list);
+    if (known !== undefined) return known;
+    const key = storageClassListKey(list);
+    if (key === undefined) return undefined;
+    let index = this.byKey.get(key);
+    if (index === undefined) {
+      index = this.lists.length;
+      this.lists.push(list as StorageClassList);
+      this.byKey.set(key, index);
+    }
+    this.byList.set(list, index);
+    return index;
+  }
+}
+
+/**
+ * A copy of the entry for a backup in which each row snapshot names its list
+ * by number. The live entry is left as it is. Versions before this format
+ * cannot replay such a backup: they read a numbered list as legacy history.
+ */
+function indexRowStorageClasses(entry: unknown, table: StorageClassListTable): unknown {
+  if (!entry || typeof entry !== 'object') return entry;
+  let copy: Record<string, unknown> | undefined;
+  for (const field of ['insertedRows', 'deletedRows'] as const) {
+    const snapshots = (entry as LabeledModification)[field];
+    if (!Array.isArray(snapshots)) continue;
+    copy ??= { ...entry };
+    copy[field] = snapshots.map(snapshot => {
+      if (!snapshot || typeof snapshot !== 'object') return snapshot;
+      const index = table.indexOf(snapshot.storageClasses);
+      return index === undefined ? snapshot : { ...snapshot, storageClasses: index };
+    });
+  }
+  return copy ?? entry;
+}
+
+/** A backup's list table, each list checked; a backup without one has its lists inline. */
+function readStorageClassListTable(value: unknown): readonly StorageClassList[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some(list => storageClassListKey(list) === undefined)) {
+    throw new Error('Hot-exit backup holds a malformed storage-class list');
+  }
+  return value as StorageClassList[];
+}
+
+/** Put back the lists an entry's snapshots name by number; a number the table lacks fails the restore. */
+function resolveRowStorageClasses(entry: unknown, lists: readonly StorageClassList[]): void {
+  if (!entry || typeof entry !== 'object') return;
+  for (const snapshots of [(entry as LabeledModification).insertedRows, (entry as LabeledModification).deletedRows]) {
+    if (!Array.isArray(snapshots)) continue;
+    for (const snapshot of snapshots) {
+      if (!snapshot || typeof snapshot !== 'object') continue;
+      const index: unknown = snapshot.storageClasses;
+      if (typeof index !== 'number') continue;
+      const list = Number.isInteger(index) ? lists[index] : undefined;
+      if (!list) throw new Error('Hot-exit backup names a storage-class list it does not hold');
+      snapshot.storageClasses = list;
+    }
+  }
 }
 
 // ============================================================================
@@ -336,6 +479,7 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     this.advanceMutationRevision();
 
     // Calculate size of new entry
+    shareRowStorageClasses(entry);
     const entrySize = estimateUndoMemoryBytes(entry);
 
     const savedUndoneCount = this.checkpointIndex - this.timeline.length;
@@ -676,13 +820,16 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
    * @returns Binary representation of state
    */
   serialize(engineKind?: 'native' | 'wasm'): Uint8Array {
+    const table = new StorageClassListTable();
+    const indexed = (entries: readonly T[]) => entries.map(entry => indexRowStorageClasses(entry, table));
     const payload = {
-      timeline: this.timeline,
+      timeline: indexed(this.timeline),
       checkpointIndex: this.checkpointIndex,
-      futureStack: this.futureStack,
-      revertOnRestore: this.revertOnRestore,
+      futureStack: indexed(this.futureStack),
+      revertOnRestore: indexed(this.revertOnRestore),
       uncommittedEntriesEvicted: this.uncommittedEntriesEvicted,
-      ...(engineKind === undefined ? {} : { engineKind })
+      ...(engineKind === undefined ? {} : { engineKind }),
+      ...(table.lists.length === 0 ? {} : { storageClassLists: table.lists })
     };
     // Preserve every non-JSON SQLite value used by undo and hot-exit replay.
     const jsonStr = JSON.stringify(payload, binaryReplacer);
@@ -720,6 +867,11 @@ export class ModificationTracker<T extends LabeledModification = LabeledModifica
     // Recalculate sizes for active timeline entries, redo entries, and captured
     // branch-revert entries so restored trackers enforce the same memory
     // accounting as live trackers.
+    const storageClassLists = readStorageClassListTable(payload.storageClassLists);
+    for (const entry of [...tracker.timeline, ...tracker.futureStack, ...tracker.revertOnRestore]) {
+      resolveRowStorageClasses(entry, storageClassLists);
+      shareRowStorageClasses(entry);
+    }
     tracker.timelineSizes = tracker.timeline.map(estimateUndoMemoryBytes);
     tracker.futureStackSizes = tracker.futureStack.map(estimateUndoMemoryBytes);
     tracker.revertOnRestoreSizes = tracker.revertOnRestore.map(estimateUndoMemoryBytes);

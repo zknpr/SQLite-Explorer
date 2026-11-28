@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.9.1
+
+### Performance
+
+- Editing many cells at once in a WITHOUT ROWID table is several times faster on both engines. In a local test against 1.9.0, a batch edit of 5,000 cells in one column took about 0.1 seconds instead of 0.6 to 0.7 on WebAssembly, and about 0.15 seconds instead of 1.9 on the native engine. Undo and redo took as long as before, and tables with a rowid are unchanged.
+
+### Fixes
+
+- Undoing an import or an added row, and redoing a row deletion, no longer removes a row whose REAL zero changed sign outside SQLite Explorer. SQL compares 0.0 and -0.0 as equal, so in a column without a declared type, which keeps the sign, such a row was removed as if it had not changed. These now fail with "Row changed outside SQLite Explorer history", as an undo or redo of a cell edit already did.
+- An import of 100,000 rows now fits the default undo memory limit (`sqliteExplorer.maxUndoMemory`, 50 MiB) unless its rows are wide. Every row's undo record held its own copy of the table's column list with each value's storage class, so a five-column import counted 53.6 MB and was refused. The rows now share one copy: the same import counts 21.4 MB and holds about 30 MB of memory instead of 72 MB or more. An import that still does not fit says how many of its rows did and names the setting.
+- Deleting rows shares the same lists, and each row is now counted against the undo memory limit as it is read, where an estimate made before reading decided alone: 100,000 rows of ten columns can be deleted at the default limit instead of being refused, and a delete can no longer take a little more than the limit. Rows with much text outside ASCII can still be refused before they reach it, because that estimate counts such text at more than its size.
+- Hot-exit backups write each of those lists once: the backup of an unsaved 100,000-row import of ten columns is 26 MB instead of 68 MB. A backup written by this version cannot be restored by 1.9.0 or earlier, so do not downgrade with unsaved changes in a window you mean to restore.
+
+### Runtime
+
+- Update the native runtime to the txiki.js fork's commit `bb489f88`, which checks more of the SQL it is asked to run and has every upstream txiki.js change through `c13adc66`.
+- Build the WebAssembly runtime from sql.js 1.17.0 (fork commit `d3a01b8`). The engine passes every integer to it in a form it already bound exactly, so stored values do not change. The browser extension is 16 KB larger, for the table of SQLite's constants that sql.js now carries.
+
 ## 1.9.0
 
 ### Security
