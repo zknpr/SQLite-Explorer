@@ -1891,10 +1891,11 @@ export async function createNativeDatabaseConnection(
           valueBytes: sizes.reduce((total, size) => total + size.valueBytes, 0),
           maxSnapshotBytes,
           operation,
-          // The most distinct lists one chunk holds: no more than the entry's,
-          // so the projection never refuses a delete whose entry fits.
+          // The distinct lists of each chunk, added: at least the entry's, so a
+          // delete whose lists alone pass the budget is refused before its rows
+          // are read. A list in several chunks counts once per chunk.
           storageClassListCount: sharedStorageClassLists
-            ? sizes.reduce((most, size) => Math.max(most, size.storageClassLists), 0)
+            ? sizes.reduce((total, size) => total + size.storageClassLists, 0)
             : undefined
         });
         return sizes;

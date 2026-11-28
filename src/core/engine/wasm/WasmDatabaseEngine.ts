@@ -3611,8 +3611,9 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     );
     let rowCount = 0;
     let valueBytes = 0;
-    // The most distinct lists one chunk holds: no more than the entry's, so
-    // the projection never refuses a delete whose entry fits.
+    // The distinct lists of each chunk, added: at least the entry's, so a
+    // delete whose lists alone pass the budget is refused before its rows
+    // are read. A list in several chunks counts once per chunk.
     let storageClassLists = 0;
     for (const predicate of predicates) {
       const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
@@ -3620,7 +3621,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       const chunk = parseDeleteSnapshotSizeRow(result.rows[0]);
       rowCount += chunk.rowCount;
       valueBytes += chunk.valueBytes;
-      storageClassLists = Math.max(storageClassLists, chunk.storageClassLists);
+      storageClassLists += chunk.storageClassLists;
     }
     assertDeleteSnapshotFitsUndoBudget({
       table,

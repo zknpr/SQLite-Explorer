@@ -9,6 +9,7 @@ import { createNativeDatabaseConnection, isNativeAvailable, NativeWorkerProcess 
 import { serializeOperations, runReadSnapshot } from '../../src/core/operation-serializer';
 import { estimateUndoMemoryBytes, ModificationTracker, SharedStorageClassLists } from '../../src/core/undo-history';
 import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
+import { projectDeleteSnapshotBytes } from '../../src/core/delete-history';
 import type { DatabaseOperations, DeletedRow, LabeledModification, RecordId } from '../../src/core/types';
 
 const ROWS = 2000;
@@ -166,5 +167,45 @@ for (const backend of ['wasm', 'native'] as const) {
             assert.equal((await ops.deleteRows('t', rowIds, snapshotBytes)).length, ROWS);
             assert.equal((await ops.executeQuery('SELECT count(*) FROM t'))[0].rows[0][0], 0);
         }, LISTS_FILL);
+    });
+}
+
+// Two identity chunks (32,765 rowids each at most) whose rows hold different
+// lists: 2,000 rows of each spell twelve bits in c0..c11, and c12 is NULL only
+// in the second chunk.
+const CHUNK_ROWS = 32_765;
+const SPLIT_ROWS = CHUNK_ROWS + 2000;
+const SPLIT_SCHEMA = 'CREATE TABLE t (id INTEGER PRIMARY KEY, ' +
+    Array.from({ length: 13 }, (_, k) => `c${k} TEXT`).join(', ') + ')';
+const SPLIT_FILL = `WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < ${SPLIT_ROWS}) ` +
+    'INSERT INTO t SELECT x, ' + Array.from({ length: 12 }, (_, k) =>
+        `CASE WHEN x <= 2000 AND x & ${1 << k} THEN NULL WHEN x > ${CHUNK_ROWS} AND (x - ${CHUNK_ROWS}) & ${1 << k} THEN NULL ELSE 'v' END`
+    ).join(', ') + `, CASE WHEN x > ${CHUNK_ROWS} THEN NULL ELSE 'v' END FROM s`;
+
+for (const backend of ['wasm', 'native'] as const) {
+    it(`${backend}: a delete whose identity chunks hold different lists counts them all before it reads its rows`, async (context) => {
+        if (backend === 'native' && await skipWithoutNative(context)) return;
+        await withBackend(backend, SPLIT_SCHEMA, async ops => {
+            const rowIds: RecordId[] = Array.from({ length: SPLIT_ROWS }, (_, index) => index + 1);
+            const snapshots = await snapshotsOf(ops, rowIds);
+            const listsIn = (rows: DeletedRow[]) => new Set(rows.map(row => JSON.stringify(row.storageClasses))).size;
+            const [first, second] = [snapshots.filter(row => Number(row.rowId) <= CHUNK_ROWS), snapshots.filter(row => Number(row.rowId) > CHUNK_ROWS)];
+            assert.equal(listsIn(snapshots), listsIn(first) + listsIn(second), 'the chunks share no list');
+            const columns = Object.keys(snapshots[0].row);
+            const valueBytes = snapshots.reduce((sum, snapshot) => sum + snapshot.storageClasses!.reduce((bytes, { column, storageClass }) =>
+                bytes + (storageClass === 'text' ? 2 * Buffer.byteLength(snapshot.row[column] as string, 'utf8') : storageClass === 'null' ? 0 : 8), 0), 0);
+            const projected = (storageClassListCount: number) => projectDeleteSnapshotBytes({
+                insertableColumns: columns, rowIds, rowCount: SPLIT_ROWS, valueBytes, storageClassListCount
+            });
+            // A budget the lists of the larger chunk fit and those of both do not.
+            const low = projected(Math.max(listsIn(first), listsIn(second)));
+            const high = projected(listsIn(first) + listsIn(second));
+            const budget = Math.floor((low + high) / 2);
+            assert.ok(low <= budget && budget < high);
+
+            const sent = await sqlSent(() => assert.rejects(ops.deleteRows('t', rowIds, budget), /Delete undo snapshot exceeds/));
+            assert.deepEqual(sent.filter(sql => sql.includes('AS BLOB) ELSE')), [], 'rows were read before the refusal');
+            assert.equal((await ops.executeQuery('SELECT count(*) FROM t'))[0].rows[0][0], SPLIT_ROWS);
+        }, SPLIT_FILL);
     });
 }
