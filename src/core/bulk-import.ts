@@ -2,7 +2,7 @@ import { bindableIntegerValue } from './integer-utils';
 import type { CellValue, DatabaseOperations, LabeledModification } from './types';
 import { runReadSnapshot } from './operation-serializer';
 import { estimateUndoMemoryBytes, SharedStorageClassLists } from './undo-history';
-import { isUndoSnapshotBudgetError } from './delete-history';
+import { isUndoSnapshotBudgetError, undoSnapshotBudgetAdmittedRows } from './delete-history';
 import { DEFAULT_MAX_CELL_EDIT_BYTES } from './cell-edit-policy';
 
 export const IMPORT_MAX_BYTES = 64 * 1024 * 1024;
@@ -225,8 +225,12 @@ export async function importRowsAtomically(
             try {
                 snapshots = await transaction.insertRowsWithHistory(table, batch, DEFAULT_MAX_CELL_EDIT_BYTES, maxUndoBytes - historyBytes);
             } catch (error) {
-                // The engine refused the batch against the budget this import had left.
-                if (isUndoSnapshotBudgetError(error, 'Insert')) throw overLimit(completed);
+                // The engine refused the batch against the budget this import had
+                // left, after the rows it names fit.
+                if (isUndoSnapshotBudgetError(error, 'Insert')) {
+                    const admitted = undoSnapshotBudgetAdmittedRows(error) ?? 0;
+                    throw overLimit(completed + Math.min(admitted, batch.length));
+                }
                 throw error;
             }
             if (snapshots.length !== batch.length) throw new Error('Backend returned incomplete import history.');

@@ -1,11 +1,11 @@
 import './vscode_mock_setup';
 import assert from 'node:assert/strict';
-import { it } from 'node:test';
+import { it, type TestContext } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import { createNativeDatabaseConnection } from '../../src/nativeWorker';
+import { createNativeDatabaseConnection, isNativeAvailable } from '../../src/nativeWorker';
 import { serializeOperations } from '../../src/core/operation-serializer';
 import { estimateUndoMemoryBytes, ModificationTracker } from '../../src/core/undo-history';
 import { importRowsAtomically } from '../../src/core/bulk-import';
@@ -23,6 +23,14 @@ function sourceRows(): Record<string, CellValue>[] {
         id: i, name: i % 7 === 0 ? null : 'user_' + i, email: 'user' + i + '@example.com',
         amount: i * 1.5 + 0.25, created: '2026-11-27'
     }));
+}
+
+/** Skips a native case where no bundled runtime runs, as the other native tests do. */
+async function skipWithoutNative(context: TestContext): Promise<boolean> {
+    if (await isNativeAvailable(process.cwd())) return false;
+    if (process.env.FUZZ_EXPECT_TARGET) throw new Error(`Missing native runtime for ${process.env.FUZZ_EXPECT_TARGET}`);
+    context.skip('Bundled native runtime unavailable');
+    return true;
 }
 
 async function withBackend(backend: 'wasm' | 'native', action: (ops: DatabaseOperations) => Promise<void>) {
@@ -131,7 +139,8 @@ it('a backup that names a list it does not hold, or holds a malformed list, does
 });
 
 for (const backend of ['wasm', 'native'] as const) {
-    it(`${backend}: an import that fits the undo memory limit is admitted, undone, redone and restored at the size it was admitted at`, async () => {
+    it(`${backend}: an import that fits the undo memory limit is admitted, undone, redone and restored at the size it was admitted at`, async (context) => {
+        if (backend === 'native' && await skipWithoutNative(context)) return;
         await withBackend(backend, async ops => {
             const rows = sourceRows();
             const modification = await importRowsAtomically(ops, 't', rows, BUDGET);
@@ -174,7 +183,8 @@ for (const backend of ['wasm', 'native'] as const) {
         });
     });
 
-    it(`${backend}: an import over the undo memory limit names the setting and how far it got, and imports nothing`, async () => {
+    it(`${backend}: an import over the undo memory limit names the setting and how far it got, and imports nothing`, async (context) => {
+        if (backend === 'native' && await skipWithoutNative(context)) return;
         await withBackend(backend, async ops => {
             await assert.rejects(importRowsAtomically(ops, 't', sourceRows(), BUDGET / 20), (error: Error) => {
                 assert.match(error.message, /sqliteExplorer\.maxUndoMemory/);

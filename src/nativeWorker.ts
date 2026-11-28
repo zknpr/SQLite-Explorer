@@ -141,6 +141,7 @@ import {
   buildDeleteSnapshotSizeQuery,
   deleteSnapshotCharger,
   deleteSnapshotValueColumns,
+  isUndoSnapshotBudgetError,
   parseDeleteSnapshotSizeRow,
   projectDeleteSnapshotBytes,
   undoSnapshotBudgetError
@@ -1851,12 +1852,12 @@ export async function createNativeDatabaseConnection(
         insertableColumns: readonly string[],
         predicates: ReturnType<typeof buildRecordIdentityPredicateChunks>,
         includeSyntheticRowId: boolean
-      ): Promise<Array<{ rowCount: number; valueBytes: number }>> => {
+      ): Promise<Array<{ rowCount: number; valueBytes: number; storageClassLists: number }>> => {
         const valueColumns = deleteSnapshotValueColumns(
           insertableColumns,
           includeSyntheticRowId
         );
-        const sizes: Array<{ rowCount: number; valueBytes: number }> = [];
+        const sizes: Array<{ rowCount: number; valueBytes: number; storageClassLists: number }> = [];
         for (const predicate of predicates) {
           const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
           const result = await worker.call<NativeQueryResult>('query', [query.sql, query.params]);
@@ -1873,8 +1874,8 @@ export async function createNativeDatabaseConnection(
         includeSyntheticRowId: boolean,
         maxSnapshotBytes: number,
         operation: 'Delete' | 'Insert' = 'Delete',
-        oneStorageClassList = false
-      ): Promise<Array<{ rowCount: number; valueBytes: number }>> => {
+        sharedStorageClassLists = false
+      ): Promise<Array<{ rowCount: number; valueBytes: number; storageClassLists: number }>> => {
         const sizes = await readNativeDeleteSnapshotSizes(
           table,
           insertableColumns,
@@ -1890,7 +1891,11 @@ export async function createNativeDatabaseConnection(
           valueBytes: sizes.reduce((total, size) => total + size.valueBytes, 0),
           maxSnapshotBytes,
           operation,
-          oneStorageClassList
+          // The most distinct lists one chunk holds: no more than the entry's,
+          // so the projection never refuses a delete whose entry fits.
+          storageClassListCount: sharedStorageClassLists
+            ? sizes.reduce((most, size) => Math.max(most, size.storageClassLists), 0)
+            : undefined
         });
         return sizes;
       };
@@ -3576,6 +3581,7 @@ export async function createNativeDatabaseConnection(
         const escapedTable = escapeMainIdentifier(table);
         const inserts = rows.map(row => buildNativeInsert(table, row));
         const savepointName = createSavepointName('sp_insert_rows_history');
+        let admitted = 0;
         await beginNativeSavepoint(savepointName);
         try {
           const probedShapes = new Set<string>();
@@ -3721,12 +3727,17 @@ export async function createNativeDatabaseConnection(
                 if (remainingSnapshotBytes < 0) throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes!);
               }
               snapshots.push(snapshot);
+              admitted++;
             });
           }
           await releaseNativeSavepoint(savepointName);
           return snapshots;
         } catch (error) {
           await safeRollbackSavepoint(savepointName, 'insertNativeRowsWithHistory', error);
+          // The rows before the refused one fit; an import reports how many.
+          if (maxUndoSnapshotBytes !== undefined && isUndoSnapshotBudgetError(error, 'Insert')) {
+            throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes, admitted);
+          }
           throw error;
         }
       };

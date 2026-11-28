@@ -77,8 +77,10 @@ import {
   LegacyCellHistoryError
 } from '../../../src/core/cell-history.ts';
 import {
+  buildRealZeroCheck,
   buildRowHistoryPredicate,
   buildRowHistoryWrites,
+  realZerosMatch,
   rowHistoryStates,
   LegacyRowHistoryError,
   RowHistoryConflictError
@@ -3817,6 +3819,18 @@ async function deleteRowHistorySnapshots(table, snapshots) {
     assertMutationHasNoUntrackedPrograms('DELETE', table);
     for (const [index, snapshot] of snapshots.entries()) {
       const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
+      // SQL compares REAL 0.0 and -0.0 as equal, so the row's zeros are read
+      // and compared first.
+      const zeroCheck = buildRealZeroCheck(states[index]);
+      if (zeroCheck) {
+        const current = db.exec(
+          `SELECT ${zeroCheck.projection} FROM ${escapeMainIdentifier(table)} WHERE ${rowIdentity.sql} LIMIT 2`,
+          normalizeBindParams(rowIdentity.params)
+        )[0]?.values ?? [];
+        if (!realZerosMatch(zeroCheck, current.length === 1 ? current[0] : undefined)) {
+          throw new RowHistoryConflictError(table);
+        }
+      }
       const rowState = buildRowHistoryPredicate(snapshot, bindPlaceholder, states[index]);
       db.run(
         `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +

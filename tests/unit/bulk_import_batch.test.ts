@@ -1,16 +1,24 @@
 import './vscode_mock_setup';
 import assert from 'node:assert/strict';
-import { it } from 'node:test';
+import { it, type TestContext } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import { createNativeDatabaseConnection } from '../../src/nativeWorker';
+import { createNativeDatabaseConnection, isNativeAvailable } from '../../src/nativeWorker';
 import { serializeOperations, runReadSnapshot } from '../../src/core/operation-serializer';
 import { estimateUndoMemoryBytes, SharedStorageClassLists } from '../../src/core/undo-history';
 import { projectDeleteSnapshotBytes } from '../../src/core/delete-history';
 import { importRowsAtomically } from '../../src/core/bulk-import';
 import type { CellValue, DatabaseOperations, DeletedRow } from '../../src/core/types';
+
+/** Skips a native case where no bundled runtime runs, as the other native tests do. */
+async function skipWithoutNative(context: TestContext): Promise<boolean> {
+    if (await isNativeAvailable(process.cwd())) return false;
+    if (process.env.FUZZ_EXPECT_TARGET) throw new Error(`Missing native runtime for ${process.env.FUZZ_EXPECT_TARGET}`);
+    context.skip('Bundled native runtime unavailable');
+    return true;
+}
 
 async function withBackend(
     backend: 'wasm' | 'native',
@@ -153,6 +161,30 @@ for (const backend of ['wasm', 'native'] as const) {
             });
         });
     }
+
+    it(`${backend} an import refused partway through a batch says how many of its rows fit`, async (context) => {
+        if (backend === 'native' && await skipWithoutNative(context)) return;
+        // The engine refuses the first batch at its thirteenth row: no batch
+        // completed, but twelve rows fit.
+        const rows = Array.from({ length: 30 }, (_, index) => ({ id: index + 1, value: 'é'.repeat(index * 7) + 'x'.repeat(index % 5) }));
+        await withBackend(backend, SCHEMAS.rowid, async ops => {
+            const reference = await attempt(ops, transaction => insertOneByOne(transaction, 'items', rows, 1 << 30));
+            assert.ok(reference.snapshots, String(reference.error));
+            let low = 0, high = 1 << 30;
+            while (low < high) {
+                const middle = Math.floor((low + high) / 2);
+                if (admittedRowByRow(reference.snapshots.slice(0, 12), middle)) high = middle; else low = middle + 1;
+            }
+            assert.ok(!admittedRowByRow(reference.snapshots.slice(0, 13), low));
+            const entry = estimateUndoMemoryBytes({
+                label: 'Import 30 rows', description: 'Import 30 rows into items',
+                modificationType: 'row_insert', targetTable: 'items', insertedRows: []
+            });
+            await assert.rejects(importRowsAtomically(ops, 'items', rows, entry + low),
+                /the history of 12 of its 30 rows fit\. Nothing was imported\./);
+            assert.deepEqual((await ops.executeQuery('SELECT count(*) FROM items'))[0].rows, [[0]]);
+        });
+    });
 
     it(`${backend} import applies each row's own columns within one batch and round-trips undo/redo`, async () => {
         await withBackend(backend, SCHEMAS.rowid, async ops => {

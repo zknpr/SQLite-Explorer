@@ -6,7 +6,7 @@ import path from 'node:path';
 import Module from 'node:module';
 import { mockVscode } from './mocks/vscode';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import { runReadSnapshot } from '../../src/core/operation-serializer';
+import { runReadSnapshot, serializeOperations } from '../../src/core/operation-serializer';
 import { estimateUndoMemoryBytes, ModificationTracker, SharedStorageClassLists } from '../../src/core/undo-history';
 import { importRowsAtomically } from '../../src/core/bulk-import';
 import type { DatabaseConnectionBundle } from '../../src/connectionTypes';
@@ -109,8 +109,21 @@ it('an import and a delete are held to their undo budgets through the worker, an
 
     // The engine's refusal crosses the worker as text and is still read as one.
     await ops.undoModification(modification);
-    await assert.rejects(importRowsAtomically(ops, 't', rows, budget / 20),
-        /Import needs more undo memory than sqliteExplorer\.maxUndoMemory allows \(131,072 bytes\): the history of [\d,]+ of its 5,000 rows fit/);
+    const refusal = (operations: typeof ops) => importRowsAtomically(operations, 't', rows, budget / 20)
+        .then(() => assert.fail('the import fit'), (error: Error) => error.message);
+    const message = await refusal(ops);
+    const fitted = /^Import needs more undo memory than sqliteExplorer\.maxUndoMemory allows \(131,072 bytes\): the history of ([\d,]+) of its 5,000 rows fit/.exec(message);
+    assert.ok(fitted, message);
+    // The refusal comes inside the import's second batch of 500, and the count
+    // is the one the same import reports in this process.
+    assert.notEqual(Number(fitted[1].replace(/,/g, '')) % 500, 0, message);
+    const local = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
+    try {
+        await local.executeQuery('CREATE TABLE t (id INTEGER, name TEXT, email TEXT, amount REAL, created TEXT)');
+        assert.equal(message, await refusal(serializeOperations(local)));
+    } finally {
+        local.shutdown();
+    }
     assert.equal(await count(), 0);
     await ops.redoModification(modification);
     assert.equal(await count(), 5000);

@@ -1,11 +1,11 @@
 import './vscode_mock_setup';
 import assert from 'node:assert/strict';
-import { it } from 'node:test';
+import { it, type TestContext } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import { createDatabaseEngine, WasmDatabaseEngine } from '../../src/core/sqlite-db';
-import { createNativeDatabaseConnection } from '../../src/nativeWorker';
+import { createNativeDatabaseConnection, isNativeAvailable, NativeWorkerProcess } from '../../src/nativeWorker';
 import { serializeOperations, runReadSnapshot } from '../../src/core/operation-serializer';
 import { estimateUndoMemoryBytes, ModificationTracker, SharedStorageClassLists } from '../../src/core/undo-history';
 import { encodePrimaryKeyRecordId } from '../../src/core/row-identity';
@@ -32,13 +32,21 @@ const TABLES = {
     }
 };
 
-async function withBackend(backend: 'wasm' | 'native', schema: string, action: (ops: DatabaseOperations) => Promise<void>) {
+/** Skips a native case where no bundled runtime runs, as the other native tests do. */
+async function skipWithoutNative(context: TestContext): Promise<boolean> {
+    if (await isNativeAvailable(process.cwd())) return false;
+    if (process.env.FUZZ_EXPECT_TARGET) throw new Error(`Missing native runtime for ${process.env.FUZZ_EXPECT_TARGET}`);
+    context.skip('Bundled native runtime unavailable');
+    return true;
+}
+
+async function withBackend(backend: 'wasm' | 'native', schema: string, action: (ops: DatabaseOperations) => Promise<void>, fill = FILL('t')) {
     const wasm = (await createDatabaseEngine({ content: null, maxSize: 0, readOnlyMode: false })).operations as WasmDatabaseEngine;
     let native: Awaited<ReturnType<typeof createNativeDatabaseConnection>> | undefined;
     let directory: string | undefined;
     try {
         await wasm.executeQuery(schema);
-        await wasm.executeQuery(FILL('t'));
+        await wasm.executeQuery(fill);
         let ops: DatabaseOperations = serializeOperations(wasm);
         if (backend === 'native') {
             fs.mkdirSync('.tmp', { recursive: true });
@@ -72,7 +80,8 @@ async function snapshotsOf(ops: DatabaseOperations, rowIds: RecordId[]): Promise
 
 for (const backend of ['wasm', 'native'] as const) {
     for (const [kind, table] of Object.entries(TABLES)) {
-        it(`${backend} ${kind}: a delete is admitted at exactly the size its entry is counted, and refused one byte under it`, async () => {
+        it(`${backend} ${kind}: a delete is admitted at exactly the size its entry is counted, and refused one byte under it`, async (context) => {
+            if (backend === 'native' && await skipWithoutNative(context)) return;
             await withBackend(backend, table.schema, async ops => {
                 const before = await contents(ops);
                 const rowIds = table.rowIds();
@@ -102,4 +111,60 @@ for (const backend of ['wasm', 'native'] as const) {
             });
         });
     }
+}
+
+/**
+ * Every SQL text the engines send while action runs. A snapshot read projects
+ * each TEXT value as its bytes (buildStoredCellStateProjection); the size
+ * query does not.
+ */
+async function sqlSent(action: () => Promise<unknown>): Promise<string[]> {
+    const sent: string[] = [];
+    const engine = WasmDatabaseEngine.prototype as unknown as { queryRaw: (sql: string, params?: unknown[]) => unknown };
+    const queryRaw = engine.queryRaw;
+    const call = NativeWorkerProcess.prototype.call;
+    engine.queryRaw = function (this: unknown, sql: string, params?: unknown[]) { sent.push(sql); return queryRaw.call(this, sql, params); };
+    NativeWorkerProcess.prototype.call = function (this: NativeWorkerProcess, ...args: Parameters<typeof call>) {
+        const [, payload] = args as unknown as [string, unknown[]];
+        if (typeof payload?.[0] === 'string') sent.push(payload[0]);
+        return call.apply(this, args);
+    } as typeof call;
+    try {
+        await action().catch(() => undefined);
+    } finally {
+        engine.queryRaw = queryRaw;
+        NativeWorkerProcess.prototype.call = call;
+    }
+    return sent;
+}
+
+// Twelve columns that are NULL by the bits of the id: each of 2,000 rows has a
+// storage-class list of its own.
+const LISTS_SCHEMA = 'CREATE TABLE t (id INTEGER PRIMARY KEY, ' +
+    Array.from({ length: 12 }, (_, k) => `c${k} TEXT`).join(', ') + ')';
+const LISTS_FILL = `WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < ${ROWS}) ` +
+    'INSERT INTO t SELECT x, ' + Array.from({ length: 12 }, (_, k) => `CASE WHEN x & ${1 << k} THEN NULL ELSE 'v' END`).join(', ') + ' FROM s';
+
+for (const backend of ['wasm', 'native'] as const) {
+    it(`${backend}: a delete whose rows hold many storage-class lists is refused before its rows are read, and admitted at its entry's size`, async (context) => {
+        if (backend === 'native' && await skipWithoutNative(context)) return;
+        await withBackend(backend, LISTS_SCHEMA, async ops => {
+            const rowIds = TABLES.rowid.rowIds();
+            const lists = new SharedStorageClassLists();
+            const snapshots = await snapshotsOf(ops, rowIds);
+            assert.equal(new Set(snapshots.map(snapshot => JSON.stringify(snapshot.storageClasses))).size, ROWS);
+            const snapshotBytes = snapshots.reduce((sum, snapshot) => sum + lists.charge(snapshot), 0);
+
+            // Half the entry: a projection that counted one list for every row
+            // would pass it and read every row before the exact charge refused.
+            const sent = await sqlSent(() => assert.rejects(ops.deleteRows('t', rowIds, Math.floor(snapshotBytes / 2)), /Delete undo snapshot exceeds/));
+            assert.ok(sent.some(sql => sql.includes('COUNT(*)')), 'the size query ran');
+            assert.deepEqual(sent.filter(sql => sql.includes('AS BLOB) ELSE')), [], 'rows were read before the refusal');
+            assert.equal((await ops.executeQuery('SELECT count(*) FROM t'))[0].rows[0][0], ROWS);
+
+            await assert.rejects(ops.deleteRows('t', rowIds, snapshotBytes - 1), /Delete undo snapshot exceeds/);
+            assert.equal((await ops.deleteRows('t', rowIds, snapshotBytes)).length, ROWS);
+            assert.equal((await ops.executeQuery('SELECT count(*) FROM t'))[0].rows[0][0], 0);
+        }, LISTS_FILL);
+    });
 }

@@ -175,6 +175,7 @@ import {
   buildDeleteSnapshotSizeQuery,
   deleteSnapshotValueColumns,
   deleteSnapshotCharger,
+  isUndoSnapshotBudgetError,
   parseDeleteSnapshotSizeRow,
   undoSnapshotBudgetError
 } from '../../delete-history';
@@ -2721,6 +2722,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     const identity = await this.resolveTableIdentity(table);
     const insertableColumns = await this.getInsertableColumnNames(table);
     const savepointName = this.createSavepointName('sp_insert_rows_history');
+    let admitted = 0;
     await this.executeQuery(`SAVEPOINT ${savepointName}`);
     try {
       const probedShapes = new Set<string>();
@@ -2754,12 +2756,17 @@ export class WasmDatabaseEngine implements DatabaseOperations {
           remainingSnapshotBytes -= snapshotBytes;
           if (remainingSnapshotBytes < 0) throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes!);
         }
+        admitted++;
         return snapshot;
       }));
       await this.executeQuery(`RELEASE ${savepointName}`);
       return snapshots;
     } catch (error) {
       await this.safeRollbackSavepoint(savepointName, 'insertRowsWithHistory');
+      // The rows before the refused one fit; an import reports how many.
+      if (maxUndoSnapshotBytes !== undefined && isUndoSnapshotBudgetError(error, 'Insert')) {
+        throw undoSnapshotBudgetError('Insert', maxUndoSnapshotBytes, admitted);
+      }
       throw error;
     }
   }
@@ -3596,7 +3603,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     includeSyntheticRowId: boolean,
     maxSnapshotBytes: number,
     operation: 'Delete' | 'Insert' = 'Delete',
-    oneStorageClassList = false
+    sharedStorageClassLists = false
   ): void {
     const valueColumns = deleteSnapshotValueColumns(
       insertableColumns,
@@ -3604,12 +3611,16 @@ export class WasmDatabaseEngine implements DatabaseOperations {
     );
     let rowCount = 0;
     let valueBytes = 0;
+    // The most distinct lists one chunk holds: no more than the entry's, so
+    // the projection never refuses a delete whose entry fits.
+    let storageClassLists = 0;
     for (const predicate of predicates) {
       const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
       const result = this.queryRaw(query.sql, query.params);
       const chunk = parseDeleteSnapshotSizeRow(result.rows[0]);
       rowCount += chunk.rowCount;
       valueBytes += chunk.valueBytes;
+      storageClassLists = Math.max(storageClassLists, chunk.storageClassLists);
     }
     assertDeleteSnapshotFitsUndoBudget({
       table,
@@ -3620,7 +3631,7 @@ export class WasmDatabaseEngine implements DatabaseOperations {
       valueBytes,
       maxSnapshotBytes,
       operation,
-      oneStorageClassList
+      storageClassListCount: sharedStorageClassLists ? storageClassLists : undefined
     });
   }
 
