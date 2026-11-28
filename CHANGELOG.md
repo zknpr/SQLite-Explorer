@@ -4,7 +4,7 @@
 
 ### Performance
 
-- Editing many cells at once in a WITHOUT ROWID table is several times faster on both engines. In a local test, a batch edit of 5,000 cells in one column took 0.1 to 0.2 seconds instead of 0.7 on WebAssembly, and 0.2 to 0.4 seconds instead of 2.2 on the native engine. Undo and redo took as long as before, and tables with a rowid are unchanged.
+- Editing many cells at once in a WITHOUT ROWID table is several times faster on both engines. In a local test against 1.9.0, a batch edit of 5,000 cells in one column took about 0.1 seconds instead of 0.6 to 0.7 on WebAssembly, and about 0.15 seconds instead of 1.9 on the native engine. Undo and redo took as long as before, and tables with a rowid are unchanged.
 
 ### Fixes
 
