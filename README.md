@@ -2,7 +2,7 @@
 
 A powerful, open-source SQLite database viewer and editor for Visual Studio Code.
 
-**[Try it in your browser](https://sqlite-explorer.zknpr.xyz/demo)** | **[Desktop app](https://github.com/zknpr/SQLite-Explorer-App)** | **[Website](https://sqlite-explorer.zknpr.xyz/)** | **[Changelog](CHANGELOG.md)**
+**[Try it in your browser](https://sqlite-explorer.zknpr.xyz/demo)** | **[Desktop app](https://sqlite-explorer.zknpr.xyz/download)** | **[Website](https://sqlite-explorer.zknpr.xyz/)** | **[Changelog](CHANGELOG.md)**
 
 ![SQLite Explorer](media/main.png)
 
@@ -136,9 +136,9 @@ code --install-extension zknpr.sqlite-explorer
 
 ### Desktop app
 
-SQLite Explorer also runs as a standalone desktop application, no VS Code required. It uses the same viewer inside a Tauri shell and ships packages for macOS (Apple Silicon `.dmg`), Linux (x86-64 `.deb`) and Windows (x86-64 installer). Download them from the [SQLite Explorer App releases](https://github.com/zknpr/SQLite-Explorer-App/releases).
+SQLite Explorer also runs as a standalone desktop application, no VS Code required. It uses the same viewer inside a Tauri shell and ships packages for macOS (Apple Silicon `.dmg`), Linux (x86-64 `.deb`) and Windows (x86-64 installer). Download them from the [download page](https://sqlite-explorer.zknpr.xyz/download), which suggests the package for your system and lists each file's size and SHA-256. The app's source is in [zknpr/SQLite-Explorer-App](https://github.com/zknpr/SQLite-Explorer-App), with every release on its [releases page](https://github.com/zknpr/SQLite-Explorer-App/releases).
 
-The packages are not signed with a publisher identity yet, so macOS and Windows warn on first launch. The app's [install notes](https://github.com/zknpr/SQLite-Explorer-App#install) cover the first-launch steps and checksum verification.
+The packages are not signed with a publisher identity yet, so macOS and Windows warn on first launch. The download page covers the [first-launch steps](https://sqlite-explorer.zknpr.xyz/download#first-launch) and [checksum verification](https://sqlite-explorer.zknpr.xyz/download#verify).
 
 ## Usage
 
